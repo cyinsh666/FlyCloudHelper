@@ -40,8 +40,10 @@ import {
   readMusicMetadataLogFields,
   readVideoMetadataLogFields,
   resolveProviderConnection,
+  requireSameCloudDriveAccount,
   validateConfiguredScanRoots,
   validateMetadataProfile,
+  validateProviderDataType,
   validateProviderAccess,
   validateScanProfile,
   validateServiceDataType,
@@ -529,6 +531,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     );
     const connection = resolvedConnection.connection;
     const adapter = runtime.providers.get(providerType);
+    validateProviderDataType(adapter, dataType);
     const scanProfile = validateScanProfile(
       request.body.scan === undefined
         ? { fullRoots: [], incrementalRoots: [] }
@@ -717,7 +720,12 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       service.providerType,
       requireObject(request.body, "connection", "连接配置"),
     ).connection;
-    return runtime.providers.get(service.providerType).validateConnection(connection);
+    const result = await runtime.providers.get(service.providerType).validateConnection(connection);
+    const currentConnection = runtime.vault.decrypt(
+      await runtime.repository.getActiveEncryptedConnection(service.id, service.userId),
+    );
+    requireSameCloudDriveAccount(service.providerType, currentConnection, connection);
+    return result;
   });
 
   server.put<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/connection", async (request) => {
@@ -733,6 +741,10 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     const connection = resolvedConnection.connection;
     const adapter = runtime.providers.get(service.providerType);
     await validateProviderAccess(adapter, connection, service.scanProfile);
+    const currentConnection = runtime.vault.decrypt(
+      await runtime.repository.getActiveEncryptedConnection(service.id, service.userId),
+    );
+    requireSameCloudDriveAccount(service.providerType, currentConnection, connection);
     const updated = await runtime.repository.updateConnection({
       serviceId: service.id,
       userId: service.userId,
@@ -1206,13 +1218,16 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.delete<{ Body: Record<string, unknown> }>("/api/v1/admin/jobs/completed", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     requireConfirmation(request.body, "completed");
-    const result = await runtime.repository.deleteCompletedJobs();
+    // 管理端与用户端采用相同清理范围，不包含已取消和未结束任务。
+    const includeFailed = request.body.includeFailed === true;
+    const result = await runtime.repository.deleteCompletedJobs(undefined, includeFailed);
     for (const job of result.scanJobs) await runtime.failureReports.remove(job);
-    await audit(runtime, operator, "clear_completed_jobs", "scan_job", null, { deletedCount: result.deletedCount });
+    await audit(runtime, operator, "clear_completed_jobs", "scan_job", null, { deletedCount: result.deletedCount, includeFailed });
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-clear",
-      事件: "管理员清除已完成任务",
+      事件: includeFailed ? "管理员清除已完成和失败任务" : "管理员清除已完成任务",
       管理员ID: operator.id,
+      包含失败任务: includeFailed,
       删除任务数量: result.deletedCount,
     });
     return { deletedCount: result.deletedCount };

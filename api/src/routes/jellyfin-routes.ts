@@ -753,11 +753,12 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
     const context = await authenticated(request);
     requireProtocolUser(context, String((request.params as { userId: string }).userId));
     const query = readQuery(request);
-    // 关键变量：收藏和已观看必须走用户状态过滤，仅 DatePlayed 排序才走全部播放历史。
+    // 关键变量：保留 DatePlayed 播放历史入口，但 SeriesDatePlayed 是剧集列表排序，不能用子串判断。
     const hasStateFilter = String(query.Filters ?? query.filters ?? "").split(",").some((value) => ["IsFavorite", "IsPlayed"].includes(value.trim()))
       || String(query.IsFavorite ?? query.isFavorite ?? "").toLowerCase() === "true"
       || String(query.IsPlayed ?? query.isPlayed ?? "").toLowerCase() === "true";
-    return !hasStateFilter && String(query.SortBy ?? query.sortBy ?? "").includes("DatePlayed")
+    const sortFields = String(query.SortBy ?? query.sortBy ?? "").split(",").map((field) => field.trim().toLowerCase());
+    return !hasStateFilter && sortFields[0] === "dateplayed"
       ? compatibility.listHistory(context, query)
       : compatibility.listItems(context, query);
   });

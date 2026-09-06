@@ -1,11 +1,12 @@
 import path from "node:path";
+import { FlymbyVideoReleaseTextHelper } from "./flymby-video-release-text-helper.js";
 import type { ProviderEntry } from "../providers/types.js";
 import { FlymbyVideoTitleCleaner } from "./flymby-video-title-cleaner.js";
 
 export type FlymbyParsedVideoType = "movie" | "tv";
 
 // 关键变量：影响影视查询语义的本地清洗规则发生变化时必须提升，避免复用旧 AI 清洗缓存。
-export const FLYMBY_VIDEO_NAME_CLEANER_VERSION = "webdav-video-name-parser-2026-08-28-ai-flymby-v3";
+export const FLYMBY_VIDEO_NAME_CLEANER_VERSION = "webdav-video-name-parser-2026-09-06-recognition-v4";
 
 export interface FlymbyParsedVideoName {
   mediaType: FlymbyParsedVideoType;
@@ -33,6 +34,8 @@ export interface FlymbyParsedVideoName {
   movieDirectoryYearCorrected?: boolean;
   /** 是否通过数字目录名与多数同名前缀季集文件确认了纯数字节目名。 */
   confirmedNumericSeriesTitle?: boolean;
+  /** 数字电影片名由独立发行年份确认，允许通过弱标题门槛。 */
+  confirmedNumericMovieTitle?: boolean;
   year: number | null;
   seasonNumber: number;
   episodeNumber: number;
@@ -50,14 +53,14 @@ export interface FlymbyParsedVideoName {
 }
 
 const videoExtensionPattern = /^(?:mp4|mkv|iso|avi|mov|wmv|flv|m4v|ts|m2ts|webm|rmvb|mpg|mpeg|3gp|strm)$/iu;
-const categoryDirectoryPattern = /^(?:电影|影片|院线|华语电影|欧美电影|日韩电影|国产|国影|美影|国产剧|国剧|电视剧|连续剧|剧集|美剧|英剧|日剧|韩剧|港剧|台剧|泰剧|陆剧|短剧|网剧|综艺|纪录片|动漫网剧|动漫|动画|番剧|国产动漫|日韩动漫|欧美动漫|日漫|美漫|国漫|4k|1080p|高清|超清|超高清|合集|系列|专题|其他|未分类)$/iu;
+const categoryDirectoryPattern = /^(?:最近接收|电影|影片|院线|华语电影|欧美电影|日韩电影|国产|国影|美影|国产剧|国剧|电视剧|连续剧|剧集|美剧|英剧|日剧|韩剧|港剧|台剧|泰剧|陆剧|短剧|网剧|综艺|纪录片|动漫网剧|动漫|动画|番剧|国产动漫|日韩动漫|欧美动漫|日漫|美漫|国漫|4k|1080p|高清|超清|超高清|合集|系列|专题|其他|未分类)$/iu;
 const seriesDirectoryHintPattern = /(?:电视剧|剧集|连续剧|国产剧|国剧|美剧|英剧|日剧|韩剧|港剧|台剧|泰剧|陆剧|短剧|网剧|番剧|动漫网剧|国产动漫|日韩动漫|欧美动漫|日漫|美漫|国漫|动漫|动画|动态漫画|动态漫|漫剧|漫画|综艺|tv\s*shows?|shows?|season|series|第\s*[0-9一二三四五六七八九十两]{1,3}\s*(?:季|部)|\d{1,4}\s*集全)/iu;
 const seasonDirectoryPattern = /^(?:(?:season|series|s)\s*0*(\d{1,2})|第\s*([0-9一二三四五六七八九十两]{1,3})\s*(?:季|部))(?:$|[\s._\-–—:：].*)/iu;
 const genericMovieFilePattern = /^(?:movie|movies|film|feature|video|videos|main|full|index|default|stream|sample|trailer|preview|part\s*\d+|cd\s*\d+|disc\s*\d+|disk\s*\d+|\d{3,4}p|\d{1,4}|正片|影片|电影|视频|样片|预告)$/iu;
 const yearPattern = /(?:^|[^\d])((?:19|20)\d{2})(?!\s*[集话話])(?:[^\d]|$)/gu;
 const imdbPattern = /tt\d{6,10}/iu;
 const tmdbPattern = /(?:tmdbid|tmdb)\s*[-_:：=]?\s*(\d{2,10})/iu;
-const resolutionPattern = /\b((?:bd|hd|uhd|fhd)?\s*(?:2160p|1080p|720p|480p)|4k|8k)\b/iu;
+const resolutionPattern = /\b((?:bd|hd|uhd|fhd)?\s*(?:2160p|1440p|1080p|720p|576p|480p)|4k|8k)\b/iu;
 const sourcePattern = /\b(web[-.\s]?dl|web[-.\s]?rip|webrip|bluray|blu[-.\s]?ray|bdrip|hdtv|dvdrip|remux)\b/iu;
 const htmlAmpersandEntityPattern = /(?:&amp;|&#0*38;|&#x0*26;)/giu;
 const explicitTmdbIdTextPattern = /[\{\[\(【（]?\s*(?:tmdbid|tmdb)\s*[-_:：=]?\s*\d{2,10}\s*[\}\]\)】）]?/giu;
@@ -72,10 +75,12 @@ const titleCategoryNoisePattern = /(?:^|[\s._+\-–—:：,，;；/\\|·•\[\]\
 const titleBracketPattern = /[\[\]\(\){}【】（）〖〗『』《》「」]/gu;
 const titleDotPattern = /[._+]+/gu;
 const titleSeparatorPattern = /[–—:：,，;；/\\|]/gu;
-const videoQualityPattern = /\b(?:(?:bd|hd|uhd|fhd)\s*)?(?:2160p|1080p|720p|480p)\b|\b(?:4k|8k|uhd|fhd|hdr10\+?|hdr|dv|dolby\s*vision|60\s*fps|120\s*fps|hq|raw|clean)\b/giu;
+const videoQualityPattern = /\b(?:(?:bd|hd|uhd|fhd)\s*)?(?:2160p|1440p|1080p|720p|576p|480p)\b|\b(?:4k|8k|uhd|fhd|hdr10\+?|hdr|dv|dolby\s*vision|60\s*fps|120\s*fps|hq|raw|clean)\b/giu;
 const videoSourceCleanPattern = /\b(?:web[-.\s]?dl|web[-.\s]?rip|webrip|bluray|blu[-.\s]?ray|bdrip|hdtv|dvdrip|remux)\b/giu;
 const videoCodecPattern = /\b(?:x\s*\.?\s*26[45]|h\s*\.?\s*26[45]|hevc|avc|10\s*bit|8\s*bit)\b/giu;
-const videoAudioCleanPattern = /\b(?:DDP\s*5\s*1|DDP(?:\s*5(?:[.\s]?1)?)?|DD\+?|EAC3|E-AC3|DTS[-\s]*HD(?:[-\s]*MA)?|DTS\s*5\s*1|DTS|TrueHD\s*\d?\s*\d?|Atmos|AAC(?:\s*[25](?:[.\s]?1)?)?|FLAC(?:\s*[25](?:[.\s]?1)?)?|LPCM|PCM(?:\s*\d(?:[.\s]?0)?)?|AC3|AV3A\s*5\s*1|\d+\s*Audios?|\d+\s*Audio)\b/giu;
+const videoAudioCleanPattern = /\b(?:DDP(?:[-._\s]*[1572][._\s]?[01])?|DD\+?(?:[-._\s]*[1572][._\s]?[01])?|EAC3|E-AC3|DTS[-._\s]*HD(?:[-._\s]*MA)?(?:[-._\s]*[1572][._\s]?[01])?|DTS(?:[-._\s]*[1572][._\s]?[01])?|TrueHD(?:[-._\s]*[1572][._\s]?[01])?|Atmos|AAC(?:[-._\s]*[257][._\s]?[01])?|FLAC(?:[-._\s]*[257][._\s]?[01])?|MP3|LPCM|PCM(?:[-._\s]*\d[._\s]?[01])?|AC3(?:[-._\s]*[1572][._\s]?[01])?|AV3A(?:[-._\s]*[1572][._\s]?[01])?|\d+\s*Audios?|\d+\s*Audio)\b/giu;
+// 声道数字不能参与弱集号判断。
+const audioChannelLayoutPattern = /(?:^|[\s._+\-–—:：,，;；/\\|\[\]（）【】])(?:1[._\s]?0|2[._\s]?[01]|4[._\s]?0|5[._\s]?[01]|6[._\s]?1|7[._\s]?[01])(?=$|[\s._+\-–—:：,，;；/\\|\[\]（）【】])/gu;
 const videoLanguagePairPattern = /(?:^|[\s._\-–—:：])(?:Mandarin|Cantonese)\s*(?:&|and)\s*(?:Mandarin|Cantonese)(?=$|[\s._\-–—:：])/giu;
 const videoEditionPattern = /\b(?:proper|repack|extended|uncut|director'?s\s*cut|multi|dual|chs|cht|subbed|v\d+)\b/giu;
 const videoPlatformPattern = /\b(?:nf|netflix|amzn|amazon|dsnp|disney|hulu|hmax|max|itunes|apple\s*tv|hami|wavve|fandango)\b/giu;
@@ -130,15 +135,21 @@ export function parseFlymbyVideoName(entry: ProviderEntry, rootPath: string): Fl
   const fileName = String(entry.name ?? "").trim();
   const baseName = removeKnownVideoExtension(fileName);
   const normalizedPath = normalizeMediaPath(entry.path);
-  const marker = parseEpisodeMarker(baseName, normalizedPath);
   const parentPath = path.posix.dirname(normalizedPath);
+  const mixedBucket = isMixedMediaBucketDirectory(parentPath);
+  // 混合接收目录不继承上级节目、季号或片名。
+  const recognitionPath = mixedBucket ? `/${fileName}` : normalizedPath;
+  const marker = parseEpisodeMarker(baseName, recognitionPath);
   // 关键变量：只采信距离文件最近的单类型目录，避免上层“电影和电视剧”混合库污染判型。
-  const nearestPathType = findNearestPathMediaType(rootPath, parentPath);
+  const nearestPathType = mixedBucket ? "none" : findNearestPathMediaType(rootPath, parentPath);
   const hasExplicitEpisode = hasExplicitEpisodeMarker(baseName);
   const shouldForceMovieByName = movieTitleHintPattern.test(fileName) && !hasExplicitEpisode;
-  const shouldUseTv = !shouldForceMovieByName
-    && (marker.matched || (nearestPathType === "tv" && isNestedBelowRoot(normalizedPath, rootPath)));
-  const year = extractYear(baseName) ?? extractNearestPathYear(normalizedPath);
+  const numericMovieTitle = cleanMovieTitle(baseName);
+  const confirmedNumericMovieTitle = nearestPathType !== "tv" && hasNumericMovieTitleEvidence(fileName, numericMovieTitle);
+  const shouldUseTv = !confirmedNumericMovieTitle && !shouldForceMovieByName
+    && ((mixedBucket ? hasExplicitEpisode : marker.matched)
+      || (nearestPathType === "tv" && isNestedBelowRoot(normalizedPath, rootPath)));
+  const year = extractYear(baseName) ?? (mixedBucket ? null : extractNearestPathYear(normalizedPath));
   const common = {
     fileName,
     baseName,
@@ -156,10 +167,10 @@ export function parseFlymbyVideoName(entry: ProviderEntry, rootPath: string): Fl
       : inferEpisodeNumbers(baseName);
     const seasonNumber = marker.explicitSeason
       ? marker.seasonNumber
-      : resolveSeasonNumber(normalizedPath, marker.seasonNumber);
-    const seriesTitle = pickSeriesTitle(baseName, normalizedPath, marker.index);
+      : resolveSeasonNumber(recognitionPath, marker.seasonNumber);
+    const seriesTitle = pickSeriesTitle(baseName, recognitionPath, marker.index);
     const fileSeriesTitle = marker.index > 0 ? cleanSeriesTitle(baseName.slice(0, marker.index)) : seriesTitle;
-    const seriesYear = resolveSeriesYearFromPath(normalizedPath, seriesTitle);
+    const seriesYear = resolveSeriesYearFromPath(recognitionPath, seriesTitle);
     return {
       ...common,
       mediaType: "tv",
@@ -178,7 +189,7 @@ export function parseFlymbyVideoName(entry: ProviderEntry, rootPath: string): Fl
   }
 
   const fileTitle = cleanMovieTitle(baseName);
-  const parentTitle = pickMovieDirectoryTitle(normalizedPath, rootPath);
+  const parentTitle = mixedBucket || confirmedNumericMovieTitle ? "" : pickMovieDirectoryTitle(normalizedPath, rootPath);
   const preferParent = FlymbyVideoTitleCleaner.shouldPreferDirectoryTitle(fileName, fileTitle, parentTitle)
     || genericMovieFilePattern.test(FlymbyVideoTitleCleaner.normalizeSearchText(fileTitle));
   const title = preferParent && parentTitle ? parentTitle : (fileTitle || parentTitle || baseName);
@@ -192,7 +203,9 @@ export function parseFlymbyVideoName(entry: ProviderEntry, rootPath: string): Fl
     title,
     query: title,
     fallbackQuery: fileTitle,
-    recognitionReason: usedParentTitleFallback ? "parent_movie_title" : "movie_file_title",
+    recognitionReason: mixedBucket ? "mixed_bucket_file_identity" :
+      (confirmedNumericMovieTitle ? "numeric_movie_file_year" : usedParentTitleFallback ? "parent_movie_title" : "movie_file_title"),
+    confirmedNumericMovieTitle,
     blockedFalseEpisode: false,
     usedParentTitleFallback,
     seriesYearCorrected: false,
@@ -219,9 +232,9 @@ export function parseFlymbyVideoDirectory(
   if (videoEntries.length === 0) return parsedByResourceId;
 
   const currentPath = path.posix.dirname(normalizeMediaPath(videoEntries[0]!.path));
+  if (isMixedMediaBucketDirectory(currentPath)) return parsedByResourceId;
   const directoryContext = buildDirectoryVideoContext(rootPath, currentPath, videoEntries, parsedByResourceId);
   const episodeNumbersByResourceId = new Map<string, number[]>();
-  let episodeLikeCount = 0;
   let explicitTvResult: FlymbyParsedVideoName | null = null;
   for (const entry of videoEntries) {
     const parsed = parsedByResourceId.get(entry.resourceId)!;
@@ -229,23 +242,31 @@ export function parseFlymbyVideoDirectory(
       ? parsed.episodeNumbers
       : inferDirectoryEpisodeNumbers(entry.name, currentPath);
     episodeNumbersByResourceId.set(entry.resourceId, inferredNumbers);
-    if (parsed.mediaType === "tv" || inferredNumbers.length > 0) episodeLikeCount += 1;
-    if (!explicitTvResult && parsed.mediaType === "tv") explicitTvResult = parsed;
+    if (hasExplicitEpisodeMarker(removeKnownVideoExtension(entry.name))) {
+      if (!explicitTvResult && parsed.mediaType === "tv") explicitTvResult = parsed;
+    }
   }
 
   if (directoryContext.mediaType === "movie") {
     for (const entry of videoEntries) {
       const parsed = parsedByResourceId.get(entry.resourceId)!;
+      if (parsed.confirmedNumericMovieTitle) continue;
+      // 文件明确季集标记优先于普通电影目录，剧场版等明确电影提示除外。
+      if (hasExplicitEpisodeMarker(parsed.baseName) && !movieTitleHintPattern.test(entry.name)
+        && !movieTitleHintPattern.test(currentPath) && parsed.mediaType === "tv") continue;
       // 关键变量：直接从原始文件名提取的电影标题，用于恢复 007、12 Years 等数字开头片名。
       const directMovieTitle = cleanMovieTitle(entry.name);
       // 关键变量：电影容器目录的同名正片、分辨率版本和多分段文件共用一个刮削任务。
       const seriesPartTitle = directoryContext.title
         ? ""
         : buildMovieSeriesPartTitle(rootPath, currentPath, entry.name, parsed.title);
-      const movieTitle = directoryContext.title || seriesPartTitle
+      const independentTitle = isCollectionDirectoryTitle(path.posix.basename(currentPath))
+        && (isUsableMovieDirectoryTitle(directMovieTitle) || hasNumericMovieTitleEvidence(entry.name, directMovieTitle))
+        ? directMovieTitle : "";
+      const movieTitle = independentTitle || directoryContext.title || seriesPartTitle
         || (isUsableMovieDirectoryTitle(directMovieTitle) ? directMovieTitle : parsed.title);
       const blockedFalseEpisode = parsed.mediaType === "tv";
-      const directoryYear = directoryContext.title
+      const directoryYear = directoryContext.title && movieTitle === directoryContext.title
         ? extractMatchingMovieTitleYearFromPath(entry.path, directoryContext.title)
         : null;
       // 关键变量：S00Exx 分段转回电影后恢复文件自身年份，不能保留节目解析阶段清空的年份。
@@ -263,6 +284,7 @@ export function parseFlymbyVideoDirectory(
         recognitionReason: blockedFalseEpisode ? "movie_category_guard" : "movie_directory_context",
         blockedFalseEpisode,
         recoveredNumericMovieTitle,
+        confirmedNumericMovieTitle: hasNumericMovieTitleEvidence(entry.name, movieTitle),
         overrodeTvCategoryWithMovieVariants: directoryContext.reason === "tv_category_movie_variant",
         movieDirectoryYearCorrected: Boolean(directoryContext.title
           && directoryYear === null
@@ -281,7 +303,7 @@ export function parseFlymbyVideoDirectory(
   const nestedBelowRoot = isNestedBelowRoot(videoEntries[0]!.path, rootPath);
   const nearestPathType = findNearestPathMediaType(rootPath, currentPath);
   const shouldUseTv = directoryContext.mediaType === "tv"
-    || Boolean(explicitTvResult || (nearestPathType === "tv" && nestedBelowRoot) || episodeLikeCount >= 2);
+    || Boolean(explicitTvResult || (nearestPathType === "tv" && nestedBelowRoot) || countConsecutiveBareEpisodeItems(videoEntries) >= 3);
   if (!shouldUseTv) return parsedByResourceId;
 
   // 关键变量：优先使用显式季集标记解析出的剧名，缺失时再逐级回退到最近可用目录。
@@ -391,15 +413,13 @@ function buildDirectoryVideoContext(
   const dateEpisodeContext = buildDateEpisodeDirectoryContext(currentPath, videoEntries);
   if (dateEpisodeContext.mediaType === "tv") return dateEpisodeContext;
 
-  const episodeLikeCount = videoEntries.reduce((count, entry) => {
-    const parsed = parsedByResourceId.get(entry.resourceId);
-    return count + ((parsed?.mediaType === "tv" || inferDirectoryEpisodeNumbers(entry.name, currentPath).length > 0) ? 1 : 0);
-  }, 0);
+  const episodeLikeCount = videoEntries.filter((entry) => hasExplicitEpisodeMarker(removeKnownVideoExtension(entry.name))).length;
+  const consecutiveBareEpisodeCount = countConsecutiveBareEpisodeItems(videoEntries);
   const normalizedRoot = normalizeMediaPath(rootPath).replace(/\/+$/u, "") || "/";
   const normalizedCurrent = normalizeMediaPath(currentPath);
   const canUseDirectoryTvHint = nearestPathType === "tv"
     && !(normalizedCurrent === normalizedRoot && episodeLikeCount === 0);
-  if (canUseDirectoryTvHint || (nearestPathType === "none" && episodeLikeCount >= 2)) {
+  if (canUseDirectoryTvHint || (nearestPathType === "none" && consecutiveBareEpisodeCount >= 3)) {
     const title = pickSeriesTitle("", `${normalizedCurrent}/placeholder.mkv`, -1);
     if (isUsableTitle(title)) {
       return {
@@ -801,9 +821,10 @@ function parseEpisodeMarker(baseName: string, filePath: string): EpisodeMarker {
   if (special) {
     return markerFromMatch(special, 0, true, [Number(special[1] || 1)]);
   }
+  const weakEpisodeText = stripEpisodeTechnicalText(baseName);
   const trailing = endsWithVideoCodecNumber(baseName)
     ? null
-    : /^(.*?[A-Za-z\u4e00-\u9fa5])[\s._-]*0*(\d{1,4})(?:\s*v\d+)?$/u.exec(baseName);
+    : /^(.*?[A-Za-z\u4e00-\u9fa5])[\s._-]*0*(\d{1,4})(?:\s*v\d+)?$/u.exec(weakEpisodeText);
   if (trailing
     && seriesDirectoryHintPattern.test(filePath)
     && !startsWithAirDate(baseName)
@@ -859,7 +880,7 @@ function inferEpisodeNumbers(baseName: string): number[] {
  * 对“2040集完/2001-2500/2001.mp4”这类目录，纯数字允许作为大于 500 的真实集号。
  */
 function inferDirectoryEpisodeNumbers(fileName: string, directoryPath: string): number[] {
-  const baseName = removeKnownVideoExtension(fileName);
+  const baseName = stripEpisodeTechnicalText(removeKnownVideoExtension(fileName));
   const direct = /^\s*[\[（(【]?\s*0*(\d{1,4})(?:\s*v\d+)?\s*[\]）)】]?\s*$/u.exec(baseName);
   const directNumber = Number(direct?.[1] ?? 0);
   const directoryHasEpisodeRange = /(?:\d{1,4}\s*集|\d{1,4}\s*[-–—~至到]\s*\d{1,4})/u.test(directoryPath);
@@ -924,7 +945,7 @@ function pickMovieDirectoryTitle(filePath: string, rootPath: string): string {
 function cleanMovieTitle(value: string): string {
   const stem = removeKnownVideoExtension(value);
   // “1917：逆战救兵”开头的四位数字属于片名，不作为发行年份删除。
-  const numericTitleMatch = /^((?:19|20)\d{2})\s*[:：]\s*/u.exec(stem);
+  const numericTitleMatch = /^((?:19|20)\d{2})(?:\s*[:：]\s*|(?=$|[\s._-]+[\[（(]?(?:(?:19|20)\d{2}|\d{3,4}[pi]|[48]k)\b))/iu.exec(stem);
   const numericTitlePrefix = numericTitleMatch?.[1] ?? "";
   const titleStem = numericTitleMatch ? stem.slice(numericTitleMatch[0].length) : stem;
   // 带年份的电影文件末尾常用 -1、-2 表示分段或版本，不属于片名。
@@ -935,9 +956,10 @@ function cleanMovieTitle(value: string): string {
     /([A-Za-z])((?:19|20)\d{2})(?=$|[\s._\-–—:：])/gu,
     "$1 ",
   );
-  let text = cleanTitleSegment(withoutAttachedYear);
+  // 先移除发行年份，再折叠括号和点号，防止“续集编号 年份”被当成合集范围。
+  let text = cleanTitleSegment(withoutAttachedYear.replace(yearBracketPattern, " "));
   if (!text) {
-    text = removeKnownVideoExtension(value).replace(/(?:^|[^\d])(?:19|20)\d{2}(?:[^\d]|$)/gu, " ");
+    text = titleStem.replace(/(?:^|[^\d])(?:19|20)\d{2}(?:[^\d]|$)/gu, " ");
     text = cleanTitleSegment(text);
   }
   const cleanedTitle = stripDetectedReleaseGroup(text, stem);
@@ -980,7 +1002,7 @@ function cleanSeriesTitle(value: string): string {
 /** 对齐 APP 的目录和文件标题清洗主链，删除站点、ID、资源规格和发布组噪声。 */
 function cleanTitleSegment(value: string): string {
   const rawValue = String(value ?? "");
-  let text = rawValue.replace(htmlAmpersandEntityPattern, "&");
+  let text = FlymbyVideoReleaseTextHelper.stripTechnicalDimensions(rawValue).replace(htmlAmpersandEntityPattern, "&");
   text = removeKnownVideoExtension(text);
   text = text.replace(leadingSiteTagPattern, " ");
   text = stripLeadingResourcePrefix(text);
@@ -1064,21 +1086,10 @@ function truncateTitleAtMetadataSuffix(value: string): string {
 
 /** 资源规格清理后若遗留独立尾部数字，则按 APP 规则继续删除。 */
 function removeTrailingNoiseNumber(value: string, rawValue: string): string {
-  let text = collapseTitleSpaces(value);
-  if (!/[A-Za-z\u4e00-\u9fa5]/u.test(text)) return value;
-  // 关键变量：只有原始名称确实包含资源或发布信息时，尾部数字才视为清洗残留。
-  const hasResourceContext = testGlobalPattern(videoFileSizePattern, rawValue)
-    || testGlobalPattern(videoResourceCleanPattern, rawValue)
-    || testGlobalPattern(videoReleaseTagPattern, rawValue)
-    || testGlobalPattern(videoAudioCleanPattern, rawValue)
-    || testGlobalPattern(videoSourceCleanPattern, rawValue);
-  if (!hasResourceContext) return value;
-  let match = /^(.*\S)\s+\d{1,4}$/u.exec(text);
-  while (match?.[1] && /[A-Za-z\u4e00-\u9fa5]/u.test(match[1])) {
-    text = match[1];
-    match = /^(.*\S)\s+\d{1,4}$/u.exec(text);
-  }
-  return text;
+  return FlymbyVideoReleaseTextHelper.stripTrailingTechnicalNumbers(value, rawValue, [
+    rawValue.search(videoResourceCleanPattern),
+    rawValue.search(videoReleaseTagPattern),
+  ]);
 }
 
 /** 安全执行带全局标记的正则，避免 lastIndex 污染后续解析。 */
@@ -1240,6 +1251,7 @@ function isGenericMediaRootDirectoryName(value: string): boolean {
 
 /** 读取文件名或路径中的最后一个有效年份，兼容片名本身带年份的情况。 */
 function extractYear(value: string): number | null {
+  value = FlymbyVideoReleaseTextHelper.stripTechnicalDimensions(value);
   yearPattern.lastIndex = 0;
   let lastYear: number | null = null;
   let match = yearPattern.exec(value);
@@ -1247,7 +1259,7 @@ function extractYear(value: string): number | null {
     const yearText = match[1] ?? "";
     const yearIndex = match.index + match[0].indexOf(yearText);
     const remainingText = value.slice(yearIndex + yearText.length);
-    if (!(yearIndex === 0 && /^\s*[:：]/u.test(remainingText))) {
+    if (!(yearIndex === 0 && (/^\s*[:：]/u.test(remainingText) || /^[\s._-]+[\[（(]?(?:19|20)\d{2}\b/u.test(remainingText)))) {
       lastYear = yearText ? Number(yearText) : lastYear;
     }
     yearPattern.lastIndex = yearIndex + yearText.length;
@@ -1302,4 +1314,51 @@ function parseChineseNumber(value: string): number {
 function normalizeMediaPath(value: string): string {
   const normalized = `/${String(value ?? "").replace(/\\/gu, "/").replace(/^\/+|\/+$/gu, "")}`;
   return normalized === "/" ? normalized : normalized.replace(/\/{2,}/gu, "/");
+}
+
+/** “最近接收”是平铺混合桶，不继承整目录影视身份。 */
+function isMixedMediaBucketDirectory(directoryPath: string): boolean {
+  return path.posix.basename(normalizeMediaPath(directoryPath)).trim() === "最近接收";
+}
+
+/** 数字片名必须携带另一个独立发行年份，不能放开普通裸集号。 */
+export function hasNumericMovieTitleEvidence(fileName: string, title: string): boolean {
+  if (!/^\d{3,4}$/u.test(title)) return false;
+  const match = /^(\d{3,4})[\s._-]+[\[（(]?((?:19|20)\d{2})(?=$|[\s._\]）)-])/u.exec(removeKnownVideoExtension(fileName));
+  return Boolean(match && match[1] === title && match[2] !== title);
+}
+
+/** 提供文件自身的电影标题和年份，不读取父目录，供 TMDB 年份证据校验使用。 */
+export function readFlymbyMovieFileEvidence(fileName: string): { title: string; year: number | null } {
+  return { title: cleanMovieTitle(fileName), year: extractYear(removeKnownVideoExtension(fileName)) };
+}
+
+/** 剔除完整技术参数后再推断弱集号，避免声道、编码和尺寸污染。 */
+function stripEpisodeTechnicalText(value: string): string {
+  return value.replace(videoDimensionPattern, " ").replace(videoQualityPattern, " ")
+    .replace(videoSourceCleanPattern, " ").replace(videoCodecPattern, " ")
+    .replace(videoAudioCleanPattern, " ").replace(audioChannelLayoutPattern, " ")
+    .replace(videoFileSizePattern, " ").replace(videoReleaseTagPattern, " ");
+}
+
+/** 无节目目录提示时，至少三个连续裸集号才能建立节目上下文。 */
+function countConsecutiveBareEpisodeItems(entries: ProviderEntry[]): number {
+  const numbers = new Set<number>();
+  for (const entry of entries) {
+    const stem = removeKnownVideoExtension(entry.name);
+    if (startsWithAirDate(stem)) continue;
+    const text = stripEpisodeTechnicalText(stem.replace(yearBracketPattern, " ")).replace(/[\[\]（）【】()]/gu, " ").trim();
+    const match = /^0*(\d{1,4})(?:\s*v\d+)?$/iu.exec(text);
+    const number = Number(match?.[1] ?? 0);
+    if (number > 0 && number <= 500) numbers.add(number);
+  }
+  let longest = 0;
+  let current = 0;
+  let previous = -1;
+  for (const number of [...numbers].sort((left, right) => left - right)) {
+    current = number === previous + 1 ? current + 1 : 1;
+    longest = Math.max(longest, current);
+    previous = number;
+  }
+  return longest;
 }

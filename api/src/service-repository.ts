@@ -2131,14 +2131,16 @@ export class ServiceRepository {
     });
   }
 
-  /** 批量删除指定用户或管理范围内的已完成任务，并返回需要清理失败报告的扫描任务。 */
-  public async deleteCompletedJobs(userId?: string): Promise<{
+  /** 批量删除权限范围内的已完成任务，可按请求同时清理失败任务及其报告。 */
+  public async deleteCompletedJobs(userId?: string, includeFailed = false): Promise<{
     deletedCount: number;
     scanJobs: Array<{ id: string; userId: string; serviceId: string }>;
   }> {
     return this.database.query.transaction(async (transaction) => {
-      let scanJobQuery = transaction("scan_jobs").select("id", "user_id", "service_id").where({ status: "completed" });
-      let mediaProbeJobQuery = transaction("media_probe_jobs").select("id").where({ status: "completed" });
+      // 清理状态由请求明确指定；已取消及所有未结束状态都不参与批量删除。
+      const statuses: JobStatus[] = includeFailed ? ["completed", "failed"] : ["completed"];
+      let scanJobQuery = transaction("scan_jobs").select("id", "user_id", "service_id").whereIn("status", statuses);
+      let mediaProbeJobQuery = transaction("media_probe_jobs").select("id").whereIn("status", statuses);
       if (userId) {
         scanJobQuery = scanJobQuery.where({ user_id: userId });
         mediaProbeJobQuery = mediaProbeJobQuery.where({ user_id: userId });

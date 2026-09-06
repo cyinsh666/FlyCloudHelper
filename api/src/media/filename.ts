@@ -6,6 +6,7 @@ import {
   buildFlymbyScrapeTaskKey,
   parseFlymbyVideoDirectory,
   parseFlymbyVideoName,
+  readFlymbyMovieFileEvidence,
   type FlymbyParsedVideoName,
 } from "./flymby-video-parser.js";
 
@@ -137,6 +138,21 @@ export function buildMediaDirectoryDescriptors(
     const descriptor = describeMediaFile(entry, allowedTypes, scanRootPath, parsedVideos.get(entry.resourceId));
     if (descriptor) descriptors.set(entry.resourceId, descriptor);
   }
+  // 同一个刮削任务携带全部文件的独立年份证据，不能只由第一个版本决定年份放宽。
+  const movieEvidenceByTask = new Map<string, Array<{ title: string; year: number | null }>>();
+  for (const entry of entries) {
+    const descriptor = descriptors.get(entry.resourceId);
+    if (descriptor?.itemType !== "video.movie") continue;
+    const key = String(descriptor.metadata.scrapeTaskKey);
+    const evidence = movieEvidenceByTask.get(key) ?? [];
+    evidence.push(readFlymbyMovieFileEvidence(entry.name));
+    movieEvidenceByTask.set(key, evidence);
+  }
+  for (const descriptor of descriptors.values()) {
+    if (descriptor.itemType === "video.movie") {
+      descriptor.metadata.movieFileEvidence = movieEvidenceByTask.get(String(descriptor.metadata.scrapeTaskKey)) ?? [];
+    }
+  }
   return descriptors;
 }
 
@@ -172,6 +188,7 @@ function describeVideo(
         overrodeTvCategoryWithMovieVariants: parsed.overrodeTvCategoryWithMovieVariants,
         movieDirectoryYearCorrected: parsed.movieDirectoryYearCorrected,
         confirmedNumericSeriesTitle: parsed.confirmedNumericSeriesTitle,
+        confirmedNumericMovieTitle: parsed.confirmedNumericMovieTitle,
         imdbId: parsed.imdbId,
         explicitTmdbId: parsed.tmdbId,
         resolution: parsed.resolution,

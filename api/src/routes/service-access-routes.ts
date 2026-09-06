@@ -21,6 +21,12 @@ function supportsRelayPlayback(runtime: ApiRuntime, providerType: string): boole
   return capabilities.includes("relayPlayback") || capabilities.includes("relay");
 }
 
+/** 只有声明支持音乐且按音乐数据创建的网盘服务才开放 Navidrome。 */
+function supportsNavidrome(runtime: ApiRuntime, providerType: string, dataType: string): boolean {
+  return dataType === "music"
+    && runtime.providers.get(providerType).descriptor.supportedDataTypes.includes("music");
+}
+
 /** 构造媒体库协议配置。 */
 async function buildServiceAccessSettings(runtime: ApiRuntime, serviceId: string) {
   const service = await runtime.repository.getServiceDetail(serviceId);
@@ -51,6 +57,7 @@ async function buildServiceAccessSettings(runtime: ApiRuntime, serviceId: string
   const navidromePath = buildNavidromePath(navidromePathSuffix);
   const embyPathSuffix = String(library?.emby_path_suffix ?? "").trim() || serviceId;
   const embyPath = buildEmbyPath(embyPathSuffix);
+  const navidromeSupported = supportsNavidrome(runtime, service.providerType, service.dataType);
   // 关键变量：Emby 账号始终从独立服务读取，禁止把 Jellyfin account/accounts 回传给 Emby 客户端。
   const embyAccounts = await runtime.embyAccess.listByService(serviceId);
   return {
@@ -72,9 +79,9 @@ async function buildServiceAccessSettings(runtime: ApiRuntime, serviceId: string
     embyDownloadEnabled: library?.emby_download_enabled === undefined || Number(library.emby_download_enabled) === 1,
     embyRegionLibrariesEnabled: Number(library?.emby_region_libraries_enabled) === 1,
     embyAccounts,
-    navidromeSupported: service.dataType === "music",
-    navidromeEnabled: service.dataType === "music" && Number(library?.navidrome_enabled) === 1,
-    navidromeUrl: service.dataType === "music" ? await runtime.publicAccess.buildNavidromeUrl(navidromePathSuffix) : null,
+    navidromeSupported,
+    navidromeEnabled: navidromeSupported && Number(library?.navidrome_enabled) === 1,
+    navidromeUrl: navidromeSupported ? await runtime.publicAccess.buildNavidromeUrl(navidromePathSuffix) : null,
     navidromePath,
     navidromePathSuffix,
     account,
@@ -386,7 +393,7 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
 
     server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/navidrome-settings`, async (request) => {
       const { operator, service } = await requireManagedService(runtime, request, request.params.serviceId, admin);
-      if (service.dataType !== "music") {
+      if (!supportsNavidrome(runtime, service.providerType, service.dataType)) {
         throw new ApiError(422, "navidrome_music_service_required", "只有音乐类型服务可以启用 Navidrome 协议");
       }
       const changesEnabled = request.body.navidromeEnabled !== undefined;

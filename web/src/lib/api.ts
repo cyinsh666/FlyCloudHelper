@@ -692,12 +692,25 @@ export interface ProviderDescriptor {
   displayName: string;
   adapterVersion: string;
   credentialSchemaVersion: number;
+  /** Provider 可以完成扫描、刮削和协议访问的数据类型。 */
+  supportedDataTypes: Array<"video" | "music">;
   capabilities: string[];
   recommendedScanSettings: {
     scanDirectoryConcurrency: { default: number };
     scrapeTaskConcurrency: { default: number };
   };
-  authenticationMode?: "form" | "web_qr";
+  authenticationMode?: "form" | "web_qr" | "authorization_session";
+  authMethods?: Array<{
+    type: string;
+    displayName: string;
+    interaction: "qr" | "sms";
+    recommended: boolean;
+  }>;
+  authSources?: Array<{
+    value: string;
+    label: string;
+    recommended: boolean;
+  }>;
   connectionFields: Array<{
     name: string;
     label: string;
@@ -730,6 +743,22 @@ export interface GuangyaSmsAuthorizationStartResult {
     verificationUri: string;
     expiresAt: string;
   } | null;
+}
+
+/** 新网盘统一扫码状态；Token、Cookie 和设备码只保留在 API 内存。 */
+export interface CloudAuthorizationStatus {
+  authorizationSessionId: string;
+  providerType: string;
+  authMethod: string;
+  state: "waiting" | "scanned" | "confirmed" | "authorized" | "rejected" | "expired" | "cancelled" | "failed";
+  qrCodeContent: string;
+  qrCodeImageUrl: string;
+  authorizationUrl: string;
+  expiresAt: string;
+  pollIntervalSeconds: number;
+  accountSummary: string | null;
+  errorCode: string | null;
+  message: string | null;
 }
 
 /** 路径选择器显示并保存的网盘目录。 */
@@ -1043,6 +1072,35 @@ export function pollGuangyaAuthorization(
   );
 }
 
+/** 在FlyCloudHelper内按可选来源启动指定网盘扫码会话。 */
+export function startCloudAuthorization(
+  providerType: string,
+  admin = false,
+  userId?: string,
+  options: { clientType?: string } = {},
+): Promise<CloudAuthorizationStatus> {
+  return requestJson(
+    admin ? `/api/v1/admin/providers/${encodeURIComponent(providerType)}/auth-sessions` : `/api/v1/providers/${encodeURIComponent(providerType)}/auth-sessions`,
+    { method: "POST", body: JSON.stringify(admin ? { userId, ...options } : options) },
+  );
+}
+
+/** 读取指定网盘扫码状态。 */
+export function pollCloudAuthorization(providerType: string, authorizationSessionId: string, admin = false): Promise<CloudAuthorizationStatus> {
+  return requestJson(admin
+    ? `/api/v1/admin/providers/${encodeURIComponent(providerType)}/auth-sessions/${encodeURIComponent(authorizationSessionId)}`
+    : `/api/v1/providers/${encodeURIComponent(providerType)}/auth-sessions/${encodeURIComponent(authorizationSessionId)}`);
+}
+
+/** 扫码确认后由服务端完成 Token 或 Cookie 交换。 */
+export function completeCloudAuthorization(providerType: string, authorizationSessionId: string, admin = false): Promise<CloudAuthorizationStatus> {
+  return requestJson(admin
+    ? `/api/v1/admin/providers/${encodeURIComponent(providerType)}/auth-sessions/${encodeURIComponent(authorizationSessionId)}/complete`
+    : `/api/v1/providers/${encodeURIComponent(providerType)}/auth-sessions/${encodeURIComponent(authorizationSessionId)}/complete`, {
+    method: "POST", body: JSON.stringify({}),
+  });
+}
+
 /** 创建用户或管理员代建的云端服务。 */
 export async function createService(
   input: CreateCloudServiceInput,
@@ -1144,11 +1202,11 @@ export async function deleteScanJob(jobId: string, admin = false): Promise<void>
   });
 }
 
-/** 清除当前用户或管理范围内的全部已完成后台任务。 */
-export async function clearCompletedScanJobs(admin = false): Promise<number> {
+/** 清除当前用户或管理范围内的全部已完成和失败后台任务。 */
+export async function clearCompletedAndFailedScanJobs(admin = false): Promise<number> {
   const result = await requestJson<{ deletedCount: number }>(
     admin ? "/api/v1/admin/jobs/completed" : "/api/v1/scan-jobs/completed",
-    { method: "DELETE", body: JSON.stringify({ confirmation: "completed" }) },
+    { method: "DELETE", body: JSON.stringify({ confirmation: "completed", includeFailed: true }) },
   );
   return result.deletedCount;
 }

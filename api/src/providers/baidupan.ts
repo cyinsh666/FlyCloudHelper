@@ -45,6 +45,7 @@ export class BaiduPanProvider implements ProviderAdapter {
     displayName: "百度网盘",
     adapterVersion: "1.0.0",
     credentialSchemaVersion: 2,
+    supportedDataTypes: ["video", "music"],
     capabilities: ["list", "stableResourceId", "playbackLocator", "directDownload", "relay"],
     recommendedScanSettings: createProviderRecommendedScanSettings({
       // 百度单页可以读取 1000 项，但业务码 31034 对突发并发更敏感。

@@ -11,6 +11,7 @@ import {
   type ProviderEnumerationCheckpoint,
   type ProviderEnumerationOptions,
   type ProviderEnumerationWarning,
+  type ProviderFileStreamAccess,
   type ProviderValidationResult,
   type ScanRoot,
   createProviderRecommendedScanSettings,
@@ -179,6 +180,7 @@ export class GuangyaProvider implements ProviderAdapter {
     displayName: "光鸭云盘",
     adapterVersion: "4.0.0-three-auth-modes",
     credentialSchemaVersion: 4,
+    supportedDataTypes: ["video", "music"],
     capabilities: [
       "list",
       "stableResourceId",
@@ -242,6 +244,16 @@ export class GuangyaProvider implements ProviderAdapter {
       signal,
     );
     return { ...access, headers: {} };
+  }
+
+  /** 音乐标签读取和 Navidrome 中转复用光鸭短期下载地址，不向客户端暴露上游凭据。 */
+  public async resolveFileStreamAccess(
+    connection: Record<string, unknown>,
+    locator: Record<string, unknown>,
+    signal?: AbortSignal,
+    context?: ProviderConnectionContext,
+  ): Promise<ProviderFileStreamAccess> {
+    return this.resolveFileAccess(connection, locator, signal, context);
   }
 
   /** 返回当前目录的直接子目录，供前端路径选择器使用。 */

@@ -20,6 +20,7 @@ import { registerAiModelRoutes } from "./routes/ai-model-routes.js";
 import { registerAuthRoutes } from "./routes/auth-routes.js";
 import { registerCatalogRoutes } from "./routes/catalog-routes.js";
 import { registerGuangyaAuthRoutes } from "./routes/guangya-auth-routes.js";
+import { registerCloudAuthorizationRoutes } from "./routes/cloud-authorization-routes.js";
 import { registerMediaStreamRoutes } from "./routes/media-stream-routes.js";
 import { registerMusicArtworkRoutes } from "./routes/music-artwork-routes.js";
 import { registerNavidromeRoutes } from "./routes/navidrome-routes.js";
@@ -88,8 +89,13 @@ function createBusinessLogger(server: FastifyInstance) {
   };
 }
 
-/** 从根包清单读取当前服务版本，确保 Docker 与本地部署展示同一版本号。 */
+/** 优先读取部署环境指定的展示版本，否则从根包清单读取当前服务版本。 */
 function readServiceVersion(): string {
+  // 关键变量：测试容器专用版本，不修改正式镜像或项目发布版本。
+  const releaseVersion = process.env.FLYCLOUDHELPER_RELEASE_VERSION?.trim();
+  if (releaseVersion) {
+    return releaseVersion;
+  }
   try {
     const manifest = JSON.parse(
       fs.readFileSync(path.join(projectRoot, "package.json"), "utf8"),
@@ -118,12 +124,18 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
           "password",
           "accessToken",
           "refreshToken",
+          "cookie",
+          "sessionKey",
+          "sessionSecret",
+          "codeVerifier",
           "masterKey",
           "credentialKeyBackup.masterKey",
           "connection",
           "apiKey",
           "body.apiKey",
           "req.body.apiKey",
+          "body.cookie",
+          "req.body.cookie",
           "botToken",
           "body.botToken",
           "req.body.botToken",
@@ -456,6 +468,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
 
   await registerAuthRoutes(server, { config, database, logBusinessEvent: logger });
   await registerGuangyaAuthRoutes(server, runtime);
+  await registerCloudAuthorizationRoutes(server, runtime);
   await registerServiceRoutes(server, runtime);
   await registerScanScheduleRoutes(server, runtime, scanSchedules);
   await registerServiceAccessRoutes(server, runtime);

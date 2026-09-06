@@ -273,7 +273,9 @@ export class AggregateJellyfinCatalog {
         sortTitle: String(row.sort_title),
         year: row.year === null || row.year === undefined ? null : Number(row.year),
         premiereDate: row.premiere_date ? String(row.premiere_date) : null,
-        createdAt: String(row.created_at),
+        // 聚合的入库日期来自有效来源，不能因首次构建或重建索引而重置。
+        createdAt: members.map((member) => member.sourceItem.createdAt)
+          .reduce((earliest, value) => Date.parse(value) < Date.parse(earliest) ? value : earliest, primaryItem.createdAt),
         updatedAt: String(row.updated_at),
         primaryItem,
         members,

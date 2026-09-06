@@ -61,6 +61,17 @@ export function validateServiceDataType(value: unknown): MediaType {
   return value as MediaType;
 }
 
+/** 校验 Provider 已明确声明支持所选数据类型，避免服务创建后才在扫描阶段失败。 */
+export function validateProviderDataType(adapter: ProviderAdapter, dataType: MediaType): void {
+  if (dataType === "audiobook" || !adapter.descriptor.supportedDataTypes.includes(dataType)) {
+    throw new ApiError(
+      422,
+      "provider_data_type_unsupported",
+      `${adapter.descriptor.displayName}暂不支持${dataType === "music" ? "音乐" : "影视"}服务`,
+    );
+  }
+}
+
 /** 判断连接配置中是否包含明文 HTTP Provider 地址，不记录完整地址。 */
 export function hasHttpProviderAddress(connection: Record<string, unknown>): boolean {
   return Object.values(connection).some((value) => typeof value === "string" && /^http:\/\//iu.test(value.trim()));
@@ -175,7 +186,25 @@ export function resolveProviderConnection(
     }
     return { connection: connectionInput, authorizationSessionId: null };
   }
-  if (providerType !== "guangya") return { connection: connectionInput, authorizationSessionId: null };
+  if (providerType !== "guangya") {
+    if (!runtime.providers.cloudAuthorization.supports(providerType)) {
+      return { connection: connectionInput, authorizationSessionId: null };
+    }
+    const rawSessionId = typeof connectionInput.authorizationSessionId === "string"
+      ? connectionInput.authorizationSessionId.trim()
+      : "";
+    // Flymby 后续关联会直接交接已有有效凭据；网页登录仍只提交一次性授权会话 ID。
+    if (!rawSessionId) return { connection: connectionInput, authorizationSessionId: null };
+    return {
+      connection: runtime.providers.cloudAuthorization.getAuthorizedConnection(
+        actorUserId,
+        targetUserId,
+        providerType,
+        rawSessionId,
+      ),
+      authorizationSessionId: rawSessionId,
+    };
+  }
   if (connectionInput.authMode === "official_api") {
     return { connection: resolveGuangyaOfficialApiConnection(connectionInput), authorizationSessionId: null };
   }
@@ -220,7 +249,34 @@ export function consumeProviderAuthorization(
   authorizationSessionId: string | null,
 ): void {
   if (authorizationSessionId) {
-    runtime.providers.guangyaAuthorization.consume(actorUserId, authorizationSessionId);
+    if (runtime.providers.cloudAuthorization.hasSession(actorUserId, authorizationSessionId)) {
+      runtime.providers.cloudAuthorization.consume(actorUserId, authorizationSessionId);
+    } else {
+      runtime.providers.guangyaAuthorization.consume(actorUserId, authorizationSessionId);
+    }
+  }
+}
+
+/** 替换连接时核对稳定账号标识，缺少历史标识则允许本次验证结果补齐。 */
+export function requireSameCloudDriveAccount(
+  providerType: string,
+  currentConnection: Record<string, unknown>,
+  nextConnection: Record<string, unknown>,
+): void {
+  const identityFields: Record<string, string[]> = {
+    cloud115: ["userId"],
+    cloud123: ["userId"],
+    cloud189: ["loginName"],
+    quark: ["userId"],
+  };
+  const fields = identityFields[providerType];
+  if (!fields) return;
+  for (const field of fields) {
+    const currentValue = readConnectionIdentityText(currentConnection, field);
+    const nextValue = readConnectionIdentityText(nextConnection, field);
+    if (currentValue && (!nextValue || currentValue !== nextValue)) {
+      throw new ApiError(409, `${providerType}_account_mismatch`, "扫码账号与原服务账号不一致，请添加为新服务");
+    }
   }
 }
 
@@ -655,6 +711,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     );
     const connection = resolvedConnection.connection;
     const adapter = runtime.providers.get(providerType);
+    validateProviderDataType(adapter, dataType);
     const scanProfile = validateScanProfile(
       request.body.scan === undefined
         ? { fullRoots: [], incrementalRoots: [] }
@@ -1106,7 +1163,12 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       service.providerType,
       requireObject(request.body, "connection", "连接配置"),
     ).connection;
-    return runtime.providers.get(service.providerType).validateConnection(connection);
+    const result = await runtime.providers.get(service.providerType).validateConnection(connection);
+    const currentConnection = runtime.vault.decrypt(
+      await runtime.repository.getActiveEncryptedConnection(service.id, user.id),
+    );
+    requireSameCloudDriveAccount(service.providerType, currentConnection, connection);
+    return result;
   });
 
   server.put<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/connection", async (request) => {
@@ -1122,6 +1184,10 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     const connection = resolvedConnection.connection;
     const adapter = runtime.providers.get(service.providerType);
     await validateProviderAccess(adapter, connection, service.scanProfile);
+    const currentConnection = runtime.vault.decrypt(
+      await runtime.repository.getActiveEncryptedConnection(service.id, user.id),
+    );
+    requireSameCloudDriveAccount(service.providerType, currentConnection, connection);
     const updated = await runtime.repository.updateConnection({
       serviceId: service.id,
       userId: user.id,
@@ -1638,12 +1704,15 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
   server.delete<{ Body: Record<string, unknown> }>("/api/v1/scan-jobs/completed", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     requireConfirmation(request.body, "completed");
-    const result = await runtime.repository.deleteCompletedJobs(user.id);
+    // 新入口明确包含失败任务；未传该选项的调用仍只清除已完成任务。
+    const includeFailed = request.body.includeFailed === true;
+    const result = await runtime.repository.deleteCompletedJobs(user.id, includeFailed);
     for (const job of result.scanJobs) await runtime.failureReports.remove(job);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-clear",
-      事件: "用户清除已完成任务",
+      事件: includeFailed ? "用户清除已完成和失败任务" : "用户清除已完成任务",
       用户ID: user.id,
+      包含失败任务: includeFailed,
       删除任务数量: result.deletedCount,
     });
     return { deletedCount: result.deletedCount };

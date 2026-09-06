@@ -1,3 +1,5 @@
+import { FlymbyVideoReleaseTextHelper } from "./flymby-video-release-text-helper.js";
+
 /**
  * Flymby APP 同源的视频标题清洗器。
  * 只清理用于识别和刮削的查询词，不修改 Provider 返回的真实文件路径。
@@ -10,7 +12,7 @@ export class FlymbyVideoTitleCleaner {
   private static readonly subtitleGroupBracketPattern = /[\[\(【（〖『《「][^\]\)】）〗』》」]{0,64}(?:字幕组|字幕社|压制组|翻译组)[^\]\)】）〗』》」]{0,64}[\]\)】）〗』》」]/giu;
   private static readonly collectionRangePattern = /(?:^|[\s._+\-–—:：,，;；/\\|·•])(?:\d{1,4}\s*(?:-|–|—|~|至|到|\s+)\s*\d{1,4}\s*(?:季|集|部)?|第\s*[0-9一二三四五六七八九十两]{1,3}\s*季(?:\s*\d{1,4}\s*(?:-|–|—|~|至|到|\s+)\s*\d{1,4}\s*集?)?|第\s*[0-9一二三四五六七八九十两]{1,3}\s*部|(?:season|series|s)\s*\d{1,2})(?:$|[\s._+\-–—:：,，;；/\\|·•])/giu;
   private static readonly resourceTagPattern = /(?:REMUX\s*蓝光原盘|蓝光原盘|高码率|高码版|普码版|低码版|码率|高码|净版|纯净版|臻彩|国粤英三语|国粤日三语|国粤日多音轨|国粤英日四语|国粤双语|国英双语|中英双字|中英字幕|国语中字|官方中字|内嵌特效|特效字幕|中文字幕|英文字幕|简繁英字幕|简繁中字|简繁|繁中|简中|简英|繁英|中字|粤语版|国语版|英语版|日语版|韩语版|多音轨|音轨|字幕|翡翠台源码|源码|附全系列|附系列|附全集|大包不错集数|国映\s*TV|动态漫画|动态漫|已更最新集|持续更新|长期更新|备用|正片|完整版|全集|单集|完结|已完结|更至\s*\d{1,4}\s*集|更新至\s*\d{1,4}\s*集|更新中)/giu;
-  private static readonly videoTechPattern = /\b(?:4k|8k|2160[pi]|1080[pi]|720[pi]|480[pi]|uhd|fhd|full\s*hd|hdr10\+?|hdr|sdr|edr|dv|dolby\s*vision|hq|raw|clean|\d{2,3}\s*fps|web[-.\s]?dl|web[-.\s]?rip|webrip|bluray|blu[-.\s]?ray|bdrip|hdtv|dvdrip|bd\s*remux|bdremux|remux|x\s*\.?\s*26[45]|h\s*\.?\s*26[45]|hevc|avc|vc[-.\s]?1|10\s*bit|8\s*bit|aac|ddp?(?:\s*\d(?:[.\s]\d)?)?|eac3|e-ac3|dts[-.\s]*hd(?:[-.\s]*ma)?|dts[-.\s]*hdma(?:\s*\d(?:[.\s]\d)?)?|hdma(?:\s*\d(?:[.\s]\d)?)?|dts|truehd|atmos|flac(?:\s*\d(?:[.\s]\d)?)?|lpcm|pcm(?:\s*\d(?:[.\s]\d)?)?|ac3|av3a(?:\s*\d(?:[.\s]\d)?)?|chs|cht|dual|multi|\d+\s*audios?|hami|wavve|fandango)\b/giu;
+  private static readonly videoTechPattern = /\b(?:4k|8k|2160[pi]|1440[pi]|1080[pi]|720[pi]|576[pi]|480[pi]|uhd|fhd|full\s*hd|hdr10\+?|hdr|sdr|edr|dv|dolby\s*vision|hq|raw|clean|\d{2,3}\s*fps|web[-.\s]?dl|web[-.\s]?rip|webrip|bluray|blu[-.\s]?ray|bdrip|hdtv|dvdrip|bd\s*remux|bdremux|remux|x\s*\.?\s*26[45]|h\s*\.?\s*26[45]|hevc|avc|vc[-.\s]?1|10\s*bit|8\s*bit|aac|ddp?(?:\s*\d(?:[.\s]\d)?)?|eac3|e-ac3|dts[-.\s]*hd(?:[-.\s]*ma)?|dts[-.\s]*hdma(?:\s*\d(?:[.\s]\d)?)?|hdma(?:\s*\d(?:[.\s]\d)?)?|dts|truehd|atmos|flac(?:\s*\d(?:[.\s]\d)?)?|lpcm|pcm(?:\s*\d(?:[.\s]\d)?)?|ac3|mp3|av3a(?:\s*\d(?:[.\s]\d)?)?|chs|cht|dual|multi|\d+\s*audios?|hami|wavve|fandango)\b/giu;
   private static readonly videoEditionPattern = /\b(?:proper|repack|extended|uncut|director'?s\s*cut|multi|dual|chs|cht|subbed|v\d+)\b/giu;
   private static readonly videoPlatformPattern = /\b(?:nf|netflix|amzn|amazon|dsnp|disney|hulu|hmax|max|itunes|apple\s*tv|hami|wavve|fandango)\b/giu;
   private static readonly videoDimensionPattern = /\b\d{3,4}\s*[xX×]\s*\d{3,4}\b/gu;
@@ -19,7 +21,7 @@ export class FlymbyVideoTitleCleaner {
   private static readonly videoResourceCleanPattern = /(?:杜比视界|高码率|高码版|高码|码率|帧率版本|臻彩|内封简繁|内封|中文字幕|双语字幕|特效字幕|歌词字幕|繁英字幕|简英双语|简繁英字幕|简繁双语|中英字幕|英文字幕|纯净版|无水印|完整版|全集|特辑|国英多音轨|国粤英三语|国粤日三语|国粤日多音轨|国英双语|多音轨|音轨|配音|字幕|国映\s*TV|大包不错集数|动态漫画|动态漫|片名水印|水印|单集\s*\d{1,4}\s*分钟|豆瓣|DIY|共\s*\d{1,4}\s*集(?:全)?|全\s*\d{1,4}\s*集|\d{1,4}\s*集全|完结|已完结|更至\s*\d{1,4}\s*集|更新至\s*\d{1,4}\s*集|更新中|(?:^|[\s._\-–—:：])(?:简繁中字|简繁|繁中|简中|中字|国语|国配|粤语|英语|日语|韩语|官中|国英|国粤英|国粤日|中英|Mandarin|Cantonese|Korean|Japanese|English|CHS|CHT|CHS-ENG|ENG)(?:$|[\s._\-–—:：]))/giu;
   private static readonly releaseGroupPattern = /\b(?:HiveWeb|HHWEB|HDSWEB|CMCT|CHD|FRDS|WiKi|NTb|BTN|PTer|PTerWEB|OurTV|ADWeb|BillionMeta|BlackTV|MOMOWEB|VARYG|CTRLWEB|EDITH|HONE|MTeam|PandaQT|QuickIO|DreamHD|ParkHD|ZeroTV|ColorTV|FROGWeb|MiniTV|MiniHD|MNHD|HDWinG|SONYHD|HQC|XLYS|Mp4Ba|Mp4Fan|QHstudIo|QHstudio|OFA|OPS|LGNB|oSpecialCN|HDSky|CHDBits|BOTHD|BestWEB|HAN|CHAOSPACE|TAGWEB|FGT|HDT|DHTCLUB|AngelaBaby|GY|CHN|NAHOM|SGF|MgB|playBD|RARBG|DirtyHippie|KAIZEN|Telly|MHDVV|KHN|HDCTV)\b/giu;
   private static readonly categoryPrefixPattern = /(?:^|[\s._+\-–—:：,，;；/\\|·•]+)(?:华语剧|华语电影|国剧|国产剧|国产|国影|美影|美剧|英剧|日剧|韩剧|港剧|台剧|泰剧|陆剧|短剧|网剧|电影|影片|院线|动漫网剧|国产动漫|日韩动漫|欧美动漫|日漫|美漫|国漫|动漫|动画|综艺|纪录片)(?=$|[\s._+\-–—:：,，;；/\\|·•]+)/giu;
-  private static readonly genericBucketPattern = /^(?:[A-Za-z]|数字开头|电影和电视剧|盘\d*电影|院线|正片|原盘|蓝光原盘|国影|影片|电影|视频|电视剧|剧集|欧美剧|日韩剧|华语剧|海外媒体流|无字片源|普码|高码|粤语版|国语版|国粤双语|动漫网剧|国产动漫|日韩动漫|欧美动漫|日漫|美漫|国漫|高能反转爽片|超清|高清|超高清|超高清SDR|4K|4K60帧|1080P|720P|专题|合集|系列|其他|未分类)$/iu;
+  private static readonly genericBucketPattern = /^(?:[A-Za-z]|数字开头|最近接收|电影和电视剧|盘\d*电影|院线|正片|原盘|蓝光原盘|国影|影片|电影|视频|电视剧|剧集|欧美剧|日韩剧|华语剧|海外媒体流|无字片源|普码|高码|粤语版|国语版|国粤双语|动漫网剧|国产动漫|日韩动漫|欧美动漫|日漫|美漫|国漫|高能反转爽片|超清|高清|超高清|超高清SDR|4K|4K60帧|1080P|720P|专题|合集|系列|其他|未分类)$/iu;
   /** 短剧目录开头用于排序的序号，仅在数字后有明确分隔符时移除。 */
   private static readonly videoMetadataLeadingOrderPattern = /^\s*0*\d{1,4}\s*[.．、_+\-–—:：]\s*/u;
   /** 短剧总集数及其后的演员、版本和类型文本，集数会单独保留给候选匹配。 */
@@ -46,7 +48,7 @@ export class FlymbyVideoTitleCleaner {
   /** 清理普通片名或剧名，保留真正用于 TMDB 搜索的部分。 */
   public static cleanTitle(value: string): string {
     const rawText = String(value ?? "");
-    let text = rawText;
+    let text = FlymbyVideoReleaseTextHelper.stripTechnicalDimensions(rawText);
     text = this.stripExplicitTmdbIdText(text);
     text = this.stripObfuscationJoiners(text);
     text = this.stripSubtitleGroupBrackets(text);
@@ -113,7 +115,7 @@ export class FlymbyVideoTitleCleaner {
    * 该入口不会重新执行整套标题归一化。
    */
   public static stripContextualMovieReleaseDescriptors(title: string, rawValue: string): string {
-    return this.collapseSpaces(this.stripTrailingReleaseDescriptors(title, rawValue));
+    return this.collapseSpaces(this.stripTrailingNoiseNumber(this.stripTrailingReleaseDescriptors(title, rawValue), rawValue));
   }
 
   /** 判断内容是否只是分类桶、范围目录或资源说明，不能用于刮削。 */
@@ -245,14 +247,10 @@ export class FlymbyVideoTitleCleaner {
 
   /** 资源规格被清理后，继续删除由码率、音轨等遗留的孤立尾部数字。 */
   private static stripTrailingNoiseNumber(value: string, rawValue: string): string {
-    if (!this.hasResourceNoise(rawValue)) return value;
-    let text = this.collapseSpaces(value);
-    let match = /^(.*\S)\s+\d{1,4}$/u.exec(text);
-    while (match?.[1] && /[A-Za-z\u4e00-\u9fa5]/u.test(match[1])) {
-      text = match[1];
-      match = /^(.*\S)\s+\d{1,4}$/u.exec(text);
-    }
-    return text;
+    return FlymbyVideoReleaseTextHelper.stripTrailingTechnicalNumbers(value, rawValue, [
+      rawValue.search(this.resourceTagPattern),
+      rawValue.search(this.releaseGroupPattern),
+    ]);
   }
 
   /** 清理资源说明被拆分后残留在标题末尾的独立短词。 */

@@ -55,6 +55,8 @@ export interface ApiConfig {
   migrationSnapshotMaxBytes: number;
   /** 可选的华为账号绑定凭证验签密钥；配置后 APP 注册必须携带受信任签名。 */
   huaweiBindingProofSecret: string | null;
+  /** 115 OpenAPI 公开应用 ID，不是应用 Secret。 */
+  cloud115ClientId: string;
 }
 
 /** FlyCloudHelper 项目根目录。 */
@@ -379,5 +381,6 @@ export function loadApiConfig(): ApiConfig {
       2 * 1024 * 1024 * 1024,
     ),
     huaweiBindingProofSecret: huaweiBindingProofSecret.value,
+    cloud115ClientId: readEnvironmentValue("FLYCLOUDHELPER_CLOUD115_CLIENT_ID") || "100195125",
   };
 }

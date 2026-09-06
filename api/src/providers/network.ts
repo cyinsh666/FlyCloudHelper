@@ -239,6 +239,10 @@ function toRequestBody(body: RequestInit["body"]): string | Uint8Array | undefin
   if (typeof body === "string" || body instanceof Uint8Array) {
     return body;
   }
+  // 115下载地址和令牌刷新使用表单对象，原生HTTP请求需要先转为编码后的字符串。
+  if (body instanceof URLSearchParams) {
+    return body.toString();
+  }
   if (body instanceof ArrayBuffer) {
     return new Uint8Array(body);
   }
@@ -256,6 +260,10 @@ async function requestResolvedProvider(
     headers[name] = value;
   });
   const body = toRequestBody(init.body);
+  // 表单未指定类型时采用标准编码类型；调用方已有的Content-Type保持不变。
+  if (init.body instanceof URLSearchParams && headers["content-type"] === undefined) {
+    headers["content-type"] = "application/x-www-form-urlencoded;charset=UTF-8";
+  }
   if (body !== undefined && headers["content-length"] === undefined) {
     headers["content-length"] = String(Buffer.byteLength(body));
   }
@@ -363,6 +371,18 @@ export async function providerFetch(
       resolvedTarget = await resolveProviderUrl(currentUrl, options);
       await waitForProviderSharedRateLimit(resolvedTarget.url, timeoutController.signal);
       response = await requestResolvedProvider(resolvedTarget, currentInit, timeoutController.signal);
+      if (currentInit.body instanceof URLSearchParams) {
+        // 临时诊断只记录接口路径及状态，不记录表单、Token、Pick Code或完整URL。
+        options.logConnectionFailure?.({
+          日志关键字: "codex-provider-form-body",
+          事件: "Provider表单请求已收到上游响应",
+          请求路径: resolvedTarget.url.pathname,
+          请求方法: currentInit.method ?? "GET",
+          请求体类型: "URLSearchParams",
+          上游状态码: response.status,
+          耗时毫秒: Date.now() - startedAt,
+        });
+      }
       const requestMethod = String(currentInit.method ?? "GET").toUpperCase();
       if (response.status === 429 && rateLimitRetryCount < PROVIDER_RATE_LIMIT_MAX_RETRIES) {
         // 关键变量：优先服从上游 Retry-After，缺失时按当前重试次数指数退避。
@@ -475,6 +495,90 @@ export async function providerFetch(
   } finally {
     clearTimeout(timeout);
     parentSignal?.removeEventListener("abort", abortParent);
+  }
+}
+
+/**
+ * 建立 Provider 小范围探测流并保留上游原始状态码和正文。
+ * 调用方必须在读取完所需前缀后销毁 body，避免无 Range 支持的上游继续传输完整媒体。
+ */
+export async function providerProbeStream(
+  url: string | URL,
+  init: RequestInit,
+  options: ProviderNetworkOptions,
+  parentSignal?: AbortSignal,
+): Promise<ProviderStreamResponse> {
+  const requestController = new AbortController();
+  let resolvedTarget: ResolvedProviderUrl | null = null;
+  let finalBody: IncomingMessage | null = null;
+  let connectionTimedOut = false;
+  const timeout = setTimeout(() => {
+    connectionTimedOut = true;
+    requestController.abort();
+  }, 30_000);
+  const abortParent = () => requestController.abort();
+  parentSignal?.addEventListener("abort", abortParent, { once: true });
+  const cleanup = () => {
+    clearTimeout(timeout);
+    parentSignal?.removeEventListener("abort", abortParent);
+  };
+  try {
+    // 关键变量：探测请求也需要逐跳校验地址，并保留最终地址供调用方判断解析结果。
+    let currentUrl: string | URL = url instanceof URL ? new URL(url.href) : url;
+    let currentInit = init;
+    let redirectCount = 0;
+    while (true) {
+      resolvedTarget = await resolveProviderUrl(currentUrl, options);
+      await waitForProviderSharedRateLimit(resolvedTarget.url, requestController.signal);
+      const response = await requestResolvedProviderStream(
+        resolvedTarget,
+        currentInit,
+        requestController.signal,
+      );
+      const requestMethod = String(currentInit.method ?? "GET").toUpperCase();
+      const location = response.headers.location;
+      if (isProviderRedirectStatus(response.statusCode ?? 500) && location && ["GET", "HEAD"].includes(requestMethod)) {
+        response.destroy();
+        if (redirectCount >= 5) {
+          throw new ApiError(503, "provider_redirect_limit_exceeded", "网盘资源探测重定向次数过多");
+        }
+        let nextUrl: URL;
+        try {
+          nextUrl = new URL(location, resolvedTarget.url);
+        } catch {
+          throw new ApiError(503, "provider_redirect_invalid", "网盘资源探测返回了无效的重定向地址");
+        }
+        const isCrossOrigin = nextUrl.origin !== resolvedTarget.url.origin;
+        redirectCount += 1;
+        currentInit = buildRedirectRequestInit(currentInit, isCrossOrigin);
+        currentUrl = nextUrl;
+        continue;
+      }
+
+      finalBody = response;
+      clearTimeout(timeout);
+      response.once("close", cleanup);
+      return {
+        statusCode: response.statusCode ?? 500,
+        headers: response.headers,
+        body: response,
+        finalUrl: resolvedTarget.url,
+      };
+    }
+  } catch (error) {
+    if (error instanceof ApiError) {
+      throw error;
+    }
+    if (requestController.signal.aborted) {
+      if (connectionTimedOut) {
+        throw new ApiError(503, "provider_connection_timeout", "连接网盘资源探测地址超时");
+      }
+      throw new ApiError(499, "provider_probe_aborted", "网盘资源探测请求已取消");
+    }
+    const errorCode = readNetworkErrorCode(error);
+    throw createProviderConnectionError(errorCode, false);
+  } finally {
+    if (!finalBody) cleanup();
   }
 }
 

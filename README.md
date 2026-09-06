@@ -37,9 +37,10 @@ FlyCloudHelper 是一个可自部署的网盘媒体扫描、元数据刮削、�
 
 ### 网盘与文件访问
 
-- 支持 WebDAV、光鸭、阿里云盘和百度网盘 Provider。
+- 内置支持 WebDAV、光鸭、阿里云盘、百度网盘、115网盘、123云盘、天翼云盘个人云和夸克网盘 Provider。
 - 光鸭支持官方 API 凭据同步、网页二维码和网页短信验证码三种授权方式。
 - 阿里云盘和百度网盘已支持目录浏览、扫描、稳定文件标识、Token 刷新、直连下载和中转读取；当前授权仍以手动填写 Token 为主。
+- 八类网盘均可创建为音乐服务，读取音频标签并完成歌曲、专辑、艺术家刮削识别；音乐服务可启用 Navidrome/Subsonic 协议。
 - Provider 可配置推荐扫描并发、刮削并发、全量目录并发和服务级中转播放开关。
 - 文件访问支持临时直连地址和 HTTP Range 中转；服务端只转发字节流，不转码、不缓存媒体正文。
 
@@ -322,6 +323,7 @@ cp .env.example .env
 | `FLYCLOUDHELPER_FFPROBE_PATH` | Docker 中为 `/usr/bin/ffprobe` | ffprobe 可执行文件路径 |
 | `FLYCLOUDHELPER_MEDIA_PROBE_CONCURRENCY` | `1` | 独立媒体规格队列并发数；不会占用扫描 Worker 槽位 |
 | `FLYCLOUDHELPER_ALLOW_INSECURE_HTTP` | `true` | 是否允许 Provider 使用 HTTP |
+| `FLYCLOUDHELPER_CLOUD115_CLIENT_ID` | `100195125` | 115 OpenAPI 公开应用 ID，不是应用 Secret |
 | `FLYCLOUDHELPER_HUAWEI_BINDING_PROOF_SECRET` | 空 | 可选的外部账号身份绑定验签密钥；配置后绑定注册必须提供短期受信任签名，支持同名 `_FILE` Secret |
 
 完整配置见 [.env.example](.env.example)。旧版 `FLYMBYSCANNER_*` 环境变量仍可由后台兼容读取，建议新部署统一改为 `FLYCLOUDHELPER_*`。
@@ -414,6 +416,7 @@ Content-Type: application/json
 - [x] **AI 模型目录文件清洗**：已完成 OpenAI Chat Completions 兼容模型配置、可用性测试、服务级选择、弱标题与 TMDB 首次未匹配补充、失败回退、任务快照和持久化缓存。
 - [x] **WebDAV 与光鸭接入**：已完成授权、目录浏览、扫描、文件稳定定位、直连访问和可选的中转读取；光鸭支持官方 API 凭据同步、网页二维码和网页验证码。
 - [x] **阿里云盘与百度网盘核心 Provider**：已完成目录浏览、文件枚举、稳定标识、Token 刷新、扫描、直连下载和中转读取。
+- [x] **网盘音乐与 Navidrome**：八类内置网盘均支持音乐扫描、标签读取、刮削识别和 Navidrome/Subsonic 兼容访问。
 - [x] **媒体库快照与首次迁移**：已完成客户端分片上传、后台迁移、进度查询、v3 分片 ZIP 快照生成、下载和删除。
 - [x] **Jellyfin 常用协议兼容**：已完成账号登录、媒体库浏览、搜索、详情、季集、图片、播放定位、直连或中转播放及观看状态上报。
 - [x] **Jellyfin 多账号隔离**：同一媒体库和访问地址可配置多个账号，观看进度、最近播放、已播放状态和会话相互隔离。

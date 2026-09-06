@@ -14,6 +14,7 @@ import {
   consumeProviderAuthorization,
   resolveProviderConnection,
   validateMetadataProfile,
+  validateProviderDataType,
   validateProviderAccess,
   validateScanProfile,
   validateServiceDataType,
@@ -168,11 +169,13 @@ export async function registerServiceMigrationRoutes(
 ): Promise<void> {
   server.get("/api/v1/service-migrations/capabilities", async (request) => {
     await requireRequestUser(request, runtime.database);
+    const providerDescriptors = runtime.providers.listDescriptors();
     return {
       snapshotFormatVersion: 1,
       chunkMaxBytes: runtime.config.migrationChunkMaxBytes,
       snapshotMaxBytes: runtime.config.migrationSnapshotMaxBytes,
-      supportedProviderTypes: ["webdav", "guangya", "aliyundrive", "baidupan"],
+      supportedProviderTypes: providerDescriptors.map((provider) => provider.type),
+      // 当前 APP 快照导入 Worker 仍按影视目录结构落库，音乐关联留到 Flymby APP 阶段实施。
       supportedDataTypes: ["video"],
     };
   });
@@ -233,10 +236,13 @@ export async function registerServiceMigrationRoutes(
 
     const displayName = requireString(request.body, "displayName", "服务名称", 100);
     const dataType = validateServiceDataType(request.body.dataType);
+    if (dataType !== "video") {
+      throw new ApiError(422, "migration_data_type_unsupported", "当前 APP 快照迁移只支持影视服务；音乐服务请在云助手中创建并重新扫描");
+    }
     const provider = requireObject(request.body, "provider", "Provider");
     const providerType = requireString(provider, "type", "Provider 类型", 64);
-    if (!["webdav", "guangya", "aliyundrive", "baidupan"].includes(providerType)) {
-      throw new ApiError(422, "migration_provider_unsupported", "当前只支持迁移 WebDAV、光鸭、阿里云盘和百度网盘视频库");
+    if (!["webdav", "guangya", "aliyundrive", "baidupan", "cloud115", "cloud123", "cloud189", "quark"].includes(providerType)) {
+      throw new ApiError(422, "migration_provider_unsupported", "当前网盘类型暂不支持迁移");
     }
     const resolvedConnection = resolveProviderConnection(
       runtime,
@@ -246,6 +252,7 @@ export async function registerServiceMigrationRoutes(
       requireObject(provider, "connection", "连接配置"),
     );
     const adapter = runtime.providers.get(providerType);
+    validateProviderDataType(adapter, dataType);
     const validatedScanProfile = validateScanProfile(
       requireObject(request.body, "scan", "扫描配置"),
       providerType,
@@ -345,8 +352,8 @@ export async function registerServiceMigrationRoutes(
       const clientDeviceId = requireString(request.body, "clientDeviceId", "客户端设备 ID", 200);
       const clientServiceId = requireString(request.body, "clientServiceId", "客户端服务 ID", 200);
       const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
-      if (!["webdav", "guangya", "aliyundrive", "baidupan"].includes(service.providerType)) {
-        throw new ApiError(422, "migration_provider_unsupported", "当前只支持迁移 WebDAV、光鸭、阿里云盘和百度网盘视频库");
+      if (!["webdav", "guangya", "aliyundrive", "baidupan", "cloud115", "cloud123", "cloud189", "quark"].includes(service.providerType)) {
+        throw new ApiError(422, "migration_provider_unsupported", "当前网盘类型暂不支持迁移");
       }
       const binding = await runtime.repository.findClientServiceBinding(user.id, clientDeviceId, clientServiceId);
       if (!binding || binding.serviceId !== service.id) {

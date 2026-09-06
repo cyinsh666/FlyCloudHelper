@@ -45,6 +45,7 @@ export class AliyunDriveProvider implements ProviderAdapter {
     displayName: "阿里云盘",
     adapterVersion: "1.0.0",
     credentialSchemaVersion: 2,
+    supportedDataTypes: ["video", "music"],
     capabilities: ["list", "stableResourceId", "playbackLocator", "directDownload", "relay"],
     recommendedScanSettings: createProviderRecommendedScanSettings({
       // 阿里开放接口单页最多读取 200 项，允许多个目录并行但限制峰值请求数。

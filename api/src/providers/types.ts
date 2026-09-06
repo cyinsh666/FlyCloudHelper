@@ -129,10 +129,25 @@ export interface ProviderDescriptor {
   displayName: string;
   adapterVersion: string;
   credentialSchemaVersion: number;
+  /** Provider 可以完整执行扫描、刮削和协议访问的数据类型。 */
+  supportedDataTypes: Array<"video" | "music">;
   capabilities: string[];
   recommendedScanSettings: ProviderRecommendedScanSettings;
-  /** 表单型 Provider 动态填写字段；web_qr Provider 通过官网二维码取得连接。 */
-  authenticationMode?: "form" | "web_qr";
+  /** 表单型 Provider 动态填写字段；authorization_session 由 FlyCloudHelper 自己完成官方扫码。 */
+  authenticationMode?: "form" | "web_qr" | "authorization_session";
+  /** 供页面展示的登录方式；凭据和上游设备码不在描述中出现。 */
+  authMethods?: Array<{
+    type: string;
+    displayName: string;
+    interaction: "qr" | "sms";
+    recommended: boolean;
+  }>;
+  /** 可选择的扫码登录来源；当前仅115使用，页面提交稳定 value。 */
+  authSources?: Array<{
+    value: string;
+    label: string;
+    recommended: boolean;
+  }>;
   connectionFields: Array<{
     name: string;
     label: string;

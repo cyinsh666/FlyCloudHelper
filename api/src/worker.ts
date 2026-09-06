@@ -25,6 +25,7 @@ import {
 import type { AiModelManager } from "./ai/ai-model-manager.js";
 import { isWeakFlymbyScrapeTitle, parseFlymbyVideoName } from "./media/flymby-video-parser.js";
 import { FlymbyVideoTitleCleaner } from "./media/flymby-video-title-cleaner.js";
+import type { TmdbMovieFileEvidence } from "./metadata/tmdb-candidate-matcher.js";
 import {
   parseFlymbyNfo,
   toPublicImageValue,
@@ -2087,6 +2088,16 @@ export class ScanWorker {
         firstItem.rootPath,
         ruleParsedVideos,
       );
+      // 记录新规则最终用于分组的文件身份，混合桶、数字电影和普通目录均可按统一关键字追踪。
+      for (const [resourceId, parsed] of ruleParsedVideos) {
+        this.logger.info({
+          日志关键字: "codex-webdav-media-recognition", 阶段: "文件判型与分组", 任务ID: job.id,
+          文件名: parsed.fileName, 媒体类型: parsed.mediaType, 查询标题: parsed.query, 年份: parsed.year,
+          季号: parsed.seasonNumber, 集号: parsed.episodeNumber, 识别依据: parsed.recognitionReason,
+          数字电影证据: Boolean(parsed.confirmedNumericMovieTitle),
+          刮削任务键: ruleDescriptors.get(resourceId)?.metadata.scrapeTaskKey,
+        });
+      }
       const videoFileNames = directoryItems.map((item) => item.entry.name);
       const explicitEpisodeFileCount = videoFileNames.filter((fileName) =>
         /(?:s\s*\d{1,2}\s*e\s*\d{1,4}|第\s*[0-9一二三四五六七八九十两]{1,4}\s*集)/iu.test(fileName),
@@ -3374,7 +3385,7 @@ export class ScanWorker {
     // TMDB 客户端必须先检查部署级共享缓存；仅在缓存未命中时才由 Key 池决定返回空结果或延迟恢复。
     const confirmedNumericSeriesTitle = Boolean(descriptor.metadata.confirmedNumericSeriesTitle);
     if (explicitTmdbId <= 0 && !imdbId &&
-      !confirmedNumericSeriesTitle && isWeakFlymbyScrapeTitle(query)) {
+      !confirmedNumericSeriesTitle && !descriptor.metadata.confirmedNumericMovieTitle && isWeakFlymbyScrapeTitle(query)) {
       return null;
     }
     const recognitionRevision = buildAiRecognitionRevision(Number(jobSnapshot.metadataProfileRevision ?? 0), aiModelSnapshot);
@@ -3396,6 +3407,8 @@ export class ScanWorker {
         mediaType,
         title: query,
         fallbackTitle: fallbackQuery,
+        movieFileEvidence: Array.isArray(descriptor.metadata.movieFileEvidence)
+          ? descriptor.metadata.movieFileEvidence as TmdbMovieFileEvidence[] : [],
         year: descriptor.year,
         language,
         region,

@@ -4,10 +4,10 @@ import { useEffect, useRef, useState } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { AdminServiceFilters } from "@/components/AdminServiceFilters";
 import { AiSupplementDialog } from "@/components/AiSupplementDialog";
-import { Panel, ProgressMeter, StatusPill, type StatusTone } from "@/components/ui-kit";
+import { FilterChip, Panel, ProgressMeter, StatusPill, type StatusTone } from "@/components/ui-kit";
 import {
   cancelScanJob,
-  clearCompletedScanJobs,
+  clearCompletedAndFailedScanJobs,
   createManualAiSupplementJob,
   deleteScanJob,
   downloadScanFailureReport,
@@ -58,15 +58,35 @@ const backgroundJobTypeLabels = {
   media_probe: "视频规格分析",
 } as const;
 
+type JobStatusFilter = "all" | "active" | JobStatus;
+type JobTypeFilter = "all" | keyof typeof backgroundJobTypeLabels;
+
+// 关键变量：状态筛选按展示顺序平铺，“全部”固定为第一项。
+const jobStatusFilterOptions: Array<{ value: JobStatusFilter; label: string }> = [
+  { value: "all", label: "全部" },
+  { value: "active", label: "未结束" },
+  { value: "queued", label: "排队中" },
+  { value: "running", label: "运行中" },
+  { value: "retry_waiting", label: "等待重试" },
+  { value: "paused", label: "已暂停" },
+  { value: "completed", label: "已完成" },
+  { value: "failed", label: "失败" },
+  { value: "cancelled", label: "已取消" },
+];
+
+// 关键变量：类型筛选按展示顺序平铺，“全部”固定为第一项。
+const jobTypeFilterOptions: Array<{ value: JobTypeFilter; label: string }> = [
+  { value: "all", label: "全部" },
+  { value: "scan", label: "扫描刮削" },
+  { value: "media_probe", label: "视频规格分析" },
+];
+
 /** 区分普通扫描和手动 AI 补充任务，避免任务列表只显示为全量扫描。 */
 function getBackgroundJobLabel(job: ScanJob): string {
   if (job.jobType === "media_probe") return backgroundJobTypeLabels.media_probe;
   if (job.snapshot.taskPurpose === "ai_supplement_unmatched") return "AI补充未识别内容";
   return `${job.scanMode === "full" ? "全量" : "增量"}扫描刮削`;
 }
-
-type JobStatusFilter = "all" | "active" | JobStatus;
-type JobTypeFilter = "all" | keyof typeof backgroundJobTypeLabels;
 
 const providerTypeLabels: Record<string, string> = {
   webdav: "WebDAV",
@@ -471,20 +491,20 @@ function JobsView({ admin }: { admin: boolean }) {
     }
   }
 
-  /** 二次确认后清除权限范围内全部已完成任务，其他状态任务保持不变。 */
+  /** 二次确认后清除权限范围内全部已完成和失败任务，保留其他状态任务。 */
   async function clearCompletedJobs(): Promise<void> {
     if (clearingCompletedJobsRef.current) return;
-    if (!window.confirm("确定清除全部已完成任务吗？本操作只删除状态为“已完成”的任务；失败、已取消、排队、运行、等待重试和暂停任务都会保留。")) return;
+    if (!window.confirm("确定清除全部已完成和失败任务吗？这些任务的进度、错误记录及失败报告将一并删除；已取消、排队、运行、等待重试和暂停任务都会保留。")) return;
     clearingCompletedJobsRef.current = true;
     setClearingCompletedJobs(true);
-    setMessage("正在清除已完成任务…");
+    setMessage("正在清除已完成和失败任务…");
     try {
-      const deletedCount = await clearCompletedScanJobs(admin);
+      const deletedCount = await clearCompletedAndFailedScanJobs(admin);
       setSelectedJobId(null);
-      setMessage(`已清除 ${deletedCount.toLocaleString()} 个已完成任务`);
+      setMessage(`已清除 ${deletedCount.toLocaleString()} 个已完成或失败任务`);
       await resource.refresh();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "清除已完成任务失败");
+      setMessage(error instanceof Error ? error.message : "清除已完成和失败任务失败");
     } finally {
       clearingCompletedJobsRef.current = false;
       setClearingCompletedJobs(false);
@@ -594,37 +614,27 @@ function JobsView({ admin }: { admin: boolean }) {
       />
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
       <Panel className="mb-4" title="筛选任务">
-        <div className="grid gap-3 sm:grid-cols-2">
-          <label className="grid gap-1.5 text-xs text-muted-foreground">
-            任务状态
-            <select
-              value={statusFilter}
-              onChange={(event) => setStatusFilter(event.target.value as JobStatusFilter)}
-              className="rounded-lg border border-input bg-background/50 px-3 py-2 text-sm text-foreground outline-none focus:border-ring"
-            >
-              <option value="all">全部状态</option>
-              <option value="active">未结束</option>
-              <option value="queued">排队中</option>
-              <option value="running">运行中</option>
-              <option value="retry_waiting">等待重试</option>
-              <option value="paused">已暂停</option>
-              <option value="completed">已完成</option>
-              <option value="failed">失败</option>
-              <option value="cancelled">已取消</option>
-            </select>
-          </label>
-          <label className="grid gap-1.5 text-xs text-muted-foreground">
-            任务类型
-            <select
-              value={jobTypeFilter}
-              onChange={(event) => setJobTypeFilter(event.target.value as JobTypeFilter)}
-              className="rounded-lg border border-input bg-background/50 px-3 py-2 text-sm text-foreground outline-none focus:border-ring"
-            >
-              <option value="all">全部类型</option>
-              <option value="scan">扫描刮削</option>
-              <option value="media_probe">视频规格分析</option>
-            </select>
-          </label>
+        <div className="grid gap-4">
+          <div className="grid gap-2">
+            <p className="text-xs text-muted-foreground">任务状态</p>
+            <div className="flex flex-wrap gap-2">
+              {jobStatusFilterOptions.map((option) => (
+                <FilterChip key={option.value} active={statusFilter === option.value} onClick={() => setStatusFilter(option.value)}>
+                  {option.label}
+                </FilterChip>
+              ))}
+            </div>
+          </div>
+          <div className="grid gap-2">
+            <p className="text-xs text-muted-foreground">任务类型</p>
+            <div className="flex flex-wrap gap-2">
+              {jobTypeFilterOptions.map((option) => (
+                <FilterChip key={option.value} active={jobTypeFilter === option.value} onClick={() => setJobTypeFilter(option.value)}>
+                  {option.label}
+                </FilterChip>
+              ))}
+            </div>
+          </div>
         </div>
       </Panel>
       {!activeJob ? <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? (statusFilter === "all" && jobTypeFilter === "all" ? "还没有后台任务" : "当前筛选条件下没有任务")}</div></Panel> : (
@@ -706,7 +716,7 @@ function JobsView({ admin }: { admin: boolean }) {
           <Panel
             title="任务列表"
             description={`共 ${resource.data?.total ?? 0} 个任务`}
-            action={<button type="button" title="只清除状态为已完成的任务" onClick={() => void clearCompletedJobs()} disabled={clearingCompletedJobs} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/8 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /> {clearingCompletedJobs ? "正在清除…" : "清除已完成"}</button>}
+            action={<button type="button" title="清除已完成和失败的任务" onClick={() => void clearCompletedJobs()} disabled={clearingCompletedJobs} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/8 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /> {clearingCompletedJobs ? "正在清除…" : "清除已完成和失败"}</button>}
           >
             <ul className="space-y-2">
               {jobs.map((job) => {
@@ -765,7 +775,7 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
   const [filters, setFilters] = useState<ServiceListFilters>({});
   const resource = useApiResource(
     () => listServices(admin, admin ? filters : {}),
-    [admin, filters.search, filters.userId, filters.providerType, filters.dataType, filters.status, filters.jellyfinEnabled],
+    [admin, filters.search, filters.userId, filters.providerType, filters.dataType, filters.status],
   );
   const filterOptions = useApiResource(async () => {
     if (!admin) return { users: [], providers: [] };

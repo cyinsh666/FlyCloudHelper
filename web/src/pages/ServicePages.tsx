@@ -1,11 +1,13 @@
 import { Link, useNavigate } from "@tanstack/react-router";
-import { CalendarClock, Plus, RefreshCw, ScanLine, Settings2, Sparkles, Trash2 } from "lucide-react";
+import { BookOpenText, CalendarClock, Film, Music2, Plus, RefreshCw, ScanLine, Settings2, Sparkles, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { AdminServiceFilters } from "@/components/AdminServiceFilters";
 import { AiCleaningSettingsFields, type AiCleaningSettingsValue } from "@/components/AiCleaningSettingsFields";
 import { GuangyaAuthorizationPanel } from "@/components/GuangyaAuthorizationPanel";
+import { CloudAuthorizationPanel } from "@/components/CloudAuthorizationPanel";
 import { ProviderConnectionGuide } from "@/components/ProviderConnectionGuide";
+import { getProviderSelectionDescription, ProviderSelectionIcon, SelectableServiceOption } from "@/components/ServiceCreateSelection";
 import { ServicePathPicker, toProviderDirectory } from "@/components/ServicePathPicker";
 import { Panel, StatCard, StatusPill, type StatusTone } from "@/components/ui-kit";
 import {
@@ -27,6 +29,7 @@ import {
   updateServiceScanProfile,
   updateServiceStatus,
   type CloudService,
+  type CloudAuthorizationStatus,
   type CreateCloudServiceInput,
   type JobStatus,
   type GuangyaAuthorizationStatus,
@@ -425,7 +428,7 @@ function ServicesListPage({ admin }: { admin: boolean }) {
   const [filters, setFilters] = useState<ServiceListFilters>({});
   const resource = useApiResource(
     () => listServices(admin, admin ? filters : {}),
-    [admin, filters.search, filters.userId, filters.providerType, filters.dataType, filters.status, filters.jellyfinEnabled],
+    [admin, filters.search, filters.userId, filters.providerType, filters.dataType, filters.status],
   );
   const filterOptions = useApiResource(async () => {
     if (!admin) return { users: [], providers: [] };
@@ -457,8 +460,10 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
   const providers = useApiResource(() => listProviders(), []);
   const users = useApiResource(() => admin ? listAdminUsers() : Promise.resolve({ items: [], total: 0 }), [admin]);
   const [providerType, setProviderType] = useState("");
+  const [dataType, setDataType] = useState<MediaType>("video");
   const [adminTargetUserId, setAdminTargetUserId] = useState("");
   const [guangyaAuthorization, setGuangyaAuthorization] = useState<GuangyaAuthorizationStatus | null>(null);
+  const [cloudAuthorization, setCloudAuthorization] = useState<CloudAuthorizationStatus | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const selectedProvider: ProviderDescriptor | undefined = providers.data?.find((item) => item.type === providerType) ?? providers.data?.[0];
 
@@ -466,8 +471,7 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
   async function submit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    const selectedType = String(form.get("providerType") ?? "");
-    const dataType = String(form.get("dataType") ?? "") as MediaType;
+    const selectedType = selectedProvider?.type ?? "";
     const descriptor = providers.data?.find((item) => item.type === selectedType);
     if (!descriptor) {
       setMessage("请选择 Provider 类型");
@@ -477,6 +481,10 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
       setMessage("当前仅支持影视或音乐数据类型");
       return;
     }
+    if (!descriptor.supportedDataTypes.includes(dataType)) {
+      setMessage(`${descriptor.displayName}暂不支持${dataType === "music" ? "音乐" : "影视"}服务`);
+      return;
+    }
     const connection: Record<string, string> = {};
     if (descriptor.authenticationMode === "web_qr") {
       if (guangyaAuthorization?.status !== "authorized") {
@@ -484,6 +492,12 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
         return;
       }
       connection.authorizationSessionId = guangyaAuthorization.authorizationSessionId;
+    } else if (descriptor.authenticationMode === "authorization_session") {
+      if (cloudAuthorization?.state !== "authorized") {
+        setMessage(`请先完成${descriptor.displayName}扫码登录，再创建服务`);
+        return;
+      }
+      connection.authorizationSessionId = cloudAuthorization.authorizationSessionId;
     } else {
       descriptor.connectionFields.forEach((field) => {
         const value = String(form.get(`connection.${field.name}`) ?? "").trim();
@@ -534,6 +548,14 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
     }
   }
 
+  /** 切换 Provider 时清空上一种网盘的临时授权状态。 */
+  function selectProvider(nextProviderType: string): void {
+    if (nextProviderType === selectedProvider?.type) return;
+    setProviderType(nextProviderType);
+    setGuangyaAuthorization(null);
+    setCloudAuthorization(null);
+  }
+
   return (
     <>
       <PageHeader title="创建云端服务" />
@@ -541,21 +563,39 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
         <form onSubmit={(event) => void submit(event)} className="grid gap-5 lg:grid-cols-2">
           {admin && <label className="block"><span className="text-xs text-muted-foreground">所属用户</span><select name="userId" required value={adminTargetUserId} onChange={(event) => setAdminTargetUserId(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm"><option value="">选择目标用户</option>{users.data?.items.map((user) => <option key={user.userId} value={user.userId}>{user.username}</option>)}</select></label>}
           <label className="block"><span className="text-xs text-muted-foreground">服务名称</span><input name="displayName" required maxLength={100} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
-          <label className="block">
-            <span className="text-xs text-muted-foreground">数据类型</span>
-            <select name="dataType" required defaultValue="video" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm">
-              <option value="video">影视</option>
-              <option value="music">音乐</option>
-              <option value="audiobook" disabled>有声书（暂未支持）</option>
-            </select>
-          </label>
-          <label className="block"><span className="text-xs text-muted-foreground">Provider 类型</span><select name="providerType" required value={selectedProvider?.type ?? ""} onChange={(event) => { setProviderType(event.target.value); setGuangyaAuthorization(null); }} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm"><option value="">选择 Provider</option>{providers.data?.map((provider) => <option key={provider.type} value={provider.type}>{provider.displayName}</option>)}</select></label>
+          <fieldset className="lg:col-span-2 pb-2">
+            <legend className="mb-3 text-xs text-muted-foreground">数据类型</legend>
+            <div role="radiogroup" aria-label="数据类型" className="grid gap-3 sm:grid-cols-3">
+              <SelectableServiceOption title="影视" description="电影、电视剧和短剧" icon={<Film className="size-5" />} selected={dataType === "video"} onSelect={() => setDataType("video")} />
+              <SelectableServiceOption title="音乐" description="歌曲、专辑和歌手" icon={<Music2 className="size-5" />} selected={dataType === "music"} onSelect={() => setDataType("music")} />
+              <SelectableServiceOption title="有声书" description="暂未支持" icon={<BookOpenText className="size-5" />} selected={dataType === "audiobook"} disabled onSelect={() => setDataType("audiobook")} />
+            </div>
+          </fieldset>
+          <fieldset className="lg:col-span-2 pb-3">
+            <legend className="mb-3 text-xs text-muted-foreground">Provider 类型</legend>
+            <div role="radiogroup" aria-label="Provider 类型" className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              {providers.loading && <p className="text-sm text-muted-foreground sm:col-span-2 xl:col-span-4">正在读取 Provider…</p>}
+              {providers.data?.map((provider) => (
+                <SelectableServiceOption
+                  key={provider.type}
+                  title={provider.displayName}
+                  description={getProviderSelectionDescription(provider)}
+                  icon={<ProviderSelectionIcon providerType={provider.type} />}
+                  selected={selectedProvider?.type === provider.type}
+                  disabled={dataType === "audiobook" || !provider.supportedDataTypes.includes(dataType)}
+                  onSelect={() => selectProvider(provider.type)}
+                />
+              ))}
+            </div>
+          </fieldset>
           {selectedProvider?.authenticationMode === "web_qr"
             ? <GuangyaAuthorizationPanel admin={admin} targetUserId={adminTargetUserId || undefined} resetKey={`${selectedProvider.type}:${adminTargetUserId}`} onAuthorizationChange={setGuangyaAuthorization} />
+            : selectedProvider?.authenticationMode === "authorization_session"
+              ? <CloudAuthorizationPanel descriptor={selectedProvider} admin={admin} targetUserId={adminTargetUserId || undefined} resetKey={`${selectedProvider.type}:${adminTargetUserId}`} onAuthorizationChange={setCloudAuthorization} />
             : selectedProvider?.connectionFields.map((field) => <label key={field.name} className="block"><span className="text-xs text-muted-foreground">{field.label}</span><input name={`connection.${field.name}`} type={field.type === "password" ? "password" : field.type} required={field.required} autoComplete="off" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>)}
           {selectedProvider && <div className="rounded-xl border border-border bg-secondary/35 p-4 lg:col-span-2"><p className="text-sm font-medium">默认任务并发</p><p className="mt-2 text-xs text-muted-foreground">扫描任务 {selectedProvider.recommendedScanSettings.scanDirectoryConcurrency.default}，刮削任务 {selectedProvider.recommendedScanSettings.scrapeTaskConcurrency.default}。创建后可以在服务详情中修改。</p></div>}
           {selectedProvider && <ProviderConnectionGuide providerType={selectedProvider.type} />}
-          <div className="lg:col-span-2 flex items-center justify-between gap-4"><p className="text-xs text-muted-foreground">创建成功后不会自动扫描或刮削，需要先在服务详情中设置扫描路径。</p><PrimaryButton type="submit" disabled={selectedProvider?.authenticationMode === "web_qr" && guangyaAuthorization?.status !== "authorized"}>验证连接并创建服务</PrimaryButton></div>
+          <div className="lg:col-span-2 flex items-center justify-between gap-4"><p className="text-xs text-muted-foreground">创建成功后不会自动扫描或刮削，需要先在服务详情中设置扫描路径。</p><PrimaryButton type="submit" disabled={(selectedProvider?.authenticationMode === "web_qr" && guangyaAuthorization?.status !== "authorized") || (selectedProvider?.authenticationMode === "authorization_session" && cloudAuthorization?.state !== "authorized")}>验证连接并创建服务</PrimaryButton></div>
           {message && <p className="lg:col-span-2 text-sm text-muted-foreground">{message}</p>}
         </form>
       </Panel>
@@ -626,6 +666,24 @@ export function ServiceConnectionPage({ serviceId, admin = false }: { serviceId:
     }
   }
 
+  /** 新网盘扫码成功后，用一次性授权会话替换当前服务连接。 */
+  async function saveCloudConnection(authorization: CloudAuthorizationStatus | null): Promise<void> {
+    if (!service || authorization?.state !== "authorized") return;
+    setMessage(`${providerDescriptor?.displayName || "网盘"}授权成功，正在验证账号并保存连接…`);
+    try {
+      await updateServiceConnection(serviceId, { authorizationSessionId: authorization.authorizationSessionId }, admin);
+      setMessage("连接已更新，后续刷新将由 Fly云助手内部处理");
+      await resource.refresh();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "网盘连接保存失败";
+      console.warn("codex-flycloud-connection-management", {
+        事件: "网页保存新增网盘连接失败", 服务ID: serviceId,
+        网盘类型: service.providerType, 错误信息: errorMessage,
+      });
+      setMessage(errorMessage);
+    }
+  }
+
   /** 使用服务端当前保存的配置重新验证连接，并拦截重复点击。 */
   async function reconnectCurrentConnection(): Promise<void> {
     if (reconnectingRef.current) return;
@@ -675,11 +733,16 @@ export function ServiceConnectionPage({ serviceId, admin = false }: { serviceId:
             </SecondaryButton>
           </div>
         </Panel>
-        <Panel title="替换连接" description={providerDescriptor?.authenticationMode === "web_qr" ? "三方光鸭可使用扫码或验证码重新登录；官方光鸭由 Flymby APP 同步。" : "Secret 不回显，保存时必须提交一套完整新连接。"}>
+        <Panel title="替换连接" description={providerDescriptor?.authenticationMode === "web_qr" ? "三方光鸭可使用扫码或验证码重新登录；官方光鸭由 Flymby APP 同步。" : providerDescriptor?.authenticationMode === "authorization_session" ? "重新扫码后会先核对账号；与原服务账号不一致时不会覆盖。" : "Secret 不回显，保存时必须提交一套完整新连接。"}>
           {providers.loading && <p className="text-sm text-muted-foreground">正在读取网盘连接配置…</p>}
           {providerDescriptor?.authenticationMode === "web_qr" ? (
             <>
               <GuangyaAuthorizationPanel admin={admin} targetUserId={admin ? service.userId : undefined} resetKey={`${service.id}:${service.credentialRevision}`} initialLoginMode={service.connectionAuthMode ?? "web_qr"} onAuthorizationChange={(authorization) => void saveGuangyaConnection(authorization)} />
+              <ProviderConnectionGuide providerType={providerDescriptor.type} mode="replace" />
+            </>
+          ) : providerDescriptor?.authenticationMode === "authorization_session" ? (
+            <>
+              <CloudAuthorizationPanel descriptor={providerDescriptor} admin={admin} targetUserId={admin ? service.userId : undefined} resetKey={`${service.id}:${service.credentialRevision}`} onAuthorizationChange={(authorization) => void saveCloudConnection(authorization)} />
               <ProviderConnectionGuide providerType={providerDescriptor.type} mode="replace" />
             </>
           ) : providerDescriptor ? (

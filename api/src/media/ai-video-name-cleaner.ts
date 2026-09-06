@@ -38,6 +38,8 @@ export interface AiVideoNameCandidateContext {
   parentDirectoryNames: string[];
   fileNames: string[];
   fileSamples: AiVideoNameFileSample[];
+  /** 规则已经依据独立发行年份确认数字电影片名。 */
+  confirmedNumericMovieTitle?: boolean;
   ruleTitle: string;
   ruleAlternateTitle: string;
   ruleYear: number | null;
@@ -215,6 +217,7 @@ export function buildAiVideoNameCandidateContexts(
           episodeNumbers: parsed.episodeNumbers.slice(0, 20),
         };
       }),
+      confirmedNumericMovieTitle: group.parsed.confirmedNumericMovieTitle,
       ruleTitle: limitInputText(group.parsed.query || group.parsed.title, 300),
       ruleAlternateTitle: limitInputText(group.parsed.fallbackQuery, 300),
       ruleYear: group.parsed.year,
@@ -252,7 +255,7 @@ export class AiVideoNameCleaner {
   }): Promise<AiDirectoryCleaningResult> {
     const contextsByResourceId = buildAiVideoNameCandidateContexts(input.entries, input.parsedVideos);
     const contexts = [...new Map([...contextsByResourceId.values()].map((context) => [context.cacheKey, context])).values()]
-      .filter((context) => isWeakFlymbyScrapeTitle(context.ruleTitle))
+      .filter((context) => !context.confirmedNumericMovieTitle && isWeakFlymbyScrapeTitle(context.ruleTitle))
       .filter((context) => context.resourceIds.every((resourceId) => {
         const parsed = input.parsedVideos.get(resourceId);
         return Boolean(parsed) && !parsed!.imdbId && parsed!.tmdbId <= 0;

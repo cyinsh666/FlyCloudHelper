@@ -58,7 +58,19 @@ export function buildUpstreamHeaders(
   if (typeof request.headers.accept === "string" && request.headers.accept.length <= 500) {
     headers.Accept = request.headers.accept;
   }
-  if (typeof request.headers["user-agent"] === "string" && request.headers["user-agent"].length <= 500) {
+  // 关键变量：115等网盘要求下载请求使用Provider指定的UA，不能被播放器UA覆盖；HTTP头名称不区分大小写。
+  const providerUserAgentKey = Object.keys(providerHeaders).find((name) => name.toLowerCase() === "user-agent");
+  if (providerUserAgentKey !== undefined) {
+    // 临时诊断只记录选择结果，不记录UA内容、Cookie、下载地址或播放器认证信息。
+    request.log.info({
+      日志关键字: "codex-provider-playback-headers",
+      事件: "媒体中转保留网盘指定UA",
+      请求方法: request.method,
+      客户端是否携带UA: typeof request.headers["user-agent"] === "string",
+      客户端UA是否不同: typeof request.headers["user-agent"] === "string"
+        && request.headers["user-agent"] !== providerHeaders[providerUserAgentKey],
+    });
+  } else if (typeof request.headers["user-agent"] === "string" && request.headers["user-agent"].length <= 500) {
     headers["User-Agent"] = request.headers["user-agent"];
   }
   return headers;
