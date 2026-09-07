@@ -1,3 +1,4 @@
+import { readVideoSeason, videoSeasonTitle, encodeVideoSeasonNumber, decodeVideoSeasonNumber } from "./media/video-season.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { FastifyRequest } from "fastify";
 import type { Knex } from "knex";
@@ -160,7 +161,7 @@ function decodeProtocolItemId(itemId: string): string {
 function encodeProtocolSeasonId(seriesId: string, seasonNumber: number): string {
   const match = INTERNAL_ITEM_ID_PATTERN.exec(seriesId);
   if (!match?.[1]) return createProtocolUuid("season", `${seriesId}:${seasonNumber}`);
-  const normalizedSeason = Math.min(0xffffff, Math.max(0, Math.floor(seasonNumber)));
+  const normalizedSeason = encodeVideoSeasonNumber(seasonNumber);
   const seasonPrefix = `${JELLYFIN_SEASON_UUID_PREFIX}${normalizedSeason.toString(16).padStart(6, "0")}`;
   return formatProtocolUuid(`${seasonPrefix}${match[1]}`);
 }
@@ -606,11 +607,11 @@ export class JellyfinCompatibilityService {
 
   /** 解析云助手生成的虚拟季 ID，供季集查询和图片路由共用。 */
   private parseSeasonReference(value: string): JellyfinSeasonReference | null {
-    const legacyMatch = value.match(/^season:([^:]+):(\d+)$/u);
+    const legacyMatch = value.match(/^season:([^:]+):(-2|\d+)$/u);
     if (legacyMatch?.[1]) return { seriesId: legacyMatch[1], seasonNumber: Number(legacyMatch[2] ?? 0) };
     const compact = value.trim().toLowerCase().replace(/-/gu, "");
     if (compact.length !== 32 || !compact.startsWith(JELLYFIN_SEASON_UUID_PREFIX)) return null;
-    const seasonNumber = Number.parseInt(compact.slice(2, 8), 16);
+    const seasonNumber = decodeVideoSeasonNumber(Number.parseInt(compact.slice(2, 8), 16));
     const itemPayload = compact.slice(8);
     if (!Number.isFinite(seasonNumber) || !/^[0-9a-f]{24}$/u.test(itemPayload)) return null;
     return { seriesId: `itm_${itemPayload}`, seasonNumber };
@@ -851,7 +852,7 @@ export class JellyfinCompatibilityService {
       SeriesId: type === "Episode" ? protocolParentItemId : undefined, SeriesName: type === "Episode" ? parent?.title ?? item.subtitle : undefined,
       ParentIndexNumber: type === "Episode" ? seasonNumber : undefined, IndexNumber: type === "Episode" ? episodeNumber : undefined,
       SeasonId: type === "Episode" && parent ? encodeProtocolSeasonId(parent.id, seasonNumber) : undefined,
-      SeasonName: type === "Episode" ? seasonNumber === 0 ? "特别篇" : `第 ${seasonNumber} 季` : undefined,
+      SeasonName: type === "Episode" ? videoSeasonTitle(seasonNumber) : undefined,
       ParentId: type === "Episode" && parent ? encodeProtocolSeasonId(parent.id, seasonNumber) : itemLibrary.id,
       ParentPrimaryImageItemId: type === "Episode" && parentPrimaryTag ? protocolParentItemId : undefined,
       ParentPrimaryImageTag: type === "Episode" ? parentPrimaryTag || undefined : undefined,
@@ -968,14 +969,14 @@ export class JellyfinCompatibilityService {
     const series = await this.aggregateCatalog.getItem(context.serviceId, context.ownerUserId, aggregateSeriesId);
     if (series.itemType !== "video.series") throw new ApiError(404, "aggregate_jellyfin_series_not_found", "聚合节目不存在");
     const episodes = await this.aggregateCatalog.listEpisodes(context.serviceId, context.ownerUserId, aggregateSeriesId);
-    const seasonNumbers = [...new Set(episodes.map((episode) => Math.max(0, Number(episode.primaryItem.metadata.seasonNumber ?? 0))))]
+    const seasonNumbers = [...new Set(episodes.map((episode) => readVideoSeason(episode.primaryItem.metadata.seasonNumber)))]
       .sort((left, right) => left - right);
     const seriesItem = this.toAggregateMediaItem(context, series);
     const primaryImageTag = seriesItem.posterUrl ? String(Date.parse(seriesItem.updatedAt) || 1) : "";
     const backdropImageTag = seriesItem.backdropUrl ? String(Date.parse(seriesItem.updatedAt) || 1) : "";
     const protocolSeriesId = encodeAggregateJellyfinItemId(series.aggregateItemId);
     const items = seasonNumbers.map((seasonNumber) => ({
-      Name: seasonNumber === 0 ? "特别篇" : `第 ${seasonNumber} 季`,
+      Name: videoSeasonTitle(seasonNumber),
       Id: `season:${series.aggregateItemId}:${seasonNumber}`,
       ServerId: context.serviceId,
       Type: "Season",
@@ -1492,12 +1493,12 @@ export class JellyfinCompatibilityService {
     const series = await this.runtime.repository.getCatalogItem(internalSeriesId, context.ownerUserId);
     if (series.serviceId !== context.serviceId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
     const children = await this.runtime.repository.listCatalogChildren(internalSeriesId, context.ownerUserId);
-    const seasons = [...new Set(children.map((item) => Math.max(0, Number(item.metadata.seasonNumber ?? 0))))].sort((left, right) => left - right);
+    const seasons = [...new Set(children.map((item) => readVideoSeason(item.metadata.seasonNumber)))].sort((left, right) => left - right);
     const primaryImageTag = series.posterUrl ? String(Date.parse(series.updatedAt) || 1) : "";
     const backdropImageTag = series.backdropUrl ? String(Date.parse(series.updatedAt) || 1) : "";
     const protocolSeriesId = encodeProtocolItemId(series.id);
     const items = seasons.map((number) => ({
-      Name: number === 0 ? "特别篇" : `第 ${number} 季`, Id: encodeProtocolSeasonId(series.id, number), ServerId: context.serviceId,
+      Name: videoSeasonTitle(number), Id: encodeProtocolSeasonId(series.id, number), ServerId: context.serviceId,
       Type: "Season", IsFolder: true, SeriesId: protocolSeriesId, SeriesName: series.title,
       IndexNumber: number, ParentId: protocolSeriesId,
       ImageTags: primaryImageTag ? { Primary: primaryImageTag } : {},

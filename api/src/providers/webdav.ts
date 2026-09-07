@@ -308,6 +308,8 @@ export class WebDavProvider implements ProviderAdapter {
             });
             throw result.error;
           }
+          const siblingDirectoryNames = result.entries.filter((item) => item.isDirectory
+            && item.resourceId !== decodePath(directoryUrl.pathname)).map((item) => item.name);
           for (const entry of sortDirectoryEntries(result.entries)) {
             if (entry.resourceId === decodePath(directoryUrl.pathname)) continue;
             if (entry.isDirectory) {
@@ -319,6 +321,7 @@ export class WebDavProvider implements ProviderAdapter {
               const configuredPath = this.toConfiguredPath(baseUrl, entry.path);
               yield {
                 ...entry,
+                siblingDirectoryNames,
                 path: configuredPath,
                 // 关键变量：资源 ID 和播放定位继续保留 Provider 原值，避免已有媒体身份发生变化。
                 locator: entry.locator,

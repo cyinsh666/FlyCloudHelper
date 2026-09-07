@@ -1,3 +1,4 @@
+import { WEBDAV_UNKNOWN_SEASON } from "./flymby-consecutive-episode-helper.js";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import type { MediaType } from "../domain.js";
@@ -206,15 +207,18 @@ function describeVideo(
     ? parsed.episodeNumbers
     : parsed.episodeNumber > 0 ? [parsed.episodeNumber] : [1];
   const episode = episodeNumbers[0] ?? 1;
+  const seasonTitle = season === WEBDAV_UNKNOWN_SEASON ? "未知季" : `第 ${season} 季`;
+  // 未知季排在已知季之后，保存的季号仍然保留独立标记。
+  const sortSeason = season === WEBDAV_UNKNOWN_SEASON ? 9999 : season;
   const episodeTitle = episodeNumbers.length > 1
-    ? `第 ${season} 季 · 第 ${episodeNumbers[0]}-${episodeNumbers[episodeNumbers.length - 1]} 集`
-    : `第 ${season} 季 · 第 ${episode} 集`;
+    ? `${seasonTitle} · 第 ${episodeNumbers[0]}-${episodeNumbers[episodeNumbers.length - 1]} 集`
+    : `${seasonTitle} · 第 ${episode} 集`;
   return {
     identityKey: `video:episode:${entry.resourceId}`,
     mediaType: "video",
     itemType: "video.episode",
     title: episodeTitle,
-    sortTitle: `${String(season).padStart(3, "0")}-${String(episode).padStart(5, "0")}`,
+    sortTitle: `${String(sortSeason).padStart(3, "0")}-${String(episode).padStart(5, "0")}`,
     subtitle: parsed.title,
     year: parsed.year,
     matchState: "unmatched",
@@ -252,7 +256,7 @@ function describeVideo(
       title: parsed.title,
       subtitle: "剧集",
       year: parsed.year,
-      sortOrder: season * 100_000 + episode,
+      sortOrder: sortSeason * 100_000 + episode,
       relationType: "series_episode",
     },
   };

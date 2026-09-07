@@ -158,6 +158,7 @@ export class BaiduPanProvider implements ProviderAdapter {
           return { directory, entries };
         }));
         for (const { directory, entries } of batchResults) {
+          const siblingDirectoryNames = entries.filter((item) => item.isdir === 1).map((item) => String(item.server_filename ?? ""));
           for (const item of entries) {
             const path = item.path || `${directory.replace(/\/$/u, "")}/${item.server_filename ?? ""}`;
             const resourceId = String(item.fs_id ?? path);
@@ -166,6 +167,7 @@ export class BaiduPanProvider implements ProviderAdapter {
               queue.push(path);
             } else {
               yield {
+                siblingDirectoryNames,
                 resourceId,
                 parentResourceId: directory,
                 path,

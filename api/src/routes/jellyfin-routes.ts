@@ -88,9 +88,15 @@ function buildJellyfinStreamUrl(
   return `/Videos/${encodeURIComponent(itemId)}/stream?${query.toString()}`;
 }
 
-/** 判断 Provider 原始地址是否依赖客户端额外携带请求头。 */
-function hasRequiredPlaybackHeaders(access: ProviderFileAccess): boolean {
-  return Object.keys(access.headers).length > 0;
+/** 115 取址 UA 与当前播放器一致时无需额外请求头；其他网盘及认证头仍保持原限制。 */
+function hasRequiredPlaybackHeaders(access: ProviderFileAccess, request: FastifyRequest, providerType: string): boolean {
+  return Object.entries(access.headers).some(([name, value]) => {
+    if (providerType === "cloud115" && name.toLowerCase() === "user-agent") {
+      const playerUserAgent = request.headers["user-agent"];
+      return typeof playerUserAgent !== "string" || !playerUserAgent || value !== playerUserAgent;
+    }
+    return true;
+  });
 }
 
 /** 生成 Jellyfin 标准 MediaSourceInfo 的公共默认字段。 */
@@ -129,17 +135,29 @@ function buildStandardMediaSourceDefaults(): Record<string, unknown> {
 }
 
 /** 解析文件访问地址，并在 Provider 刷新令牌时安全持久化。 */
-async function resolveFileAccess(runtime: ApiRuntime, service: Record<string, unknown>, ownerUserId: string, locator: Record<string, unknown>, signal: AbortSignal) {
+async function resolveFileAccess(runtime: ApiRuntime, service: Record<string, unknown>, ownerUserId: string, locator: Record<string, unknown>, signal: AbortSignal, playbackRequest?: FastifyRequest) {
   const adapter = runtime.providers.get(String(service.provider_type));
   const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(String(service.id), ownerUserId));
   const providerContext: ProviderConnectionContext = {
+    // 只在实际访问 Videos/stream 时传入播放器 UA，不能把 PlaybackInfo 的 API 客户端 UA 当成播放 UA。
+    playbackUserAgent: String(service.provider_type) === "cloud115" && playbackRequest
+      ? playbackRequest.headers["user-agent"] || undefined
+      : undefined,
     persistConnection: async (nextConnection) => runtime.repository.refreshActiveEncryptedConnection({
       serviceId: String(service.id), userId: ownerUserId, credentialRevision: Number(service.credential_revision),
       encryptedConnection: runtime.vault.encrypt(nextConnection),
     }),
   };
-  if (adapter.resolveFileAccess) return adapter.resolveFileAccess(connection, locator, signal, providerContext);
-  return null;
+  const access = adapter.resolveFileAccess ? await adapter.resolveFileAccess(connection, locator, signal, providerContext) : null;
+  if (String(service.provider_type) === "cloud115" && playbackRequest) {
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-jellyfin-115-direct", 事件: "115直连取址完成", 服务ID: String(service.id),
+      使用播放器UA: Boolean(providerContext.playbackUserAgent), 请求方法: playbackRequest.method,
+      是否取得原始地址: Boolean(access && /^https?:\/\//iu.test(access.url)),
+      是否仍需额外请求头: access ? hasRequiredPlaybackHeaders(access, playbackRequest, "cloud115") : null,
+    });
+  }
+  return access;
 }
 
 /** 为聚合 Jellyfin 构造播放信息；每个版本始终回到其真实来源服务解析网盘访问地址。 */
@@ -476,7 +494,7 @@ async function sendAggregateMediaStream(
         if (effectiveRoute === "origin") {
           let originAccess: ProviderFileAccess | null = null;
           try {
-            originAccess = await resolveFileAccess(runtime, sourceService, context.ownerUserId, file.playbackLocator, abortController.signal);
+            originAccess = await resolveFileAccess(runtime, sourceService, context.ownerUserId, file.playbackLocator, abortController.signal, request);
           } catch (error) {
             if (isMissingProviderFileError(error) || requestedRoute === "origin") throw error;
             // auto 模式允许 Provider 原始地址解析失败后改由服务端读取，显式 origin 仍严格失败。
@@ -491,15 +509,15 @@ async function sendAggregateMediaStream(
               回退原因: error instanceof Error ? error.name : "原始地址解析失败",
             });
           }
-          if (originAccess && /^https?:\/\//iu.test(originAccess.url) && !hasRequiredPlaybackHeaders(originAccess)) {
+          if (originAccess && /^https?:\/\//iu.test(originAccess.url) && !hasRequiredPlaybackHeaders(originAccess, request, String(sourceService.provider_type))) {
             reply.header("Cache-Control", "private, no-store");
             return reply.redirect(originAccess.url, 307);
           }
           if (!access && requestedRoute === "origin") {
-            const errorCode = originAccess && hasRequiredPlaybackHeaders(originAccess)
+            const errorCode = originAccess && hasRequiredPlaybackHeaders(originAccess, request, String(sourceService.provider_type))
               ? "jellyfin_origin_headers_required"
               : "jellyfin_origin_direct_unavailable";
-            const errorMessage = originAccess && hasRequiredPlaybackHeaders(originAccess)
+            const errorMessage = originAccess && hasRequiredPlaybackHeaders(originAccess, request, String(sourceService.provider_type))
               ? "当前网盘原始地址依赖专用请求头，无法强制直连"
               : "当前文件无法生成原始播放地址";
             throw new ApiError(409, errorCode, errorMessage);
@@ -514,7 +532,7 @@ async function sendAggregateMediaStream(
               聚合服务ID: context.serviceId,
               来源服务ID: file.sourceServiceId,
               源文件ID: file.fileId,
-              回退原因: originAccess && hasRequiredPlaybackHeaders(originAccess) ? "原始地址需要认证请求头" : "未生成可用原始地址",
+              回退原因: originAccess && hasRequiredPlaybackHeaders(originAccess, request, String(sourceService.provider_type)) ? "原始地址需要认证请求头" : "未生成可用原始地址",
             });
           }
         } else {
@@ -631,11 +649,12 @@ async function sendMediaStream(
             context.ownerUserId,
             locator,
             abortController.signal,
+            request,
           );
           if (!originAccess || !/^https?:\/\//iu.test(originAccess.url)) {
             throw new ApiError(409, "jellyfin_origin_direct_unavailable", "当前文件无法生成原始播放地址，请启用 Jellyfin 中转播放");
           }
-          if (!hasRequiredPlaybackHeaders(originAccess)) {
+          if (!hasRequiredPlaybackHeaders(originAccess, request, String(service.provider_type))) {
             reply.header("Cache-Control", "private, no-store");
             return reply.redirect(originAccess.url, 307);
           }

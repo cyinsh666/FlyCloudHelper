@@ -204,6 +204,7 @@ export class AliyunDriveProvider implements ProviderAdapter {
           return { directory, entries };
         }));
         for (const { directory, entries } of batchResults) {
+          const siblingDirectoryNames = entries.filter((item) => item.type === "folder").map((item) => String(item.name ?? ""));
           for (const item of entries) {
             const id = String(item.file_id ?? "");
             const name = String(item.name ?? id);
@@ -214,6 +215,7 @@ export class AliyunDriveProvider implements ProviderAdapter {
               queue.push({ id, path: itemPath });
             } else {
               yield {
+                siblingDirectoryNames,
                 resourceId: id,
                 parentResourceId: item.parent_file_id ?? directory.id,
                 path: itemPath,

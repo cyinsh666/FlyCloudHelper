@@ -94,20 +94,26 @@ export abstract class CloudDriveProviderBase implements ProviderAdapter {
         if (!directory) continue;
         let pageNumber = 1;
         let hasMore = false;
+        // 汇总当前目录全部分页后再识别，避免后页季目录遗漏造成默认第一季。
+        const directoryItems: CloudDriveItem[] = [];
         do {
+          if (signal?.aborted) return;
           const page = await this.listPage(connection, directory.id, pageNumber, signal, { persistConnection: options?.persistConnection });
-          for (const item of page.items) {
-            const path = `${directory.path.replace(/\/$/u, "")}/${item.name}`;
-            if (item.isDirectory) queue.push({ id: item.id, path });
-            else yield {
-              resourceId: item.id, parentResourceId: item.parentId || directory.id, path, name: item.name,
-              isDirectory: false, size: item.size, modifiedAt: item.modifiedAt, etag: item.etag,
-              locator: item.locator,
-            };
-          }
+          directoryItems.push(...page.items);
           hasMore = page.hasMore;
           pageNumber += 1;
         } while (hasMore);
+        const siblingDirectoryNames = directoryItems.filter((item) => item.isDirectory).map((item) => item.name);
+        for (const item of directoryItems) {
+          const path = `${directory.path.replace(/\/$/u, "")}/${item.name}`;
+          if (item.isDirectory) queue.push({ id: item.id, path });
+          else yield {
+            siblingDirectoryNames,
+            resourceId: item.id, parentResourceId: item.parentId || directory.id, path, name: item.name,
+            isDirectory: false, size: item.size, modifiedAt: item.modifiedAt, etag: item.etag,
+            locator: item.locator,
+          };
+        }
       }
       await options?.onRootComplete?.({ rootIndex, root, warningCount: 0 });
     }

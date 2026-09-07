@@ -1,3 +1,4 @@
+import { readVideoSeason } from "./media/video-season.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
@@ -468,7 +469,7 @@ async function importSnapshotRows(
       const parentId = itemIdByLocalId.get(readText(local, "itemId"));
       if (!localEpisodeId || !parentId || episodeIdByLocalId.has(localEpisodeId)) continue;
       const episodeId = createStableId("itm", migration.userId, migration.libraryId, "episode", localEpisodeId);
-      const seasonNumber = Math.max(0, Math.floor(readNumber(local, "seasonNumber")));
+      const seasonNumber = readVideoSeason(Math.floor(readNumber(local, "seasonNumber")));
       const episodeNumber = Math.max(0, Math.floor(readNumber(local, "episodeNumber")));
       const tmdbId = Math.max(0, Math.floor(readNumber(local, "tmdbId")));
       episodeIdByLocalId.set(localEpisodeId, episodeId);

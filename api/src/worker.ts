@@ -1,3 +1,4 @@
+import { WEBDAV_UNKNOWN_SEASON } from "./media/flymby-consecutive-episode-helper.js";
 import path from "node:path";
 import type { AggregateIndexService } from "./aggregate-index-service.js";
 import type { ApiConfig } from "./config.js";
@@ -357,7 +358,8 @@ function resolveCatalogIdentityKey(
       : `video:${itemKind}:task:${businessTaskKey}`;
   }
   if (descriptor.itemType === "video.episode") {
-    const seasonNumber = Math.max(0, Number(descriptor.metadata.seasonNumber ?? 1));
+    const seasonNumber = (Number(descriptor.metadata.seasonNumber) === WEBDAV_UNKNOWN_SEASON
+      ? WEBDAV_UNKNOWN_SEASON : Math.max(0, Number(descriptor.metadata.seasonNumber ?? 1)));
     const episodeNumber = Math.max(1, Number(descriptor.metadata.episodeNumber ?? 1));
     const parentIdentity = metadata.parent ? readMetadataIdentity(metadata.parent) : "";
     const seriesIdentity = parentIdentity || businessTaskKey;
@@ -2094,6 +2096,8 @@ export class ScanWorker {
           日志关键字: "codex-webdav-media-recognition", 阶段: "文件判型与分组", 任务ID: job.id,
           文件名: parsed.fileName, 媒体类型: parsed.mediaType, 查询标题: parsed.query, 年份: parsed.year,
           季号: parsed.seasonNumber, 集号: parsed.episodeNumber, 识别依据: parsed.recognitionReason,
+          连续三集优先: parsed.recognitionReason === "consecutive_episode_priority",
+          未知季: parsed.seasonNumber === WEBDAV_UNKNOWN_SEASON,
           数字电影证据: Boolean(parsed.confirmedNumericMovieTitle),
           刮削任务键: ruleDescriptors.get(resourceId)?.metadata.scrapeTaskKey,
         });
@@ -3472,9 +3476,11 @@ export class ScanWorker {
 
     const parentMetadata = this.mapTmdbVideoMetadata(result, descriptor.parent?.subtitle ?? descriptor.subtitle);
     if (result.mediaType === "movie") return parentMetadata;
-    const seasonNumber = Math.max(0, Number(descriptor.metadata.seasonNumber ?? 1));
+    const seasonNumber = (Number(descriptor.metadata.seasonNumber) === WEBDAV_UNKNOWN_SEASON
+      ? WEBDAV_UNKNOWN_SEASON : Math.max(0, Number(descriptor.metadata.seasonNumber ?? 1)));
     const episodeNumber = Math.max(1, Number(descriptor.metadata.episodeNumber ?? 1));
-    if (!synchronizeDetails) {
+    // 未知季只匹配节目，不请求猜测季号的单集资料。
+    if (!synchronizeDetails || seasonNumber === WEBDAV_UNKNOWN_SEASON) {
       return {
         title: descriptor.title,
         subtitle: result.title,

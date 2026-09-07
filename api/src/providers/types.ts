@@ -8,6 +8,8 @@ export interface ScanRoot {
 }
 
 export interface ProviderEntry {
+  /** 当前目录的同级子目录名，仅用于扫描季号判定，不写入播放定位。 */
+  siblingDirectoryNames?: string[];
   resourceId: string;
   parentResourceId: string | null;
   path: string;
@@ -122,6 +124,8 @@ export interface ProviderEnumerationOptions {
 /** 路由执行 Provider 操作时携带的连接刷新持久化能力。 */
 export interface ProviderConnectionContext {
   persistConnection?: (connection: Record<string, unknown>) => Promise<void>;
+  /** Jellyfin 直连取址使用实际媒体请求的 UA；未传入时 Provider 保持原有默认值。 */
+  playbackUserAgent?: string;
 }
 
 export interface ProviderDescriptor {

@@ -73,14 +73,16 @@ export class Cloud115Provider extends CloudDriveProviderBase {
   /** 使用 pick_code 换取115原画地址。 */
   protected async loadFileAccess(connection: Record<string, unknown>, locator: Record<string, unknown>, signal?: AbortSignal, context?: ProviderConnectionContext): Promise<ProviderFileAccess> {
     const pickCode = requireConnectionString(locator, "pickCode", "115 Pick Code");
+    // 关键变量：取址和下载使用同一个 UA；只对本次请求生效，不能改 Provider 全局 UA 影响并发中转。
+    const downloadUserAgent = context?.playbackUserAgent || CLOUD115_UA;
     const payload = await this.request(connection, "/open/ufile/downurl", {
-      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ pick_code: pickCode }),
+      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": downloadUserAgent }, body: new URLSearchParams({ pick_code: pickCode }),
     }, signal, context);
     const data = readCloudRecord(payload.data);
     const first = readCloudRecord(data[Object.keys(data)[0] ?? ""]);
     const url = readCloudText(readCloudRecord(first.url), ["url"]);
     if (!url) throw new ApiError(502, "cloud115_download_url_missing", "115网盘未返回原画地址");
-    return { url, expiresAt: null, headers: { "User-Agent": CLOUD115_UA } };
+    return { url, expiresAt: null, headers: { "User-Agent": downloadUserAgent } };
   }
 
   /** 读取115小型文本文件。 */

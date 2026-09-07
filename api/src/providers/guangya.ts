@@ -377,6 +377,7 @@ export class GuangyaProvider implements ProviderAdapter {
             continue;
           }
           result.entries.sort((left, right) => left.name.localeCompare(right.name, "zh-CN", { numeric: true }));
+          const siblingDirectoryNames = result.entries.filter((item) => item.isDirectory).map((item) => item.name);
           for (const item of result.entries) {
             const itemPath = `${result.directory.path.replace(/\/$/u, "")}/${item.name}`;
             if (item.isDirectory) {
@@ -384,6 +385,7 @@ export class GuangyaProvider implements ProviderAdapter {
               continue;
             }
             yield {
+              siblingDirectoryNames,
               resourceId: item.fileId,
               parentResourceId: item.parentId || result.directory.id,
               path: itemPath,

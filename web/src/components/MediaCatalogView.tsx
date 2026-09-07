@@ -86,6 +86,7 @@ export interface MediaCatalogQuery {
 
 /** 将媒体详情中的常用元数据转换为可读中文文本。 */
 function formatMetadataValue(key: string, value: unknown): string {
+  if (key === "seasonNumber" && Number(value) === -2) return "未知季";
   if (key === "durationMs" && typeof value === "number") return formatMediaDuration(value);
   if (key === "audioBitRate" && typeof value === "number") return formatMediaBitRate(value);
   if (key === "audioSampleRate" && typeof value === "number" && value > 0) return `${Math.round(value).toLocaleString("zh-CN")} Hz`;
@@ -119,10 +120,10 @@ function getDisplayMetadata(metadata: Record<string, unknown>): Array<{ label: s
 function getSeriesEpisodeLabel(child: MediaItem): string {
   const seasonNumber = Number(child.metadata.seasonNumber);
   const episodeNumber = Number(child.metadata.episodeNumber);
-  if (!Number.isInteger(seasonNumber) || seasonNumber < 0 || !Number.isInteger(episodeNumber) || episodeNumber < 1) {
+  if (!Number.isInteger(seasonNumber) || (seasonNumber < 0 && seasonNumber !== -2) || !Number.isInteger(episodeNumber) || episodeNumber < 1) {
     return child.title;
   }
-  return `第 ${seasonNumber} 季 第 ${episodeNumber} 集`;
+  return seasonNumber === -2 ? `未知季 第 ${episodeNumber} 集` : `第 ${seasonNumber} 季 第 ${episodeNumber} 集`;
 }
 
 /** 生成节目单集副标题，保留单集名称、补充标题和年份。 */
@@ -548,7 +549,7 @@ export function MediaCatalogView({
         const missingPositionCount = children.filter((child) => {
           const seasonNumber = Number(child.metadata.seasonNumber);
           const episodeNumber = Number(child.metadata.episodeNumber);
-          return !Number.isInteger(seasonNumber) || seasonNumber < 0 || !Number.isInteger(episodeNumber) || episodeNumber < 1;
+          return !Number.isInteger(seasonNumber) || (seasonNumber < 0 && seasonNumber !== -2) || !Number.isInteger(episodeNumber) || episodeNumber < 1;
         }).length;
         console.info("codex-media-series-children", {
           事件: "加载节目剧集列表",

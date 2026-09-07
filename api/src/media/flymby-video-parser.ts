@@ -1,3 +1,4 @@
+import { WebdavConsecutiveEpisodeHelper, WEBDAV_UNKNOWN_SEASON } from "./flymby-consecutive-episode-helper.js";
 import path from "node:path";
 import { FlymbyVideoReleaseTextHelper } from "./flymby-video-release-text-helper.js";
 import type { ProviderEntry } from "../providers/types.js";
@@ -6,7 +7,7 @@ import { FlymbyVideoTitleCleaner } from "./flymby-video-title-cleaner.js";
 export type FlymbyParsedVideoType = "movie" | "tv";
 
 // 关键变量：影响影视查询语义的本地清洗规则发生变化时必须提升，避免复用旧 AI 清洗缓存。
-export const FLYMBY_VIDEO_NAME_CLEANER_VERSION = "webdav-video-name-parser-2026-09-06-recognition-v4";
+export const FLYMBY_VIDEO_NAME_CLEANER_VERSION = "webdav-video-name-parser-2026-09-06-consecutive-v5";
 
 export interface FlymbyParsedVideoName {
   mediaType: FlymbyParsedVideoType;
@@ -216,11 +217,63 @@ export function parseFlymbyVideoName(entry: ProviderEntry, rootPath: string): Fl
   };
 }
 
+/** 连续三集优先使用作品目录；未命中的文件完整保留原识别结果。 */
+export function parseFlymbyVideoDirectory(entries: ProviderEntry[], rootPath: string): Map<string, FlymbyParsedVideoName> {
+  const parsedByResourceId = parseFlymbyVideoDirectoryLegacy(entries, rootPath);
+  const videos = entries.filter((entry) => !entry.isDirectory && videoExtensionPattern.test(readVideoExtension(entry.name)));
+  const first = videos[0];
+  if (!first) return parsedByResourceId;
+  const currentPath = path.posix.dirname(normalizeMediaPath(first.path));
+  const folderName = path.posix.basename(currentPath);
+  // 合集、混合桶及明确电影资源继续由已有规则逐文件识别。
+  if (isMixedMediaBucketDirectory(currentPath) || isCollectionDirectoryTitle(cleanSeriesTitle(folderName))
+    || /(?:系列|合集|collection|trilogy)/iu.test(folderName)
+    || /(?:剧场版|劇場版|电影版|電影版|映画)/u.test(folderName)
+    || /^(?:最近接收|待看|收藏|下载|downloads?|videos?|剧集|电影)$/iu.test(folderName)
+    || videos.some((entry) => /(?:剧场版|劇場版|电影版|電影版|映画)/u.test(entry.name))) return parsedByResourceId;
+  const title = pickSeriesTitle("", `${currentPath}/placeholder.mkv`, -1);
+  if (!isUsableTitle(title) || isCollectionDirectoryTitle(title)) return parsedByResourceId;
+  const pathContext = buildPathTvContext(currentPath);
+  // 枚举器复用完整目录列表传入同级目录名，不额外请求网盘。
+  const siblingNames = first.siblingDirectoryNames ?? entries.filter((entry) => entry.isDirectory).map((entry) => entry.name);
+  const childSeasons = new Set<number>();
+  for (const name of siblingNames) {
+    const match = /(?:第\s*([0-9一二三四五六七八九十两]{1,3})\s*(?:季|部)|(?:season|series|s)\s*0*(\d{1,2}))/iu.exec(name);
+    const season = match ? Number(match[2] ?? parseChineseNumber(match[1] ?? "")) : 0;
+    if (season > 0) childSeasons.add(season);
+  }
+  const defaultSeason = pathContext.mediaType === "tv" ? pathContext.seasonNumber
+    : childSeasons.size >= 2 ? WEBDAV_UNKNOWN_SEASON : resolveSeasonNumber(`${currentPath}/placeholder.mkv`, 1);
+  const evidence = WebdavConsecutiveEpisodeHelper.collect(videos.map((entry) => entry.name), defaultSeason);
+  if (evidence.length === 0 || (!evidence.some((item) => item.explicit)
+    && findNearestPathMediaType(rootPath, currentPath) === "movie")) return parsedByResourceId;
+  const byName = new Map(evidence.map((item) => [item.fileName, item]));
+  for (const entry of videos) {
+    const item = byName.get(entry.name);
+    if (!item) continue;
+    const parsed = parseFlymbyVideoName(entry, rootPath);
+    parsed.mediaType = "tv";
+    parsed.fallbackQuery = parsed.query !== title ? parsed.query : parsed.fallbackQuery;
+    parsed.title = title;
+    parsed.query = title;
+    parsed.seasonNumber = item.seasonNumber;
+    parsed.episodeNumber = item.episodeNumber;
+    parsed.episodeNumbers = [item.episodeNumber];
+    const seriesYear = resolveSeriesYearFromPath(entry.path, title);
+    parsed.seriesYearCorrected = seriesYear !== null && seriesYear !== parsed.year;
+    parsed.year = seriesYear ?? parsed.year;
+    parsed.usedParentTitleFallback = true;
+    parsed.recognitionReason = "consecutive_episode_priority";
+    parsedByResourceId.set(entry.resourceId, parsed);
+  }
+  return parsedByResourceId;
+}
+
 /**
  * 按 Flymby APP 的目录上下文统一识别同目录视频。
  * APP 会先观察同目录的全部视频，再决定它们是一部节目的一组单集还是相互独立的电影。
  */
-export function parseFlymbyVideoDirectory(
+function parseFlymbyVideoDirectoryLegacy(
   entries: ProviderEntry[],
   rootPath: string,
 ): Map<string, FlymbyParsedVideoName> {
