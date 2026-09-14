@@ -1931,6 +1931,8 @@ export class ServiceRepository {
     unmatchedCount?: number;
     errorCount?: number;
     currentPath?: string | null;
+    /** 音乐阶段状态快照，兼容旧任务响应。 */
+    musicStages?: unknown[];
   }): Promise<ScanJobRecord> {
     const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
     if (input.stage !== undefined) patch.stage = input.stage;
@@ -1942,6 +1944,10 @@ export class ServiceRepository {
     if (input.unmatchedCount !== undefined) patch.unmatched_count = input.unmatchedCount;
     if (input.errorCount !== undefined) patch.error_count = input.errorCount;
     if (input.currentPath !== undefined) patch.current_path = input.currentPath;
+    if (input.musicStages) {
+      const row = await this.database.query("scan_jobs").select("snapshot_json").where({ id: jobId }).first();
+      patch.snapshot_json = JSON.stringify({ ...parseJsonObject(row?.snapshot_json), musicStages: input.musicStages });
+    }
     await this.database.query("scan_jobs").where({ id: jobId }).update(patch);
     const job = await this.getJob(jobId);
     await this.addJobEvent(job.userId, job.id, "progress", {
@@ -2004,7 +2010,7 @@ export class ServiceRepository {
       let connectionStatus = String(service?.connection_status ?? "valid");
       if (usesCurrentCredential) {
         if (input.status === "failed" && (input.errorCode === "provider_authentication_failed"
-          || input.errorCode === "cloud123_authentication_expired")) {
+          || input.errorCode === "cloud123_authentication_expired" || input.errorCode === "cloud139_authentication_expired")) {
           connectionStatus = "reauthorization_required";
         } else if (input.status === "failed" && input.errorCode === "cloud123_business_failed"
           && service?.provider_type === "cloud123" && connectionStatus !== "reauthorization_required") {
@@ -2699,6 +2705,8 @@ export class ServiceRepository {
           .count<{ count: string | number }[]>({ count: "id" })
           .first();
         // 关键变量：显式按媒体库删除关联表，确保不同服务的数据不会被一起清空。
+        // 音乐任务历史保留，但旧阶段不可再次把已清空的曲目恢复出来。
+        await transaction("music_scan_runs").whereIn("job_id", transaction("scan_jobs").select("id").where({ service_id: serviceId })).delete();
         await transaction("file_links").where({ library_id: libraryId }).delete();
         await transaction("media_relations").where({ library_id: libraryId }).delete();
         await transaction("media_items").where({ library_id: libraryId }).delete();
@@ -3661,6 +3669,12 @@ export class ServiceRepository {
       ...input,
       posterUrl: input.posterUrl || (existing.poster_url ? String(existing.poster_url) : null),
       backdropUrl: input.backdropUrl || (existing.backdrop_url ? String(existing.backdrop_url) : null),
+      ...(input.itemType !== "music.track" ? {
+        year: input.year ?? (existing.year == null ? null : Number(existing.year)),
+        overview: input.overview || String(existing.overview ?? ""),
+        matchState: existing.match_state === "matched" ? "matched" as const : input.matchState,
+        metadata: { ...existingMetadata, ...Object.fromEntries(Object.entries(input.metadata).filter(([, value]) => value !== undefined && value !== null && value !== "" && (!Array.isArray(value) || value.length > 0))) },
+      } : {}),
     } : input;
     // 关键变量：人工匹配结果优先于后续自动扫描，但扫描仍刷新 generation，避免条目被全量扫描误删。
     const effectiveInput = hasManualMatch && existing ? {
@@ -3944,11 +3958,13 @@ export class ServiceRepository {
     userId: string;
     libraryId: string;
     artistItemIds: string[];
+    albumArtistItemIds?: string[];
     albumItemId: string | null;
     trackItemId: string;
   }): Promise<void> {
     // 关键变量：艺术家编号去重后同时用于删除过期关系和写入本轮关系。
     const artistItemIds = [...new Set(input.artistItemIds.filter(Boolean))];
+    const albumArtistItemIds = [...new Set((input.albumArtistItemIds ?? input.artistItemIds).filter(Boolean))];
     await this.database.query.transaction(async (transaction) => {
       if (input.albumItemId) {
         const albumRelations = transaction("media_relations").where({
@@ -3957,7 +3973,7 @@ export class ServiceRepository {
           child_item_id: input.albumItemId,
           relation_type: "artist_album",
         });
-        if (artistItemIds.length > 0) albumRelations.whereNotIn("parent_item_id", artistItemIds);
+        if (albumArtistItemIds.length > 0) albumRelations.whereNotIn("parent_item_id", albumArtistItemIds);
         await albumRelations.delete();
       }
       const trackRelations = transaction("media_relations").where({
@@ -3968,14 +3984,15 @@ export class ServiceRepository {
       });
       if (artistItemIds.length > 0) trackRelations.whereNotIn("parent_item_id", artistItemIds);
       await trackRelations.delete();
+      for (const [index, artistItemId] of albumArtistItemIds.entries()) {
+        if (!input.albumItemId) break;
+        await transaction("media_relations").insert({
+          id: randomUUID(), user_id: input.userId, library_id: input.libraryId,
+          parent_item_id: artistItemId, child_item_id: input.albumItemId,
+          relation_type: "artist_album", sort_order: index,
+        }).onConflict(["user_id", "parent_item_id", "child_item_id", "relation_type"]).merge({ sort_order: index });
+      }
       for (const [index, artistItemId] of artistItemIds.entries()) {
-        if (input.albumItemId) {
-          await transaction("media_relations").insert({
-            id: randomUUID(), user_id: input.userId, library_id: input.libraryId,
-            parent_item_id: artistItemId, child_item_id: input.albumItemId,
-            relation_type: "artist_album", sort_order: index,
-          }).onConflict(["user_id", "parent_item_id", "child_item_id", "relation_type"]).merge({ sort_order: index });
-        }
         await transaction("media_relations").insert({
           id: randomUUID(), user_id: input.userId, library_id: input.libraryId,
           parent_item_id: artistItemId, child_item_id: input.trackItemId,

@@ -1,3 +1,4 @@
+import { loadEnumerationPage } from "./types.js";
 import type {
   ProviderAdapter, ProviderConnectionContext, ProviderDescriptor, ProviderDirectoryListing,
   ProviderEntry, ProviderEnumerationOptions, ProviderEnumerationWarning, ProviderFileAccess,
@@ -20,9 +21,11 @@ export interface CloudDriveItem {
 export interface CloudDrivePage {
   items: CloudDriveItem[];
   hasMore: boolean;
+  /** 游标分页由调用方独立持有，避免同目录并发请求互相覆盖。 */
+  nextPageToken?: string;
 }
 
-/** 四种只读网盘共用目录浏览、枚举与文件访问编排，协议差异留给子类。 */
+/** 只读网盘共用目录浏览、枚举与文件访问编排，协议差异留给子类。 */
 export abstract class CloudDriveProviderBase implements ProviderAdapter {
   public abstract readonly descriptor: ProviderDescriptor;
   protected abstract readonly rootResourceId: string;
@@ -36,6 +39,7 @@ export abstract class CloudDriveProviderBase implements ProviderAdapter {
   protected abstract listPage(
     connection: Record<string, unknown>, parentId: string, page: number, signal?: AbortSignal,
     context?: ProviderConnectionContext,
+    pageToken?: string,
   ): Promise<CloudDrivePage>;
 
   /** 把文件定位信息换成短期下载结果。 */
@@ -64,8 +68,10 @@ export abstract class CloudDriveProviderBase implements ProviderAdapter {
     const items: ProviderDirectoryListing["items"] = [];
     let pageNumber = 1;
     let hasMore = false;
+    let pageToken = "";
     do {
-      const page = await this.listPage(connection, parentId, pageNumber, signal, context);
+      const page = await this.listPage(connection, parentId, pageNumber, signal, context, pageToken);
+      pageToken = page.nextPageToken ?? "";
       page.items.filter((item) => item.isDirectory).forEach((item) => items.push({
         name: item.name, resourceId: item.id,
         displayPath: `${parentPath.replace(/\/$/u, "")}/${item.name}`,
@@ -88,31 +94,38 @@ export abstract class CloudDriveProviderBase implements ProviderAdapter {
       if (!root) continue;
       await options?.onRootStart?.({ rootIndex, root, warningCount: 0 });
       const queue: Array<{ id: string; path: string }> = [{ id: root.resourceId || this.rootResourceId, path: root.displayPath || "/" }];
+      const visited = new Set<string>();
+      const concurrency = Math.max(1, options?.directoryConcurrency ?? 1);
       while (queue.length > 0) {
-        if (signal?.aborted) return;
-        const directory = queue.shift();
-        if (!directory) continue;
-        let pageNumber = 1;
-        let hasMore = false;
-        // 汇总当前目录全部分页后再识别，避免后页季目录遗漏造成默认第一季。
-        const directoryItems: CloudDriveItem[] = [];
-        do {
-          if (signal?.aborted) return;
-          const page = await this.listPage(connection, directory.id, pageNumber, signal, { persistConnection: options?.persistConnection });
-          directoryItems.push(...page.items);
-          hasMore = page.hasMore;
-          pageNumber += 1;
-        } while (hasMore);
-        const siblingDirectoryNames = directoryItems.filter((item) => item.isDirectory).map((item) => item.name);
-        for (const item of directoryItems) {
-          const path = `${directory.path.replace(/\/$/u, "")}/${item.name}`;
-          if (item.isDirectory) queue.push({ id: item.id, path });
-          else yield {
-            siblingDirectoryNames,
-            resourceId: item.id, parentResourceId: item.parentId || directory.id, path, name: item.name,
-            isDirectory: false, size: item.size, modifiedAt: item.modifiedAt, etag: item.etag,
-            locator: item.locator,
-          };
+        signal?.throwIfAborted();
+        const batch = queue.splice(0, concurrency).filter((directory) => !visited.has(directory.id));
+        batch.forEach((directory) => visited.add(directory.id));
+        // 目录并行、目录内分页串行，保证游标及同目录旁挂集合完整。
+        const results = await Promise.all(batch.map(async (directory) => {
+          let pageNumber = 1;
+          let pageToken = "";
+          const items: CloudDriveItem[] = [];
+          let hasMore = false;
+          do {
+            signal?.throwIfAborted();
+            const page = await loadEnumerationPage(options, directory.path, `${directory.id}:${pageNumber}:${pageToken}`, () =>
+              this.listPage(connection, directory.id, pageNumber, signal, { persistConnection: options?.persistConnection }, pageToken));
+            pageToken = page.nextPageToken ?? "";
+            items.push(...page.items);
+            hasMore = page.hasMore;
+            pageNumber += 1;
+          } while (hasMore);
+          return { directory, items };
+        }));
+        for (const { directory, items } of results) {
+          const siblingDirectoryNames = items.filter((item) => item.isDirectory).map((item) => item.name);
+          for (const item of items) {
+            const path = `${directory.path.replace(/\/$/u, "")}/${item.name}`;
+            if (item.isDirectory) queue.push({ id: item.id, path });
+            else yield { siblingDirectoryNames, resourceId: item.id, parentResourceId: item.parentId || directory.id,
+              path, name: item.name, isDirectory: false, size: item.size, modifiedAt: item.modifiedAt, etag: item.etag, locator: item.locator };
+          }
+          await options?.onDirectoryComplete?.(directory.path);
         }
       }
       await options?.onRootComplete?.({ rootIndex, root, warningCount: 0 });

@@ -1,3 +1,4 @@
+import { loadEnumerationPage } from "./types.js";
 import { providerFetch, validateProviderUrl, type ProviderNetworkOptions } from "./network.js";
 import { validationError } from "../errors.js";
 import {
@@ -196,8 +197,8 @@ export class AliyunDriveProvider implements ProviderAdapter {
           let marker: string | null = null;
           const entries: AliyunFileItem[] = [];
           do {
-            const page = await this.listDirectory(connection, driveId, directory.id, marker, 200, signal,
-              options?.persistConnection);
+            const page: { items: AliyunFileItem[]; nextMarker: string | null } = await loadEnumerationPage(options, directory.path, `${driveId}:${directory.id}:${marker ?? ""}`, () => this.listDirectory(connection, driveId, directory.id, marker, 200, signal,
+              options?.persistConnection));
             entries.push(...page.items);
             marker = page.nextMarker;
           } while (marker);
@@ -228,6 +229,7 @@ export class AliyunDriveProvider implements ProviderAdapter {
               };
             }
           }
+          await options?.onDirectoryComplete?.(directory.path);
         }
       }
       await options?.onRootComplete?.({ rootIndex, root, warningCount: 0 });

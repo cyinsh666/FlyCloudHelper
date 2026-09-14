@@ -1,3 +1,4 @@
+import { MusicScanStages } from "../components/MusicScanStages";
 import { Link } from "@tanstack/react-router";
 import { Download, Images, Layers3, Pause, Play, Radio, RefreshCw, RotateCcw, Settings2, Sparkles, Square, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -254,7 +255,8 @@ function getQueuedJobWaitSummary(job: ScanJob): string {
 /** 判断任务是否支持重试；规格任务完成但包含失败文件时也可以只重试失败项。 */
 function canRetryJob(job: ScanJob): boolean {
   return job.status === "failed" || job.status === "cancelled"
-    || (job.jobType === "media_probe" && job.status === "completed" && job.errorCount > 0);
+    || (job.jobType === "media_probe" && job.status === "completed" && job.errorCount > 0)
+    || (job.dataType === "music" && job.status === "completed" && (job.errorCount > 0 || Number(job.unmatchedCount) > 0));
 }
 
 /** 判断任务是否可以进入暂停状态。 */
@@ -403,13 +405,13 @@ function JobsView({ admin }: { admin: boolean }) {
   }
 
   /** 通过任务重试接口保留原任务关联并创建新任务。 */
-  async function retryJob(targetJob: ScanJob): Promise<void> {
+  async function retryJob(targetJob: ScanJob, musicStage?: string): Promise<void> {
     if (!canRetryJob(targetJob)) return;
     const targetJobId = targetJob.id;
     if (!beginJobOperation(targetJobId, "retry")) return;
-    setMessage("正在创建重试任务…");
+    setMessage(targetJob.dataType === "music" ? "正在将音乐阶段重新加入队列…" : "正在创建重试任务…");
     try {
-      const job = await retryScanJob(targetJobId, admin);
+      const job = await retryScanJob(targetJobId, admin, musicStage);
       setSelectedJobId(job.id);
       setMessage(`任务 ${job.id} 已进入队列`);
       await resource.refresh();
@@ -690,6 +692,7 @@ function JobsView({ admin }: { admin: boolean }) {
                 <p className="mt-2 text-right text-xs text-muted-foreground">{failureReportState.message}</p>
               )}
             </div>
+            {activeJob.dataType === "music" && <MusicScanStages jobId={activeJob.id} admin={admin} stages={activeJob.snapshot.musicStages} retryEnabled={canRetryActiveJob && !activeJobOperationBlocked} onRetry={(stage) => void retryJob(activeJob, stage)} />}
             <h3 className="mt-6 mb-3 text-sm font-semibold">配置快照（只读）</h3>
             <div className="rounded-xl border border-border bg-secondary/40 p-4">
               <dl className="grid gap-3 sm:grid-cols-2">

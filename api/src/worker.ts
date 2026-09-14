@@ -1,5 +1,8 @@
+import { refreshMusicJobCredential } from "./music/credentials.js";
 import { WEBDAV_UNKNOWN_SEASON } from "./media/flymby-consecutive-episode-helper.js";
 import path from "node:path";
+import { musicFileNameHints } from "./music/name-hints.js";
+import { runMusicScan } from "./music/scan-coordinator.js";
 import type { AggregateIndexService } from "./aggregate-index-service.js";
 import type { ApiConfig } from "./config.js";
 import type { FlyCloudHelperDatabase } from "./database.js";
@@ -89,7 +92,7 @@ function isStoredAiSupplementJob(job: ScanJobRecord): boolean {
   return job.snapshot.taskPurpose === "ai_supplement_unmatched";
 }
 
-interface EnrichedMetadata {
+export interface EnrichedMetadata {
   title: string;
   subtitle: string;
   year: number | null;
@@ -109,7 +112,7 @@ interface ScanMetadataCache {
   videoDecisions?: Map<string, Record<string, unknown>>;
   /** 同一节目季在一次扫描中只请求一次单集列表。 */
   seasons: Map<string, Promise<TmdbEpisodeMetadata[]>>;
-  /** 完整标签按专辑复用一次图片补全，缺失标签则按曲目复用多平台刮削结果。 */
+  /** 只按完整单曲查询条件复用候选，不跨曲目复用平台 ID、曲序或歌词。 */
   music: Map<string, Promise<MusicPlatformCandidate | null>>;
   /** 同一节目父项在一次扫描中只落库一次，避免每一集都对远端数据库重复查询和 upsert。 */
   parentItems: Map<string, Promise<{
@@ -336,19 +339,14 @@ function resolveCatalogIdentityKey(
     if (parent || descriptor.itemType === "music.album") {
       const releaseId = metadata.externalIds.musicbrainzRelease
         || String(descriptor.metadata.musicBrainzReleaseId ?? "");
-      return releaseId
-        ? `music:album:release:${releaseId}`
+      if (releaseId) return `music:album:release:${releaseId}`;
+      const album = String(metadata.metadata.album || descriptor.metadata.album || "").trim();
+      const albumArtist = String(metadata.metadata.albumArtist || descriptor.metadata.albumArtist || metadata.metadata.artist || descriptor.metadata.artist || "").trim();
+      // 有效专辑和专辑艺术家共同分组，多碟可跨目录，同名专辑不串歌手。
+      return album && albumArtist ? `music:album:tags:${JSON.stringify([album.toLocaleLowerCase("und"), albumArtist.toLocaleLowerCase("und")])}`
         : descriptor.parent?.identityKey || descriptor.identityKey;
     }
     if (descriptor.itemType === "music.track") {
-      const releaseTrackId = metadata.externalIds.musicbrainzReleaseTrack
-        || String(descriptor.metadata.musicBrainzReleaseTrackId ?? "");
-      if (releaseTrackId) return `music:track:release-track:${releaseTrackId}`;
-      const discNumber = Math.max(1, Number(descriptor.metadata.discNumber ?? 1));
-      const trackNumber = Math.max(0, Number(descriptor.metadata.trackNumber ?? 0));
-      if (trackNumber > 0 && descriptor.parent) {
-        return `${descriptor.parent.identityKey}:disc:${discNumber}:track:${trackNumber}`;
-      }
       return descriptor.identityKey;
     }
   }
@@ -1421,8 +1419,77 @@ export class ScanWorker {
     });
   }
 
+  /** 音乐父任务复用现有鉴权、通知、媒体落库与凭据持久化，阶段独立调度。 */
+  private async scanMusic(job: ScanJobRecord, signal: AbortSignal): Promise<void> {
+    await refreshMusicJobCredential(this.database, this.vault, job);
+    const runtime = await this.repository.getJobRuntimeConfiguration(job);
+    const adapter = this.providers.get(runtime.providerType);
+    const connection = this.vault.decrypt(runtime.encryptedConnection);
+    const roots = readScanRoots(runtime.scanProfile, job.scanMode);
+    if (!roots.length) throw new ApiError(409, "scan_paths_not_configured", "请先配置音乐扫描目录");
+    const sources = await loadMusicSourceSettings(this.database);
+    const settings: Record<string, unknown> = { profile: runtime.metadataProfile, enabledSources: sources.enabledSources, version: "music-three-stages-v2" };
+    const checkpoint = (await this.repository.getOrCreateScanJobCheckpoint(job, runtime.providerType)).checkpoint;
+    const cache: ScanMetadataCache = { video: new Map(), seasons: new Map(), music: new Map(), parentItems: new Map(), aiResults: new Map(), aiContexts: new Map(), aiUsageOwner: { userId: job.userId, serviceId: job.serviceId } };
+    await runMusicScan({ job, database: this.database, repository: this.repository, config: this.config, adapter, connection, roots, scanProfile: runtime.scanProfile, settings, signal,
+      context: { persistConnection: async (next) => {
+        await this.repository.refreshActiveEncryptedConnection({ serviceId: job.serviceId, userId: job.userId, credentialRevision: Number(job.snapshot.credentialRevision), encryptedConnection: this.vault.encrypt(next) });
+      } },
+      control: async () => {
+        if (await this.repository.getJobControl(job.id) !== "none") this.abortControllers.get(job.id)?.abort();
+      },
+      enrich: async (descriptor, stageSignal) => {
+        const stored = settings.profile as Record<string, unknown>;
+        const profiles = { ...(stored.profiles as Record<string, unknown>), music: { ...readMetadataProfile(stored, "music"), systemEnabledSources: settings.enabledSources } };
+        return this.enrichMetadata(descriptor, { ...stored, profiles }, job.snapshot, cache, new Map(), job.id, stageSignal);
+      },
+      persist: async (descriptor, sourceFile, metadata, stageSignal) => {
+        stageSignal.throwIfAborted();
+        let resolvedMetadata = metadata ?? this.createLocalMetadata(descriptor);
+        if (!metadata || metadata.metadata.musicOnlineState === "unmatched") {
+          const linked = await this.database.query("file_links as f").join("media_items as i", "i.id", "f.item_id")
+            .where({ "f.source_file_id": sourceFile.id, "i.library_id": job.libraryId, "i.item_type": "music.track" }).select("i.id").first();
+          if (linked) {
+            const previous = await this.repository.getCatalogItem(String(linked.id), job.userId);
+            const fields = descriptor.metadata.metadataFieldSources as Record<string, string> | undefined;
+            const compatible = (fields?.title !== "embedded_tag" || descriptor.title === previous.title)
+              && (fields?.artist !== "embedded_tag" || descriptor.metadata.artist === previous.metadata.artist)
+              && (fields?.album !== "embedded_tag" || descriptor.metadata.album === previous.metadata.album);
+            if (compatible) resolvedMetadata = this.mergeMusicMetadataWithLocal(descriptor, {
+              title: previous.title, subtitle: previous.subtitle, year: previous.year, overview: previous.overview,
+              posterUrl: previous.posterUrl, backdropUrl: previous.backdropUrl, matchState: previous.matchState,
+              externalIds: previous.externalIds, metadata: previous.metadata,
+            });
+            if (compatible && metadata) {
+              resolvedMetadata.metadata.musicOnlineState = metadata.metadata.musicOnlineState;
+              resolvedMetadata.metadata.onlineReadError = metadata.metadata.onlineReadError ?? "";
+              if (metadata.metadata.lyrics) resolvedMetadata.metadata.lyrics = metadata.metadata.lyrics;
+            }
+          }
+        }
+        const result = await this.persistScannedMedia({ job, descriptor, sourceFile, entryLocator: sourceFile.locator, generationId: checkpoint.generationId,
+          metadataProfiles: runtime.metadataProfile, metadataCache: cache, nfoSidecars: new Map(), forceCatalogChange: false,
+          resolvedMetadata, signal: stageSignal });
+        return result.changedItemIds;
+      },
+      failure: async (stage, entry, message) => {
+        await this.failureReports.record(job, { stage: stage === "directory" ? "enumerating" : "scraping", errorCode: `music_${stage}_failed`, error: new Error(message), recovered: false,
+          mediaPath: entry?.path, resourceId: entry?.resourceId, fileName: entry?.name, context: { 音乐阶段: stage, 处理说明: "已有资料保留，可按阶段重试" } });
+        this.logger.warn({ 日志关键字: "codex-flycloud-music", 事件: "音乐阶段失败", 任务ID: job.id, 阶段: stage, 资源ID: entry?.resourceId, 错误信息: message });
+      },
+    });
+    const [notificationEnabled, createdMediaCounts, completedJob] = await Promise.all([
+      this.readServiceNotificationEnabled(job.serviceId), this.readScanCreatedMediaCounts(job), this.repository.getJob(job.id, job.userId),
+    ]);
+    await this.database.createNotificationSafely({ userId: job.userId, category: "task",
+      tone: completedJob.errorCount > 0 || completedJob.status !== "completed" ? "warning" : "success", title: completedJob.status === "completed" ? "音乐扫描任务已完成" : "音乐阶段已结束，其他阶段待继续",
+      message: buildScanCompletionMessage(job, createdMediaCounts), actionPath: "/app/jobs",
+      deliverExternally: notificationEnabled && createdMediaCounts.songCount > 0 });
+  }
+
   /** 完成 Provider 枚举、分类、刮削、持久化和 generation 对账。 */
   private async scan(job: ScanJobRecord, signal: AbortSignal): Promise<void> {
+    if (job.dataType === "music") { await this.scanMusic(job, signal); return; }
     const scanStartedAt = Date.now();
     const runtime = await this.repository.getJobRuntimeConfiguration(job);
     const connection = this.vault.decrypt(runtime.encryptedConnection);
@@ -2848,9 +2915,7 @@ export class ScanWorker {
       this.readScanCreatedMediaCounts(job),
     ]);
     // 关键变量：影视与音乐使用不同业务单位，只有本次任务确实有新内容入库时才投递 Telegram。
-    const createdContentCount = job.dataType === "music"
-      ? createdMediaCounts.songCount + createdMediaCounts.albumCount + createdMediaCounts.artistCount
-      : createdMediaCounts.videoContentCount;
+    const createdContentCount = createdMediaCounts.videoContentCount;
     const deliverScanNotificationExternally = notificationEnabled && createdContentCount > 0;
     const completionMessage = buildScanCompletionMessage(job, createdMediaCounts);
     await this.database.createNotificationSafely({
@@ -2924,9 +2989,10 @@ export class ScanWorker {
     metadataCache: ScanMetadataCache;
     nfoSidecars: Map<string, NfoSidecarEntry>;
     forceCatalogChange: boolean;
+    resolvedMetadata?: EnrichedMetadata;
     signal: AbortSignal;
   }): Promise<{ changedItemIds: string[]; matched: boolean; providerUnavailable: boolean }> {
-    const metadata = await this.enrichMetadata(
+    const metadata = input.resolvedMetadata ?? await this.enrichMetadata(
       input.descriptor,
       input.metadataProfiles,
       input.job.snapshot,
@@ -2944,13 +3010,14 @@ export class ScanWorker {
       itemType: string;
     } | null = null;
     if (input.descriptor.parent) {
+      const parentDescriptor = input.descriptor.parent;
       const parentMetadata = metadata.parent ?? (input.descriptor.mediaType === "music" ? {
         ...metadata,
-        title: String(metadata.metadata.album ?? input.descriptor.metadata.album ?? input.descriptor.parent.title),
-        subtitle: String(metadata.metadata.albumArtist ?? metadata.metadata.artist ?? input.descriptor.parent.subtitle),
+        title: String(metadata.metadata.album ?? input.descriptor.metadata.album ?? parentDescriptor.title),
+        subtitle: String(metadata.metadata.albumArtist ?? metadata.metadata.artist ?? parentDescriptor.subtitle),
         metadata: {
-          album: metadata.metadata.album ?? input.descriptor.parent.title,
-          albumArtist: metadata.metadata.albumArtist ?? metadata.metadata.artist ?? input.descriptor.parent.subtitle,
+          album: metadata.metadata.album ?? parentDescriptor.title,
+          albumArtist: metadata.metadata.albumArtist ?? metadata.metadata.artist ?? parentDescriptor.subtitle,
           genres: metadata.metadata.genres ?? input.descriptor.metadata.genres,
           artistIds: metadata.metadata.artistIds ?? input.descriptor.metadata.musicBrainzArtistIds,
         },
@@ -2964,19 +3031,24 @@ export class ScanWorker {
         input.generationId,
       );
       let parentPromise = input.metadataCache.parentItems.get(parentCacheKey);
-      if (!parentPromise) {
-        parentPromise = this.repository.upsertMediaItem({
+      if (!parentPromise || input.descriptor.mediaType === "music") {
+        // 同一专辑串行更新，在线阶段可以补上文件阶段缺失的资料。
+        const previousParent = parentPromise;
+        parentPromise = (async () => {
+          if (input.descriptor.mediaType === "music" && previousParent) await previousParent.catch(() => undefined);
+          input.signal.throwIfAborted();
+          return this.repository.upsertMediaItem({
           id: createStableId("itm", input.job.userId, input.job.libraryId, parentIdentityKey),
           userId: input.job.userId,
           serviceId: input.job.serviceId,
           libraryId: input.job.libraryId,
           identityKey: createStableId("identity", parentIdentityKey),
           mediaType: input.descriptor.mediaType,
-          itemType: input.descriptor.parent.itemType,
-          title: parentMetadata.title || input.descriptor.parent.title,
-          sortTitle: parentMetadata.title || input.descriptor.parent.title,
-          subtitle: parentMetadata.subtitle || input.descriptor.parent.subtitle,
-          year: parentMetadata.year ?? input.descriptor.parent.year,
+          itemType: parentDescriptor.itemType,
+          title: parentMetadata.title || parentDescriptor.title,
+          sortTitle: parentMetadata.title || parentDescriptor.title,
+          subtitle: parentMetadata.subtitle || parentDescriptor.subtitle,
+          year: parentMetadata.year ?? parentDescriptor.year,
           overview: parentMetadata.overview,
           posterUrl: parentMetadata.posterUrl,
           backdropUrl: parentMetadata.backdropUrl,
@@ -2984,7 +3056,8 @@ export class ScanWorker {
           externalIds: parentMetadata.externalIds,
           metadata: parentMetadata.metadata,
           generationId: input.generationId,
-        });
+          });
+        })();
         input.metadataCache.parentItems.set(parentCacheKey, parentPromise);
       }
       try {
@@ -3001,12 +3074,16 @@ export class ScanWorker {
       if (parentItemState.changed || input.forceCatalogChange) changedItemIds.push(parentItemState.itemId);
     }
     const itemIdentityKey = resolveCatalogIdentityKey(input.descriptor, metadata, false);
+    // 音乐重刮继续使用当前文件关联的曲目 ID，保留歌单与播放记录。
+    const existingMusic = input.descriptor.mediaType === "music" ? await this.database.query("file_links as f")
+      .join("media_items as i", "i.id", "f.item_id").where({ "f.source_file_id": input.sourceFile.id, "i.library_id": input.job.libraryId, "i.item_type": "music.track" })
+      .select("i.id", "i.identity_key").first() : undefined;
     const itemResult = await this.repository.upsertMediaItem({
-      id: createStableId("itm", input.job.userId, input.job.libraryId, itemIdentityKey),
+      id: existingMusic ? String(existingMusic.id) : createStableId("itm", input.job.userId, input.job.libraryId, itemIdentityKey),
       userId: input.job.userId,
       serviceId: input.job.serviceId,
       libraryId: input.job.libraryId,
-      identityKey: createStableId("identity", itemIdentityKey),
+      identityKey: existingMusic ? String(existingMusic.identity_key) : createStableId("identity", itemIdentityKey),
       mediaType: input.descriptor.mediaType,
       itemType: input.descriptor.itemType,
       title: metadata.title,
@@ -3041,7 +3118,9 @@ export class ScanWorker {
         parentItemId,
         childItemId: itemResult.itemId,
         relationType: input.descriptor.parent.relationType,
-        sortOrder: input.descriptor.parent.sortOrder,
+        sortOrder: input.descriptor.mediaType === "music"
+          ? Math.max(0, Number(metadata.metadata.discNumber) || 0) * 100_000 + Math.max(0, Number(metadata.metadata.trackNumber) || 0)
+          : input.descriptor.parent.sortOrder,
         parentItemType: parentItemState.itemType,
         parentHasManualMatch: parentItemState.hasManualMatch,
       });
@@ -3069,10 +3148,15 @@ export class ScanWorker {
       const artistSource = typeof metadata.metadata.artistSource === "string" && metadata.metadata.artistSource
         ? metadata.metadata.artistSource
         : hasEmbeddedMusicBrainzArtistIds ? "musicbrainz" : "name";
+      const albumArtistNames = Array.isArray(metadata.metadata.albumArtists) && metadata.metadata.albumArtists.length
+        ? metadata.metadata.albumArtists.filter((name): name is string => typeof name === "string" && Boolean(name.trim()))
+        : [String(metadata.metadata.albumArtist || metadata.metadata.artist || "").trim()].filter(Boolean);
       const artistItemIds: string[] = [];
-      for (const [index, artistName] of [...new Set(artistNames)].entries()) {
-        const platformArtistId = artistIds[index] ?? "";
-        const artistImageUrl = artistImages[index] || fallbackArtistImage || null;
+      const albumArtistItemIds: string[] = [];
+      for (const artistName of new Set([...artistNames, ...albumArtistNames])) {
+        const index = artistNames.indexOf(artistName);
+        const platformArtistId = index >= 0 ? artistIds[index] ?? "" : "";
+        const artistImageUrl = (index >= 0 ? artistImages[index] || fallbackArtistImage : "") || null;
         const artistIdentityKey = platformArtistId && artistSource === "musicbrainz"
           ? `music:artist:${artistSource}:${platformArtistId}`
           : `music:artist:name:${artistName.toLocaleLowerCase("und")}`;
@@ -3096,13 +3180,15 @@ export class ScanWorker {
           metadata: { artist: artistName, artistSource, artistImageUrl },
           generationId: input.generationId,
         });
-        artistItemIds.push(artistResult.itemId);
+        if (artistNames.includes(artistName)) artistItemIds.push(artistResult.itemId);
+        if (albumArtistNames.includes(artistName)) albumArtistItemIds.push(artistResult.itemId);
         if (artistResult.changed || input.forceCatalogChange) changedItemIds.push(artistResult.itemId);
       }
       await this.repository.replaceMusicArtistRelations({
         userId: input.job.userId,
         libraryId: input.job.libraryId,
         artistItemIds,
+        albumArtistItemIds,
         albumItemId: parentItemId,
         trackItemId: itemResult.itemId,
       });
@@ -3264,7 +3350,9 @@ export class ScanWorker {
         ? String(profile.retryProviderId ?? "")
         : providerId || "auto";
       if (configuredProviderId === "local") {
-        return this.createLocalMetadata(descriptor);
+        const local = this.createLocalMetadata(descriptor);
+        local.metadata.musicOnlineState = "skipped";
+        return local;
       }
       const selectedSource = this.readMusicPlatformSource(configuredProviderId);
       if (selectedSource === "auto") {
@@ -3275,7 +3363,9 @@ export class ScanWorker {
         if (platformResult) return platformResult;
       }
     }
-    return this.createLocalMetadata(descriptor);
+    const local = this.createLocalMetadata(descriptor);
+    if (descriptor.mediaType === "music") local.metadata.musicOnlineState = "unmatched";
+    return local;
   }
 
   /** 按 APP 的 movie/tvshow/episodedetails 优先级选择本地 NFO 元数据。 */
@@ -3669,7 +3759,7 @@ export class ScanWorker {
       && fieldSources.album === "embedded_tag";
     const embeddedArtworkUrl = isMusic && typeof descriptor.metadata.embeddedArtworkUrl === "string"
       ? descriptor.metadata.embeddedArtworkUrl
-      : null;
+      : isMusic && typeof descriptor.metadata.sidecarArtworkUrl === "string" ? descriptor.metadata.sidecarArtworkUrl : null;
     const localMetadata: EnrichedMetadata = {
       title: descriptor.title,
       subtitle: descriptor.subtitle,
@@ -3678,8 +3768,8 @@ export class ScanWorker {
       posterUrl: embeddedArtworkUrl,
       backdropUrl: null,
       matchState: hasReadableMusicTags ? "matched" : descriptor.matchState,
-      externalIds: isMusic && typeof descriptor.metadata.musicbrainzRecordingId === "string"
-        ? { musicbrainzRecording: descriptor.metadata.musicbrainzRecordingId }
+      externalIds: isMusic && typeof descriptor.metadata.musicBrainzRecordingId === "string"
+        ? { musicbrainzRecording: descriptor.metadata.musicBrainzRecordingId }
         : {},
       metadata: { ...descriptor.metadata },
     };
@@ -3693,14 +3783,14 @@ export class ScanWorker {
         posterUrl: embeddedArtworkUrl,
         backdropUrl: null,
         matchState: hasReadableMusicTags ? "matched" : descriptor.matchState,
-        externalIds: isMusic && typeof descriptor.metadata.musicbrainzReleaseId === "string"
-          ? { musicbrainzRelease: descriptor.metadata.musicbrainzReleaseId }
+        externalIds: isMusic && typeof descriptor.metadata.musicBrainzReleaseId === "string"
+          ? { musicbrainzRelease: descriptor.metadata.musicBrainzReleaseId }
           : {},
         metadata: isMusic ? {
           album: descriptor.metadata.album ?? descriptor.parent.title,
           albumArtist: descriptor.metadata.albumArtist ?? descriptor.metadata.artist ?? descriptor.parent.subtitle,
           genres: descriptor.metadata.genres,
-          artistIds: descriptor.metadata.musicbrainzArtistIds,
+          artistIds: descriptor.metadata.musicBrainzArtistIds,
         } : {},
       };
     }
@@ -3733,6 +3823,8 @@ export class ScanWorker {
       matchState: "matched",
       externalIds,
       metadata: {
+        musicOnlineState: "succeeded",
+        onlineReadError: candidate.supplementError ?? "",
         metadataSource: candidate.source,
         metadataSourceName: candidate.sourceName,
         artistSource: candidate.source,
@@ -3830,8 +3922,16 @@ export class ScanWorker {
       // 内嵌歌词与其他文件标签一致，优先级高于在线补全结果。
       lyrics: embeddedLyrics || online.metadata.lyrics,
       embeddedArtworkUrl: embeddedArtworkUrl || null,
+      metadataFieldSources: {
+        ...fieldSources,
+        title: fieldSources.title === "embedded_tag" ? "embedded_tag" : online.title ? "online" : fieldSources.title,
+        artist: fieldSources.artist === "embedded_tag" ? "embedded_tag" : online.metadata.artist ? "online" : "missing",
+        album: fieldSources.album === "embedded_tag" ? "embedded_tag" : online.metadata.album ? "online" : "missing",
+        lyrics: embeddedLyrics ? fieldSources.lyrics ?? "embedded_tag" : online.metadata.lyrics ? "online" : "missing",
+        artwork: embeddedArtworkUrl ? "embedded_tag" : descriptor.metadata.sidecarArtworkUrl ? "sidecar" : online.posterUrl ? "online" : "missing",
+      },
     };
-    const posterUrl = embeddedArtworkUrl || online.posterUrl || local.posterUrl;
+    const posterUrl = embeddedArtworkUrl || String(descriptor.metadata.sidecarArtworkUrl || "") || online.posterUrl || local.posterUrl;
     const parentOnline = online.parent ?? online;
     return {
       ...online,
@@ -3864,7 +3964,7 @@ export class ScanWorker {
     };
   }
 
-  /** 查询单个内置平台或六平台聚合，并按一次扫描的曲目/专辑键复用结果。 */
+  /** 查询单个内置平台或六平台聚合，并按一次扫描的完整单曲查询键复用结果。 */
   private async searchMusicPlatformMetadata(
     descriptor: MediaDescriptor,
     profile: Record<string, unknown>,
@@ -3892,29 +3992,53 @@ export class ScanWorker {
         typeof item === "string" && MUSIC_PLATFORM_SOURCE_ORDER.includes(item as BuiltinMusicPlatformSource)
       ))
       : MUSIC_PLATFORM_SOURCE_ORDER;
-    const cacheScope = embeddedTagsComplete && !includeLyrics
-      ? `album:${artist}:${album}`
-      : `track:${descriptor.title}:${artist}:${album}`;
-    const cacheKey = `${configuredSources.join(",")}|${source}|${profile.aggregateMode === "fast" ? "fast" : "complete"}|${cacheScope}`;
-    let candidatePromise = cache.music.get(cacheKey);
-    if (!candidatePromise) {
-      candidatePromise = this.musicPlatforms.search({
-        title: descriptor.title,
-        artist,
-        album,
-        durationMs: Number(descriptor.metadata.durationMs ?? 0),
-        source,
-        aggregateMode: profile.aggregateMode === "fast" ? "fast" : "complete",
-        requireCover: !embeddedArtworkUrl,
-        requireArtistImage: true,
-        includeLyrics,
-        enabledSources: configuredSources,
-        signal,
-      });
-      cache.music.set(cacheKey, candidatePromise);
+    const durationMs = Number(descriptor.metadata.durationMs ?? 0);
+    const queryTitle = fieldSources.title === "embedded_tag" ? descriptor.title : "";
+    const queryArtist = fieldSources.artist === "embedded_tag" ? artist : "";
+    const queryAlbum = fieldSources.album === "embedded_tag" ? album : "";
+    if (embeddedTagsComplete && (embeddedArtworkUrl || descriptor.metadata.sidecarArtworkUrl) && (!includeLyrics || descriptor.metadata.lyrics)
+      && descriptor.metadata.albumArtist && Array.isArray(descriptor.metadata.genres) && descriptor.metadata.genres.length > 0 && descriptor.year && durationMs > 0) {
+      const local = this.createLocalMetadata(descriptor);
+      local.metadata.musicOnlineState = "skipped";
+      return local;
     }
-    const candidate = await candidatePromise;
-    return candidate ? this.mergeMusicMetadataWithLocal(descriptor, this.mapMusicPlatformCandidate(candidate)) : null;
+    const search = async (title: string, searchArtist: string, searchAlbum: string) => {
+      if (!title) return null;
+      const key = JSON.stringify([configuredSources, source, profile.aggregateMode, title, searchArtist, searchAlbum, durationMs, includeLyrics, Boolean(embeddedArtworkUrl || descriptor.metadata.sidecarArtworkUrl), Boolean(descriptor.metadata.lyrics), queryArtist, queryAlbum]);
+      let task = cache.music.get(key);
+      if (!task) {
+        task = this.musicPlatforms.search({ title, artist: searchArtist, album: searchAlbum, durationMs, source,
+          aggregateMode: profile.aggregateMode === "fast" ? "fast" : "complete", requireCover: !(embeddedArtworkUrl || descriptor.metadata.sidecarArtworkUrl),
+          requireArtistImage: false, includeLyrics: includeLyrics && !descriptor.metadata.lyrics, enabledSources: configuredSources,
+          protectedArtist: queryArtist, protectedAlbum: queryAlbum, signal });
+        if (cache.music.size >= 300) cache.music.clear();
+        cache.music.set(key, task);
+      }
+      try { const result = await task; if (!result) cache.music.delete(key); return result; }
+      catch (error) { cache.music.delete(key); throw error; }
+    };
+    let candidate = queryTitle ? await search(queryTitle, queryArtist, queryAlbum) : null;
+    if (!candidate && !embeddedTagsComplete) {
+      const hints = musicFileNameHints(String(descriptor.metadata.fileName || descriptor.title), queryTitle, queryArtist);
+      if (hints.title !== queryTitle || hints.artist !== queryArtist) {
+        try { candidate = await search(hints.title, hints.artist, queryAlbum); }
+        catch (error) {
+          // 首轮已正常响应时，辅助查询断连仍属于未匹配，不能变成全部来源断连。
+          if (!queryTitle || !(error instanceof ApiError) || error.code !== "music_sources_unavailable") throw error;
+        }
+      }
+    }
+    if (candidate) return this.mergeMusicMetadataWithLocal(descriptor, this.mapMusicPlatformCandidate(candidate));
+    if (includeLyrics && !descriptor.metadata.lyrics && queryTitle && queryArtist) {
+      const local = this.createLocalMetadata(descriptor);
+      local.metadata.musicOnlineState = "unmatched";
+      try {
+        local.metadata.lyrics = await this.musicPlatforms.searchLyrics(queryTitle, queryArtist, signal, durationMs);
+        if (local.metadata.lyrics) local.metadata.metadataFieldSources = { ...fieldSources, lyrics: "online" };
+      } catch { signal.throwIfAborted(); local.metadata.onlineReadError = "在线歌词补全失败"; }
+      return local;
+    }
+    return null;
   }
 
   /** 参考 FlymbyServer 的 fast/complete 策略并发聚合六个内置平台与已启用音乐插件。 */
@@ -3962,6 +4086,7 @@ export class ScanWorker {
       if (requiredFields.album === true && typeof item.metadata.album !== "string") return false;
       return true;
     };
+    if (tasks.length === 1) return tasks[0]!;
     if (profile.aggregateMode === "fast") {
       try {
         return await Promise.any(tasks.map(async (task) => {

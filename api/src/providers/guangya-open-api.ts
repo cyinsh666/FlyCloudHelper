@@ -1,3 +1,4 @@
+import { acquireMusicBudget } from "./request-budget.js";
 import { createHash, randomBytes } from "node:crypto";
 import { ApiError } from "../errors.js";
 import {
@@ -375,7 +376,9 @@ export class GuangyaOpenApiClient {
     const abortFromParent = () => timeoutController.abort();
     if (parentSignal?.aborted) timeoutController.abort();
     parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+    let release: (() => void) | undefined;
     try {
+      release = await acquireMusicBudget("api", timeoutController.signal);
       const response = await fetch(url, { ...init, signal: timeoutController.signal });
       return { ok: response.ok, status: response.status, body: await readResponseJson(response) };
     } catch (error) {
@@ -393,6 +396,7 @@ export class GuangyaOpenApiClient {
       if (parentSignal?.aborted) throw error;
       throw new ApiError(503, "provider_network_unreachable", "无法连接光鸭官方 API，请检查服务器网络和 DNS");
     } finally {
+      release?.();
       clearTimeout(timeout);
       parentSignal?.removeEventListener("abort", abortFromParent);
     }

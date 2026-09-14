@@ -6,7 +6,7 @@ import type { ApiConfig } from "../config.js";
 import type { MediaDescriptor } from "../media/filename.js";
 import type { ProviderEntry, ProviderFileStreamAccess } from "../providers/types.js";
 
-export const AUDIO_TAG_PARSER_VERSION = "ffprobe-audio-tags-v3";
+export const AUDIO_TAG_PARSER_VERSION = "ffprobe-audio-tags-v4";
 
 export interface AudioTagFields {
   title: string;
@@ -48,6 +48,8 @@ export interface AudioTagReadResult {
   technical: AudioTechnicalFields;
   artwork: { embedded: boolean; url: string | null };
   readBytesLimit: number;
+  actualReadBytes?: number;
+  requestCount?: number;
   errorCode: string | null;
   errorMessage: string | null;
   readAt: string;
@@ -250,6 +252,7 @@ async function extractAndCacheEmbeddedArtwork(input: {
       finish(null);
     }, Math.min(input.config.ffprobeTimeoutMs, 30_000));
     input.signal.addEventListener("abort", abort, { once: true });
+    if (input.signal.aborted) abort();
     child.stdout.on("data", (chunk: Buffer) => {
       outputBytes += chunk.length;
       if (outputBytes > 10 * 1024 * 1024) {
@@ -320,6 +323,7 @@ export function readRemoteAudioTags(input: {
       finish(createFailureResult("audio_tag_timeout", "音频标签读取超时", readBytesLimit));
     }, Math.min(input.config.ffprobeTimeoutMs, 15_000));
     input.signal.addEventListener("abort", abort, { once: true });
+    if (input.signal.aborted) abort();
     child.stdout.on("data", (chunk: Buffer) => {
       outputBytes += chunk.length;
       if (outputBytes > 2 * 1024 * 1024) {
@@ -354,6 +358,11 @@ export function readRemoteAudioTags(input: {
             access: input.access,
             signal: input.signal,
           });
+          if (!result.artwork.url) {
+            result.status = "partial";
+            result.errorCode = "audio_artwork_failed";
+            result.errorMessage = "内嵌封面读取失败，已保留音频标签";
+          }
         }
         finish(result);
       } catch {
@@ -363,7 +372,7 @@ export function readRemoteAudioTags(input: {
   });
 }
 
-/** 将内嵌标签补充到路径识别结果，保留原始路径推断作为字段降级。 */
+/** 将真实标签补充到文件描述，缺失身份不使用目录推断。 */
 export function applyAudioTagsToDescriptor(
   descriptor: MediaDescriptor,
   result: AudioTagReadResult,
@@ -374,7 +383,7 @@ export function applyAudioTagsToDescriptor(
   const tagAlbumArtist = result.tags.albumArtists[0] ?? "";
   const artist = tagArtist || String(originalMetadata.artist ?? "");
   const albumArtist = tagAlbumArtist || artist || String(originalMetadata.artist ?? "");
-  const album = result.tags.album || String(originalMetadata.album ?? descriptor.parent?.title ?? "未知专辑");
+  const album = result.tags.album || String(originalMetadata.album ?? "");
   const title = result.tags.title || descriptor.title;
   const trackNumber = result.tags.trackNumber || Number(originalMetadata.trackNumber ?? 0);
   const discNumber = result.tags.discNumber || 1;
@@ -420,15 +429,16 @@ export function applyAudioTagsToDescriptor(
       musicBrainzAlbumArtistIds: result.tags.musicBrainzAlbumArtistIds,
       metadataFieldSources: {
         title: result.tags.title ? "embedded_tag" : "path",
-        artist: tagArtist ? "embedded_tag" : "path",
-        album: result.tags.album ? "embedded_tag" : "path",
+        artist: tagArtist ? "embedded_tag" : "missing",
+        album: result.tags.album ? "embedded_tag" : "missing",
         lyrics: result.tags.lyrics ? "embedded_tag" : "missing",
-        trackNumber: result.tags.trackNumber > 0 ? "embedded_tag" : "filename",
+        trackNumber: result.tags.trackNumber > 0 ? "embedded_tag" : "missing",
+        artwork: result.artwork.url ? "embedded_tag" : "missing",
       },
     },
     parent: descriptor.parent ? {
       ...descriptor.parent,
-      title: album,
+      title: album || "未知专辑",
       subtitle: albumArtist || artist,
       year,
       sortOrder: discNumber * 100_000 + trackNumber,

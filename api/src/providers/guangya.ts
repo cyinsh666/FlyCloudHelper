@@ -1,3 +1,4 @@
+import { loadEnumerationPage } from "./types.js";
 import { ApiError } from "../errors.js";
 import { isFlymbyExcludedFolderName } from "../media/flymby-scan-exclusions.js";
 import { GuangyaWebApiClient } from "./guangya-web-api.js";
@@ -350,14 +351,14 @@ export class GuangyaProvider implements ProviderAdapter {
             let page = 0;
             let hasMore = false;
             do {
-              const result = await this.listDirectory(
+              const result = await loadEnumerationPage(options, directory.path, String(page), () => this.listDirectory(
                 connection,
                 directory.id,
                 page,
                 100,
                 options?.persistConnection,
                 signal,
-              );
+              ));
               entries.push(...result.items);
               hasMore = result.hasMore;
               page += 1;
@@ -397,6 +398,7 @@ export class GuangyaProvider implements ProviderAdapter {
               locator: { providerType: "guangya", fileId: item.fileId, bizId: item.bizId },
             };
           }
+          await options?.onDirectoryComplete?.(result.directory.path);
         }
         completedDirectoryBatchCount = (completedDirectoryBatchCount + 1) % checkpointDirectoryInterval;
       }

@@ -13,7 +13,7 @@ import {
 const videoExtensions = new Set([
   "mp4", "mkv", "avi", "mov", "wmv", "flv", "m4v", "ts", "m2ts", "mpg", "mpeg", "rmvb", "webm", "3gp", "iso", "strm",
 ]);
-const audioExtensions = new Set(["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "ape", "wma", "mka"]);
+const audioExtensions = new Set(["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "ape", "wma", "mka", "aiff", "aif", "dsf", "dff", "alac"]);
 
 export interface MediaDescriptor {
   identityKey: string;
@@ -251,33 +251,13 @@ function describeVideo(
 
 /** 按“艺术家/专辑/曲目”目录惯例识别音乐条目。 */
 function describeMusic(entry: ProviderEntry): MediaDescriptor {
-  const fileTitle = cleanMediaTitle(entry.name).title;
   const directory = path.posix.dirname(entry.path);
-  const album = cleanMediaTitle(path.posix.basename(directory)).title;
-  const artistDirectory = path.posix.dirname(directory);
-  const artist = cleanMediaTitle(path.posix.basename(artistDirectory)).title;
-  const trackMatch = entry.name.match(/^\s*(\d{1,3})(?:[-._ ]|$)/u);
-  const trackNumber = trackMatch ? Number(trackMatch[1]) : 0;
-  const title = fileTitle.replace(/^\s*\d{1,3}\s*[-._ ]\s*/u, "").trim() || fileTitle;
+  const title = entry.name.replace(/\.[^.]+$/u, "");
   return {
-    identityKey: `music:track:${entry.resourceId}`,
-    mediaType: "music",
-    itemType: "music.track",
-    title,
-    sortTitle: String(trackNumber).padStart(5, "0"),
-    subtitle: `${artist} · ${album}`,
-    year: cleanMediaTitle(album).year,
-    matchState: "unmatched",
-    metadata: { artist, album, trackNumber },
-    parent: {
-      identityKey: `music:album:${directory}`,
-      itemType: "music.album",
-      title: album,
-      subtitle: artist,
-      year: cleanMediaTitle(album).year,
-      sortOrder: trackNumber,
-      relationType: "album_track",
-    },
+    identityKey: `music:track:${entry.resourceId}`, mediaType: "music", itemType: "music.track",
+    title, sortTitle: title, subtitle: "", year: null, matchState: "unmatched",
+    metadata: { fileName: entry.name, artist: "", album: "", trackNumber: 0 },
+    parent: { identityKey: `music:album:${directory}`, itemType: "music.album", title: "未知专辑", subtitle: "", year: null, sortOrder: 0, relationType: "album_track" },
   };
 }
 

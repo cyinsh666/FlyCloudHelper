@@ -1,3 +1,4 @@
+import { ApiError } from "../errors.js";
 import { createHash, randomInt } from "node:crypto";
 import type { MusicBrainzClient } from "./musicbrainz.js";
 
@@ -18,6 +19,8 @@ export interface MusicPlatformCandidate {
   source: BuiltinMusicPlatformSource;
   sourceName: string;
   sourceOfficial: boolean;
+  /** 身份命中后的封面或歌词局部失败，不丢弃已取得候选。 */
+  supplementError?: string;
   matchScore: number;
   title: string;
   artist: string;
@@ -51,6 +54,9 @@ interface SearchInput {
   aggregateMode: "fast" | "complete";
   requireCover: boolean;
   requireArtistImage: boolean;
+  /** 文件内嵌身份用于阻止同名异曲候选。 */
+  protectedArtist?: string;
+  protectedAlbum?: string;
   includeLyrics: boolean;
   /** 当前扫描允许使用的系统级内置音乐来源。 */
   enabledSources: BuiltinMusicPlatformSource[];
@@ -268,6 +274,10 @@ export class MusicPlatformAggregator {
       candidates = await this.searchFast(sources, input);
     } else {
       const results = await Promise.allSettled(sources.map((source) => this.searchSource(source, input)));
+      if (results.length && results.every((result) => result.status === "rejected")) {
+        input.signal.throwIfAborted();
+        throw new ApiError(503, "music_sources_unavailable", "在线音乐资料来源连接失败，可稍后重试");
+      }
       results.forEach((result, index) => {
         if (result.status === "fulfilled") {
           candidates.push(...result.value);
@@ -282,16 +292,27 @@ export class MusicPlatformAggregator {
       });
     }
     const rankedCandidates = candidates
-      .filter((candidate) => candidate.matchScore >= 0.72)
+      .filter((candidate) => this.acceptCandidate(candidate, input))
       .sort((left, right) => this.rankCandidate(right, input) - this.rankCandidate(left, input));
     const selected = rankedCandidates[0] ?? null;
     if (!selected) return null;
     if (input.source === "auto" && input.aggregateMode === "complete") {
       this.mergeSupplementalFields(selected, rankedCandidates.slice(1));
     }
-    if (input.includeLyrics) {
-      selected.lyrics = await this.searchLyrics(selected.title || input.title, selected.artist || input.artist, input.signal);
+    const errors: string[] = [];
+    if (input.requireCover && !selected.coverUrl && selected.source === "netease" && /^\d+$/u.test(selected.identifiers.neteaseSongId ?? "")) {
+      try {
+        const songId = selected.identifiers.neteaseSongId!;
+        const detail = await this.requestJson("netease", `https://music.163.com/api/song/detail?ids=${encodeURIComponent(`[${songId}]`)}`, { headers: { Referer: "https://music.163.com/" } }, input.signal);
+        const song = asObjectArray(detail.songs).find((item) => String(item.id) === songId);
+        selected.coverUrl = readImageUrl(asObject(song?.album ?? song?.al).picUrl) || null;
+      } catch { input.signal.throwIfAborted(); errors.push("在线封面补全失败"); }
     }
+    if (input.includeLyrics) {
+      try { selected.lyrics = await this.searchLyrics(selected.title || input.title, selected.artist || input.artist, input.signal, input.durationMs); }
+      catch { input.signal.throwIfAborted(); errors.push("在线歌词补全失败"); }
+    }
+    if (errors.length) selected.supplementError = errors.join("；");
     this.logger.info({
       日志关键字: "codex-flycloud-helper-music-scrape",
       事件: "多平台音乐刮削命中",
@@ -310,21 +331,25 @@ export class MusicPlatformAggregator {
     input: SearchInput,
   ): Promise<MusicPlatformCandidate[]> {
     const controllers = sources.map(() => new AbortController());
+    let availableSources = 0;
     const tasks = sources.map(async (source, index) => {
       const controller = controllers[index]!;
       const candidates = await this.searchSource(source, {
         ...input,
         signal: AbortSignal.any([input.signal, controller.signal]),
       });
+      availableSources += 1;
       const selected = candidates
         .filter((candidate) => this.acceptCandidate(candidate, input))
-        .sort((left, right) => right.matchScore - left.matchScore)[0];
+        .sort((left, right) => this.rankCandidate(right, input) - this.rankCandidate(left, input))[0];
       if (!selected) throw new Error(`${MUSIC_PLATFORM_SOURCE_NAMES[source]}没有满足条件的候选`);
       return selected;
     });
     try {
       return [await Promise.any(tasks)];
     } catch {
+      input.signal.throwIfAborted();
+      if (!availableSources && sources.length) throw new ApiError(503, "music_sources_unavailable", "在线音乐资料来源连接失败，可稍后重试");
       return [];
     } finally {
       controllers.forEach((controller) => controller.abort());
@@ -334,9 +359,9 @@ export class MusicPlatformAggregator {
 
   /** 校验候选可信度和当前缺失字段。 */
   private acceptCandidate(candidate: MusicPlatformCandidate, input: SearchInput): boolean {
-    if (candidate.matchScore < 0.72) return false;
-    if (input.requireCover && !candidate.coverUrl) return false;
-    if (input.requireArtistImage && !candidate.artistImages.some(Boolean)) return false;
+    if (!candidate.title || candidate.matchScore < 0.72) return false;
+    if (input.protectedArtist && candidate.artist && textSimilarity(input.protectedArtist, candidate.artist) < 0.65) return false;
+    if (input.protectedAlbum && candidate.album && textSimilarity(input.protectedAlbum, candidate.album) < 0.65) return false;
     return true;
   }
 
@@ -353,6 +378,10 @@ export class MusicPlatformAggregator {
     supplementalCandidates: MusicPlatformCandidate[],
   ): void {
     for (const supplemental of supplementalCandidates) {
+      if (textSimilarity(selected.title, supplemental.title) < 0.9
+        || (selected.artist && supplemental.artist && textSimilarity(selected.artist, supplemental.artist) < 0.9)
+        || (selected.album && supplemental.album && textSimilarity(selected.album, supplemental.album) < 0.9)
+        || (selected.durationMs && supplemental.durationMs && Math.abs(selected.durationMs - supplemental.durationMs) > 10_000)) continue;
       selected.coverUrl ||= supplemental.coverUrl;
       selected.album ||= supplemental.album;
       selected.albumArtist ||= supplemental.albumArtist;
@@ -623,14 +652,16 @@ export class MusicPlatformAggregator {
   }
 
   /** 从 LRCLIB 读取与歌曲最接近的普通歌词和逐行歌词。 */
-  private async searchLyrics(title: string, artist: string, signal: AbortSignal): Promise<MusicLyricsMetadata | null> {
+  public async searchLyrics(title: string, artist: string, signal: AbortSignal, durationMs = 0): Promise<MusicLyricsMetadata | null> {
     const url = new URL("https://lrclib.net/api/search");
     url.searchParams.set("track_name", title);
     if (artist) url.searchParams.set("artist_name", artist);
     try {
       const response = await this.request("musicbrainz", url, {}, signal);
       const payload = await response.json() as unknown;
-      const candidates = asObjectArray(payload);
+      const candidates = asObjectArray(payload).filter((item) => titleSimilarity(title, String(item.trackName ?? "")) >= 0.9
+        && (!artist || textSimilarity(artist, String(item.artistName ?? "")) >= 0.65)
+        && (!durationMs || !Number(item.duration) || Math.abs(durationMs - Number(item.duration) * 1000) <= 10_000));
       const selected = candidates.sort((left, right) => {
         const leftScore = textSimilarity(String(left.trackName ?? ""), title) * 0.7
           + textSimilarity(String(left.artistName ?? ""), artist) * 0.3;
@@ -654,7 +685,8 @@ export class MusicPlatformAggregator {
         事件: "音乐歌词补全降级",
         错误信息: error instanceof Error ? error.message : "未知歌词服务错误",
       });
-      return null;
+      signal.throwIfAborted();
+      throw new ApiError(503, "music_lyrics_unavailable", "在线歌词暂时不可用，已保留已匹配的音乐资料");
     }
   }
 

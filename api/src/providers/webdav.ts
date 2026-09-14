@@ -1,3 +1,4 @@
+import { loadEnumerationPage } from "./types.js";
 import { XMLParser } from "fast-xml-parser";
 import { ApiError } from "../errors.js";
 import { isFlymbyExcludedFolderName } from "../media/flymby-scan-exclusions.js";
@@ -269,7 +270,7 @@ export class WebDavProvider implements ProviderAdapter {
         directoryBatch.forEach((directory) => visited.add(directory.url.href));
         const batchResults = await Promise.all(directoryBatch.map(async (queuedDirectory) => {
           try {
-            const entries = await this.propfind(queuedDirectory.url, connection, "1", signal);
+            const entries = await loadEnumerationPage(options, this.toConfiguredPath(baseUrl, decodePath(queuedDirectory.url.pathname)), "1", () => this.propfind(queuedDirectory.url, connection, "1", signal));
             return { queuedDirectory, entries, error: null };
           } catch (error) {
             return { queuedDirectory, entries: [] as ProviderEntry[], error };
@@ -283,7 +284,7 @@ export class WebDavProvider implements ProviderAdapter {
               const errorCode = result.error instanceof ApiError ? result.error.code : "provider_directory_unavailable";
               const errorMessage = result.error instanceof Error ? result.error.message : "WebDAV 子目录访问失败";
               rootWarningCount += 1;
-              onWarning?.({ code: errorCode, message: errorMessage, path: decodePath(directoryUrl.pathname) });
+              onWarning?.({ code: errorCode, message: errorMessage, path: this.toConfiguredPath(baseUrl, decodePath(directoryUrl.pathname)) });
               this.networkOptions.logConnectionFailure?.({
                 日志关键字: "codex-flycloud-helper-webdav-directory",
                 事件: "扫描时跳过无法访问的子目录",
@@ -328,6 +329,7 @@ export class WebDavProvider implements ProviderAdapter {
               };
             }
           }
+          await options?.onDirectoryComplete?.(this.toConfiguredPath(baseUrl, decodePath(directoryUrl.pathname)));
         }
         completedDirectoryBatchCount = (completedDirectoryBatchCount + 1) % checkpointDirectoryInterval;
       }

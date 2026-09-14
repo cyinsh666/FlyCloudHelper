@@ -60,6 +60,8 @@ const metadataLabels: Record<string, string> = {
   audioChannelLayout: "声道布局",
   audioBitDepth: "位深",
   tagStatus: "标签状态",
+  fileReadError: "文件资料读取说明",
+  onlineReadError: "在线资料补全说明",
   originalTitle: "原始标题",
   releaseDate: "上映日期",
   airDate: "播出日期",

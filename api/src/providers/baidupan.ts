@@ -1,3 +1,4 @@
+import { loadEnumerationPage } from "./types.js";
 import { ApiError } from "../errors.js";
 import {
   PROVIDER_RATE_LIMIT_MAX_RETRIES,
@@ -150,7 +151,7 @@ export class BaiduPanProvider implements ProviderAdapter {
           let start = 0;
           const entries: BaiduFileItem[] = [];
           while (true) {
-            const page = await this.listDirectory(connection, directory, start, signal, options?.persistConnection);
+            const page = await loadEnumerationPage(options, directory, String(start), () => this.listDirectory(connection, directory, start, signal, options?.persistConnection));
             entries.push(...page.items);
             if (!page.hasMore || page.items.length === 0) break;
             start += page.items.length;
@@ -180,6 +181,7 @@ export class BaiduPanProvider implements ProviderAdapter {
               };
             }
           }
+          await options?.onDirectoryComplete?.(directory);
         }
       }
       await options?.onRootComplete?.({ rootIndex, root, warningCount: 0 });

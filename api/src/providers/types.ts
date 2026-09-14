@@ -106,6 +106,10 @@ export interface ProviderScanSettingsInput {
 
 /** Worker 交给 Provider 的单次枚举运行参数。 */
 export interface ProviderEnumerationOptions {
+  /** 音乐按目录和分页持久化原始结果，恢复时重放结果而不重复请求网盘。 */
+  loadDirectoryPage?: <T>(directoryPath: string, pageKey: string, load: () => Promise<T>) => Promise<T>;
+  /** 当前目录全部分页及文件输出完成，供音乐阶段安全领取旁挂资料。 */
+  onDirectoryComplete?: (directoryPath: string) => Promise<void>;
   directoryConcurrency: number;
   /** 上一次安全检查点保存的 Provider 游标。 */
   resumeState?: Record<string, unknown> | null;
@@ -259,4 +263,9 @@ export function requireConnectionString(
 export function toFileSize(value: unknown): number {
   const size = Number(value ?? 0);
   return Number.isFinite(size) && size >= 0 ? size : 0;
+}
+
+/** 未启用音乐持久化时直接读取，保持影视扫描原有行为。 */
+export function loadEnumerationPage<T>(options: ProviderEnumerationOptions | undefined, directoryPath: string, pageKey: string, load: () => Promise<T>): Promise<T> {
+  return options?.loadDirectoryPage ? options.loadDirectoryPage(directoryPath, pageKey, load) : load();
 }

@@ -1,3 +1,5 @@
+import { listMusicStageTasks } from "../music/task-query.js";
+import { retryMusicScan } from "../music/retry.js";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -1150,6 +1152,12 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     });
   });
 
+  server.get<{ Params: { jobId: string }; Querystring: Record<string, unknown> }>("/api/v1/admin/jobs/:jobId/music-tasks", async (request) => {
+    await requireSuperAdmin(request, runtime.database);
+    const job = await runtime.repository.getJob(request.params.jobId);
+    return listMusicStageTasks(runtime.database.query, job, request.query);
+  });
+
   server.get<{ Params: { jobId: string } }>("/api/v1/admin/jobs/:jobId", async (request) => {
     await requireSuperAdmin(request, runtime.database);
     return { job: await runtime.repository.getJob(request.params.jobId) };
@@ -1263,6 +1271,11 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
         新任务ID: job.id,
       });
       await audit(runtime, operator, "retry_media_probe_job", "background_job", job.id, { 原任务ID: sourceJob.id });
+      return reply.status(202).send({ job });
+    }
+    if (sourceJob.dataType === "music") {
+      const job = await retryMusicScan(runtime, sourceJob, request.body?.musicStage);
+      await audit(runtime, operator, "retry_music_stage", "scan_job", job.id, { 阶段: String(request.body?.musicStage ?? "全部") });
       return reply.status(202).send({ job });
     }
     if (sourceJob.status !== "failed" && sourceJob.status !== "cancelled") {

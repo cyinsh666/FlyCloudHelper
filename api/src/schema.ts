@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
-export const currentSchemaVersion = 52;
+import { createMusicScanTables } from "./music/scan-state.js";
+
+export const currentSchemaVersion = 53;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -1819,6 +1821,7 @@ export async function migrateDatabase(database: Knex): Promise<void> {
   await createAggregateJellyfinPlaybackTables(database);
   await createEmbyProtocolTables(database);
   await createOperationTables(database);
+  await createMusicScanTables(database);
 
   const now = new Date().toISOString();
   const existingState = await database("system_state").where({ singleton_id: 1 }).first();

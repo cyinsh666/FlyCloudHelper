@@ -120,6 +120,7 @@ interface VideoMetadataSettings {
 }
 
 interface ScanConcurrencySettings {
+  musicFileConcurrency: number;
   scanDirectoryConcurrency: number;
   scrapeTaskConcurrency: number;
 }
@@ -133,6 +134,7 @@ function readScanConcurrencySettings(
   const scanDefault = recommended?.scanDirectoryConcurrency.default ?? 8;
   const scrapeDefault = recommended?.scrapeTaskConcurrency.default ?? 4;
   return {
+    musicFileConcurrency: typeof profile.musicFileConcurrency === "number" ? profile.musicFileConcurrency : 4,
     scanDirectoryConcurrency: typeof profile.scanDirectoryConcurrency === "number"
       ? profile.scanDirectoryConcurrency
       : scanDefault,
@@ -499,14 +501,15 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
         incrementalRoots: [],
         mediaTypes: [dataType],
         removedRootPolicy: "protect",
-        scanDirectoryConcurrency: descriptor.recommendedScanSettings.scanDirectoryConcurrency.default,
-        scrapeTaskConcurrency: descriptor.recommendedScanSettings.scrapeTaskConcurrency.default,
+        scanDirectoryConcurrency: dataType === "music" ? 4 : descriptor.recommendedScanSettings.scanDirectoryConcurrency.default,
+        ...(dataType === "music" ? { musicFileConcurrency: 4 } : {}),
+        scrapeTaskConcurrency: dataType === "music" ? 2 : descriptor.recommendedScanSettings.scrapeTaskConcurrency.default,
       },
       metadata: dataType === "music" ? {
         profiles: {
           music: {
             providerId: "auto",
-            aggregateMode: "complete",
+            aggregateMode: "fast",
             requiredFields: { artist: true, album: true, cover: true, lyrics: false },
           },
         },
@@ -579,7 +582,7 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
             : selectedProvider?.authenticationMode === "authorization_session"
               ? <CloudAuthorizationPanel descriptor={selectedProvider} admin={admin} targetUserId={adminTargetUserId || undefined} resetKey={`${selectedProvider.type}:${adminTargetUserId}`} onAuthorizationChange={setCloudAuthorization} />
             : selectedProvider?.connectionFields.map((field) => <label key={field.name} className="block"><span className="text-xs text-muted-foreground">{field.label}</span><input name={`connection.${field.name}`} type={field.type === "password" ? "password" : field.type} required={field.required} autoComplete="off" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>)}
-          {selectedProvider && <div className="rounded-xl border border-border bg-secondary/35 p-4 lg:col-span-2"><p className="text-sm font-medium">默认任务并发</p><p className="mt-2 text-xs text-muted-foreground">扫描任务 {selectedProvider.recommendedScanSettings.scanDirectoryConcurrency.default}，刮削任务 {selectedProvider.recommendedScanSettings.scrapeTaskConcurrency.default}。创建后可以在服务详情中修改。</p></div>}
+          {selectedProvider && <div className="rounded-xl border border-border bg-secondary/35 p-4 lg:col-span-2"><p className="text-sm font-medium">默认任务并发</p><p className="mt-2 text-xs text-muted-foreground">{dataType === "music" ? "目录 4，文件 4，在线 2" : `扫描任务 ${selectedProvider.recommendedScanSettings.scanDirectoryConcurrency.default}，刮削任务 ${selectedProvider.recommendedScanSettings.scrapeTaskConcurrency.default}`}。创建后可以在服务详情中修改。</p></div>}
           {selectedProvider && <ProviderConnectionGuide providerType={selectedProvider.type} />}
           <div className="lg:col-span-2 flex items-center justify-between gap-4"><p className="text-xs text-muted-foreground">创建成功后不会自动扫描或刮削，需要先在服务详情中设置扫描路径。</p><PrimaryButton type="submit" disabled={(selectedProvider?.authenticationMode === "web_qr" && guangyaAuthorization?.status !== "authorized") || (selectedProvider?.authenticationMode === "authorization_session" && cloudAuthorization?.state !== "authorized")}>验证连接并创建服务</PrimaryButton></div>
           {message && <p className="lg:col-span-2 text-sm text-muted-foreground">{message}</p>}
@@ -781,6 +784,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     aiCleaning: { enabled: false, modelId: "", triggerMode: "weak_or_unmatched", minConfidence: 0.75 },
   });
   const [scanConcurrencySettings, setScanConcurrencySettings] = useState<ScanConcurrencySettings>({
+    musicFileConcurrency: 4,
     scanDirectoryConcurrency: 8,
     scrapeTaskConcurrency: 4,
   });
@@ -897,11 +901,12 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
       ...activeService.scanProfile,
       scanDirectoryConcurrency: scanConcurrencySettings.scanDirectoryConcurrency,
       scrapeTaskConcurrency: scanConcurrencySettings.scrapeTaskConcurrency,
+      ...(activeService.dataType === "music" ? { musicFileConcurrency: scanConcurrencySettings.musicFileConcurrency } : {}),
     };
     setMessage("正在保存扫描与刮削任务并发…");
     try {
       await updateServiceScanProfile(serviceId, nextProfile, admin);
-      setMessage(`任务并发已保存：扫描 ${scanConcurrencySettings.scanDirectoryConcurrency}，刮削 ${scanConcurrencySettings.scrapeTaskConcurrency}`);
+      setMessage(`任务并发已保存：目录 ${scanConcurrencySettings.scanDirectoryConcurrency}${activeService.dataType === "music" ? `，文件 ${scanConcurrencySettings.musicFileConcurrency}` : ""}，${activeService.dataType === "music" ? "在线" : "刮削"} ${scanConcurrencySettings.scrapeTaskConcurrency}`);
       await resource.refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "任务并发保存失败");
@@ -1150,13 +1155,17 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
             <label className="block">
               <span className="text-xs text-muted-foreground">扫描任务数</span>
               <input type="number" step="1" value={scanConcurrencySettings.scanDirectoryConcurrency} onChange={(event) => setScanConcurrencySettings((current) => ({ ...current, scanDirectoryConcurrency: Number(event.target.value) }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" />
-              <p className="mt-2 text-xs text-muted-foreground">全量和增量扫描都使用该任务数；当前服务默认值为 {recommendedScanSettings?.scanDirectoryConcurrency.default ?? 8}，不限制最大值。</p>
+              <p className="mt-2 text-xs text-muted-foreground">全量和增量扫描都使用该任务数。{service.dataType === "music" ? `当前音乐目录并发上限 ${Math.min(8, Math.max(1, scanConcurrencySettings.scanDirectoryConcurrency || 4))}，受账号共享请求预算约束。` : `当前服务默认值为 ${recommendedScanSettings?.scanDirectoryConcurrency.default ?? 8}，不限制最大值。`}</p>
             </label>
             <label className="block">
               <span className="text-xs text-muted-foreground">刮削任务数</span>
               <input type="number" step="1" value={scanConcurrencySettings.scrapeTaskConcurrency} onChange={(event) => setScanConcurrencySettings((current) => ({ ...current, scrapeTaskConcurrency: Number(event.target.value) }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" />
-              <p className="mt-2 text-xs text-muted-foreground">当前服务默认值为 {recommendedScanSettings?.scrapeTaskConcurrency.default ?? 4}，不限制最大值。{service.dataType === "music" ? "音乐标签读取仍使用云助手内置并发。" : "TMDB 网络请求仍由可用 Key 容量独立调度。"}</p>
+              <p className="mt-2 text-xs text-muted-foreground">{service.dataType === "music" ? `当前在线并发上限 ${Math.min(4, Math.max(1, scanConcurrencySettings.scrapeTaskConcurrency || 2))}，同实例最多并行 4 首，仍受平台限流约束。` : `当前服务默认值为 ${recommendedScanSettings?.scrapeTaskConcurrency.default ?? 4}，不限制最大值。TMDB 网络请求仍由可用 Key 容量独立调度。`}</p>
             </label>
+            {service.dataType === "music" && <label className="block"><span className="text-xs text-muted-foreground">文件资料读取任务数</span>
+              <input type="number" min="1" step="1" value={scanConcurrencySettings.musicFileConcurrency} onChange={(event) => setScanConcurrencySettings((current) => ({ ...current, musicFileConcurrency: Number(event.target.value) }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" />
+              <p className="mt-2 text-xs text-muted-foreground">标签、内嵌和旁挂资料共用；实际生效 {Math.min(8, Math.max(1, scanConcurrencySettings.musicFileConcurrency || 4))} 个任务。目录实际最多 8 个、在线最多 4 个，网盘限流时继续降低。</p>
+            </label>}
             <div className="flex justify-end md:col-span-2"><PrimaryButton type="submit">保存任务并发</PrimaryButton></div>
           </form>
         </Panel>

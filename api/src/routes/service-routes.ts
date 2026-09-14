@@ -1,3 +1,6 @@
+import { parseCloud139Credential } from "../providers/cloud139-protocol.js";
+import { listMusicStageTasks } from "../music/task-query.js";
+import { retryMusicScan } from "../music/retry.js";
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import type { CloudServiceRecord, JobStatus, MediaType, ServiceDetailRecord, ServiceStatus } from "../domain.js";
@@ -194,7 +197,14 @@ export function resolveProviderConnection(
       ? connectionInput.authorizationSessionId.trim()
       : "";
     // Flymby 后续关联会直接交接已有有效凭据；网页登录仍只提交一次性授权会话 ID。
-    if (!rawSessionId) return { connection: connectionInput, authorizationSessionId: null };
+    if (!rawSessionId) {
+      if (providerType === "cloud139") {
+        const authorization = String(connectionInput.authorization || connectionInput.cloud139Authorization || connectionInput.accessToken || "");
+        const credential = parseCloud139Credential(authorization);
+        return { connection: { ...credential, accountSummary: credential.account }, authorizationSessionId: null };
+      }
+      return { connection: connectionInput, authorizationSessionId: null };
+    }
     return {
       connection: runtime.providers.cloudAuthorization.getAuthorizedConnection(
         actorUserId,
@@ -267,6 +277,7 @@ export function requireSameCloudDriveAccount(
     cloud115: ["userId"],
     cloud123: ["userId"],
     cloud189: ["loginName"],
+    cloud139: ["account"],
     quark: ["userId"],
   };
   const fields = identityFields[providerType];
@@ -446,7 +457,7 @@ export function validateScanProfile(
   } = profile;
   /** 读取单个并发设置；Provider 只提供服务默认值，不限制用户设置的任务数量。 */
   const readConcurrency = (
-    fieldName: "scanDirectoryConcurrency" | "scrapeTaskConcurrency",
+    fieldName: "scanDirectoryConcurrency" | "scrapeTaskConcurrency" | "musicFileConcurrency",
     setting: { default: number },
   ): number => {
     const value = profile[fieldName];
@@ -454,7 +465,7 @@ export function validateScanProfile(
     // 关键变量：仅保存路径时原样保留该服务的任务数，不让路径修改触发并发配置校验。
     if (preserveConcurrency) return value as number;
     if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
-      const fieldLabel = fieldName === "scanDirectoryConcurrency" ? "扫描任务数" : "刮削任务数";
+      const fieldLabel = fieldName === "scanDirectoryConcurrency" ? "扫描任务数" : fieldName === "musicFileConcurrency" ? "文件读取任务数" : "刮削任务数";
       throw validationError(`scan.${fieldName}`, `${fieldLabel}必须是正整数`);
     }
     return value;
@@ -467,11 +478,12 @@ export function validateScanProfile(
     removedRootPolicy: profile.removedRootPolicy === "delete_missing" ? "delete_missing" : "protect",
     scanDirectoryConcurrency: readConcurrency(
       "scanDirectoryConcurrency",
-      recommendedSettings.scanDirectoryConcurrency,
+      serviceDataType === "music" ? { default: 4 } : recommendedSettings.scanDirectoryConcurrency,
     ),
+    ...(serviceDataType === "music" ? { musicFileConcurrency: readConcurrency("musicFileConcurrency", { default: 4 }) } : {}),
     scrapeTaskConcurrency: readConcurrency(
       "scrapeTaskConcurrency",
-      recommendedSettings.scrapeTaskConcurrency,
+      serviceDataType === "music" ? { default: 2 } : recommendedSettings.scrapeTaskConcurrency,
     ),
   };
 }
@@ -1660,6 +1672,12 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     });
   });
 
+  server.get<{ Params: { jobId: string }; Querystring: Record<string, unknown> }>("/api/v1/scan-jobs/:jobId/music-tasks", async (request) => {
+    const user = await requireRequestUser(request, runtime.database);
+    const job = await runtime.repository.getJob(request.params.jobId, user.id);
+    return listMusicStageTasks(runtime.database.query, job, request.query);
+  });
+
   server.get<{ Params: { jobId: string } }>("/api/v1/scan-jobs/:jobId", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     return { job: await runtime.repository.getJob(request.params.jobId, user.id) };
@@ -1759,6 +1777,9 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
         新任务ID: job.id,
       });
       return reply.status(202).send({ job });
+    }
+    if (sourceJob.dataType === "music") {
+      return reply.status(202).send({ job: await retryMusicScan(runtime, sourceJob, request.body?.musicStage) });
     }
     if (sourceJob.status !== "failed" && sourceJob.status !== "cancelled") {
       throw new ApiError(409, "job_not_retryable", "只有失败或已取消任务可以重试");

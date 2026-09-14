@@ -1153,12 +1153,12 @@ export async function updateServiceScanSchedule(
 }
 
 /** 为失败或已取消任务创建一条保留原扫描模式的新任务。 */
-export async function retryScanJob(jobId: string, admin = false): Promise<ScanJob> {
+export async function retryScanJob(jobId: string, admin = false, musicStage?: string): Promise<ScanJob> {
   const result = await requestJson<{ job: ScanJob }>(
     admin ? `/api/v1/admin/jobs/${jobId}/retry` : `/api/v1/scan-jobs/${jobId}/retry`,
     {
       method: "POST",
-      body: JSON.stringify({
+      body: JSON.stringify({ musicStage,
         requestId: createRequestId(),
         clientDeviceId: "flycloud-helper-web",
       }),
@@ -2017,4 +2017,14 @@ export async function clearNotifications(): Promise<number> {
 /** 撤销当前 Web 会话。 */
 export async function logout(): Promise<void> {
   await requestJson<void>("/api/v1/auth/logout", { method: "POST" });
+}
+
+export interface MusicStageTask {
+  id: string; stage: string; status: string; path: string; name: string; resourceId: string; error: string;
+}
+
+/** 分页读取当前用户或管理员有权查看的音乐阶段明细。 */
+export function listMusicStageTasks(jobId: string, stage: string, offset: number, admin = false): Promise<{ items: MusicStageTask[]; total: number }> {
+  const query = new URLSearchParams({ stage, offset: String(offset), limit: "20", status: "problems" });
+  return requestJson(`${admin ? "/api/v1/admin/jobs" : "/api/v1/scan-jobs"}/${encodeURIComponent(jobId)}/music-tasks?${query}`);
 }

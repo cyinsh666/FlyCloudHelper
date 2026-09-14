@@ -11,6 +11,7 @@ const providerIconPaths: Record<string, string> = {
   cloud115: "/provider-icons/cloud115.png",
   cloud123: "/provider-icons/cloud123.png",
   cloud189: "/provider-icons/cloud189.png",
+  cloud139: "/provider-icons/cloud139.png",
   quark: "/provider-icons/quark.png",
 };
 

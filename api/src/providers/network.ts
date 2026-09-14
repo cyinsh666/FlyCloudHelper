@@ -1,3 +1,4 @@
+import { acquireMusicBudget } from "./request-budget.js";
 import dns from "node:dns/promises";
 import http, { type IncomingHttpHeaders, type IncomingMessage } from "node:http";
 import https from "node:https";
@@ -250,7 +251,7 @@ function toRequestBody(body: RequestInit["body"]): string | Uint8Array | undefin
 }
 
 /** 使用本次已经解析的地址发送请求，保证请求过程中解析结果一致。 */
-async function requestResolvedProvider(
+async function requestResolvedProviderWithoutBudget(
   target: ResolvedProviderUrl,
   init: RequestInit,
   signal: AbortSignal,
@@ -308,7 +309,7 @@ async function requestResolvedProvider(
 }
 
 /** 使用固定 DNS 解析结果建立不会预读媒体正文的上游流请求。 */
-async function requestResolvedProviderStream(
+async function requestResolvedProviderStreamWithoutBudget(
   target: ResolvedProviderUrl,
   init: RequestInit,
   signal: AbortSignal,
@@ -330,6 +331,25 @@ async function requestResolvedProviderStream(
     request.once("close", () => signal.removeEventListener("abort", abortRequest));
     request.end();
   });
+}
+
+/** 实际 API 请求占用账号名额直到正文收完，包括目录与下载取址。 */
+async function requestResolvedProvider(target: ResolvedProviderUrl, init: RequestInit, signal: AbortSignal): Promise<Response> {
+  const release = await acquireMusicBudget("api", signal);
+  try { signal.throwIfAborted(); return await requestResolvedProviderWithoutBudget(target, init, signal); }
+  finally { release(); }
+}
+
+/** 字节流名额直到关闭才释放，ffprobe 本机网关也经过这里。 */
+async function requestResolvedProviderStream(target: ResolvedProviderUrl, init: RequestInit, signal: AbortSignal): Promise<IncomingMessage> {
+  const release = await acquireMusicBudget("bytes", signal);
+  try {
+    signal.throwIfAborted();
+    const response = await requestResolvedProviderStreamWithoutBudget(target, init, signal);
+    response.once("close", release);
+    response.once("end", release);
+    return response;
+  } catch (error) { release(); throw error; }
 }
 
 /** 判断 Provider 响应是否要求客户端跳转到新的资源地址。 */
@@ -360,6 +380,7 @@ export async function providerFetch(
   const timeout = setTimeout(() => timeoutController.abort(), 30_000);
   const abortParent = () => timeoutController.abort();
   parentSignal?.addEventListener("abort", abortParent, { once: true });
+  if (parentSignal?.aborted) abortParent();
   try {
     // 关键变量：每次跳转都重新执行 URL 和 DNS 校验，最多跟随五次以阻止循环重定向。
     let currentUrl: string | URL = url instanceof URL ? new URL(url.href) : url;
@@ -370,6 +391,7 @@ export async function providerFetch(
     while (true) {
       resolvedTarget = await resolveProviderUrl(currentUrl, options);
       await waitForProviderSharedRateLimit(resolvedTarget.url, timeoutController.signal);
+      timeoutController.signal.throwIfAborted();
       response = await requestResolvedProvider(resolvedTarget, currentInit, timeoutController.signal);
       if (currentInit.body instanceof URLSearchParams) {
         // 临时诊断只记录接口路径及状态，不记录表单、Token、Pick Code或完整URL。
@@ -518,6 +540,7 @@ export async function providerProbeStream(
   }, 30_000);
   const abortParent = () => requestController.abort();
   parentSignal?.addEventListener("abort", abortParent, { once: true });
+  if (parentSignal?.aborted) abortParent();
   const cleanup = () => {
     clearTimeout(timeout);
     parentSignal?.removeEventListener("abort", abortParent);
@@ -530,6 +553,7 @@ export async function providerProbeStream(
     while (true) {
       resolvedTarget = await resolveProviderUrl(currentUrl, options);
       await waitForProviderSharedRateLimit(resolvedTarget.url, requestController.signal);
+      requestController.signal.throwIfAborted();
       const response = await requestResolvedProviderStream(
         resolvedTarget,
         currentInit,
@@ -603,6 +627,7 @@ export async function providerStream(
   }, 30_000);
   const abortParent = () => requestController.abort();
   parentSignal?.addEventListener("abort", abortParent, { once: true });
+  if (parentSignal?.aborted) abortParent();
   const cleanup = () => {
     clearTimeout(timeout);
     parentSignal?.removeEventListener("abort", abortParent);
@@ -614,6 +639,7 @@ export async function providerStream(
     let redirectCount = 0;
     while (true) {
       resolvedTarget = await resolveProviderUrl(currentUrl, options);
+      requestController.signal.throwIfAborted();
       const response = await requestResolvedProviderStream(
         resolvedTarget,
         currentInit,

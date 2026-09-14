@@ -19,10 +19,11 @@ interface CloudAuthorizationSession extends CloudAuthorizationStatus {
   driverState: Record<string, unknown>;
   connection: Record<string, unknown> | null;
   completing: boolean;
+  polling: boolean;
   consumed: boolean;
 }
 
-/** 管理四种新网盘授权会话、用户归属和一次性连接领取。 */
+/** 管理网盘授权会话、用户归属和一次性连接领取。 */
 export class CloudAuthorizationManager {
   private readonly drivers = new Map<string, CloudAuthorizationDriver>();
   private readonly sessions = new Map<string, CloudAuthorizationSession>();
@@ -85,6 +86,7 @@ export class CloudAuthorizationManager {
       driverState: started.driverState,
       connection: null,
       completing: false,
+      polling: false,
       consumed: false,
     };
     this.sessions.set(session.authorizationSessionId, session);
@@ -104,9 +106,16 @@ export class CloudAuthorizationManager {
       await this.finishSession(session, "expired", "provider_auth_session_expired", "二维码已过期，请重新扫码");
       return this.toPublicStatus(session);
     }
-    if (Date.now() < session.nextPollAtMs) return this.toPublicStatus(session);
+    if (session.polling || Date.now() < session.nextPollAtMs) return this.toPublicStatus(session);
+    session.polling = true;
     try {
       const result = await this.requireDriver(session.providerType).poll(session.driverState, signal);
+      // 等待上游时可能已取消或到期，迟到响应不得恢复二维码或凭据。
+      if (this.isTerminal(session.state) || session.consumed || !this.sessions.has(authorizationSessionId)) return this.toPublicStatus(session);
+      if (Date.now() >= session.expiresAtMs) {
+        await this.finishSession(session, "expired", "provider_auth_session_expired", "二维码已过期，请重新扫码");
+        return this.toPublicStatus(session);
+      }
       session.state = result.state;
       session.pollIntervalSeconds = Math.max(1, Math.floor(result.retryAfterSeconds || session.pollIntervalSeconds));
       session.nextPollAtMs = Date.now() + session.pollIntervalSeconds * 1_000;
@@ -121,7 +130,7 @@ export class CloudAuthorizationManager {
       session.errorCode = error instanceof ApiError ? error.code : "provider_auth_poll_failed";
       session.message = error instanceof Error ? error.message.slice(0, 200) : "查询扫码状态失败，请稍后重试";
       throw error;
-    }
+    } finally { session.polling = false; }
   }
 
   /** 扫码确认后交换最终连接，连接仍只保留在服务端。 */
@@ -149,6 +158,9 @@ export class CloudAuthorizationManager {
     session.completing = true;
     try {
       const result = await this.requireDriver(session.providerType).complete(session.driverState, signal);
+      if (session.consumed || !this.sessions.has(authorizationSessionId) || Date.now() >= session.expiresAtMs || session.state !== "confirmed") {
+        throw new ApiError(410, "provider_auth_session_expired", "授权会话已经结束，请重新扫码");
+      }
       session.connection = result.connection;
       session.accountSummary = result.accountSummary;
       session.state = "authorized";

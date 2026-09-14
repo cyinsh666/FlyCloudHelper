@@ -1,3 +1,4 @@
+import { openMusicFileStream } from "../music/file-stream.js";
 import type { IncomingMessage } from "node:http";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -243,7 +244,7 @@ function mapAlbum(item: MediaItemRecord, artistId = "", songCount = 0, duration 
 
 /** 按文件扩展名返回常见音频 MIME。 */
 function readAudioContentType(extension: string): string {
-  return ({ mp3: "audio/mpeg", flac: "audio/flac", m4a: "audio/mp4", aac: "audio/aac", ogg: "audio/ogg", opus: "audio/ogg", wav: "audio/wav", ape: "audio/ape", wma: "audio/x-ms-wma" } as Record<string, string>)[extension] ?? "application/octet-stream";
+  return ({ mp3: "audio/mpeg", flac: "audio/flac", m4a: "audio/mp4", aac: "audio/aac", ogg: "audio/ogg", opus: "audio/ogg", wav: "audio/wav", ape: "audio/ape", wma: "audio/x-ms-wma", mka: "audio/x-matroska", aiff: "audio/aiff", aif: "audio/aiff", dsf: "audio/x-dsf", dff: "audio/x-dff", alac: "audio/mp4" } as Record<string, string>)[extension] ?? "application/octet-stream";
 }
 
 /** 映射 Subsonic 歌曲对象，文件字段只包含格式与大小，不返回网盘路径。 */
@@ -450,7 +451,7 @@ async function sendLocalMusicCover(
   request: FastifyRequest,
   reply: FastifyReply,
 ): Promise<FastifyReply> {
-  if (!/^[a-f0-9]{64}\.jpg$/u.test(fileName)) {
+  if (!/^[a-f0-9]{64}\.(?:jpg|png|webp)$/u.test(fileName)) {
     throw new ApiError(404, "navidrome_cover_not_found", "封面不存在");
   }
   const filePath = path.join(runtime.config.musicArtworkDirectory, fileName);
@@ -459,7 +460,7 @@ async function sendLocalMusicCover(
     if (!file.isFile() || file.size <= 0 || file.size > 10 * 1024 * 1024) {
       throw new ApiError(404, "navidrome_cover_not_found", "封面不存在");
     }
-    reply.header("Content-Type", "image/jpeg");
+    reply.header("Content-Type", fileName.endsWith(".png") ? "image/png" : fileName.endsWith(".webp") ? "image/webp" : "image/jpeg");
     reply.header("Content-Length", file.size);
     reply.header("Cache-Control", "private, max-age=86400");
     return request.method === "HEAD" ? reply.send() : reply.send(fs.createReadStream(filePath));
@@ -525,7 +526,7 @@ async function sendNavidromeCoverArt(
   reply: FastifyReply,
 ): Promise<FastifyReply> {
   const posterUrl = item.posterUrl ?? "";
-  const localArtworkMatch = posterUrl.match(/^\/api\/v1\/music-artwork\/([a-f0-9]{64}\.jpg)$/u);
+  const localArtworkMatch = posterUrl.match(/^\/api\/v1\/music-artwork\/([a-f0-9]{64}\.(?:jpg|png|webp))$/u);
   if (localArtworkMatch?.[1]) {
     return sendLocalMusicCover(runtime, localArtworkMatch[1], request, reply);
   }
@@ -866,20 +867,17 @@ async function streamSong(runtime: ApiRuntime, context: NavidromeContext, itemId
   let upstreamBody: IncomingMessage | null = null;
   try {
     const locator = file.playbackLocator && typeof file.playbackLocator === "object" ? file.playbackLocator as Record<string, unknown> : {};
-    const access = await resolveRelayAccess(runtime, context.relayLibrary, context.ownerUserId, locator, controller.signal);
-    const upstream = await providerStream(access.url, {
-      method: request.method,
-      headers: buildUpstreamHeaders(request, access.headers),
-    }, {
-      allowInsecureHttp: runtime.config.allowInsecureProviderHttp,
-      logConnectionFailure: (fields) => runtime.logBusinessEvent("warn", fields),
-    }, controller.signal);
+    const upstream = await openMusicFileStream(
+      () => resolveRelayAccess(runtime, context.relayLibrary, context.ownerUserId, locator, controller.signal),
+      { method: request.method === "HEAD" ? "HEAD" : "GET", headers: buildUpstreamHeaders(request, {}) },
+      { allowInsecureHttp: runtime.config.allowInsecureProviderHttp, logConnectionFailure: (fields) => runtime.logBusinessEvent("warn", fields) }, controller.signal);
     upstreamBody = upstream.body;
     upstream.body.once("close", () => {
       request.raw.removeListener("aborted", abort);
       reply.raw.removeListener("close", abort);
     });
     copyMediaResponseHeaders(reply, upstream.headers);
+    if (!upstream.headers["content-type"]) reply.type(readAudioContentType(String(file.name ?? "").split(".").pop()?.toLowerCase() ?? ""));
     reply.header("Content-Disposition", `inline; filename*=UTF-8''${encodeURIComponent(String(file.name ?? item.title))}`);
     reply.status(upstream.statusCode);
     runtime.logBusinessEvent("info", {

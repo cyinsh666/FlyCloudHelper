@@ -15,6 +15,8 @@ import { QuarkAuthorizationDriver } from "./auth/quark-authorization.js";
 import { Cloud115Provider } from "./cloud115.js";
 import { Cloud123Provider } from "./cloud123.js";
 import { Cloud189Provider } from "./cloud189.js";
+import { Cloud139Provider } from "./cloud139.js";
+import { Cloud139AuthorizationDriver } from "./auth/cloud139-authorization.js";
 import { QuarkProvider } from "./quark.js";
 
 /** 管理内置 Provider 能力，扫描核心只依赖统一适配器契约。 */
@@ -47,6 +49,8 @@ export class ProviderRegistry {
     this.cloudAuthorization.register(new Cloud123AuthorizationDriver());
     this.add(new Cloud189Provider(networkOptions));
     this.cloudAuthorization.register(new Cloud189AuthorizationDriver());
+    this.add(new Cloud139Provider(networkOptions));
+    this.cloudAuthorization.register(new Cloud139AuthorizationDriver());
     this.add(new QuarkProvider(networkOptions));
     this.cloudAuthorization.register(new QuarkAuthorizationDriver());
   }

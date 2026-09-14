@@ -241,7 +241,7 @@ export async function registerServiceMigrationRoutes(
     }
     const provider = requireObject(request.body, "provider", "Provider");
     const providerType = requireString(provider, "type", "Provider 类型", 64);
-    if (!["webdav", "guangya", "aliyundrive", "baidupan", "cloud115", "cloud123", "cloud189", "quark"].includes(providerType)) {
+    if (!["webdav", "guangya", "aliyundrive", "baidupan", "cloud115", "cloud123", "cloud189", "quark", "cloud139"].includes(providerType)) {
       throw new ApiError(422, "migration_provider_unsupported", "当前网盘类型暂不支持迁移");
     }
     const resolvedConnection = resolveProviderConnection(
@@ -352,7 +352,7 @@ export async function registerServiceMigrationRoutes(
       const clientDeviceId = requireString(request.body, "clientDeviceId", "客户端设备 ID", 200);
       const clientServiceId = requireString(request.body, "clientServiceId", "客户端服务 ID", 200);
       const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
-      if (!["webdav", "guangya", "aliyundrive", "baidupan", "cloud115", "cloud123", "cloud189", "quark"].includes(service.providerType)) {
+      if (!["webdav", "guangya", "aliyundrive", "baidupan", "cloud115", "cloud123", "cloud189", "quark", "cloud139"].includes(service.providerType)) {
         throw new ApiError(422, "migration_provider_unsupported", "当前网盘类型暂不支持迁移");
       }
       const binding = await runtime.repository.findClientServiceBinding(user.id, clientDeviceId, clientServiceId);
