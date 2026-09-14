@@ -424,6 +424,17 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
           });
         },
       });
+      // 临时诊断：APP 关联直连直接接收 Provider 请求头，不经过 Jellyfin 的307跳转检查。
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-flycloud-app-direct",
+        事件: "关联服务直连地址与请求头下发",
+        服务ID: service.id,
+        网盘类型: String(library.provider_type),
+        媒体条目ID: request.params.itemId,
+        源文件ID: request.params.fileId,
+        请求头名称: Object.keys(access.headers).join(","),
+        是否携带UA: Object.keys(access.headers).some((name) => name.toLowerCase() === "user-agent"),
+      });
       if (String(library.provider_type) === "baidupan") {
         runtime.logBusinessEvent("info", {
           日志关键字: "codex-baidupan-cloud-playback",

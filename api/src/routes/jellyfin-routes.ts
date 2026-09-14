@@ -88,10 +88,15 @@ function buildJellyfinStreamUrl(
   return `/Videos/${encodeURIComponent(itemId)}/stream?${query.toString()}`;
 }
 
-/** 115 取址 UA 与当前播放器一致时无需额外请求头；其他网盘及认证头仍保持原限制。 */
+/** 判断网盘是否支持使用当前 Jellyfin 播放器 UA 申请直连地址。 */
+function supportsPlaybackUserAgent(providerType: string): boolean {
+  return providerType === "cloud115" || providerType === "cloud123";
+}
+
+/** 115、123取址 UA 与当前播放器一致时无需额外请求头；其他网盘及认证头仍保持原限制。 */
 function hasRequiredPlaybackHeaders(access: ProviderFileAccess, request: FastifyRequest, providerType: string): boolean {
   return Object.entries(access.headers).some(([name, value]) => {
-    if (providerType === "cloud115" && name.toLowerCase() === "user-agent") {
+    if (supportsPlaybackUserAgent(providerType) && name.toLowerCase() === "user-agent") {
       const playerUserAgent = request.headers["user-agent"];
       return typeof playerUserAgent !== "string" || !playerUserAgent || value !== playerUserAgent;
     }
@@ -136,11 +141,13 @@ function buildStandardMediaSourceDefaults(): Record<string, unknown> {
 
 /** 解析文件访问地址，并在 Provider 刷新令牌时安全持久化。 */
 async function resolveFileAccess(runtime: ApiRuntime, service: Record<string, unknown>, ownerUserId: string, locator: Record<string, unknown>, signal: AbortSignal, playbackRequest?: FastifyRequest) {
-  const adapter = runtime.providers.get(String(service.provider_type));
+  // 关键变量：只有明确适配播放器 UA 的网盘才覆盖本次取址标识，不修改其他网盘的固定访问头。
+  const providerType = String(service.provider_type);
+  const adapter = runtime.providers.get(providerType);
   const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(String(service.id), ownerUserId));
   const providerContext: ProviderConnectionContext = {
     // 只在实际访问 Videos/stream 时传入播放器 UA，不能把 PlaybackInfo 的 API 客户端 UA 当成播放 UA。
-    playbackUserAgent: String(service.provider_type) === "cloud115" && playbackRequest
+    playbackUserAgent: supportsPlaybackUserAgent(providerType) && playbackRequest
       ? playbackRequest.headers["user-agent"] || undefined
       : undefined,
     persistConnection: async (nextConnection) => runtime.repository.refreshActiveEncryptedConnection({
@@ -149,6 +156,20 @@ async function resolveFileAccess(runtime: ApiRuntime, service: Record<string, un
     }),
   };
   const access = adapter.resolveFileAccess ? await adapter.resolveFileAccess(connection, locator, signal, providerContext) : null;
+  if (playbackRequest) {
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-jellyfin-cloud-direct",
+      事件: "网盘直连请求头检查",
+      服务ID: String(service.id),
+      网盘类型: providerType,
+      请求方法: playbackRequest.method,
+      请求播放路由: readPlaybackRoute(playbackRequest),
+      使用播放器UA: Boolean(providerContext.playbackUserAgent),
+      是否取得原始地址: Boolean(access && /^https?:\/\//iu.test(access.url)),
+      请求头名称: access ? Object.keys(access.headers).join(",") : "",
+      是否仍需额外请求头: access ? hasRequiredPlaybackHeaders(access, playbackRequest, providerType) : null,
+    });
+  }
   if (String(service.provider_type) === "cloud115" && playbackRequest) {
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-jellyfin-115-direct", 事件: "115直连取址完成", 服务ID: String(service.id),

@@ -58,16 +58,17 @@ export class Cloud123Provider extends CloudDriveProviderBase {
     };
   }
 
-  /** 获取123文件下载地址。 */
-  protected async loadFileAccess(connection: Record<string, unknown>, locator: Record<string, unknown>, signal?: AbortSignal): Promise<ProviderFileAccess> {
+  /** 获取123文件下载地址；Jellyfin 直连取址和下载节点解析沿用实际播放器 UA。 */
+  protected async loadFileAccess(connection: Record<string, unknown>, locator: Record<string, unknown>, signal?: AbortSignal, context?: ProviderConnectionContext): Promise<ProviderFileAccess> {
+    // 关键变量：只覆盖当前直连请求的 UA，APP 关联播放、中转和刮削继续返回原有123客户端 UA。
+    const userAgent = context?.playbackUserAgent || this.createUserAgent(connection);
     const payload = await this.request(connection, "/a/api/file/download_info", {
-      method: "POST", body: JSON.stringify({ driveId: 0, etag: String(locator.etag ?? ""), fileId: requireConnectionString(locator, "fileId", "123文件 ID"), s3keyFlag: String(locator.s3KeyFlag ?? ""), type: Number(locator.type ?? 0), fileName: String(locator.fileName ?? ""), size: Number(locator.size ?? 0) }),
+      method: "POST", headers: { "User-Agent": userAgent }, body: JSON.stringify({ driveId: 0, etag: String(locator.etag ?? ""), fileId: requireConnectionString(locator, "fileId", "123文件 ID"), s3keyFlag: String(locator.s3KeyFlag ?? ""), type: Number(locator.type ?? 0), fileName: String(locator.fileName ?? ""), size: Number(locator.size ?? 0) }),
     }, signal);
     const data = readCloudRecord(payload.data);
     const directUrl = readCloudText(data, ["RedirectUrl", "redirect_url"]);
     const downloadUrl = readCloudText(data, ["DownloadUrl", "downloadUrl"]);
     if (!directUrl && !downloadUrl) throw new ApiError(502, "cloud123_download_url_missing", "123云盘未返回下载地址");
-    const userAgent = this.createUserAgent(connection);
     // 关键变量：RedirectUrl 已是接口给出的直达地址，不能再次包装成会返回 HTML 的 download-v2 页面。
     const resolvedUrl = directUrl && !directUrl.includes("/download-v2/")
       ? directUrl

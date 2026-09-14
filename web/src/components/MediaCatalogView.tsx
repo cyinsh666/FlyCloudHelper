@@ -623,6 +623,7 @@ export function MediaCatalogView({
   return (
     <>
       <Panel
+        collapsible
         className="mb-4"
         title="筛选上下文"
         description={contextDescription}

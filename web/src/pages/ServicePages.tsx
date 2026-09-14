@@ -9,7 +9,8 @@ import { CloudAuthorizationPanel } from "@/components/CloudAuthorizationPanel";
 import { ProviderConnectionGuide } from "@/components/ProviderConnectionGuide";
 import { getProviderSelectionDescription, ProviderSelectionIcon, SelectableServiceOption } from "@/components/ServiceCreateSelection";
 import { ServicePathPicker, toProviderDirectory } from "@/components/ServicePathPicker";
-import { Panel, StatCard, StatusPill, type StatusTone } from "@/components/ui-kit";
+import { ServiceConnectionAlert, ServiceStatePill, getServiceConnectionIssue } from "@/components/ServiceConnectionStatus";
+import { Panel, StatCard, StatusPill } from "@/components/ui-kit";
 import {
   ApiClientError,
   backfillExistingMediaProbes,
@@ -36,17 +37,9 @@ import {
   type MediaType,
   type ProviderDirectory,
   type ProviderDescriptor,
-  type ServiceStatus,
   type ServiceListFilters,
 } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
-
-const serviceStatusLabels: Record<ServiceStatus, string> = {
-  active: "正常",
-  scanning: "扫描中",
-  disabled: "已停用",
-  reauthorization_required: "需重新授权",
-};
 
 const dataTypeLabels: Record<MediaType, string> = {
   video: "影视",
@@ -91,14 +84,6 @@ const jobStageLabels: Record<string, string> = {
   scraping_music: "刮削音乐信息",
   completed: "已完成",
 };
-
-/** 将服务状态映射为视觉语义。 */
-function getServiceTone(status: ServiceStatus): StatusTone {
-  if (status === "active") return "success";
-  if (status === "scanning") return "primary";
-  if (status === "reauthorization_required") return "warning";
-  return "neutral";
-}
 
 /** 把 ISO 时间转换为控制台可读时间。 */
 function formatTime(value: string | null): string {
@@ -388,15 +373,16 @@ function ServiceCard({ service, admin, onChanged }: { service: CloudService; adm
       <header className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
         <div className="flex min-w-0 items-center gap-3">
           <span className="grid size-10 shrink-0 place-items-center rounded-xl border border-border text-xs font-semibold" style={{ backgroundImage: "var(--gradient-surface)" }}>
-            {service.providerType.slice(0, 2).toUpperCase()}
+            <ProviderSelectionIcon providerType={service.providerType} />
           </span>
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold">{service.displayName}</h2>
             <p className="truncate font-mono text-[11px] text-muted-foreground">{getServiceProviderLabel(service)} · {service.id}{admin ? ` · ${service.ownerUsername}` : ""}</p>
           </div>
         </div>
-        <StatusPill tone={getServiceTone(service.status)}>{serviceStatusLabels[service.status]}</StatusPill>
+        <ServiceStatePill service={service} />
       </header>
+      <ServiceConnectionAlert service={service} admin={admin} />
 
       <dl className="mt-5 grid grid-cols-3 gap-3 text-center">
         <div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">连接修订</dt><dd className="mt-1 text-xs font-medium">r{service.credentialRevision}</dd></div>
@@ -721,8 +707,9 @@ export function ServiceConnectionPage({ serviceId, admin = false }: { serviceId:
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
       <div className="grid gap-4 xl:grid-cols-2">
         <Panel title="当前连接">
+          <ServiceConnectionAlert service={service} admin={admin} showLogin={false} />
           <div className="flex flex-wrap items-center gap-2">
-            <StatusPill tone={getServiceTone(service.status)}>{serviceStatusLabels[service.status]}</StatusPill>
+            <ServiceStatePill service={service} />
             <StatusPill>{service.connectionAuthMode ? guangyaLoginModeLabels[service.connectionAuthMode] : service.credentialConfigured ? "凭据已配置" : "凭据未配置"}</StatusPill>
             <StatusPill>连接 r{service.credentialRevision}</StatusPill>
           </div>
@@ -1083,7 +1070,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
         title={service.displayName}
         actions={(
           <div className="flex flex-wrap items-center gap-2">
-            <StatusPill tone={getServiceTone(service.status)}>服务{serviceStatusLabels[service.status]}</StatusPill>
+            <ServiceStatePill service={service} />
             <SecondaryButton disabled={updatingStatus || service.status === "scanning" || deletingService} onClick={() => void toggleStatus()}>
               {updatingStatus ? "正在更新…" : service.status === "disabled" ? "启用服务" : "停用服务"}
             </SecondaryButton>
@@ -1100,14 +1087,15 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
         <StatCard label="最近后台任务" value={recentJob ? recentJob.status === "retry_waiting" && recentJob.jobType === "media_probe" ? "等待重试" : jobStatusLabels[recentJob.status] : "暂无"} hint={recentJob ? `${recentJob.jobType === "media_probe" ? "视频规格分析" : "扫描刮削"} · ${getJobStageLabel(recentJob.stage)}` : "尚无任务"} tone="warning" />
         <StatCard
           label="连接状态"
-          value={service.status === "reauthorization_required" ? "需重新授权" : service.credentialConfigured ? "已配置" : "未配置"}
+          value={getServiceConnectionIssue(service)?.title ?? (service.credentialConfigured ? "已配置" : "未配置")}
           hint={service.connectionAuthMode
             ? guangyaLoginModeLabels[service.connectionAuthMode]
             : service.credentialConfigured ? "Secret 已配置" : "Secret 未配置"}
-          tone={service.status === "reauthorization_required" ? "warning" : "muted"}
+          tone={getServiceConnectionIssue(service) ? "warning" : "muted"}
           action={<Link to={admin ? "/admin/services/$serviceId/connection" : "/app/services/$serviceId/connection"} params={{ serviceId }} className="inline-flex rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">连接管理</Link>}
         />
       </div>
+      <ServiceConnectionAlert service={service} admin={admin} />
       <Panel title="配置修订与范围" className="mt-4">
         <div className="grid gap-3 md:grid-cols-2">
           <div className="rounded-xl border border-border bg-secondary/40 p-4">

@@ -9,12 +9,6 @@ export interface TmdbCandidateIdentity {
   popularity: number;
 }
 
-/** 文件自身的电影身份，不使用目录覆盖后的年份。 */
-export interface TmdbMovieFileEvidence {
-  title: string;
-  year: number | null;
-}
-
 /** 保留中英文和数字用于强标题比较，续集数字参与身份判断。 */
 export function buildTmdbStrongTitleKey(value: string): string {
   return FlymbyVideoTitleCleaner.normalizeSearchText(value).replace(/[^a-z0-9\u4e00-\u9fa5]+/gu, "");
@@ -99,27 +93,24 @@ function scoreTvCandidate(candidate: TmdbCandidateIdentity, query: string, year:
   return score;
 }
 
-/** 缺年份、相邻发行年或电影文件的一致独立年份证据，才允许放宽年份。 */
-export function canRelaxTmdbCandidateYear(
-  mediaType: "movie" | "tv", year: number | null, candidate: TmdbCandidateIdentity,
-  fileEvidence: TmdbMovieFileEvidence[] = [],
-): boolean {
-  const candidateYear = tmdbCandidateYear(candidate);
-  if (!year || (candidateYear && Math.abs(year - candidateYear) <= 1)) return true;
-  if (mediaType !== "movie" || !candidateYear) return false;
-  const evidence = fileEvidence.filter((file) => file.year && isTmdbStrongTitleMatch(file.title, candidate));
-  return evidence.length > 0 && evidence.every((file) => file.year === candidateYear);
-}
-
-/** 严格匹配失败后，只接受合并搜索结果中唯一的强标题候选。 */
-export function pickRelaxedTmdbCandidate<T extends TmdbCandidateIdentity>(
-  mediaType: "movie" | "tv", candidates: T[], queries: string[], year: number | null,
-  fileEvidence: TmdbMovieFileEvidence[] = [],
+/** 与 APP 第 5 版一致：严格匹配失败后标题优先，同分比较年份，再保留搜索顺序。 */
+export function pickAppTmdbFallbackCandidate<T extends TmdbCandidateIdentity>(
+  candidates: T[], query: string, year: number | null,
 ): T | undefined {
-  const strong = candidates.filter((candidate) => queries.some((query) => isTmdbStrongTitleMatch(query, candidate)));
-  if (strong.length !== 1) return undefined;
-  const candidate = strong[0]!;
-  return canRelaxTmdbCandidateYear(mediaType, year, candidate, fileEvidence) ? candidate : undefined;
+  let selected: T | undefined;
+  let bestTitleScore = -1001;
+  let bestYearMatched = false;
+  for (const candidate of candidates) {
+    const titleScore = isTmdbStrongTitleMatch(query, candidate) ? 1000
+      : isTmdbCandidateTitleCompatible(query, candidate) ? 100 : -1000;
+    const yearMatched = Boolean(year && tmdbCandidateYear(candidate) === year);
+    if (titleScore > bestTitleScore || (titleScore === bestTitleScore && yearMatched && !bestYearMatched)) {
+      selected = candidate;
+      bestTitleScore = titleScore;
+      bestYearMatched = yearMatched;
+    }
+  }
+  return selected;
 }
 
 /** 合并同类型两轮结果，保留首轮顺序并按 TMDB ID 去重。 */

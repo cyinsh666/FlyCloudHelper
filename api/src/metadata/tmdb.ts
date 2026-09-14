@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
 import {
-  canRelaxTmdbCandidateYear, isTmdbCandidateTitleCompatible, isTmdbStrongTitleMatch,
-  mergeTmdbCandidates, pickRelaxedTmdbCandidate, pickStrictTmdbCandidate,
-  type TmdbMovieFileEvidence,
+  isTmdbCandidateTitleCompatible, isTmdbStrongTitleMatch, tmdbCandidateYear,
+  mergeTmdbCandidates, pickAppTmdbFallbackCandidate, pickStrictTmdbCandidate,
 } from "./tmdb-candidate-matcher.js";
 import type { ApiConfig } from "../config.js";
 import { FlymbyVideoTitleCleaner } from "../media/flymby-video-title-cleaner.js";
@@ -127,6 +126,10 @@ export interface TmdbVideoMetadata {
   detailsSynchronized: boolean;
   /** 当前规则完整校验后的请求指纹，仅供查询缓存复用，不用于 ID 详情缓存。 */
   recognitionCacheKey?: string;
+  /** APP 第 5 版接受结果不再被旧年份门槛否定。 */
+  recognitionVersion?: number;
+  /** 父目录补查结果单独缓存，不能冒充文件标题命中。 */
+  parentMovieMatch?: TmdbParentMovieQuery;
 }
 
 export interface TmdbEpisodeMetadata {
@@ -141,14 +144,23 @@ export interface TmdbEpisodeMetadata {
   durationMs: number;
 }
 
+/** 完整目录证据确认的父目录补查输入。 */
+export interface TmdbParentMovieQuery {
+  parentPath: string;
+  query: string;
+  year: number | null;
+}
+
 export interface TmdbVideoQuery {
+  /** 同步日志串联到任务及失败报告，不参与公共缓存身份。 */
+  jobId?: string;
+  onRecognitionDecision?: (decision: Record<string, unknown>) => void;
+  parentMovieQuery?: TmdbParentMovieQuery;
   mediaType: "movie" | "tv";
   title: string;
   /** 目录标题无候选时使用的文件名查询词。 */
   fallbackTitle?: string;
-  /** 同任务全部文件的独立片名与年份，用于电影年份冲突判定。 */
-  movieFileEvidence?: TmdbMovieFileEvidence[];
-  /** 首次标题没有可接受候选时，延迟生成 AI 第二查询建议；允许同时纠正电影或节目类型。 */
+  /** APP 普通查询和父目录补查均无结果时，沿用云助手 AI 查询建议，允许纠正媒体类型。 */
   resolveSecondSearchSuggestion?: () => Promise<{
     title: string;
     mediaType: "movie" | "tv";
@@ -317,7 +329,11 @@ export class TmdbKeyPool {
     if (this.states.length === 0) return null;
     const metadata = await this.scrapeVideoFromRemote(query);
     if (!metadata) return null;
-    await this.writeCachedVideo(queryCacheKey, query.language, query.region, { ...metadata, recognitionCacheKey: queryCacheKey });
+    metadata.recognitionVersion = 5;
+    // 父目录结果只写入独立缓存，常规查询缓存仍保留文件查询身份。
+    if (!metadata.parentMovieMatch) {
+      await this.writeCachedVideo(queryCacheKey, query.language, query.region, { ...metadata, recognitionCacheKey: queryCacheKey });
+    }
     if (metadata.detailsSynchronized) {
       await this.writeCachedVideo(
         this.buildVideoIdCacheKey(metadata.mediaType, metadata.id, query.language, query.region),
@@ -382,83 +398,78 @@ export class TmdbKeyPool {
     }
 
     const primaryTitle = query.title.trim();
-    const primaryCandidates = await this.searchCandidates(
-      query.mediaType,
-      primaryTitle,
-      query.year,
-      query.language,
-      query.region,
-      query.signal,
-    );
+    const searchedTitles = [FlymbyVideoTitleCleaner.normalizeSearchText(primaryTitle)];
+    const primaryCandidates = await this.searchCandidates(query.mediaType, primaryTitle, query.year,
+      query.language, query.region, query.signal);
     let candidates = mergeTmdbCandidates([], primaryCandidates);
+    let actualTitle = primaryTitle;
     let candidate = pickStrictTmdbCandidate(query.mediaType, candidates, primaryTitle, query.year);
-    if (candidate) {
-      this.logRecognitionCandidates(query, query.mediaType, candidates, primaryTitle, candidate, false);
-      return this.readAcceptedCandidate(query, query.mediaType, candidate, primaryTitle, candidates.length);
+    // 与 APP 相同：有候选直接进行标题优先选择，只有空结果才换词并忽略年份。
+    if (candidates.length === 0 && !query.signal?.aborted) {
+      const simplified = FlymbyVideoTitleCleaner.buildAlternateTmdbSearchQuery(primaryTitle);
+      const seriesFallback = query.mediaType === "tv" && !query.fallbackTitle && !simplified
+        ? this.buildFirstSeriesTitleFallback(primaryTitle) : "";
+      const alternateTitle = query.fallbackTitle || simplified || seriesFallback || (query.year ? primaryTitle : "");
+      if (alternateTitle && (query.year || FlymbyVideoTitleCleaner.normalizeSearchText(alternateTitle) !== searchedTitles[0])) {
+        searchedTitles.push(FlymbyVideoTitleCleaner.normalizeSearchText(alternateTitle));
+        const alternate = await this.searchCandidates(query.mediaType, alternateTitle, null,
+          query.language, query.region, query.signal);
+        candidates = mergeTmdbCandidates(candidates, alternate);
+        actualTitle = alternateTitle;
+        candidate = pickStrictTmdbCandidate(query.mediaType, candidates, actualTitle, query.year)
+          ?? pickStrictTmdbCandidate(query.mediaType, candidates, primaryTitle, query.year);
+      }
     }
     if (query.signal?.aborted) return null;
-    // 首轮候选全部不合格时也进入第二查询，保留云助手现有 AI 建议能力。
-    const aiSecondSuggestion = query.resolveSecondSearchSuggestion
-      ? await query.resolveSecondSearchSuggestion()
-      : null;
-    const aiSecondTitle = String(aiSecondSuggestion?.title ?? "").trim();
-    // 关键变量：文件名回退优先于普通简化标题，并与主查询去重。
-    const fileFallbackTitle = String(query.fallbackTitle ?? "").trim();
-    const simplifiedTitle = FlymbyVideoTitleCleaner.buildAlternateTmdbSearchQuery(primaryTitle);
-    const firstSeriesFallback = query.mediaType === "tv" && !fileFallbackTitle && !simplifiedTitle
-      ? this.buildFirstSeriesTitleFallback(primaryTitle)
-      : "";
-    const normalizedPrimaryTitle = FlymbyVideoTitleCleaner.normalizeSearchText(primaryTitle);
-    const aiMediaTypeChanged = Boolean(aiSecondSuggestion && aiSecondSuggestion.mediaType !== query.mediaType);
-    const validAiSecondTitle = FlymbyVideoTitleCleaner.normalizeSearchText(aiSecondTitle) === normalizedPrimaryTitle
-      && !aiMediaTypeChanged
-      ? ""
-      : aiSecondTitle;
-    const alternateTitle = validAiSecondTitle || fileFallbackTitle || simplifiedTitle || firstSeriesFallback;
-    // 关键变量：只有实际采用 AI 第二查询词时才切换类型，普通文件名回退仍使用原规则类型。
-    const alternateMediaType = validAiSecondTitle && aiSecondSuggestion
-      ? aiSecondSuggestion.mediaType
-      : query.mediaType;
-    if (validAiSecondTitle && alternateMediaType !== query.mediaType) {
-      this.diagnosticLogger({
-        日志关键字: "codex-flycloud-helper-ai-clean",
-        事件: "TMDB第二次查询采用AI纠正类型",
-        原媒体类型: query.mediaType,
-        AI媒体类型: alternateMediaType,
-        原查询标题: primaryTitle,
-        AI查询标题: validAiSecondTitle,
-      });
+    const usedFallback = !candidate;
+    candidate ??= pickAppTmdbFallbackCandidate(candidates, actualTitle, query.year);
+    this.logRecognitionCandidates(query, query.mediaType, candidates, actualTitle, candidate, usedFallback);
+    if (candidate) return this.readAcceptedCandidate(query, query.mediaType, candidate, actualTitle, candidates.length);
+
+    const parentResult = await this.scrapeParentMovie(query, searchedTitles);
+    if (parentResult || query.signal?.aborted) return parentResult;
+    // 云助手已有 AI 配置保留；APP 普通搜索和父目录补查都未命中后，才请求 AI 纠正查询。
+    const suggestion = await query.resolveSecondSearchSuggestion?.();
+    if (suggestion?.title && !query.signal?.aborted &&
+      (suggestion.mediaType !== query.mediaType || !searchedTitles.includes(FlymbyVideoTitleCleaner.normalizeSearchText(suggestion.title)))) {
+      const aiCandidates = await this.searchCandidates(suggestion.mediaType, suggestion.title, null,
+        query.language, query.region, query.signal);
+      const strict = pickStrictTmdbCandidate(suggestion.mediaType, aiCandidates, suggestion.title, query.year);
+      const aiCandidate = strict ?? pickAppTmdbFallbackCandidate(aiCandidates, suggestion.title, query.year);
+      this.logRecognitionCandidates(query, suggestion.mediaType, aiCandidates, suggestion.title, aiCandidate, !strict);
+      if (aiCandidate) return this.readAcceptedCandidate(query, suggestion.mediaType, aiCandidate, suggestion.title, aiCandidates.length);
     }
-    const relaxedTitle = alternateTitle || (query.year ? primaryTitle : "");
-    let actualTitle = primaryTitle;
-    let actualMediaType = query.mediaType;
-    // 第二轮去掉年份，但候选接受仍使用原解析年份；类型改变时两种 ID 空间不能混合。
-    if (relaxedTitle && (query.year || alternateMediaType !== query.mediaType
-      || FlymbyVideoTitleCleaner.normalizeSearchText(relaxedTitle) !== normalizedPrimaryTitle)) {
-      const secondCandidates = await this.searchCandidates(
-        alternateMediaType, relaxedTitle, null, query.language, query.region, query.signal,
-      );
-      if (query.signal?.aborted) return null;
-      if (alternateMediaType !== query.mediaType) {
-        this.logRecognitionCandidates(query, query.mediaType, candidates, primaryTitle, undefined, false);
-      }
-      actualTitle = relaxedTitle;
-      actualMediaType = alternateMediaType;
-      candidates = alternateMediaType === query.mediaType
-        ? mergeTmdbCandidates(candidates, secondCandidates) : mergeTmdbCandidates([], secondCandidates);
-      candidate = pickStrictTmdbCandidate(actualMediaType, candidates, actualTitle, query.year);
-      if (!candidate && actualMediaType === query.mediaType) {
-        candidate = pickStrictTmdbCandidate(actualMediaType, candidates, primaryTitle, query.year);
-      }
+    return null;
+  }
+
+  /** 文件搜索失败后只补查经过完整目录确认的直属父目录，缓存与普通查询隔离。 */
+  private async scrapeParentMovie(query: TmdbVideoQuery, searchedTitles: string[]): Promise<TmdbVideoMetadata | null> {
+    const parent = query.parentMovieQuery;
+    if (query.mediaType !== "movie" || !parent || !parent.parentPath || parent.parentPath === "/"
+      || (parent.year && query.year && parent.year !== query.year)
+      || searchedTitles.includes(FlymbyVideoTitleCleaner.normalizeSearchText(parent.query))) return null;
+    const cacheKey = this.createMetadataCacheKey([this.buildVideoQueryCacheKey(query), "parent-directory-v1",
+      parent.parentPath, parent.query, parent.year]);
+    const cached = await this.readCachedVideo(cacheKey);
+    if (cached?.recognitionVersion === 5 && cached.recognitionCacheKey === cacheKey && cached.mediaType === "movie"
+      && cached.parentMovieMatch?.parentPath === parent.parentPath
+      && cached.parentMovieMatch.query === parent.query && cached.parentMovieMatch.year === parent.year) {
+      this.diagnosticLogger({日志关键字: "codex-flycloud-app-scan-sync", 事件: "命中电影父目录缓存", 任务ID: query.jobId ?? "", 父目录: parent.parentPath, 查询标题: parent.query});
+      return cached;
     }
-    const usedRelaxedYear = !candidate;
-    if (!candidate) {
-      const titles = actualMediaType === query.mediaType ? [primaryTitle, actualTitle] : [actualTitle];
-      candidate = pickRelaxedTmdbCandidate(actualMediaType, candidates, titles, query.year, query.movieFileEvidence);
-    }
-    this.logRecognitionCandidates(query, actualMediaType, candidates, actualTitle, candidate, usedRelaxedYear);
-    if (!candidate) return null;
-    return this.readAcceptedCandidate(query, actualMediaType, candidate, actualTitle, candidates.length);
+    const candidates = await this.searchCandidates("movie", parent.query, parent.year, query.language, query.region, query.signal);
+    searchedTitles.push(FlymbyVideoTitleCleaner.normalizeSearchText(parent.query));
+    const strict = pickStrictTmdbCandidate("movie", candidates, parent.query, parent.year);
+    const candidate = strict ?? pickAppTmdbFallbackCandidate(candidates, parent.query, parent.year);
+    this.logRecognitionCandidates({...query, year: parent.year}, "movie", candidates, parent.query, candidate, !strict);
+    if (!candidate || query.signal?.aborted) return null;
+    const metadata = await this.readAcceptedCandidate(query, "movie", candidate, parent.query, candidates.length);
+    if (!metadata) return null;
+    metadata.parentMovieMatch = parent;
+    metadata.recognitionVersion = 5;
+    metadata.recognitionCacheKey = cacheKey;
+    await this.writeCachedVideo(cacheKey, query.language, query.region, metadata);
+    return metadata;
   }
 
   /** 接受后统一读取摘要或详情，扫描阶段的详情开关保持原有行为。 */
@@ -478,14 +489,23 @@ export class TmdbKeyPool {
     query: TmdbVideoQuery, mediaType: "movie" | "tv", candidates: TmdbSearchCandidate[],
     actualTitle: string, accepted: TmdbSearchCandidate | undefined, relaxed: boolean,
   ): void {
-    this.diagnosticLogger({
-      日志关键字: "codex-webdav-media-recognition", 阶段: "TMDB候选", 媒体类型: mediaType,
+    const titleScore = accepted ? isTmdbStrongTitleMatch(actualTitle, accepted) ? 1000
+      : isTmdbCandidateTitleCompatible(actualTitle, accepted) ? 100 : -1000 : null;
+    const yearMatched = Boolean(accepted && query.year && tmdbCandidateYear(accepted) === query.year);
+    const reason = !accepted ? "搜索没有返回候选" : !relaxed ? "严格标题与年份匹配"
+      : titleScore === 1000 ? "优先采用标题相同候选" : titleScore === 100 ? "优先采用标题兼容候选"
+      : yearMatched ? "无标题匹配，采用同年候选" : "采用搜索首条";
+    const decision = {
       原查询标题: query.title, 实际查询标题: actualTitle, 解析年份: query.year, 候选数量: candidates.length,
-      判定: accepted ? "接受" : "拒绝自动绑定", 年份放宽: Boolean(accepted && relaxed),
-      TMDB编号: accepted?.id ?? 0,
-    });
+      判定: accepted ? "接受" : "未匹配", 选择原因: reason, 标题得分: titleScore,
+      年份匹配: yearMatched, 候选年份: accepted ? tmdbCandidateYear(accepted) : null,
+      候选标题: accepted?.title ?? "", TMDB编号: accepted?.id ?? 0,
+    };
+    query.onRecognitionDecision?.(decision);
+    this.diagnosticLogger({日志关键字: "codex-flycloud-app-scan-sync", 阶段: "TMDB候选",
+      任务ID: query.jobId ?? "", 媒体类型: mediaType, ...decision});
     for (const candidate of candidates) this.diagnosticLogger({
-      日志关键字: "codex-webdav-media-recognition", 阶段: "候选明细", 查询标题: actualTitle,
+      日志关键字: "codex-flycloud-app-scan-sync", 阶段: "候选明细", 任务ID: query.jobId ?? "", 查询标题: actualTitle,
       TMDB编号: candidate.id, 标题: candidate.title, 原标题: candidate.originalTitle,
       年份: extractDateYear(candidate.date), 判定: accepted?.id === candidate.id ? "接受" : "未选中",
     });
@@ -493,18 +513,9 @@ export class TmdbKeyPool {
 
   /** 只有当前规则校验过且请求证据一致的查询缓存，才可复用放宽年份或 AI 纠正结果。 */
   private isQueryCacheCompatible(query: TmdbVideoQuery, metadata: TmdbVideoMetadata, cacheKey: string): boolean {
-    if (metadata.recognitionCacheKey !== cacheKey) return false;
-    if (query.explicitTmdbId || query.imdbId) return true;
-    const candidate = { ...metadata, date: metadata.releaseDate, popularity: 0 };
-    const titles = [query.title, query.fallbackTitle ?? "",
-      FlymbyVideoTitleCleaner.buildAlternateTmdbSearchQuery(query.title),
-      query.mediaType === "tv" ? this.buildFirstSeriesTitleFallback(query.title) : ""];
-    if (metadata.mediaType === query.mediaType && titles.some((title) =>
-      (isTmdbCandidateTitleCompatible(title, candidate) && (!query.year || metadata.year === query.year))
-      || (isTmdbStrongTitleMatch(title, candidate)
-        && canRelaxTmdbCandidateYear(query.mediaType, query.year, candidate, query.movieFileEvidence)))) return true;
-    // AI 的实际查询词不进入公共载荷；请求指纹和 AI 配置修订共同证明它已通过本版候选检查。
-    return Boolean(query.resolveSecondSearchSuggestion);
+    // 指纹包含查询词、年份、类型、语言和当前规则修订；不再用地区上映年否定已接受结果。
+    if (metadata.recognitionVersion !== 5 || metadata.recognitionCacheKey !== cacheKey || metadata.parentMovieMatch) return false;
+    return metadata.mediaType === query.mediaType || Boolean(query.resolveSecondSearchSuggestion || query.explicitTmdbId || query.imdbId);
   }
 
   /** 兼容原电影调用点，内部使用完整电影刮削。 */
@@ -612,7 +623,7 @@ export class TmdbKeyPool {
   /** 为标题匹配生成部署级公共缓存键，避免不同语言、地区或详情模式互相覆盖。 */
   private buildVideoQueryCacheKey(query: TmdbVideoQuery): string {
     return this.createMetadataCacheKey([
-      "recognition-v2-2026-09-06",
+      "flymby-app-recognition-v5-2026-09-13",
       "video_query",
       query.mediaType,
       this.normalizeCacheQueryText(query.title),
@@ -625,8 +636,7 @@ export class TmdbKeyPool {
       query.includeDetails === false ? "summary" : "details",
       String(query.cacheRevision ?? ""),
       query.resolveSecondSearchSuggestion ? "ai-second-query" : "rule-second-query",
-      JSON.stringify((query.movieFileEvidence ?? []).map((file) => [file.title, file.year])
-        .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)))),
+
     ]);
   }
 
@@ -777,7 +787,10 @@ export class TmdbKeyPool {
       include_adult: "false",
     };
     if (region) params.region = region;
-    if (year) params[mediaType === "movie" ? "primary_release_year" : "first_air_date_year"] = String(year);
+    if (year) {
+      params[mediaType === "movie" ? "primary_release_year" : "first_air_date_year"] = String(year);
+      if (mediaType === "movie") params.year = String(year);
+    }
     const payload = await this.requestJson<Record<string, unknown>>(`/search/${mediaType}`, params, signal);
     const results = Array.isArray(payload?.results) ? payload.results : [];
     return results.flatMap((raw): TmdbSearchCandidate[] => {

@@ -1119,6 +1119,12 @@ export class ServiceRepository {
       });
     });
     // 连接重新配置成功后，自动把因鉴权失效而停止的规格文件放入新的后台任务。
+    this.logger?.("info", {
+      日志标记: "codex-flycloud-helper-service-connection-state",
+      事件: "新连接验证成功并清除异常提示",
+      服务ID: input.serviceId,
+      当前连接状态: "valid",
+    });
     await this.recoverMediaProbesAfterReauthorization(input.serviceId, input.userId, input.userId);
     return this.getServiceDetail(input.serviceId, input.userId);
   }
@@ -1141,6 +1147,13 @@ export class ServiceRepository {
       connection_status: "valid",
       status: nextStatus,
       updated_at: now,
+    });
+    this.logger?.("info", {
+      日志标记: "codex-flycloud-helper-service-connection-state",
+      事件: "当前连接验证成功并清除异常提示",
+      服务ID: serviceId,
+      原连接状态: service.connection_status,
+      当前连接状态: "valid",
     });
     if (nextStatus === "active") {
       await this.recoverMediaProbesAfterReauthorization(serviceId, String(service.user_id), String(service.user_id));
@@ -1985,9 +1998,25 @@ export class ServiceRepository {
       if (changed !== 1) {
         throw new ApiError(409, "job_operation_in_progress", "任务正在处理其他操作，请等待状态刷新后再试");
       }
+      const service = await transaction("cloud_services").where({ id: current.serviceId }).forUpdate().first();
+      // 关键变量：重新登录已生成新凭据时，旧任务的结果不能覆盖新连接状态。
+      const usesCurrentCredential = Number(service?.credential_revision) === Number(current.snapshot.credentialRevision);
+      let connectionStatus = String(service?.connection_status ?? "valid");
+      if (usesCurrentCredential) {
+        if (input.status === "failed" && (input.errorCode === "provider_authentication_failed"
+          || input.errorCode === "cloud123_authentication_expired")) {
+          connectionStatus = "reauthorization_required";
+        } else if (input.status === "failed" && input.errorCode === "cloud123_business_failed"
+          && service?.provider_type === "cloud123" && connectionStatus !== "reauthorization_required") {
+          connectionStatus = "cloud123_business_failed";
+        } else if (input.status === "completed" && current.snapshot.taskPurpose !== "ai_supplement_unmatched") {
+          connectionStatus = "valid";
+        }
+      }
       const servicePatch: Record<string, unknown> = {
-        status: input.errorCode === "provider_authentication_failed" ? "reauthorization_required" : "active",
-        connection_status: input.errorCode === "provider_authentication_failed" ? "reauthorization_required" : "valid",
+        status: service?.status === "disabled" ? "disabled"
+          : connectionStatus === "reauthorization_required" ? "reauthorization_required" : "active",
+        connection_status: connectionStatus,
         updated_at: now,
       };
       // AI 补充只处理数据库现有未匹配内容，完成时不能伪造一次网盘扫描时间。
@@ -1995,6 +2024,19 @@ export class ServiceRepository {
         servicePatch.last_scan_at = now;
       }
       await transaction("cloud_services").where({ id: current.serviceId }).update(servicePatch);
+      if (connectionStatus !== service?.connection_status || (!usesCurrentCredential && input.errorCode)) {
+        this.logger?.("info", {
+          日志标记: "codex-flycloud-helper-service-connection-state",
+          事件: usesCurrentCredential ? "任务结果更新服务连接状态" : "旧凭据任务保留当前连接状态",
+          服务ID: current.serviceId,
+          任务ID: current.id,
+          错误码: input.errorCode ?? null,
+          原连接状态: service?.connection_status,
+          当前连接状态: connectionStatus,
+          任务凭据修订: Number(current.snapshot.credentialRevision),
+          当前凭据修订: service?.credential_revision,
+        });
+      }
       if (input.status === "completed" || input.status === "cancelled") {
         await transaction("scan_job_checkpoints").where({ job_id: current.id }).delete();
       }
@@ -2992,10 +3034,9 @@ export class ServiceRepository {
         const storedMetadataRevision = Number(existing?.metadata_profile_revision ?? 0);
         const revisionMatches = storedMetadataRevision === 0
           || storedMetadataRevision === input.metadataProfileRevision;
-        // 关键变量：历史数据没有识别修订时允许复用一次，之后统一写入当前识别修订。
+        // 关键变量：旧识别规则和缺少修订的历史结果必须重新识别，不能直接盖上 APP 新版修订。
         const storedRecognitionRevision = String(existing?.recognition_revision ?? "");
-        const recognitionRevisionMatches = storedRecognitionRevision.length === 0
-          || storedRecognitionRevision === input.recognitionRevision;
+        const recognitionRevisionMatches = storedRecognitionRevision === input.recognitionRevision;
         reusableByResourceId.set(input.providerResourceId, Boolean(existing)
           && fingerprintUnchangedByResourceId.get(input.providerResourceId) === true
           && !replacementPathSet.has(input.path)

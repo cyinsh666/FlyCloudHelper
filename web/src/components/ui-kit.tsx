@@ -1,4 +1,5 @@
-import type { ReactNode } from "react";
+import { useId, useState, type ReactNode } from "react";
+import { ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { MatchState, MediaItem } from "@/lib/api";
 
@@ -43,25 +44,53 @@ export function Panel({
   action,
   children,
   className,
+  collapsible = false,
 }: {
   title?: string;
   description?: string;
   action?: ReactNode;
   children: ReactNode;
   className?: string;
+  collapsible?: boolean;
 }) {
+  // 关键变量：可折叠面板默认收起，普通面板始终展示内容。
+  const [expanded, setExpanded] = useState(false);
+  const contentId = useId();
+  const contentVisible = !collapsible || expanded;
+
+  /** 切换面板内容的可见状态，保留内部搜索和筛选控件。 */
+  function toggleExpanded(): void {
+    setExpanded((current) => !current);
+  }
+
   return (
     <section className={cn("surface p-5 sm:p-6", className)}>
-      {(title || action) && (
-        <header className="mb-5 grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
+      {(title || action || collapsible) && (
+        <header className={cn("grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3", contentVisible && "mb-5")}>
           <div className="min-w-0">
-            {title && <h2 className="truncate text-base font-semibold">{title}</h2>}
+            {collapsible ? (
+              <h2>
+                <button
+                  type="button"
+                  onClick={toggleExpanded}
+                  aria-expanded={expanded}
+                  aria-controls={contentId}
+                  className="flex w-full items-center gap-3 rounded-md text-left focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-muted-foreground"
+                >
+                  <span className="min-w-0 truncate text-base font-semibold">{title}</span>
+                  <span className="ml-auto inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
+                    {expanded ? "收起" : "展开"}
+                    <ChevronDown aria-hidden="true" className={cn("size-4 transition-transform", expanded && "rotate-180")} />
+                  </span>
+                </button>
+              </h2>
+            ) : title && <h2 className="truncate text-base font-semibold">{title}</h2>}
             {description && <p className="mt-1 text-xs text-muted-foreground">{description}</p>}
           </div>
           {action && <div className="shrink-0">{action}</div>}
         </header>
       )}
-      {children}
+      {collapsible ? <div id={contentId} hidden={!expanded}>{children}</div> : children}
     </section>
   );
 }

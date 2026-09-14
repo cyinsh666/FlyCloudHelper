@@ -26,7 +26,6 @@ import {
 import type { AiModelManager } from "./ai/ai-model-manager.js";
 import { isWeakFlymbyScrapeTitle, parseFlymbyVideoName } from "./media/flymby-video-parser.js";
 import { FlymbyVideoTitleCleaner } from "./media/flymby-video-title-cleaner.js";
-import type { TmdbMovieFileEvidence } from "./metadata/tmdb-candidate-matcher.js";
 import {
   parseFlymbyNfo,
   toPublicImageValue,
@@ -106,6 +105,8 @@ interface EnrichedMetadata {
 interface ScanMetadataCache {
   /** 同一电影或节目在一次扫描中只执行一次搜索；是否继续读取详情由服务开关决定。 */
   video: Map<string, Promise<TmdbVideoMetadata | null>>;
+  /** 同一影片的多个文件共用候选判断，导出失败报告时保留一致的原因。 */
+  videoDecisions?: Map<string, Record<string, unknown>>;
   /** 同一节目季在一次扫描中只请求一次单集列表。 */
   seasons: Map<string, Promise<TmdbEpisodeMetadata[]>>;
   /** 完整标签按专辑复用一次图片补全，缺失标签则按曲目复用多平台刮削结果。 */
@@ -1835,6 +1836,10 @@ export class ScanWorker {
                 parsedTitle: descriptor.title,
                 businessTaskKey,
                 context: {
+                  候选判断: descriptor.metadata.tmdbRecognitionDecision
+                    ? JSON.stringify(descriptor.metadata.tmdbRecognitionDecision) : null,
+                  判型说明: typeof descriptor.metadata.recognitionDetail === "string"
+                    ? descriptor.metadata.recognitionDetail : null,
                   使用元数据Provider: descriptor.mediaType === "music"
                     ? musicMetadataProviderId
                     : readMetadataProviderId(videoMetadataProfile) || "builtin.tmdb",
@@ -2096,7 +2101,11 @@ export class ScanWorker {
           日志关键字: "codex-webdav-media-recognition", 阶段: "文件判型与分组", 任务ID: job.id,
           文件名: parsed.fileName, 媒体类型: parsed.mediaType, 查询标题: parsed.query, 年份: parsed.year,
           季号: parsed.seasonNumber, 集号: parsed.episodeNumber, 识别依据: parsed.recognitionReason,
-          连续三集优先: parsed.recognitionReason === "consecutive_episode_priority",
+          连续集号优先: parsed.recognitionReason === "consecutive_episode_priority",
+          APP同步关键字: "codex-flycloud-app-scan-sync",
+          判型说明: parsed.recognitionDetail,
+          清洗命中词: parsed.titleNoise,
+          父目录补查: parsed.parentMovieFallback?.query ?? "",
           未知季: parsed.seasonNumber === WEBDAV_UNKNOWN_SEASON,
           数字电影证据: Boolean(parsed.confirmedNumericMovieTitle),
           刮削任务键: ruleDescriptors.get(resourceId)?.metadata.scrapeTaskKey,
@@ -3394,6 +3403,7 @@ export class ScanWorker {
     }
     const recognitionRevision = buildAiRecognitionRevision(Number(jobSnapshot.metadataProfileRevision ?? 0), aiModelSnapshot);
     const cacheKey = `${mediaType}|${String(descriptor.metadata.scrapeTaskKey ?? query)}|${language}|${region}|${recognitionRevision}`;
+    cache.videoDecisions ??= new Map<string, Record<string, unknown>>();
     let videoPromise = cache.video.get(cacheKey);
     const isFirstTaskQuery = !videoPromise;
     if (!videoPromise) {
@@ -3408,11 +3418,15 @@ export class ScanWorker {
         IMDB编号: imdbId || "无",
       });
       videoPromise = this.tmdb.scrapeVideo({
+        jobId,
+        // 候选选择原因随失败报告一起导出，避免只剩统一的“未匹配”。
+        onRecognitionDecision: (decision): void => {
+          cache.videoDecisions?.set(cacheKey, decision);
+        },
+        parentMovieQuery: descriptor.metadata.parentMovieQuery as import("./metadata/tmdb.js").TmdbParentMovieQuery | undefined,
         mediaType,
         title: query,
         fallbackTitle: fallbackQuery,
-        movieFileEvidence: Array.isArray(descriptor.metadata.movieFileEvidence)
-          ? descriptor.metadata.movieFileEvidence as TmdbMovieFileEvidence[] : [],
         year: descriptor.year,
         language,
         region,
@@ -3445,6 +3459,7 @@ export class ScanWorker {
       cache.video.set(cacheKey, videoPromise);
     }
     const result = await videoPromise;
+    descriptor.metadata.tmdbRecognitionDecision = cache.videoDecisions.get(cacheKey);
     if (!result) {
       if (isFirstTaskQuery) {
         this.logger.warn({

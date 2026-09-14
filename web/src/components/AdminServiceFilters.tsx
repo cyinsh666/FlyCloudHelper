@@ -71,7 +71,7 @@ export function AdminServiceFilters({
   }
 
   return (
-    <Panel className="mb-4" title="筛选" action={<span className="text-xs text-muted-foreground">共 {resultCount.toLocaleString()} 项</span>}>
+    <Panel collapsible className="mb-4" title="筛选" action={<span className="text-xs text-muted-foreground">共 {resultCount.toLocaleString()} 项</span>}>
       <form onSubmit={submitSearch} className="grid gap-5">
         <div className="grid gap-3 md:grid-cols-[minmax(220px,1fr)_auto]">
           <div className="flex min-w-0 items-center gap-2 rounded-lg border border-input bg-background/50 px-3 py-2.5">

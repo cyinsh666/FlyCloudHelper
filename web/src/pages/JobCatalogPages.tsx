@@ -613,7 +613,7 @@ function JobsView({ admin }: { admin: boolean }) {
         </>}
       />
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
-      <Panel className="mb-4" title="筛选任务">
+      <Panel collapsible className="mb-4" title="筛选任务">
         <div className="grid gap-4">
           <div className="grid gap-2">
             <p className="text-xs text-muted-foreground">任务状态</p>
