@@ -229,6 +229,7 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.integer("emby_region_libraries_enabled").notNullable().defaultTo(0);
       table.integer("emby_enabled").notNullable().defaultTo(0);
       table.integer("navidrome_enabled").notNullable().defaultTo(0);
+      table.integer("navidrome_relay_playback_enabled").notNullable().defaultTo(1);
       table.string("navidrome_path_suffix", 255).notNullable();
       table.string("navidrome_path_suffix_lookup", 255).notNullable();
       table.string("jellyfin_path_suffix", 255).notNullable();
@@ -270,6 +271,10 @@ async function createServiceTables(database: Knex): Promise<void> {
     });
     await addColumnIfMissing(database, "media_libraries", "emby_enabled", (table) => {
       table.integer("emby_enabled").notNullable().defaultTo(0);
+    });
+    // 历史音乐服务始终中转，新增开关默认开启，升级后保持原有行为。
+    await addColumnIfMissing(database, "media_libraries", "navidrome_relay_playback_enabled", (table) => {
+      table.integer("navidrome_relay_playback_enabled").notNullable().defaultTo(1);
     });
     await addColumnIfMissing(database, "media_libraries", "navidrome_enabled", (table) => {
       table.integer("navidrome_enabled").notNullable().defaultTo(0);

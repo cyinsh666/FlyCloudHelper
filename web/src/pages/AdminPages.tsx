@@ -49,6 +49,13 @@ const userStatusLabels = {
   pending_delete: "待删除",
 } as const;
 
+/** 将用户状态转换为用户名旁的圆点颜色。 */
+function getUserStatusDotClass(status: keyof typeof userStatusLabels): string {
+  if (status === "active") return "bg-success";
+  if (status === "pending_delete") return "bg-destructive";
+  return "bg-muted-foreground";
+}
+
 const databaseTypeLabels = {
   sqlite: "SQLite",
   postgres: "PostgreSQL",
@@ -284,16 +291,58 @@ export function AdminUsersPage() {
     }
   }
 
+  // 关键变量：管理账号与普通账号分区展示，避免角色只依赖卡片内的小字区分。
+  const userGroups = [
+    {
+      key: "administrators",
+      title: "管理员",
+      users: resource.data?.items.filter((user) => user.role === "super_admin") ?? [],
+    },
+    {
+      key: "users",
+      title: "普通用户",
+      users: resource.data?.items.filter((user) => user.role === "user") ?? [],
+    },
+  ];
+
   return (
     <>
       <PageHeader title="用户管理" actions={<PrimaryButton onClick={() => setShowCreate((value) => !value)}><Plus className="size-4" /> 创建用户</PrimaryButton>} />
-      {showCreate && <Panel className="mb-4" title="创建普通用户"><form onSubmit={(event) => void submitCreate(event)} className="grid gap-3 md:grid-cols-4"><input name="username" required minLength={4} placeholder="用户名" className="rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /><input name="password" required minLength={4} type="password" placeholder="密码" className="rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /><input name="passwordConfirmation" required minLength={4} type="password" placeholder="确认密码" className="rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /><PrimaryButton type="submit">确认创建</PrimaryButton></form></Panel>}
+      {showCreate && <Panel className="mb-4 p-4 sm:p-4" title="创建普通用户"><form onSubmit={(event) => void submitCreate(event)} className="grid gap-2 md:grid-cols-4"><input name="username" required minLength={4} placeholder="用户名" className="rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm" /><input name="password" required minLength={4} type="password" placeholder="密码" className="rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm" /><input name="passwordConfirmation" required minLength={4} type="password" placeholder="确认密码" className="rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm" /><PrimaryButton type="submit">确认创建</PrimaryButton></form></Panel>}
       {message && <p className="mb-4 text-sm text-muted-foreground">{message}</p>}
-      <div className="grid gap-4 lg:grid-cols-2">{resource.data?.items.map((user) => {
+      <div className="grid gap-5">{userGroups.map((group) => <section key={group.key}>
+        <header className="mb-3 flex items-center gap-2">
+          <h2 className="text-sm font-semibold">{group.title}</h2>
+          <StatusPill>{group.users.length}</StatusPill>
+        </header>
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">{group.users.map((user) => {
         const isCurrentUser = user.userId === resource.data?.currentUser.userId;
         const isDeleting = deletingUserId === user.userId;
-        return <article key={user.userId} className="surface p-5"><header className="flex items-center justify-between gap-3"><div><h2 className="text-sm font-semibold">{user.username}</h2><p className="mt-1 font-mono text-[11px] text-muted-foreground">{user.userId}</p></div><div className="flex gap-2"><StatusPill tone={user.role === "super_admin" ? "primary" : "neutral"}>{userRoleLabels[user.role]}</StatusPill><StatusPill tone={user.status === "active" ? "success" : "danger"}>{userStatusLabels[user.status]}</StatusPill></div></header><dl className="mt-5 grid grid-cols-2 gap-3 text-center"><div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">服务数</dt><dd className="mt-1 text-xs font-medium">{user.serviceCount}</dd></div><div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">媒体数</dt><dd className="mt-1 text-xs font-medium">{user.mediaCount.toLocaleString()}</dd></div></dl><footer className="mt-5 flex flex-wrap gap-2"><button type="button" onClick={() => void toggleUser(user.userId, user.username, user.status === "active")} className="cursor-pointer rounded-lg border border-border bg-secondary/30 px-3 py-2 text-xs text-foreground transition-colors hover:border-foreground/30 hover:bg-secondary">{user.status === "active" ? "停用用户" : "启用用户"}</button><button type="button" onClick={() => void revokeUserSessions(user.userId, user.username)} className="cursor-pointer rounded-lg border border-border bg-secondary/30 px-3 py-2 text-xs text-foreground transition-colors hover:border-warning/50 hover:bg-warning/10 hover:text-warning">撤销全部会话</button>{!isCurrentUser && user.status !== "pending_delete" && <button type="button" disabled={isDeleting} onClick={() => void deleteUser(user.userId, user.username)} className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive transition-colors hover:border-destructive/70 hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-60"><Trash2 className="size-3.5" /> {isDeleting ? "正在删除…" : "删除用户"}</button>}{!isCurrentUser && user.status === "pending_delete" && <button type="button" disabled={isDeleting} onClick={() => void purgeUser(user.userId, user.username)} className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-destructive/60 bg-destructive px-3 py-2 text-xs font-semibold text-destructive-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"><Trash2 className="size-3.5" /> {isDeleting ? "正在彻底删除…" : "彻底删除"}</button>}</footer></article>;
-      })}</div>
+        return <article key={user.userId} className="surface p-4">
+          <header className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex min-w-0 items-center gap-2">
+                <h2 className="truncate text-sm font-semibold">{user.username}</h2>
+                <span role="status" aria-label={userStatusLabels[user.status]} title={userStatusLabels[user.status]} className={`size-2 shrink-0 rounded-full ${getUserStatusDotClass(user.status)}`} />
+              </div>
+              <p className="mt-0.5 text-[11px] text-muted-foreground">{userRoleLabels[user.role]}</p>
+            </div>
+            {isCurrentUser && <StatusPill tone="primary">当前账号</StatusPill>}
+          </header>
+          <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+            <span>服务 {user.serviceCount.toLocaleString()}</span>
+            <span>媒体 {user.mediaCount.toLocaleString()}</span>
+          </div>
+          <p className="mt-1 truncate text-[10px] text-muted-foreground" title={user.lastLoginAt ? formatJobDateTime(user.lastLoginAt) : "尚未登录"}>最近登录 {user.lastLoginAt ? formatJobDateTime(user.lastLoginAt) : "尚未登录"}</p>
+          <footer className="mt-3 flex items-center gap-2 border-t border-border/70 pt-3">
+            <button type="button" onClick={() => void toggleUser(user.userId, user.username, user.status === "active")} className="cursor-pointer rounded-lg border border-border bg-secondary/30 px-3 py-2 text-xs text-foreground transition-colors hover:border-foreground/30 hover:bg-secondary">{user.status === "active" ? "停用" : "启用"}</button>
+            <button type="button" onClick={() => void revokeUserSessions(user.userId, user.username)} className="cursor-pointer rounded-lg border border-border bg-secondary/30 px-3 py-2 text-xs text-foreground transition-colors hover:border-warning/50 hover:bg-warning/10 hover:text-warning">撤销会话</button>
+            {!isCurrentUser && user.status !== "pending_delete" && <button type="button" aria-label={`删除用户 ${user.username}`} title="删除用户" disabled={isDeleting} onClick={() => void deleteUser(user.userId, user.username)} className="ml-auto grid size-8 shrink-0 cursor-pointer place-items-center rounded-lg text-destructive transition-colors hover:bg-destructive/12 disabled:cursor-not-allowed disabled:opacity-60"><Trash2 className="size-3.5" /></button>}
+            {!isCurrentUser && user.status === "pending_delete" && <button type="button" aria-label={`彻底删除用户 ${user.username}`} title="彻底删除用户" disabled={isDeleting} onClick={() => void purgeUser(user.userId, user.username)} className="ml-auto grid size-8 shrink-0 cursor-pointer place-items-center rounded-lg bg-destructive text-destructive-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"><Trash2 className="size-3.5" /></button>}
+          </footer>
+        </article>;
+        })}</div>
+      </section>)}</div>
     </>
   );
 }

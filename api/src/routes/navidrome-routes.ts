@@ -1,3 +1,4 @@
+import { resolveNavidromeDirectPlayback } from "../music/navidrome-playback.js";
 import { openMusicFileStream } from "../music/file-stream.js";
 import type { IncomingMessage } from "node:http";
 import { randomUUID } from "node:crypto";
@@ -125,7 +126,7 @@ async function authenticateRequest(
     .join("media_libraries as l", "l.id", "s.library_id")
     .select(
       "s.id", "s.user_id", "s.library_id", "s.display_name", "s.status", "s.provider_type", "s.credential_revision",
-      "l.navidrome_enabled",
+      "l.navidrome_enabled", "l.navidrome_relay_playback_enabled",
     )
     .where("l.navidrome_path_suffix_lookup", pathSuffix.toLowerCase())
     .where("s.data_type", "music")
@@ -153,7 +154,7 @@ async function authenticateRequest(
       service_id: serviceId,
       provider_type: String(service.provider_type),
       service_status: String(service.status),
-      relay_playback_enabled: 1,
+      relay_playback_enabled: Number(service.navidrome_relay_playback_enabled ?? 1),
       credential_revision: Number(service.credential_revision),
     },
   };
@@ -867,6 +868,22 @@ async function streamSong(runtime: ApiRuntime, context: NavidromeContext, itemId
   let upstreamBody: IncomingMessage | null = null;
   try {
     const locator = file.playbackLocator && typeof file.playbackLocator === "object" ? file.playbackLocator as Record<string, unknown> : {};
+    if (Number(context.relayLibrary.relay_playback_enabled) !== 1) {
+      const direct = await resolveNavidromeDirectPlayback(runtime, context.relayLibrary, context.ownerUserId, locator, request, controller.signal);
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-flycloud-navidrome-playback", 事件: "选择音乐传输方式",
+        服务ID: context.serviceId, 歌曲ID: item.id, 网盘类型: context.relayLibrary.provider_type,
+        实际方式: direct.url ? "直连" : "回退中转", 回退原因: direct.fallbackReason,
+        请求方法: request.method, 是否Range请求: Boolean(request.headers.range),
+      });
+      if (direct.url) {
+        request.raw.removeListener("aborted", abort);
+        reply.raw.removeListener("close", abort);
+        reply.header("Cache-Control", "private, no-store");
+        // POST 表单包含 Subsonic 认证信息，303 改为 GET，不能将表单透传给网盘。
+        return reply.redirect(direct.url, request.method === "POST" ? 303 : 307);
+      }
+    }
     const upstream = await openMusicFileStream(
       () => resolveRelayAccess(runtime, context.relayLibrary, context.ownerUserId, locator, controller.signal),
       { method: request.method === "HEAD" ? "HEAD" : "GET", headers: buildUpstreamHeaders(request, {}) },
@@ -883,6 +900,9 @@ async function streamSong(runtime: ApiRuntime, context: NavidromeContext, itemId
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-navidrome",
       事件: "Navidrome歌曲流连接建立",
+      播放日志关键字: "codex-flycloud-navidrome-playback",
+      配置方式: Number(context.relayLibrary.relay_playback_enabled) === 1 ? "中转" : "直连优先",
+      实际方式: "中转",
       服务ID: context.serviceId,
       服务访问账号ID: context.accountId,
       歌曲ID: item.id,

@@ -109,7 +109,6 @@ export class Cloud139Provider extends CloudDriveProviderBase {
         } else if (error.code === "provider_request_failed" && /状态码 5\d\d/u.test(error.message)) {
           await delay((attempt + 1) * 1500, undefined, { signal });
         } else throw error;
-        this.networkOptions.logConnectionFailure?.({ 日志关键字: "codex-flycloud-music", 事件: "移动云盘有限重试", 错误码: error.code, 重试次数: attempt + 1 });
       }
     }
   }
@@ -123,7 +122,9 @@ export class Cloud139Provider extends CloudDriveProviderBase {
     if (["9000", "9008", "9100", "100002"].includes(code)) throw new ApiError(410, "cloud139_authentication_expired", "移动云盘登录已失效，请重新扫码");
     if (["403", "100403"].includes(code)) throw new ApiError(403, "cloud139_permission_denied", "移动云盘文件访问权限不足");
     if (code === "429") throw new ApiError(429, "cloud139_rate_limited", "移动云盘请求频繁，请稍后重试");
-    if (payload.success === false || (!["", "0", "0000"].includes(code) && payload.success !== true)) throw new ApiError(502, "cloud139_business_failed", "移动云盘文件请求失败，请检查文件是否存在");
+    if (payload.success === false || (!["", "0", "0000"].includes(code) && payload.success !== true)) {
+      throw new ApiError(502, "cloud139_business_failed", `移动云盘接口返回业务错误（业务码：${code || "未返回"}）`);
+    }
     return readCloudRecord(payload.data);
   }
 }

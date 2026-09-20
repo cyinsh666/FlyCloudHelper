@@ -1,7 +1,14 @@
+import { createHash } from "node:crypto";
 import { ApiError } from "../errors.js";
 import { CloudDriveProviderBase, type CloudDrivePage } from "./cloud-drive-base.js";
 import { parseCloudApiObject, readCloudNumber, readCloudRecord, readCloudText, readCloudTextFile, requestCloudApiText } from "./cloud-api.js";
-import type { ProviderNetworkOptions } from "./network.js";
+import {
+  PROVIDER_RATE_LIMIT_MAX_RETRIES,
+  readProviderRateLimitDelayMs,
+  registerProviderSharedRateLimit,
+  waitForProviderSharedRateLimit,
+  type ProviderNetworkOptions,
+} from "./network.js";
 import { type ProviderConnectionContext, type ProviderDescriptor, type ProviderEntry, type ProviderFileAccess, createProviderRecommendedScanSettings, requireConnectionString } from "./types.js";
 
 const QUARK_API = "https://drive.quark.cn/1/clouddrive";
@@ -10,6 +17,10 @@ const QUARK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) quark-cloud-drive/2.
 /** 夸克网盘 Cookie 只读 Provider。 */
 export class QuarkProvider extends CloudDriveProviderBase {
   protected readonly rootResourceId = "0";
+  /** 同一账号的 Cookie 更新按响应到达顺序执行，避免连接副本互相覆盖。 */
+  private readonly cookieMergeQueues = new Map<string, Promise<void>>();
+  /** 保存进程内最新 Cookie，后续从旧密文解出的连接会先追上该快照。 */
+  private readonly latestCookies = new Map<string, string>();
   public readonly descriptor: ProviderDescriptor = {
     type: "quark", displayName: "夸克网盘", adapterVersion: "1.0.0", credentialSchemaVersion: 1,
     supportedDataTypes: ["video", "music"],
@@ -75,20 +86,49 @@ export class QuarkProvider extends CloudDriveProviderBase {
     return readCloudTextFile(await this.loadFileAccess(connection, entry.locator, signal), this.networkOptions, signal);
   }
 
-  /** 请求夸克业务接口，只持久化允许轮换的两个主 Cookie。 */
+  /** 请求夸克业务接口，只持久化允许轮换的两个主 Cookie，并处理响应体中的业务限流。 */
   private async request(connection: Record<string, unknown>, url: string, init: RequestInit, signal?: AbortSignal, context?: ProviderConnectionContext, account = false): Promise<Record<string, unknown>> {
-    const result = await requestCloudApiText(url, { ...init, headers: { ...this.createHeaders(connection), ...init.headers } }, this.networkOptions, signal);
-    await this.mergeRotatingCookies(connection, result.response, context);
-    const payload = parseCloudApiObject(result.text, ["uid"]);
-    if (account) {
-      if (payload.success !== true) throw new ApiError(410, "quark_authentication_expired", "夸克登录已失效，请重新扫码");
+    const cookieIdentityKey = this.createCookieIdentityKey(connection);
+    for (let retryCount = 0; ; retryCount += 1) {
+      this.applyLatestCookie(connection, cookieIdentityKey);
+      const result = await requestCloudApiText(url, { ...init, headers: { ...this.createHeaders(connection), ...init.headers } }, this.networkOptions, signal);
+      await this.mergeRotatingCookies(connection, result.response, context, cookieIdentityKey);
+      const payload = parseCloudApiObject(result.text, ["uid"]);
+      const status = Number(payload.status);
+      const businessCode = Number(payload.code);
+      if (status === 429 || businessCode === 429) {
+        const delayMs = readProviderRateLimitDelayMs(result.response.headers.get("retry-after"), retryCount);
+        registerProviderSharedRateLimit(QUARK_API, delayMs);
+        if (retryCount < PROVIDER_RATE_LIMIT_MAX_RETRIES) {
+          await waitForProviderSharedRateLimit(QUARK_API, signal);
+          continue;
+        }
+        throw new ApiError(503, "provider_rate_limited", "夸克网盘请求频繁，等待重试后仍未恢复，请稍后再试");
+      }
+      if (account) {
+        if (payload.success !== true) {
+          if (status === 401 || businessCode === 401) {
+            throw new ApiError(410, "quark_authentication_expired", "夸克登录已失效，请重新扫码");
+          }
+          throw new ApiError(502, "quark_business_failed",
+            `夸克账号接口请求失败（业务码：${this.displayBusinessCode(status, businessCode)}）`);
+        }
+        return payload;
+      }
+      if (status === 401 || businessCode === 401) throw new ApiError(410, "quark_authentication_expired", "夸克登录已失效，请重新扫码");
+      if (status === 403 || businessCode === 403) throw new ApiError(403, "quark_permission_denied", "夸克访问被拒绝，请检查账号权限");
+      if (!Number.isFinite(status) || status >= 400 || businessCode !== 0) {
+        throw new ApiError(502, "quark_business_failed",
+          `夸克文件接口请求失败（业务码：${this.displayBusinessCode(status, businessCode)}）`);
+      }
       return payload;
     }
-    const status = Number(payload.status);
-    if (status === 401) throw new ApiError(410, "quark_authentication_expired", "夸克登录已失效，请重新扫码");
-    if (status === 403) throw new ApiError(403, "quark_permission_denied", "夸克访问被拒绝，请检查账号权限");
-    if (!Number.isFinite(status) || status >= 400 || Number(payload.code) !== 0) throw new ApiError(502, "quark_business_failed", "夸克文件接口请求失败");
-    return payload;
+  }
+
+  /** 优先展示夸克业务码，缺失时退回业务状态。 */
+  private displayBusinessCode(status: number, businessCode: number): string {
+    if (Number.isFinite(businessCode)) return String(businessCode);
+    return Number.isFinite(status) ? String(status) : "未知";
   }
 
   /** 返回夸克业务与下载所需的请求头。 */
@@ -96,10 +136,35 @@ export class QuarkProvider extends CloudDriveProviderBase {
     return { Cookie: requireConnectionString(connection, "cookie", "夸克 Cookie"), "User-Agent": QUARK_UA, Referer: "https://pan.quark.cn/", Accept: "application/json, text/plain, */*", "Content-Type": "application/json" };
   }
 
-  /** 只合并 __pus 和 __puus，避免追踪 Cookie 进入长期凭据。 */
-  private async mergeRotatingCookies(connection: Record<string, unknown>, response: Response, context?: ProviderConnectionContext): Promise<void> {
+  /** 在共享最新快照上合并 __pus 和 __puus，避免旧连接副本覆盖新 Cookie。 */
+  private async mergeRotatingCookies(
+    connection: Record<string, unknown>,
+    response: Response,
+    context: ProviderConnectionContext | undefined,
+    cookieIdentityKey: string,
+  ): Promise<void> {
+    const previousMerge = this.cookieMergeQueues.get(cookieIdentityKey) ?? Promise.resolve();
+    const currentMerge = previousMerge.catch(() => undefined).then(async () => {
+      await this.performCookieMerge(connection, response, context, cookieIdentityKey);
+    });
+    this.cookieMergeQueues.set(cookieIdentityKey, currentMerge);
+    try {
+      await currentMerge;
+    } finally {
+      if (this.cookieMergeQueues.get(cookieIdentityKey) === currentMerge) this.cookieMergeQueues.delete(cookieIdentityKey);
+    }
+  }
+
+  /** 执行一次串行 Cookie 增量合并，并保存包含全部最新轮换字段的连接。 */
+  private async performCookieMerge(
+    connection: Record<string, unknown>,
+    response: Response,
+    context: ProviderConnectionContext | undefined,
+    cookieIdentityKey: string,
+  ): Promise<void> {
     const headers = (response.headers as Headers & { getSetCookie?: () => string[] }).getSetCookie?.() ?? [];
-    const values = new Map(String(connection.cookie ?? "").split(";").map((part) => part.trim().split(/=(.*)/su, 2) as [string, string]).filter(([name, value]) => name && value));
+    const latestCookie = this.latestCookies.get(cookieIdentityKey) || String(connection.cookie ?? "");
+    const values = this.parseCookie(latestCookie);
     let changed = false;
     for (const raw of headers) {
       const pair = raw.split(";", 1)[0] ?? "";
@@ -109,8 +174,39 @@ export class QuarkProvider extends CloudDriveProviderBase {
       const value = pair.slice(separator + 1).trim();
       if (value && values.get(name) !== value) { values.set(name, value); changed = true; }
     }
-    if (!changed) return;
+    if (!changed) {
+      connection.cookie = latestCookie;
+      return;
+    }
     connection.cookie = [...values.entries()].map(([name, value]) => `${name}=${value}`).join("; ");
     await context?.persistConnection?.(connection);
+    this.latestCookies.set(cookieIdentityKey, String(connection.cookie));
+  }
+
+  /** 让旧连接副本在发请求前使用本进程已经保存的最新 Cookie。 */
+  private applyLatestCookie(connection: Record<string, unknown>, cookieIdentityKey: string): void {
+    const latestCookie = this.latestCookies.get(cookieIdentityKey);
+    if (!latestCookie || latestCookie === connection.cookie) return;
+    connection.cookie = latestCookie;
+  }
+
+  /** 使用不会轮换的 Cookie 字段生成账号内存键，不保存也不输出原始 Cookie。 */
+  private createCookieIdentityKey(connection: Record<string, unknown>): string {
+    const values = this.parseCookie(String(connection.cookie ?? ""));
+    values.delete("__pus");
+    values.delete("__puus");
+    const stableCookie = [...values.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, value]) => `${name}=${value}`)
+      .join(";");
+    const identitySource = stableCookie || String(connection.userId ?? "") || String(connection.cookie ?? "");
+    return createHash("sha256").update(identitySource).digest("hex");
+  }
+
+  /** 把 Cookie 文本解析成保留字段顺序的键值表。 */
+  private parseCookie(cookie: string): Map<string, string> {
+    return new Map(cookie.split(";")
+      .map((part) => part.trim().split(/=(.*)/su, 2) as [string, string])
+      .filter(([name, value]) => Boolean(name && value)));
   }
 }

@@ -31,6 +31,28 @@ export function ServiceStatePill({ service }: { service: CloudService }) {
   return <StatusPill tone={tone}>{label}</StatusPill>;
 }
 
+/** 使用紧凑彩色圆点展示服务状态，状态文字保留给悬停提示和无障碍读取。 */
+export function ServiceStateDot({ service }: { service: CloudService }) {
+  const issue = getServiceConnectionIssue(service);
+  let label = "正常";
+  let colorClass = "bg-success";
+  if (service.status === "disabled") {
+    label = "已停用";
+    colorClass = "bg-muted-foreground";
+  } else if (issue) {
+    label = issue.title;
+    colorClass = "bg-warning";
+  } else if (service.status === "scanning") {
+    label = "扫描中";
+    colorClass = "bg-primary";
+  }
+  return (
+    <span role="status" aria-label={label} title={label} className="inline-flex size-6 shrink-0 items-center justify-center">
+      <span className={`size-2.5 rounded-full ${colorClass}`} />
+    </span>
+  );
+}
+
 /** 在服务卡片、详情和连接页展示异常，入口跳转到现有登录流程。 */
 export function ServiceConnectionAlert({ service, admin, showLogin = true }: { service: CloudService; admin: boolean; showLogin?: boolean }) {
   const issue = getServiceConnectionIssue(service);

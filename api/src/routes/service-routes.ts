@@ -25,6 +25,19 @@ import { streamJobEvents } from "./event-stream.js";
 /** 当前版本允许创建的服务数据类型；有声书仍保留为后续阶段。 */
 const supportedServiceDataTypes = new Set<MediaType>(["video", "music"]);
 
+/** APP 双端同步接收影视和音乐；音乐库在 APP 侧通过 Navidrome 使用。 */
+export function requireClientSync(runtime: ApiRuntime, dataType: string, stage: string): void {
+  if (dataType === "video" || dataType === "music") return;
+  runtime.logBusinessEvent("warn", {
+    日志关键字: "codex-flycloud-sync-scope",
+    阶段: stage,
+    结果: "拒绝",
+    数据类型: dataType,
+    原因: "数据类型不支持APP双端同步",
+  });
+  throw new ApiError(422, "client_sync_data_type_unsupported", "当前媒体库类型不支持与 APP 双端同步");
+}
+
 /** 记录迁回接口的失败阶段，不输出连接配置、Token 或导出文件路径。 */
 function logTransferOutFailure(
   runtime: ApiRuntime,
@@ -697,9 +710,11 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     const clientDeviceId = typeof request.body.clientDeviceId === "string" ? request.body.clientDeviceId.trim() : "";
     const clientServiceId = typeof request.body.clientServiceId === "string" ? request.body.clientServiceId.trim() : "";
     if (clientDeviceId && clientServiceId) {
+      requireClientSync(runtime, dataType, "APP创建关联");
       const existingBinding = await runtime.repository.findClientServiceBinding(user.id, clientDeviceId, clientServiceId);
       if (existingBinding) {
         const existingService = await runtime.repository.getServiceDetail(existingBinding.serviceId, user.id);
+        requireClientSync(runtime, existingService.dataType, "复用APP关联");
         if (existingService.providerType !== providerType) {
           throw new ApiError(409, "provider_type_conflict", "本地服务已经关联其他 Provider 类型的云端服务");
         }
@@ -765,6 +780,17 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       数据类型: dataType,
       自动创建扫描任务: false,
     });
+    if (dataType === "music" && clientDeviceId && clientServiceId) {
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-flycloud-music-sync",
+        阶段: "APP创建音乐服务关联",
+        结果: "成功",
+        用户ID: user.id,
+        服务ID: service.id,
+        客户端服务ID: clientServiceId,
+        网盘类型: providerType,
+      });
+    }
     if (providerType === "guangya" && connection.authMode === "official_api") {
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-flycloud-helper-guangya-official-api",
@@ -852,6 +878,8 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
 
   server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/client-bindings", async (request, reply) => {
     const user = await requireRequestUser(request, runtime.database);
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+    requireClientSync(runtime, service.dataType, "绑定APP设备");
     const result = await runtime.repository.bindClientService({
       bindingId: randomUUID(),
       userId: user.id,
@@ -860,6 +888,15 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       clientServiceId: requireString(request.body, "clientServiceId", "客户端服务 ID", 200),
       providerType: requireString(request.body, "providerType", "Provider 类型", 64),
     });
+    if (service.dataType === "music") {
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-flycloud-music-sync",
+        阶段: "APP绑定云端音乐服务",
+        结果: "成功",
+        用户ID: user.id,
+        服务ID: service.id,
+      });
+    }
     return reply.status(201).send(result);
   });
 
@@ -897,6 +934,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       let failureStage = "读取服务和设备绑定"; // 关键变量：NAS 日志据此定位创建迁回任务的失败边界。
       try {
       const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+      requireClientSync(runtime, service.dataType, "创建迁回任务");
       const clientDeviceId = requireString(request.body, "clientDeviceId", "客户端设备 ID", 200);
       const clientServiceId = requireString(request.body, "clientServiceId", "客户端服务 ID", 200);
       const binding = await runtime.repository.findClientServiceBinding(user.id, clientDeviceId, clientServiceId);
@@ -1058,6 +1096,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       }
       failureStage = "读取并解密Provider凭据";
       const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+      requireClientSync(runtime, service.dataType, "领取迁回凭据");
       const encryptedConnection = await runtime.repository.getActiveEncryptedConnection(service.id, user.id);
       const connection = runtime.vault.decrypt(encryptedConnection); // 关键变量：先完成解密再写已领取标记。
       failureStage = "保存凭据领取状态";
@@ -1122,6 +1161,8 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
         }
         throw new ApiError(404, "service_transfer_not_found", "迁回任务不存在");
       }
+      const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+      requireClientSync(runtime, service.dataType, "完成迁回");
       if (Number(transfer.credential_claimed) !== 1) {
         throw new ApiError(409, "service_transfer_credential_not_claimed", "APP 尚未接收 Provider 凭据");
       }

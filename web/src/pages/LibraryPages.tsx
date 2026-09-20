@@ -3,7 +3,7 @@ import { Copy, Images, Pencil, Plus, Settings2, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { MediaCatalogView, type MediaCatalogQuery } from "@/components/MediaCatalogView";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
-import { Panel, StatCard, StatusPill } from "@/components/ui-kit";
+import { Panel, StatusPill } from "@/components/ui-kit";
 import {
   clearServiceCatalog,
   createServiceAccessAccount,
@@ -41,7 +41,7 @@ async function copyLibraryText(value: string): Promise<void> {
   }
 }
 
-/** 集中管理单个媒体库的 Jellyfin 总开关、APP 播放和数据清理。 */
+/** 集中管理单个媒体库的 APP 播放、协议入口和数据清理。 */
 export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: string; admin?: boolean }) {
   const resource = useApiResource(async () => {
     const [service, settings] = await Promise.all([
@@ -150,6 +150,11 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   if (!service || !settings) {
     return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取媒体库设置…"}</div></Panel>;
   }
+  // 关键变量：音乐库展示 Navidrome 状态，视频库展示 Jellyfin 状态。
+  const libraryProtocolName = settings.navidromeSupported ? "Navidrome" : "Jellyfin";
+  const libraryProtocolEnabled = settings.navidromeSupported
+    ? settings.navidromeEnabled
+    : settings.jellyfinEnabled;
 
   return (
     <>
@@ -163,87 +168,88 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
         )}
       />
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
-      <div className="grid gap-4 sm:grid-cols-3">
-        <StatCard label="媒体条目" value={service.itemCount.toLocaleString()} hint="当前已入库" />
-        <StatCard label="目录版本" value={`v${service.catalogVersion}`} tone="info" />
-        {settings.navidromeSupported
-          ? <StatCard label="Navidrome" value={settings.navidromeEnabled ? "已启用" : "未启用"} tone="muted" />
-          : <StatCard label="Jellyfin" value={settings.jellyfinEnabled ? "已启用" : "未启用"} tone="muted" />}
+      <div className={`grid gap-3 sm:grid-cols-3 ${settings.navidromeSupported ? "" : "xl:grid-cols-4"}`}>
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-border bg-secondary/20 px-4 py-3">
+          <span className="text-xs text-muted-foreground">媒体条目</span>
+          <span className="text-lg font-semibold">{service.itemCount.toLocaleString()}</span>
+        </div>
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-border bg-secondary/20 px-4 py-3">
+          <span className="text-xs text-muted-foreground">目录版本</span>
+          <span className="text-lg font-semibold">v{service.catalogVersion}</span>
+        </div>
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-border bg-secondary/20 px-4 py-3">
+          <span className="text-xs text-muted-foreground">{libraryProtocolName}</span>
+          <span className="text-sm font-semibold">{libraryProtocolEnabled ? "已启用" : "未启用"}</span>
+        </div>
+        {!settings.navidromeSupported && <div className="flex items-center justify-between gap-3 rounded-xl border border-border bg-secondary/20 px-4 py-3">
+          <span className="text-xs text-muted-foreground">Emby</span>
+          <span className="text-sm font-semibold">{settings.embyEnabled ? "已启用" : "未启用"}</span>
+        </div>}
       </div>
-      <Panel title="APP 专用播放" description="仅控制 Flymby 通过云助手媒体库播放时是否使用中转。" className="mt-4">
-        <div className="rounded-xl border border-border bg-secondary/35 p-4">
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <p className="text-sm font-medium">APP 专用中转播放</p>
-              <p className="mt-1 text-xs text-muted-foreground">开启后，Flymby 的云助手媒体库播放流量会经过 FlyCloudHelper。</p>
-            </div>
-            <button type="button" role="switch" aria-checked={settings.appRelayPlaybackEnabled} aria-label="启用 APP 专用中转播放" disabled={(!settings.relayPlaybackSupported && !settings.appRelayPlaybackEnabled) || updatingRelayPlayback} onClick={() => void toggleAppRelayPlayback()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.appRelayPlaybackEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
-              <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.appRelayPlaybackEnabled ? "translate-x-5" : "translate-x-0"}`} />
-            </button>
-          </div>
-        </div>
-        {!settings.relayPlaybackSupported && <p className="mt-3 text-xs text-muted-foreground">当前网盘类型暂不支持中转播放。</p>}
-      </Panel>
-      {!settings.navidromeSupported && <Panel title="Jellyfin 协议" className="mt-4">
-        <div className="rounded-xl border border-border bg-secondary/35 p-4">
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <p className="text-sm font-medium">启用 Jellyfin 协议</p>
-              <p className="mt-1 text-xs text-muted-foreground">关闭后会撤销当前媒体库的 Jellyfin 会话，保留播放记录。</p>
-            </div>
-            <button type="button" role="switch" aria-checked={settings.jellyfinEnabled} aria-label="启用 Jellyfin 协议" disabled={updatingJellyfin} onClick={() => void toggleJellyfin()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.jellyfinEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
-              <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.jellyfinEnabled ? "translate-x-5" : "translate-x-0"}`} />
-            </button>
-          </div>
-          <div className="mt-4 border-t border-border pt-4">
-            <Link to={jellyfinPath} params={{ serviceId }}><SecondaryButton><Settings2 className="size-4" /> Jellyfin 配置</SecondaryButton></Link>
-          </div>
-        </div>
-      </Panel>}
-      {!settings.navidromeSupported && <Panel title="Emby 协议" className="mt-4">
-        <div className="rounded-xl border border-border bg-secondary/35 p-4">
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <p className="text-sm font-medium">启用 Emby 协议</p>
-              <p className="mt-1 text-xs text-muted-foreground">使用独立 Emby 账号、会话、收藏和观看记录，不与 Jellyfin 共用。</p>
-            </div>
-            <button type="button" role="switch" aria-checked={settings.embyEnabled} aria-label="启用 Emby 协议" disabled={updatingEmby} onClick={() => void toggleEmby()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.embyEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
-              <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.embyEnabled ? "translate-x-5" : "translate-x-0"}`} />
-            </button>
-          </div>
-          <div className="mt-4 border-t border-border pt-4">
-            <Link to={embyPath} params={{ serviceId }}><SecondaryButton><Settings2 className="size-4" /> Emby 配置</SecondaryButton></Link>
-          </div>
-        </div>
-      </Panel>}
-      {settings.navidromeSupported && (
-        <Panel title="Navidrome 协议" description="对外提供兼容 Subsonic 1.16.1 的音乐浏览、搜索、封面和原音频播放接口。" className="mt-4">
-          <div className="rounded-xl border border-border bg-secondary/35 p-4">
-            <div className="flex items-center justify-between gap-4">
-              <div>
-                <p className="text-sm font-medium">启用 Navidrome 协议</p>
-                <p className="mt-1 text-xs text-muted-foreground">关闭后客户端不能继续访问，已扫描的音乐和协议账号仍会保留。</p>
+      <div className="mt-4 grid items-start gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(240px,1fr)]">
+        <Panel title="播放与协议" description={settings.navidromeSupported ? "管理 APP 播放和 Navidrome 客户端访问。" : "管理 APP 播放及 Jellyfin、Emby 客户端访问。"}>
+          <div className="divide-y divide-border overflow-hidden rounded-xl border border-border">
+            <div className="flex items-center justify-between gap-4 px-4 py-3">
+              <div className="min-w-0">
+                <p className="text-sm font-medium">APP 专用中转播放</p>
+                <p className="mt-0.5 text-xs text-muted-foreground">Flymby 通过云助手播放时由 FlyCloudHelper 转发媒体流。</p>
+                {!settings.relayPlaybackSupported && <p className="mt-1 text-xs text-warning">当前网盘类型暂不支持中转播放。</p>}
               </div>
-              <button type="button" role="switch" aria-checked={settings.navidromeEnabled} aria-label="启用 Navidrome 协议" disabled={updatingNavidrome} onClick={() => void toggleNavidrome()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.navidromeEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
-                <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.navidromeEnabled ? "translate-x-5" : "translate-x-0"}`} />
+              <button type="button" role="switch" aria-checked={settings.appRelayPlaybackEnabled} aria-label="启用 APP 专用中转播放" disabled={(!settings.relayPlaybackSupported && !settings.appRelayPlaybackEnabled) || updatingRelayPlayback} onClick={() => void toggleAppRelayPlayback()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.appRelayPlaybackEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
+                <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.appRelayPlaybackEnabled ? "translate-x-5" : "translate-x-0"}`} />
               </button>
             </div>
-            <div className="mt-4 flex items-start justify-between gap-3 border-t border-border pt-4">
+            {!settings.navidromeSupported && <div className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="min-w-0">
-                <p className="text-xs text-muted-foreground">客户端服务器地址</p>
-                <p className="mt-1 break-all font-mono text-xs">{settings.navidromeUrl ?? `云助手 API 地址${settings.navidromePath}`}</p>
-                <p className="mt-2 text-xs text-muted-foreground">默认访问账号：<span className="font-mono text-foreground">{settings.account.username}</span>（密码在协议访问账号中设置）</p>
+                <p className="text-sm font-medium">Jellyfin 协议</p>
+                <p className="mt-0.5 text-xs text-muted-foreground">关闭时撤销现有会话，保留播放记录。</p>
               </div>
-              <SecondaryButton type="button" onClick={() => void copyLibraryText(settings.navidromeUrl ?? settings.navidromePath).then(() => setMessage(settings.navidromeUrl ? "Navidrome 服务地址已复制" : "Navidrome 服务路径已复制"))}><Copy className="size-4" /> 复制</SecondaryButton>
-            </div>
+              <div className="flex shrink-0 items-center gap-3">
+                <Link to={jellyfinPath} params={{ serviceId }}><SecondaryButton><Settings2 className="size-4" /> 配置</SecondaryButton></Link>
+                <button type="button" role="switch" aria-checked={settings.jellyfinEnabled} aria-label="启用 Jellyfin 协议" disabled={updatingJellyfin} onClick={() => void toggleJellyfin()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.jellyfinEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
+                  <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.jellyfinEnabled ? "translate-x-5" : "translate-x-0"}`} />
+                </button>
+              </div>
+            </div>}
+            {!settings.navidromeSupported && <div className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0">
+                <p className="text-sm font-medium">Emby 协议</p>
+                <p className="mt-0.5 text-xs text-muted-foreground">使用独立账号、会话、收藏和观看记录。</p>
+              </div>
+              <div className="flex shrink-0 items-center gap-3">
+                <Link to={embyPath} params={{ serviceId }}><SecondaryButton><Settings2 className="size-4" /> 配置</SecondaryButton></Link>
+                <button type="button" role="switch" aria-checked={settings.embyEnabled} aria-label="启用 Emby 协议" disabled={updatingEmby} onClick={() => void toggleEmby()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.embyEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
+                  <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.embyEnabled ? "translate-x-5" : "translate-x-0"}`} />
+                </button>
+              </div>
+            </div>}
+            {settings.navidromeSupported && <div className="px-4 py-3">
+              <div className="flex items-center justify-between gap-4">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium">Navidrome 协议</p>
+                  <p className="mt-0.5 text-xs text-muted-foreground">提供兼容 Subsonic 的浏览、搜索、封面和原音频播放接口。</p>
+                </div>
+                <button type="button" role="switch" aria-checked={settings.navidromeEnabled} aria-label="启用 Navidrome 协议" disabled={updatingNavidrome} onClick={() => void toggleNavidrome()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.navidromeEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
+                  <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.navidromeEnabled ? "translate-x-5" : "translate-x-0"}`} />
+                </button>
+              </div>
+              <div className="mt-3 flex flex-col gap-3 border-t border-border pt-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="min-w-0">
+                  <p className="break-all font-mono text-xs">{settings.navidromeUrl ?? `云助手 API 地址${settings.navidromePath}`}</p>
+                  <p className="mt-1 text-xs text-muted-foreground">账号：<span className="font-mono text-foreground">{settings.account.username}</span> · 原音频透传，不转码</p>
+                </div>
+                <div className="flex shrink-0 flex-wrap gap-2">
+                  <SecondaryButton type="button" onClick={() => void copyLibraryText(settings.navidromeUrl ?? settings.navidromePath).then(() => setMessage(settings.navidromeUrl ? "Navidrome 服务地址已复制" : "Navidrome 服务路径已复制"))}><Copy className="size-4" /> 复制</SecondaryButton>
+                  <Link to={jellyfinPath} params={{ serviceId }}><SecondaryButton><Settings2 className="size-4" /> 账号与地址</SecondaryButton></Link>
+                </div>
+              </div>
+            </div>}
           </div>
-          <p className="mt-3 text-xs text-muted-foreground">登录使用本媒体库的协议访问账号。建议公开地址使用 HTTPS；当前播放透传网盘或 WebDAV 原音频，不进行转码。</p>
-          <div className="mt-3"><Link to={jellyfinPath} params={{ serviceId }}><SecondaryButton><Settings2 className="size-4" /> 配置地址、用户名和密码</SecondaryButton></Link></div>
         </Panel>
-      )}
-      <Panel title="危险操作" className="mt-4">
-        <button type="button" onClick={() => void clearCatalog()} disabled={service.status === "scanning" || clearingCatalog} className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm font-medium text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {clearingCatalog ? "正在清空…" : "清空媒体库"}</button>
-      </Panel>
+        <Panel title="危险操作" description="清空媒体条目、文件索引和目录版本。" className="self-start">
+          <button type="button" onClick={() => void clearCatalog()} disabled={service.status === "scanning" || clearingCatalog} className="inline-flex w-full cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm font-medium text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {clearingCatalog ? "正在清空…" : "清空媒体库"}</button>
+        </Panel>
+      </div>
     </>
   );
 }
@@ -288,6 +294,22 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
   useEffect(() => {
     if (settings?.navidromePathSuffix) setNavidromePathSuffix(settings.navidromePathSuffix);
   }, [settings?.navidromePathSuffix]);
+
+  /** 保存音乐库独立的 Navidrome 传输方式，不影响视频协议。 */
+  async function toggleNavidromeRelayPlayback(): Promise<void> {
+    if (!settings || updatingPlayback) return;
+    const nextEnabled = !(settings.navidromeRelayPlaybackEnabled ?? true);
+    setUpdatingPlayback(true);
+    try {
+      await updateServiceNavidromeSettings(serviceId, { navidromeRelayPlaybackEnabled: nextEnabled }, admin);
+      setMessage(nextEnabled ? "Navidrome 已切换为中转" : "Navidrome 已切换为直连优先，不满足直连条件时回退中转");
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Navidrome 播放方式保存失败");
+    } finally {
+      setUpdatingPlayback(false);
+    }
+  }
 
   /** 保存 Jellyfin 专用中转播放开关。 */
   async function toggleJellyfinRelayPlayback(): Promise<void> {
@@ -597,6 +619,19 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
           </div>
         </div>
       </Panel></>}
+      {settings.navidromeSupported && (
+        <Panel title="播放设置" description="控制 Navidrome 音乐播放和下载的传输方式，不转码。" className="mb-4">
+          <div className="flex items-center justify-between gap-4 rounded-xl border border-border bg-secondary/35 p-4">
+            <div>
+              <p className="text-sm font-medium">Navidrome 中转播放</p>
+              <p className="mt-1 text-xs text-muted-foreground">开启后由云助手转发音频；关闭后优先直连网盘，需认证请求头或无法生成直链时回退中转。客户端直连后若无法播放，可重新开启中转。</p>
+            </div>
+            <button type="button" role="switch" aria-checked={settings.navidromeRelayPlaybackEnabled ?? true} aria-label="启用 Navidrome 中转播放" disabled={updatingPlayback} onClick={() => void toggleNavidromeRelayPlayback()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${(settings.navidromeRelayPlaybackEnabled ?? true) ? "border-foreground bg-foreground" : "border-border bg-secondary"}`}>
+              <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-background shadow-sm transition-transform ${(settings.navidromeRelayPlaybackEnabled ?? true) ? "translate-x-5" : "translate-x-0"}`} />
+            </button>
+          </div>
+        </Panel>
+      )}
       {settings.navidromeSupported && (
         <Panel title="服务地址" description="客户端填写完整地址，固定 /n/ 前缀不可修改。">
           <div className="rounded-xl border border-border bg-secondary/35 p-4">

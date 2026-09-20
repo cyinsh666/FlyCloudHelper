@@ -12,6 +12,21 @@ const CLOUD115_UA = "Flymby/115Open";
 const CLOUD115_REQUEST_INTERVAL_MS = 1_000;
 /** 115业务限流最多等待三轮，持续受限时交回任务队列处理。 */
 const CLOUD115_RATE_LIMIT_DELAYS_MS = [10_000, 20_000, 30_000];
+/** 已完成刷新结果保留十分钟，供稍晚到达的旧令牌并发请求复用。 */
+const CLOUD115_REFRESH_RESULT_RETENTION_MS = 10 * 60_000;
+
+/** 115 单次令牌轮换结果，源 Refresh Token 只作为内存索引，不写日志。 */
+interface Cloud115RefreshResult {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+}
+
+/** 已完成刷新结果及其内存保留截止时间。 */
+interface Cloud115RecentRefresh {
+  result: Cloud115RefreshResult;
+  retainUntilMs: number;
+}
 
 /** 115网盘 OpenAPI 只读 Provider。 */
 export class Cloud115Provider extends CloudDriveProviderBase {
@@ -20,6 +35,10 @@ export class Cloud115Provider extends CloudDriveProviderBase {
   private nextRequestAtMs = 0;
   /** 业务码770004触发的共享冷却截止时间，已在排队的请求也必须遵守。 */
   private cooldownUntilMs = 0;
+  /** 同一个旧 Refresh Token 只能向115提交一次轮换请求。 */
+  private readonly refreshFlights = new Map<string, Promise<Cloud115RefreshResult>>();
+  /** 复用刚完成的轮换结果，避免后到请求再次提交已经作废的旧 Refresh Token。 */
+  private readonly recentRefreshes = new Map<string, Cloud115RecentRefresh>();
   public readonly descriptor: ProviderDescriptor = {
     type: "cloud115", displayName: "115网盘", adapterVersion: "1.0.0", credentialSchemaVersion: 1,
     supportedDataTypes: ["video", "music"],
@@ -128,7 +147,7 @@ export class Cloud115Provider extends CloudDriveProviderBase {
           return payload;
         }
         const businessCode = Number(payload.code ?? payload.errno);
-        if (!retried && businessCode === 99) return this.refreshAndRetry(connection, path, init, signal, context);
+        if (!retried && businessCode === 99) return this.refreshAndRetry(connection, path, init, signal, context, accessToken);
         if (businessCode === 770004) {
           const delayMs = CLOUD115_RATE_LIMIT_DELAYS_MS[retryCount];
           this.cooldownUntilMs = Math.max(this.cooldownUntilMs, Date.now() + (delayMs ?? 30_000));
@@ -154,15 +173,19 @@ export class Cloud115Provider extends CloudDriveProviderBase {
         });
         throw new ApiError(502, "cloud115_business_failed", `115网盘接口返回业务错误（业务码：${Number.isFinite(businessCode) ? businessCode : "未知"}）`);
       } catch (error) {
-        if (!retried && error instanceof ApiError && error.code === "provider_authentication_failed") return this.refreshAndRetry(connection, path, init, signal, context);
+        if (!retried && error instanceof ApiError && error.code === "provider_authentication_failed") return this.refreshAndRetry(connection, path, init, signal, context, accessToken);
         throw error;
       }
     }
   }
 
   /** 立即刷新并重试原请求。 */
-  private async refreshAndRetry(connection: Record<string, unknown>, path: string, init: RequestInit, signal?: AbortSignal, context?: ProviderConnectionContext): Promise<Record<string, unknown>> {
-    await this.refreshToken(connection, signal, context);
+  private async refreshAndRetry(connection: Record<string, unknown>, path: string, init: RequestInit, signal?: AbortSignal, context?: ProviderConnectionContext, failedAccessToken = ""): Promise<Record<string, unknown>> {
+    const currentAccessToken = String(connection.accessToken ?? "").trim();
+    // 同一连接对象已被另一个请求刷新时，当前失败响应直接使用新 Token 重试。
+    if (!failedAccessToken || !currentAccessToken || currentAccessToken === failedAccessToken) {
+      await this.refreshToken(connection, signal, context);
+    }
     return this.request(connection, path, init, signal, context, true);
   }
 
@@ -172,20 +195,74 @@ export class Cloud115Provider extends CloudDriveProviderBase {
     if (expiresAt > 0 && expiresAt <= Date.now() + 5 * 60_000) await this.refreshToken(connection, signal, context);
   }
 
-  /** 直接调用115官方刷新端点并保存轮换后的两个 Token。 */
+  /** 合并同一 Refresh Token 的并发轮换，并把结果保存到每个调用方的连接对象。 */
   private async refreshToken(connection: Record<string, unknown>, signal?: AbortSignal, context?: ProviderConnectionContext): Promise<void> {
-    const refreshToken = requireConnectionString(connection, "refreshToken", "115 Refresh Token");
+    const sourceRefreshToken = requireConnectionString(connection, "refreshToken", "115 Refresh Token");
+    this.removeExpiredRefreshResults();
+    const recent = this.recentRefreshes.get(sourceRefreshToken);
+    if (recent) {
+      await this.applyRefreshResult(connection, recent.result, context);
+      return;
+    }
+    let refreshFlight = this.refreshFlights.get(sourceRefreshToken);
+    if (!refreshFlight) {
+      // 轮换独立使用 Provider 的30秒超时，避免首个等待任务取消后丢失已经轮换的令牌。
+      refreshFlight = this.performTokenRefresh(sourceRefreshToken);
+      this.refreshFlights.set(sourceRefreshToken, refreshFlight);
+    }
+    try {
+      const result = await refreshFlight;
+      this.recentRefreshes.set(sourceRefreshToken, {
+        result,
+        retainUntilMs: Date.now() + CLOUD115_REFRESH_RESULT_RETENTION_MS,
+      });
+      await this.applyRefreshResult(connection, result, context);
+    } finally {
+      if (this.refreshFlights.get(sourceRefreshToken) === refreshFlight) {
+        this.refreshFlights.delete(sourceRefreshToken);
+      }
+    }
+  }
+
+  /** 执行一次115官方刷新请求，只返回完整轮换结果，不直接修改调用方连接。 */
+  private async performTokenRefresh(refreshToken: string, signal?: AbortSignal): Promise<Cloud115RefreshResult> {
     const result = await requestCloudApiText(`${CLOUD115_AUTH}/open/refreshToken`, {
       method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "FlyCloudHelper/115Open" }, body: new URLSearchParams({ refresh_token: refreshToken }),
     }, this.networkOptions, signal);
-    const data = readCloudRecord(parseCloudApiObject(result.text).data);
+    const payload = parseCloudApiObject(result.text);
+    const nestedData = readCloudRecord(payload.data);
+    // 关键变量：兼容115刷新接口把令牌放在 data 内或直接放在响应顶层。
+    const data = Object.keys(nestedData).length > 0 ? nestedData : payload;
     const nextAccessToken = readCloudText(data, ["access_token", "accessToken"]);
     const nextRefreshToken = readCloudText(data, ["refresh_token", "refreshToken"]);
-    if (!nextAccessToken || !nextRefreshToken) throw new ApiError(410, "cloud115_refresh_expired", "115登录已失效，请重新扫码");
-    connection.accessToken = nextAccessToken;
-    connection.refreshToken = nextRefreshToken;
-    const expiresIn = readCloudNumber(data.expires_in);
-    connection.expiresAt = expiresIn > 0 ? Date.now() + expiresIn * 1_000 : 0;
+    if (!nextAccessToken || !nextRefreshToken) {
+      throw new ApiError(410, "cloud115_refresh_expired", "115登录已失效，请重新扫码");
+    }
+    const expiresIn = readCloudNumber(data.expires_in ?? data.expiresIn);
+    return {
+      accessToken: nextAccessToken,
+      refreshToken: nextRefreshToken,
+      expiresAt: expiresIn > 0 ? Date.now() + expiresIn * 1_000 : 0,
+    };
+  }
+
+  /** 将共享刷新结果写入当前请求连接，并原子保存轮换后的两个 Token。 */
+  private async applyRefreshResult(
+    connection: Record<string, unknown>,
+    result: Cloud115RefreshResult,
+    context?: ProviderConnectionContext,
+  ): Promise<void> {
+    connection.accessToken = result.accessToken;
+    connection.refreshToken = result.refreshToken;
+    connection.expiresAt = result.expiresAt;
     await context?.persistConnection?.(connection);
+  }
+
+  /** 清理过期的内存刷新结果，避免长期持有旧 Refresh Token。 */
+  private removeExpiredRefreshResults(): void {
+    const now = Date.now();
+    for (const [sourceRefreshToken, recent] of this.recentRefreshes) {
+      if (recent.retainUntilMs <= now) this.recentRefreshes.delete(sourceRefreshToken);
+    }
   }
 }

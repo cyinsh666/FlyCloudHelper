@@ -1,5 +1,6 @@
 import { loadEnumerationPage } from "./types.js";
 import { ApiError } from "../errors.js";
+import { CredentialRefreshCoordinator } from "./credential-refresh-coordinator.js";
 import {
   PROVIDER_RATE_LIMIT_MAX_RETRIES,
   providerFetch,
@@ -36,8 +37,18 @@ interface BaiduFileItem {
   md5?: string;
 }
 
+/** 百度网盘一次完整的令牌轮换结果。 */
+interface BaiduTokenRefreshResult {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  refreshUrl: string;
+}
+
 const DEFAULT_BAIDUPAN_REFRESH_URL = "https://api.oplist.org/baiduyun/renewapi";
 const TOKEN_REFRESH_AHEAD_MS = 5 * 60 * 1000;
+// 关键变量：这些 errno 明确表示 Access Token 失效，可以刷新一次；其他业务码不能误判成登录失效。
+const BAIDUPAN_AUTHENTICATION_ERROR_CODES = new Set([2, 110, 111, -6, 401]);
 
 /** 百度网盘开放接口 Provider。 */
 export class BaiduPanProvider implements ProviderAdapter {
@@ -60,6 +71,8 @@ export class BaiduPanProvider implements ProviderAdapter {
   };
 
   private readonly networkOptions: ProviderNetworkOptions;
+  /** 按旧 Refresh Token 合并跨请求刷新，并接住稍晚到达的旧连接副本。 */
+  private readonly tokenRefreshCoordinator = new CredentialRefreshCoordinator<BaiduTokenRefreshResult>();
 
   public constructor(networkOptions: ProviderNetworkOptions) {
     this.networkOptions = networkOptions;
@@ -214,6 +227,7 @@ export class BaiduPanProvider implements ProviderAdapter {
     locator: Record<string, unknown>,
     signal?: AbortSignal,
     context?: ProviderConnectionContext,
+    retriedAuthentication = false,
   ): Promise<ProviderFileAccess> {
     await this.ensureValidToken(connection, context?.persistConnection, signal);
     const accessToken = requireConnectionString(connection, "accessToken", "Access Token");
@@ -240,13 +254,14 @@ export class BaiduPanProvider implements ProviderAdapter {
       list?: Array<{ dlink?: string }>;
     }>(url, signal);
     if (payload.errno && payload.errno !== 0) {
-      this.networkOptions.logConnectionFailure?.({
-        日志关键字: "codex-baidupan-cloud-playback",
-        事件: "百度网盘播放地址解析失败",
-        业务错误码: payload.errno,
-        文件ID长度: fsId.length,
-      });
-      throw new Error(`百度网盘下载接口错误 ${payload.errno}`);
+      if (BAIDUPAN_AUTHENTICATION_ERROR_CODES.has(payload.errno) && !retriedAuthentication) {
+        await this.refreshAfterAuthenticationFailure(connection, accessToken, context?.persistConnection, signal);
+        return this.resolvePlaybackAccess(connection, locator, signal, context, true);
+      }
+      if (BAIDUPAN_AUTHENTICATION_ERROR_CODES.has(payload.errno)) {
+        throw new ApiError(410, "baidupan_authentication_expired", "百度网盘登录已失效，请重新登录");
+      }
+      throw new ApiError(502, "baidupan_business_failed", `百度网盘下载接口返回业务错误（业务码：${payload.errno}）`);
     }
     const dlink = payload.list?.[0]?.dlink;
     if (!dlink) {
@@ -269,6 +284,7 @@ export class BaiduPanProvider implements ProviderAdapter {
     start: number,
     signal?: AbortSignal,
     persistConnection?: (connection: Record<string, unknown>) => Promise<void>,
+    retriedAuthentication = false,
   ): Promise<{ items: BaiduFileItem[]; hasMore: boolean }> {
     await this.ensureValidToken(connection, persistConnection, signal);
     const accessToken = requireConnectionString(connection, "accessToken", "Access Token");
@@ -289,7 +305,14 @@ export class BaiduPanProvider implements ProviderAdapter {
       has_more?: number;
     }>(url, signal);
     if (payload.errno && payload.errno !== 0) {
-      throw new Error(`百度网盘接口错误 ${payload.errno}`);
+      if (BAIDUPAN_AUTHENTICATION_ERROR_CODES.has(payload.errno) && !retriedAuthentication) {
+        await this.refreshAfterAuthenticationFailure(connection, accessToken, persistConnection, signal);
+        return this.listDirectory(connection, directory, start, signal, persistConnection, true);
+      }
+      if (BAIDUPAN_AUTHENTICATION_ERROR_CODES.has(payload.errno)) {
+        throw new ApiError(410, "baidupan_authentication_expired", "百度网盘登录已失效，请重新登录");
+      }
+      throw new ApiError(502, "baidupan_business_failed", `百度网盘接口返回业务错误（业务码：${payload.errno}）`);
     }
     return { items: Array.isArray(payload.list) ? payload.list : [], hasMore: payload.has_more === 1 };
   }
@@ -337,19 +360,53 @@ export class BaiduPanProvider implements ProviderAdapter {
     }
   }
 
-  /** 临近过期时刷新百度令牌，并把轮换后的 Refresh Token 原位加密保存。 */
+  /** Access Token 被上游明确拒绝时刷新一次；并发请求发现连接已经更新则直接复用。 */
+  private async refreshAfterAuthenticationFailure(
+    connection: Record<string, unknown>,
+    failedAccessToken: string,
+    persistConnection?: (connection: Record<string, unknown>) => Promise<void>,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (String(connection.accessToken ?? "").trim() !== failedAccessToken) return;
+    await this.ensureValidToken(connection, persistConnection, signal, true);
+  }
+
+  /** 临近过期或上游明确拒绝时刷新百度令牌，并把轮换后的 Refresh Token 原位加密保存。 */
   private async ensureValidToken(
     connection: Record<string, unknown>,
     persistConnection?: (connection: Record<string, unknown>) => Promise<void>,
     signal?: AbortSignal,
+    forceRefresh = false,
   ): Promise<void> {
     const accessToken = typeof connection.accessToken === "string" ? connection.accessToken.trim() : "";
     const expiresAt = Number(connection.expiresAt ?? 0);
-    if (accessToken && (expiresAt <= 0 || Date.now() + TOKEN_REFRESH_AHEAD_MS < expiresAt)) return;
+    if (!forceRefresh && accessToken && (expiresAt <= 0 || Date.now() + TOKEN_REFRESH_AHEAD_MS < expiresAt)) return;
     const refreshToken = requireConnectionString(connection, "refreshToken", "Refresh Token");
     const configuredRefreshUrl = typeof connection.refreshUrl === "string" && connection.refreshUrl.trim()
       ? connection.refreshUrl.trim()
       : DEFAULT_BAIDUPAN_REFRESH_URL;
+    // 强制刷新把被拒绝的 Access Token 纳入键，避免复用刚刚已被上游判定失效的近期结果。
+    const refreshCoordinationKey = forceRefresh
+      ? `${configuredRefreshUrl}\n${refreshToken}\n${accessToken}`
+      : `${configuredRefreshUrl}\n${refreshToken}`;
+    const sharedRefresh = await this.tokenRefreshCoordinator.execute(
+      refreshCoordinationKey,
+      // 轮换独立使用 Provider 的30秒超时，避免首个等待任务取消后丢失已经轮换的令牌。
+      () => this.performTokenRefresh(refreshToken, configuredRefreshUrl),
+    );
+    connection.accessToken = sharedRefresh.result.accessToken;
+    connection.refreshToken = sharedRefresh.result.refreshToken;
+    connection.expiresAt = sharedRefresh.result.expiresAt;
+    connection.refreshUrl = sharedRefresh.result.refreshUrl;
+    await persistConnection?.(connection);
+  }
+
+  /** 向百度刷新端点提交一次旧 Refresh Token，只返回结果，不修改调用方连接。 */
+  private async performTokenRefresh(
+    refreshToken: string,
+    configuredRefreshUrl: string,
+    signal?: AbortSignal,
+  ): Promise<BaiduTokenRefreshResult> {
     const refreshUrl = new URL(configuredRefreshUrl);
     if (refreshUrl.protocol !== "https:") throw new Error("百度网盘 Token 刷新地址必须使用 HTTPS");
     refreshUrl.searchParams.set("refresh_ui", refreshToken);
@@ -360,7 +417,9 @@ export class BaiduPanProvider implements ProviderAdapter {
     const payload = await response.json() as Record<string, unknown>;
     const nextAccessToken = typeof payload.access_token === "string" ? payload.access_token.trim()
       : typeof payload.accessToken === "string" ? payload.accessToken.trim() : "";
-    if (!nextAccessToken) throw new Error("百度网盘令牌刷新接口未返回 Access Token");
+    if (!nextAccessToken) {
+      throw new ApiError(410, "baidupan_refresh_expired", "百度网盘登录已失效，请重新登录");
+    }
     const nextRefreshToken = typeof payload.refresh_token === "string" && payload.refresh_token.trim()
       ? payload.refresh_token.trim()
       : typeof payload.refreshToken === "string" && payload.refreshToken.trim()
@@ -368,10 +427,11 @@ export class BaiduPanProvider implements ProviderAdapter {
     // 关键变量：刷新站响应可能不包含有效期，避免将 NaN 写入加密连接。
     const rawExpiresIn = Number(payload.expires_in ?? payload.expiresIn ?? 0);
     const expiresIn = Number.isFinite(rawExpiresIn) ? Math.max(0, rawExpiresIn) : 0;
-    connection.accessToken = nextAccessToken;
-    connection.refreshToken = nextRefreshToken;
-    connection.expiresAt = expiresIn > 0 ? Date.now() + expiresIn * 1000 : 0;
-    connection.refreshUrl = configuredRefreshUrl;
-    await persistConnection?.(connection);
+    return {
+      accessToken: nextAccessToken,
+      refreshToken: nextRefreshToken,
+      expiresAt: expiresIn > 0 ? Date.now() + expiresIn * 1000 : 0,
+      refreshUrl: configuredRefreshUrl,
+    };
   }
 }

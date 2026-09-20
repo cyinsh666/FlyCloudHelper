@@ -27,6 +27,7 @@ import type { FlymbyNfoMetadata } from "./media/flymby-nfo-parser.js";
 import { parseFlymbyVideoName } from "./media/flymby-video-parser.js";
 import { parseMediaProbeResult, type MediaProbeResult } from "./media/media-probe.js";
 import type { TmdbEpisodeMetadata, TmdbVideoMetadata } from "./metadata/tmdb.js";
+import { isProviderAuthenticationErrorCode } from "./providers/authentication-errors.js";
 import {
   AUDIO_TAG_PARSER_VERSION,
   type AudioTagReadResult,
@@ -167,6 +168,12 @@ interface MediaProbeJobRow {
   active_duration_ms: number | string;
   active_started_at: string | null;
   updated_at: string;
+}
+
+/** 规格任务确认Provider鉴权失效后的服务级处理结果。 */
+interface MediaProbeAuthenticationFailureResult {
+  stoppedJobIds: string[];
+  ignoredStaleCredential: boolean;
 }
 
 interface ActiveDurationRow {
@@ -861,6 +868,7 @@ export class ServiceRepository {
         emby_region_libraries_enabled: 0,
         emby_enabled: 0,
         navidrome_enabled: 0,
+        navidrome_relay_playback_enabled: 1,
         navidrome_path_suffix: input.serviceId,
         navidrome_path_suffix_lookup: input.serviceId.toLowerCase(),
         jellyfin_path_suffix: input.serviceId,
@@ -2007,12 +2015,14 @@ export class ServiceRepository {
       const service = await transaction("cloud_services").where({ id: current.serviceId }).forUpdate().first();
       // 关键变量：重新登录已生成新凭据时，旧任务的结果不能覆盖新连接状态。
       const usesCurrentCredential = Number(service?.credential_revision) === Number(current.snapshot.credentialRevision);
+      // 关键变量：不同网盘使用不同错误码，但都必须进入同一重新授权状态流转。
+      const isAuthenticationFailure = input.status === "failed"
+        && isProviderAuthenticationErrorCode(input.errorCode);
       let connectionStatus = String(service?.connection_status ?? "valid");
       if (usesCurrentCredential) {
-        if (input.status === "failed" && (input.errorCode === "provider_authentication_failed"
-          || input.errorCode === "cloud123_authentication_expired" || input.errorCode === "cloud139_authentication_expired")) {
+        if (isAuthenticationFailure) {
           connectionStatus = "reauthorization_required";
-        } else if (input.status === "failed" && input.errorCode === "cloud123_business_failed"
+        } else if (input.status === "failed" && ["cloud123_business_failed", "cloud123_account_attention_required"].includes(input.errorCode ?? "")
           && service?.provider_type === "cloud123" && connectionStatus !== "reauthorization_required") {
           connectionStatus = "cloud123_business_failed";
         } else if (input.status === "completed" && current.snapshot.taskPurpose !== "ai_supplement_unmatched") {
@@ -3359,9 +3369,24 @@ export class ServiceRepository {
    * 服务级鉴权失效时一次性停止该服务的全部规格任务，避免对每个视频重复请求已经失效的 Token。
    * 文件保留为可恢复状态，APP 同步有效凭据后会自动建立新的规格后台任务。
    */
-  public async failMediaProbeJobsForAuthentication(serviceId: string, userId: string): Promise<string[]> {
+  public async failMediaProbeJobsForAuthentication(
+    serviceId: string,
+    userId: string,
+    expectedCredentialRevision?: number,
+  ): Promise<MediaProbeAuthenticationFailureResult> {
     const now = new Date().toISOString();
     return this.database.query.transaction(async (transaction) => {
+      const service = await transaction("cloud_services")
+        .where({ id: serviceId, user_id: userId })
+        .whereNull("deleted_at")
+        .forUpdate()
+        .first();
+      if (!service) throw new ApiError(404, "service_not_found", "云端服务不存在");
+      // 关键变量：重新扫码会增加凭据修订；旧任务迟到的鉴权失败不能覆盖新登录状态。
+      if (expectedCredentialRevision !== undefined
+        && Number(service.credential_revision) !== expectedCredentialRevision) {
+        return { stoppedJobIds: [], ignoredStaleCredential: true };
+      }
       const jobRows = await transaction("media_probe_jobs")
         .where({ service_id: serviceId, user_id: userId })
         .whereIn("status", ["queued", "running", "retry_waiting"])
@@ -3399,7 +3424,7 @@ export class ServiceRepository {
         connection_status: "reauthorization_required",
         updated_at: now,
       });
-      return jobIds;
+      return { stoppedJobIds: jobIds, ignoredStaleCredential: false };
     });
   }
 

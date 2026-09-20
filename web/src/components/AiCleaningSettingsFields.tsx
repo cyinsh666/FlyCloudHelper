@@ -25,11 +25,11 @@ export function AiCleaningSettingsFields({ state }: { state: AiCleaningSettingsF
   }
 
   return (
-    <div className="rounded-xl border border-border bg-secondary/35 p-4">
+    <div className="border-t border-border pt-3">
       <div className="flex items-center justify-between gap-4">
         <div>
           <p className="text-sm font-medium">AI 补充目录文件识别</p>
-          <p className="mt-1 text-xs text-muted-foreground">只补充刮削查询词，不修改网盘目录、文件名、电影/节目类型和季集号。</p>
+          <p className="mt-0.5 text-xs text-muted-foreground">只补充刮削查询词，不修改网盘文件和季集信息。</p>
         </div>
         <button
           type="button"
@@ -44,7 +44,7 @@ export function AiCleaningSettingsFields({ state }: { state: AiCleaningSettingsF
       </div>
 
       {state.value.enabled && (
-        <div className="mt-4 grid gap-4 border-t border-border/70 pt-4 sm:grid-cols-2">
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
           <label className="block">
             <span className="text-xs text-muted-foreground">清洗模型</span>
             <select
@@ -52,7 +52,7 @@ export function AiCleaningSettingsFields({ state }: { state: AiCleaningSettingsF
               required
               disabled={state.loading}
               onChange={(event) => updateValue({ modelId: event.target.value })}
-              className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm"
+              className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm"
             >
               <option value="">{state.loading ? "正在读取模型…" : "请选择模型"}</option>
               {state.models.map((model) => (
@@ -64,14 +64,14 @@ export function AiCleaningSettingsFields({ state }: { state: AiCleaningSettingsF
           </label>
           <label className="block">
             <span className="text-xs text-muted-foreground">触发策略</span>
-            <select value={state.value.triggerMode} onChange={(event) => updateValue({ triggerMode: event.target.value as AiCleaningSettingsValue["triggerMode"] })} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm">
+            <select value={state.value.triggerMode} onChange={(event) => updateValue({ triggerMode: event.target.value as AiCleaningSettingsValue["triggerMode"] })} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm">
               <option value="weak_or_unmatched">弱识别和首次未匹配时补充</option>
               <option value="weak_only">仅补充弱识别结果</option>
             </select>
           </label>
           <label className="block sm:col-span-2">
             <span className="text-xs text-muted-foreground">最低置信度</span>
-            <select value={state.value.minConfidence} onChange={(event) => updateValue({ minConfidence: Number(event.target.value) })} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm">
+            <select value={state.value.minConfidence} onChange={(event) => updateValue({ minConfidence: Number(event.target.value) })} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm">
               <option value={0.65}>0.65（更积极）</option>
               <option value={0.75}>0.75（推荐）</option>
               <option value={0.85}>0.85（更谨慎）</option>

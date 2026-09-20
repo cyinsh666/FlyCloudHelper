@@ -5,6 +5,8 @@ import { useEffect, useRef, useState } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { AdminServiceFilters } from "@/components/AdminServiceFilters";
 import { AiSupplementDialog } from "@/components/AiSupplementDialog";
+import { ProviderSelectionIcon } from "@/components/ServiceCreateSelection";
+import { ServiceStateDot } from "@/components/ServiceConnectionStatus";
 import { FilterChip, Panel, ProgressMeter, StatusPill, type StatusTone } from "@/components/ui-kit";
 import {
   cancelScanJob,
@@ -33,6 +35,16 @@ import { formatJobDateTime, formatJobDuration, getJobDurationLabel } from "@/lib
 
 // 关键变量：后台任务页固定每 5 秒读取一次进度，避免轮询和 SSE 同时触发重复请求。
 const JOB_PROGRESS_REFRESH_INTERVAL_MS = 5_000;
+
+// 关键变量：右侧任务列表每页固定展示 8 条，以两列四行展示当前页任务。
+const JOB_LIST_PAGE_SIZE = 8;
+
+// 关键变量：媒体库卡片使用简短中文类型，避免在紧凑布局中展示接口枚举。
+const catalogDataTypeLabels: Record<string, string> = {
+  video: "影视",
+  music: "音乐",
+  audiobook: "有声书",
+};
 
 const jobStatusLabels: Record<JobStatus, string> = {
   queued: "排队中",
@@ -233,6 +245,14 @@ function getJobTone(status: JobStatus): StatusTone {
   return "primary";
 }
 
+/** 将任务状态映射为标题旁圆点颜色，文字说明通过 title 和 aria-label 保留。 */
+function getJobStatusDotClass(status: JobStatus): string {
+  if (status === "completed") return "bg-success";
+  if (status === "failed" || status === "cancelled") return "bg-destructive";
+  if (status === "queued" || status === "retry_waiting" || status === "paused") return "bg-warning";
+  return "animate-pulse bg-primary";
+}
+
 /** 生成排队任务的简短等待说明，列表和详情保持同一套含义。 */
 function getQueuedJobWaitSummary(job: ScanJob): string {
   if (job.status !== "queued") return "";
@@ -283,12 +303,15 @@ function canDeleteJob(job: ScanJob): boolean {
 function JobsView({ admin }: { admin: boolean }) {
   const [statusFilter, setStatusFilter] = useState<JobStatusFilter>("all");
   const [jobTypeFilter, setJobTypeFilter] = useState<JobTypeFilter>("all");
+  const [jobPageOffset, setJobPageOffset] = useState(0);
   const resource = useApiResource(
     () => listJobs(admin, {
       status: statusFilter === "all" ? undefined : statusFilter,
       jobType: jobTypeFilter === "all" ? undefined : jobTypeFilter,
+      limit: JOB_LIST_PAGE_SIZE,
+      offset: jobPageOffset,
     }),
-    [admin, statusFilter, jobTypeFilter],
+    [admin, statusFilter, jobTypeFilter, jobPageOffset],
   );
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -331,6 +354,15 @@ function JobsView({ admin }: { admin: boolean }) {
   const canDownloadFailureReport = Boolean(activeJob && activeJob.jobType === "scan" && activeJob.status !== "queued");
   const snapshotFields = activeJob ? getJobSnapshotFields(activeJob.snapshot) : [];
   const pluginSnapshots = activeJob ? getJobPluginSnapshots(activeJob.snapshot) : [];
+  const jobTotal = resource.data?.total ?? 0;
+  const jobPageCount = Math.max(1, Math.ceil(jobTotal / JOB_LIST_PAGE_SIZE));
+  const currentJobPage = Math.floor(jobPageOffset / JOB_LIST_PAGE_SIZE) + 1;
+
+  useEffect(() => {
+    if (jobTotal === 0 || jobPageOffset < jobTotal) return;
+    // 删除当前页最后一条任务后返回新的末页，避免列表停留在空白页。
+    setJobPageOffset(Math.max(0, (jobPageCount - 1) * JOB_LIST_PAGE_SIZE));
+  }, [jobPageCount, jobPageOffset, jobTotal]);
 
   useEffect(() => {
     /** 页面处于前台时才读取任务进度，后台标签页不继续占用接口。 */
@@ -412,6 +444,7 @@ function JobsView({ admin }: { admin: boolean }) {
     setMessage(targetJob.dataType === "music" ? "正在将音乐阶段重新加入队列…" : "正在创建重试任务…");
     try {
       const job = await retryScanJob(targetJobId, admin, musicStage);
+      setJobPageOffset(0);
       setSelectedJobId(job.id);
       setMessage(`任务 ${job.id} 已进入队列`);
       await resource.refresh();
@@ -502,6 +535,7 @@ function JobsView({ admin }: { admin: boolean }) {
     setMessage("正在清除已完成和失败任务…");
     try {
       const deletedCount = await clearCompletedAndFailedScanJobs(admin);
+      setJobPageOffset(0);
       setSelectedJobId(null);
       setMessage(`已清除 ${deletedCount.toLocaleString()} 个已完成或失败任务`);
       await resource.refresh();
@@ -621,7 +655,7 @@ function JobsView({ admin }: { admin: boolean }) {
             <p className="text-xs text-muted-foreground">任务状态</p>
             <div className="flex flex-wrap gap-2">
               {jobStatusFilterOptions.map((option) => (
-                <FilterChip key={option.value} active={statusFilter === option.value} onClick={() => setStatusFilter(option.value)}>
+                <FilterChip key={option.value} active={statusFilter === option.value} onClick={() => { setJobPageOffset(0); setStatusFilter(option.value); }}>
                   {option.label}
                 </FilterChip>
               ))}
@@ -631,7 +665,7 @@ function JobsView({ admin }: { admin: boolean }) {
             <p className="text-xs text-muted-foreground">任务类型</p>
             <div className="flex flex-wrap gap-2">
               {jobTypeFilterOptions.map((option) => (
-                <FilterChip key={option.value} active={jobTypeFilter === option.value} onClick={() => setJobTypeFilter(option.value)}>
+                <FilterChip key={option.value} active={jobTypeFilter === option.value} onClick={() => { setJobPageOffset(0); setJobTypeFilter(option.value); }}>
                   {option.label}
                 </FilterChip>
               ))}
@@ -641,10 +675,10 @@ function JobsView({ admin }: { admin: boolean }) {
       </Panel>
       {!activeJob ? <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? (statusFilter === "all" && jobTypeFilter === "all" ? "还没有后台任务" : "当前筛选条件下没有任务")}</div></Panel> : (
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
-          <Panel title={`任务详情 ${activeJob.id}`} description={`${activeJob.serviceName} · ${getBackgroundJobLabel(activeJob)}${admin ? ` · ${activeJob.ownerUsername}` : ""}`}>
-            <div className="rounded-xl border border-primary/25 bg-primary/8 p-5">
-              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3"><div><p className="text-xs text-muted-foreground">当前阶段</p><p className="font-display mt-1 text-2xl font-semibold">{getJobStageLabel(activeJob.stage)}</p><p className="mt-1 text-xs text-muted-foreground">{getJobDurationLabel(activeJob.status)}：{formatJobDuration(activeJob.elapsedMs)}</p></div><StatusPill tone={getJobTone(activeJob.status)}>{getJobStatusLabel(activeJob)}</StatusPill></div>
-              <div className="mt-4"><ProgressMeter value={activeJob.status === "completed" ? 1 : activeJob.processedCount} total={activeJob.status === "completed" ? 1 : activeJob.totalCount} /></div>
+          <Panel className="p-4 sm:p-4 xl:h-[calc(100vh-14rem)] xl:min-h-[560px] xl:max-h-[720px] xl:overflow-y-auto" title="任务详情" description={`${activeJob.serviceName} · ${getBackgroundJobLabel(activeJob)}${admin ? ` · ${activeJob.ownerUsername}` : ""} · 任务 ${activeJob.id.slice(0, 8)}`}>
+            <div className="rounded-xl border border-primary/25 bg-primary/8 p-4">
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3"><div><p className="text-[11px] text-muted-foreground">当前阶段</p><p className="font-display mt-0.5 text-xl font-semibold">{getJobStageLabel(activeJob.stage)}</p><p className="mt-0.5 text-[11px] text-muted-foreground">{getJobDurationLabel(activeJob.status)}：{formatJobDuration(activeJob.elapsedMs)}</p></div><StatusPill tone={getJobTone(activeJob.status)}>{getJobStatusLabel(activeJob)}</StatusPill></div>
+              <div className="mt-3"><ProgressMeter value={activeJob.status === "completed" ? 1 : activeJob.processedCount} total={activeJob.status === "completed" ? 1 : activeJob.totalCount} /></div>
               {activeJob.status === "queued" && <div className="mt-3 rounded-lg border border-warning/30 bg-warning/8 px-3 py-2.5">
                 <p className="text-xs font-medium">{getQueuedJobWaitSummary(activeJob)}</p>
                 {activeJob.waitingForJobs.length > 0 && <ul className="mt-2 space-y-1.5">
@@ -654,7 +688,7 @@ function JobsView({ admin }: { admin: boolean }) {
                   </li>)}
                 </ul>}
               </div>}
-              <div className="mt-3 min-w-0 rounded-lg border border-border/70 bg-background/30 px-3 py-2">
+              <div className="mt-3 min-w-0 border-t border-border/70 pt-3">
                 <p className="text-[11px] text-muted-foreground">{activeJob.jobType === "media_probe" ? "当前分析文件" : activeJobIsAiSupplement ? "当前处理内容" : "当前扫描路径"}</p>
                 <p className="mt-1 truncate font-mono text-xs" title={activeJob.currentPath ?? undefined}>{activeJob.currentPath || (activeJob.jobType === "media_probe" ? "等待领取视频文件" : activeJobIsAiSupplement ? "准备读取媒体库未匹配内容" : "准备读取扫描目录")}</p>
                 {activeJob.jobType === "scan" && activeJob.resumeSupported && <p className="mt-2 text-[11px] text-muted-foreground">可恢复检查点：{formatCheckpointTime(activeJob.checkpointUpdatedAt)}</p>}
@@ -675,7 +709,7 @@ function JobsView({ admin }: { admin: boolean }) {
                   <span title="完整电影或节目处理失败的数量">错误 {activeJob.errorCount.toLocaleString()}</span>
                 </div>
               )}
-              {activeJob.jobType === "scan" && <div className="mt-4 flex flex-wrap justify-end gap-2 border-t border-border/70 pt-4">
+              {activeJob.jobType === "scan" && <div className="mt-3 flex flex-wrap justify-end gap-2 border-t border-border/70 pt-3">
                 <SecondaryButton onClick={() => void openAiSupplementDialog()}>
                   <Sparkles className="size-4" /> AI补充详情
                 </SecondaryButton>
@@ -693,10 +727,10 @@ function JobsView({ admin }: { admin: boolean }) {
               )}
             </div>
             {activeJob.dataType === "music" && <MusicScanStages jobId={activeJob.id} admin={admin} stages={activeJob.snapshot.musicStages} retryEnabled={canRetryActiveJob && !activeJobOperationBlocked} onRetry={(stage) => void retryJob(activeJob, stage)} />}
-            <h3 className="mt-6 mb-3 text-sm font-semibold">配置快照（只读）</h3>
-            <div className="rounded-xl border border-border bg-secondary/40 p-4">
-              <dl className="grid gap-3 sm:grid-cols-2">
-                {snapshotFields.map((field) => <div key={field.label}><dt className="text-[11px] text-muted-foreground">{field.label}</dt><dd className="mt-1 break-all text-sm">{field.value}</dd></div>)}
+            <h3 className="mt-4 mb-2 text-sm font-semibold">配置快照（只读）</h3>
+            <div className="rounded-xl border border-border bg-secondary/40 p-3">
+              <dl className="grid gap-x-4 gap-y-2 sm:grid-cols-2">
+                {snapshotFields.map((field) => <div key={field.label}><dt className="text-[10px] text-muted-foreground">{field.label}</dt><dd className="mt-0.5 break-all text-xs">{field.value}</dd></div>)}
               </dl>
               {activeJob.jobType === "scan" && <div className="mt-4 border-t border-border pt-4">
                 <p className="text-[11px] text-muted-foreground">元数据插件</p>
@@ -717,41 +751,50 @@ function JobsView({ admin }: { admin: boolean }) {
             {activeJob.status !== "retry_waiting" && (activeJob.errorCode || activeJob.errorMessage) && <div className="mt-4 rounded-xl border border-destructive/30 bg-destructive/8 p-4"><p className="font-mono text-xs text-destructive">{activeJob.errorCode}</p><p className="mt-2 text-sm">{activeJob.errorMessage}</p></div>}
           </Panel>
           <Panel
+            className="overflow-hidden p-4 sm:p-4 xl:flex xl:h-[calc(100vh-14rem)] xl:min-h-[560px] xl:max-h-[720px] xl:flex-col"
             title="任务列表"
-            description={`共 ${resource.data?.total ?? 0} 个任务`}
+            description={`共 ${jobTotal} 个任务 · 第 ${currentJobPage}/${jobPageCount} 页`}
             action={<button type="button" title="清除已完成和失败的任务" onClick={() => void clearCompletedJobs()} disabled={clearingCompletedJobs} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/8 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /> {clearingCompletedJobs ? "正在清除…" : "清除已完成和失败"}</button>}
           >
-            <ul className="space-y-2">
+            <ul className="grid max-h-[560px] grid-cols-1 content-start gap-1.5 overflow-y-auto pr-1 sm:grid-cols-2 xl:min-h-0 xl:flex-1 xl:max-h-none">
               {jobs.map((job) => {
                 const selected = activeJob?.id === job.id;
                 const pendingOperation = pendingJobOperations[job.id];
                 const operationBlocked = Boolean(pendingOperation || job.controlAction !== "none");
+                const hasFooterOperation = canPauseJob(job) || canResumeJob(job) || canCancelJob(job) || canRetryJob(job);
                 return <li key={job.id}>
-                  <article className={`overflow-hidden rounded-xl border bg-secondary/40 transition-colors ${selected ? "border-foreground/45" : "border-border hover:border-foreground/25"}`}>
-                    <button type="button" aria-pressed={selected} onClick={() => setSelectedJobId(job.id)} className="w-full p-3.5 text-left">
-                      <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
-                        <div className="min-w-0">
-                          <p className="truncate font-mono text-xs">{job.id}</p>
-                          <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{job.serviceName} · {getBackgroundJobLabel(job)} · {getJobStageLabel(job.stage)}{admin ? ` · ${job.ownerUsername}` : ""}</p>
-                          <p className="mt-1 text-[11px] text-muted-foreground">{getJobDurationLabel(job.status)}：{formatJobDuration(job.elapsedMs)}</p>
-                          {job.status === "queued" && <p className="mt-1 truncate text-[11px] text-warning" title={getQueuedJobWaitSummary(job)}>{getQueuedJobWaitSummary(job)}</p>}
-                          <div className="mt-1 grid gap-1 text-[11px] text-muted-foreground sm:grid-cols-2"><span>开始时间：{formatJobDateTime(job.startedAt)}</span><span>结束时间：{formatJobDateTime(job.finishedAt)}</span></div>
+                  <article className={`relative overflow-hidden rounded-xl border bg-secondary/40 transition-colors ${selected ? "border-foreground/45" : "border-border hover:border-foreground/25"}`}>
+                    <button type="button" aria-pressed={selected} onClick={() => setSelectedJobId(job.id)} className={`w-full px-3 py-2.5 text-left ${canDeleteJob(job) ? "pr-11" : ""}`}>
+                      <div className="min-w-0">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <p className="truncate text-sm font-semibold" title={job.serviceName}>{job.serviceName}</p>
+                          <span role="status" aria-label={getJobStatusLabel(job)} title={getJobStatusLabel(job)} className={`size-2 shrink-0 rounded-full ${getJobStatusDotClass(job.status)}`} />
                         </div>
-                        <StatusPill tone={getJobTone(job.status)}>{getJobStatusLabel(job)}</StatusPill>
+                        <div className="min-w-0">
+                          <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{getBackgroundJobLabel(job)} · {getJobStageLabel(job.stage)}{admin ? ` · ${job.ownerUsername}` : ""}</p>
+                          {job.status === "queued" && <p className="mt-1 truncate text-[11px] text-warning" title={getQueuedJobWaitSummary(job)}>{getQueuedJobWaitSummary(job)}</p>}
+                          <p className="mt-1 truncate text-[11px] text-muted-foreground">{getJobDurationLabel(job.status)} {formatJobDuration(job.elapsedMs)}</p>
+                          <p className="mt-0.5 truncate text-[11px] text-muted-foreground">开始时间 {formatJobDateTime(job.startedAt)}</p>
+                        </div>
                       </div>
-                      <div className="mt-2.5"><ProgressMeter value={job.status === "completed" ? 1 : job.processedCount} total={job.status === "completed" ? 1 : job.totalCount} /></div>
+                      <div className="mt-1.5"><ProgressMeter value={job.status === "completed" ? 1 : job.processedCount} total={job.status === "completed" ? 1 : job.totalCount} /></div>
                     </button>
-                    <div className="flex flex-wrap justify-end gap-2 border-t border-border/70 px-3.5 py-2.5">
+                    {canDeleteJob(job) && <button type="button" aria-label={`删除 ${job.serviceName} 的任务`} title="删除任务" onClick={() => { setSelectedJobId(job.id); void deleteJob(job); }} disabled={operationBlocked} className="absolute top-2.5 right-2.5 grid size-7 place-items-center rounded-md text-destructive transition-colors hover:bg-destructive/12 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /></button>}
+                    {hasFooterOperation && <div className="flex flex-wrap justify-end gap-1.5 border-t border-border/70 px-3 py-2">
                       {canPauseJob(job) && <button type="button" onClick={() => { setSelectedJobId(job.id); void pauseJob(job); }} disabled={operationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/35 px-2.5 py-1.5 text-[11px] text-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"><Pause className="size-3.5" />{pendingOperation === "pause" || job.controlAction === "pause" ? "暂停处理中…" : "暂停"}</button>}
                       {canResumeJob(job) && <button type="button" onClick={() => { setSelectedJobId(job.id); void resumeJob(job); }} disabled={operationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/35 px-2.5 py-1.5 text-[11px] text-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"><Play className="size-3.5" />{pendingOperation === "resume" ? "正在继续…" : "继续"}</button>}
                       {canCancelJob(job) && <button type="button" onClick={() => { setSelectedJobId(job.id); void cancelJob(job); }} disabled={operationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-destructive/35 bg-destructive/8 px-2.5 py-1.5 text-[11px] text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Square className="size-3.5" />{pendingOperation === "cancel" || job.controlAction === "cancel" ? "终止处理中…" : "终止"}</button>}
                       {canRetryJob(job) && <button type="button" onClick={() => { setSelectedJobId(job.id); void retryJob(job); }} disabled={operationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/35 px-2.5 py-1.5 text-[11px] text-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"><RotateCcw className="size-3.5" />{pendingOperation === "retry" ? "正在重试…" : job.snapshot.taskPurpose === "ai_supplement_unmatched" ? "重试AI补充" : "重试"}</button>}
-                      {canDeleteJob(job) && <button type="button" onClick={() => { setSelectedJobId(job.id); void deleteJob(job); }} disabled={operationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-destructive/35 bg-destructive/8 px-2.5 py-1.5 text-[11px] text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" />{pendingOperation === "delete" ? "正在删除…" : "删除"}</button>}
-                    </div>
+                    </div>}
                   </article>
                 </li>;
               })}
             </ul>
+            <div className="mt-3 flex items-center justify-center gap-3 border-t border-border/70 pt-3">
+              <button type="button" disabled={jobPageOffset <= 0 || resource.loading} onClick={() => setJobPageOffset(Math.max(0, jobPageOffset - JOB_LIST_PAGE_SIZE))} className="rounded-lg border border-border px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40">上一页</button>
+              <span className="text-xs text-muted-foreground">{currentJobPage} / {jobPageCount}</span>
+              <button type="button" disabled={jobPageOffset + JOB_LIST_PAGE_SIZE >= jobTotal || resource.loading} onClick={() => setJobPageOffset(jobPageOffset + JOB_LIST_PAGE_SIZE)} className="rounded-lg border border-border px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40">下一页</button>
+            </div>
           </Panel>
         </div>
       )}
@@ -811,21 +854,30 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
       />
       {admin && <AdminServiceFilters value={filters} users={filterOptions.data?.users ?? []} providers={filterOptions.data?.providers ?? []} resultCount={resource.data?.total ?? 0} onChange={setFilters} />}
       {resource.error && <Panel className="mb-4"><p className="text-sm text-destructive">{resource.error}</p></Panel>}
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
         {services.map((service) => (
-          <article key={service.id} className="surface p-5">
-            <div className="flex items-start justify-between gap-3"><div className="min-w-0"><h2 className="truncate text-sm font-semibold">{service.displayName}</h2><p className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{service.providerType} · {service.libraryId}</p></div><StatusPill tone={service.status === "active" ? "success" : "warning"}>{service.status === "active" ? "来源服务正常" : "来源服务需处理"}</StatusPill></div>
-            <dl className="mt-5 grid grid-cols-2 gap-3 text-center">
-              <div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">媒体条目</dt><dd className="mt-1 text-xs font-medium">{service.itemCount.toLocaleString()}</dd></div>
-              <div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">目录版本</dt><dd className="mt-1 text-xs font-medium">v{service.catalogVersion}</dd></div>
-            </dl>
-            <div className="mt-4 flex flex-wrap gap-2">
-              <StatusPill tone={service.jellyfinEnabled ? "success" : "neutral"}>Jellyfin {service.jellyfinEnabled ? "已启用" : "未启用"}</StatusPill>
-              {admin && <StatusPill>{service.ownerUsername}</StatusPill>}
+          <article key={service.id} className="surface p-4">
+            <header className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
+              <div className="flex min-w-0 items-center gap-3">
+                <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-border text-xs font-semibold" style={{ backgroundImage: "var(--gradient-surface)" }}>
+                  <ProviderSelectionIcon providerType={service.providerType} />
+                </span>
+                <div className="min-w-0">
+                  <h2 className="truncate text-sm font-semibold">{service.displayName}</h2>
+                  <p className="truncate text-[11px] text-muted-foreground">{service.providerType}{admin ? ` · ${service.ownerUsername}` : ""}</p>
+                </div>
+              </div>
+              <ServiceStateDot service={service} />
+            </header>
+            <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+              <StatusPill>{catalogDataTypeLabels[service.dataType] ?? service.dataType}</StatusPill>
+              <span>条目 {service.itemCount.toLocaleString()}</span>
+              <span>版本 v{service.catalogVersion}</span>
+              {service.dataType !== "music" && <span>Jellyfin {service.jellyfinEnabled ? "已启用" : "未启用"}</span>}
             </div>
-            <footer className="mt-5 flex flex-wrap gap-2">
-              <Link to={admin ? "/admin/libraries/$serviceId/catalog" : "/app/libraries/$serviceId/catalog"} params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Images className="size-3.5" /> 海报墙</Link>
-              <Link to={admin ? "/admin/libraries/$serviceId/settings" : "/app/libraries/$serviceId/settings"} params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Settings2 className="size-3.5" /> 媒体库设置</Link>
+            <footer className="mt-3 flex flex-wrap gap-2 border-t border-border/70 pt-3">
+              <Link to={admin ? "/admin/libraries/$serviceId/catalog" : "/app/libraries/$serviceId/catalog"} params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Images className="size-3.5" /> 海报</Link>
+              <Link to={admin ? "/admin/libraries/$serviceId/settings" : "/app/libraries/$serviceId/settings"} params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Settings2 className="size-3.5" /> 设置</Link>
             </footer>
           </article>
         ))}

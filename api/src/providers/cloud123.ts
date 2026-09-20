@@ -1,15 +1,27 @@
 import { ApiError } from "../errors.js";
 import { CloudDriveProviderBase, type CloudDrivePage } from "./cloud-drive-base.js";
 import { parseCloudApiObject, readCloudNumber, readCloudRecord, readCloudText, readCloudTextFile, requestCloudApiText } from "./cloud-api.js";
-import { providerProbeStream, type ProviderNetworkOptions, type ProviderStreamResponse } from "./network.js";
+import {
+  PROVIDER_RATE_LIMIT_MAX_RETRIES,
+  providerProbeStream,
+  readProviderRateLimitDelayMs,
+  registerProviderSharedRateLimit,
+  waitForProviderRateLimit,
+  type ProviderNetworkOptions,
+  type ProviderStreamResponse,
+} from "./network.js";
 import { type ProviderConnectionContext, type ProviderDescriptor, type ProviderEntry, type ProviderFileAccess, createProviderRecommendedScanSettings, requireConnectionString } from "./types.js";
 
 const CLOUD123_API = "https://www.123pan.cn";
 const CLOUD123_DOWNLOAD_PROBE_MAX_BYTES = 64 * 1024;
+/** 与 APP 保持一致的123业务接口最小请求间隔，避免扫描并发形成瞬时突发。 */
+const CLOUD123_REQUEST_INTERVAL_MS = 150;
 
 /** 123云盘 Android 客户端协议只读 Provider。 */
 export class Cloud123Provider extends CloudDriveProviderBase {
   protected readonly rootResourceId = "0";
+  /** FlyCloudHelper 实例内所有123请求共享下一次允许发出的时间。 */
+  private nextRequestAtMs = 0;
   public readonly descriptor: ProviderDescriptor = {
     type: "cloud123", displayName: "123云盘", adapterVersion: "1.0.0", credentialSchemaVersion: 1,
     supportedDataTypes: ["video", "music"],
@@ -81,15 +93,50 @@ export class Cloud123Provider extends CloudDriveProviderBase {
     return readCloudTextFile(await this.loadFileAccess(connection, entry.locator, signal), this.networkOptions, signal);
   }
 
-  /** 请求123业务接口并严格处理登录失效业务码。 */
+  /** 等待123请求时间窗口，扫描取消时立即结束等待。 */
+  private async waitForRequestSlot(signal?: AbortSignal): Promise<void> {
+    while (true) {
+      if (signal?.aborted) throw new ApiError(499, "provider_request_aborted", "123云盘请求已取消");
+      const now = Date.now();
+      if (now >= this.nextRequestAtMs) {
+        // 检查与占用窗口之间没有异步操作，并发目录不能在同一时刻一起发出。
+        this.nextRequestAtMs = now + CLOUD123_REQUEST_INTERVAL_MS;
+        return;
+      }
+      await waitForProviderRateLimit(this.nextRequestAtMs - now, signal);
+    }
+  }
+
+  /** 请求123业务接口，区分登录失效、限流、安全验证和普通业务失败。 */
   private async request(connection: Record<string, unknown>, path: string, init: RequestInit, signal?: AbortSignal): Promise<Record<string, unknown>> {
     const token = requireConnectionString(connection, "accessToken", "123登录 Token");
-    const result = await requestCloudApiText(`${CLOUD123_API}${path}`, { ...init, headers: { ...this.createHeaders(connection, token), ...init.headers } }, this.networkOptions, signal);
-    const payload = parseCloudApiObject(result.text, ["FileId", "ParentFileId", "UID"]);
-    const code = Number(payload.code ?? -1);
-    if (code === 2) throw new ApiError(410, "cloud123_authentication_expired", "123云盘登录已失效，请重新扫码");
-    if (![0, 5113, 5114].includes(code)) throw new ApiError(502, "cloud123_business_failed", "123云盘接口返回业务错误");
-    return payload;
+    for (let retryCount = 0; ; retryCount += 1) {
+      await this.waitForRequestSlot(signal);
+      const result = await requestCloudApiText(`${CLOUD123_API}${path}`, {
+        ...init,
+        headers: { ...this.createHeaders(connection, token), ...init.headers },
+      }, this.networkOptions, signal);
+      const payload = parseCloudApiObject(result.text, ["FileId", "ParentFileId", "UID"]);
+      const code = Number(payload.code ?? -1);
+      const message = readCloudText(payload, ["message", "msg", "Message"]).slice(0, 200);
+      if ([0, 5113, 5114].includes(code)) {
+        return payload;
+      }
+      if (code === 2) {
+        throw new ApiError(410, "cloud123_authentication_expired", "123云盘登录已失效，请重新扫码");
+      }
+      if (/验证码|安全验证|账号被限制|账号已冻结/u.test(message)) {
+        throw new ApiError(423, "cloud123_account_attention_required", "123云盘账号需要完成安全验证，请处理后重试");
+      }
+      if (code === 429) {
+        const delayMs = readProviderRateLimitDelayMs(result.response.headers.get("retry-after"), retryCount);
+        registerProviderSharedRateLimit(CLOUD123_API, delayMs);
+        if (retryCount < PROVIDER_RATE_LIMIT_MAX_RETRIES) continue;
+        throw new ApiError(503, "provider_rate_limited", "123云盘请求频繁，等待重试后仍未恢复，请稍后再试");
+      }
+      throw new ApiError(502, "cloud123_business_failed",
+        `123云盘接口返回业务错误（业务码：${Number.isFinite(code) ? code : "未知"}）`);
+    }
   }
 
   /** 构造123 Android 设备头。 */

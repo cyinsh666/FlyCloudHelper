@@ -1,7 +1,7 @@
 {
   "name": "flycloud-helper",
   "private": true,
-  "version": "0.1.12",
+  "version": "0.1.15",
   "workspaces": [
     "web",
     "api"

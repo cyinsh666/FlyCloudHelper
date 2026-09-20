@@ -1,6 +1,7 @@
 import { loadEnumerationPage } from "./types.js";
 import { providerFetch, validateProviderUrl, type ProviderNetworkOptions } from "./network.js";
-import { validationError } from "../errors.js";
+import { CredentialRefreshCoordinator } from "./credential-refresh-coordinator.js";
+import { ApiError, validationError } from "../errors.js";
 import {
   type ProviderAdapter,
   type ProviderConnectionContext,
@@ -33,6 +34,14 @@ interface AliyunDriveInfo {
   backupDriveId: string;
 }
 
+/** 阿里云盘一次完整的令牌轮换结果。 */
+interface AliyunTokenRefreshResult {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  refreshUrl: string;
+}
+
 const DEFAULT_ALIYUN_REFRESH_URL = "https://api.oplist.org/alicloud/renewapi";
 const TOKEN_REFRESH_AHEAD_MS = 5 * 60 * 1000;
 const ALIYUN_RESOURCE_DRIVE_NAME = "资源库";
@@ -61,6 +70,8 @@ export class AliyunDriveProvider implements ProviderAdapter {
 
   private readonly networkOptions: ProviderNetworkOptions;
   private cachedDriveInfo: { accessToken: string; info: AliyunDriveInfo } | null = null;
+  /** 按旧 Refresh Token 合并跨请求刷新，并接住稍晚到达的旧连接副本。 */
+  private readonly tokenRefreshCoordinator = new CredentialRefreshCoordinator<AliyunTokenRefreshResult>();
 
   public constructor(networkOptions: ProviderNetworkOptions) {
     this.networkOptions = networkOptions;
@@ -243,18 +254,15 @@ export class AliyunDriveProvider implements ProviderAdapter {
     signal?: AbortSignal,
     context?: ProviderConnectionContext,
   ): Promise<ProviderFileAccess> {
-    await this.ensureValidToken(connection, context?.persistConnection, signal);
-    const accessToken = requireConnectionString(connection, "accessToken", "Access Token");
     const driveId = requireConnectionString(locator, "driveId", "Drive ID");
     const fileId = requireConnectionString(locator, "fileId", "File ID");
-    const apiBase = this.resolveApiBaseUrl(connection);
-    const baseUrl = await validateProviderUrl(apiBase, this.networkOptions);
-    const response = await providerFetch(new URL("/adrive/v1.0/openFile/getDownloadUrl", baseUrl), {
-      method: "POST",
-      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ drive_id: driveId, file_id: fileId }),
-    }, this.networkOptions, signal);
-    const payload = await response.json() as { url?: string; expiration?: string };
+    const payload = await this.requestAliyunJson<{ url?: string; expiration?: string }>(
+      connection,
+      "/adrive/v1.0/openFile/getDownloadUrl",
+      { drive_id: driveId, file_id: fileId },
+      context?.persistConnection,
+      signal,
+    );
     if (!payload.url) throw new Error("阿里云盘开放接口未返回下载地址");
     return { url: payload.url, expiresAt: payload.expiration ?? null, headers: {} };
   }
@@ -279,16 +287,13 @@ export class AliyunDriveProvider implements ProviderAdapter {
     signal?: AbortSignal,
     persistConnection?: (connection: Record<string, unknown>) => Promise<void>,
   ): Promise<{ items: AliyunFileItem[]; nextMarker: string | null }> {
-    await this.ensureValidToken(connection, persistConnection, signal);
-    const accessToken = requireConnectionString(connection, "accessToken", "Access Token");
-    const apiBase = this.resolveApiBaseUrl(connection);
-    const baseUrl = await validateProviderUrl(apiBase, this.networkOptions);
-    const response = await providerFetch(new URL("/adrive/v1.0/openFile/list", baseUrl), {
-      method: "POST",
-      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ drive_id: driveId, parent_file_id: parentFileId, limit, marker: marker ?? "" }),
-    }, this.networkOptions, signal);
-    const payload = await response.json() as { items?: AliyunFileItem[]; next_marker?: string };
+    const payload = await this.requestAliyunJson<{ items?: AliyunFileItem[]; next_marker?: string }>(
+      connection,
+      "/adrive/v1.0/openFile/list",
+      { drive_id: driveId, parent_file_id: parentFileId, limit, marker: marker ?? "" },
+      persistConnection,
+      signal,
+    );
     return { items: Array.isArray(payload.items) ? payload.items : [], nextMarker: payload.next_marker || null };
   }
 
@@ -308,25 +313,18 @@ export class AliyunDriveProvider implements ProviderAdapter {
     signal?: AbortSignal,
     persistConnection?: (connection: Record<string, unknown>) => Promise<void>,
   ): Promise<AliyunDriveInfo> {
-    await this.ensureValidToken(connection, persistConnection, signal);
     const legacyDriveId = typeof connection.driveId === "string" ? connection.driveId.trim() : "";
+    await this.ensureValidToken(connection, persistConnection, signal);
     const accessToken = requireConnectionString(connection, "accessToken", "Access Token");
     const cached = this.cachedDriveInfo;
     if (cached !== null && cached.accessToken === accessToken && cached.info.defaultDriveId.length > 0) {
       return cached.info;
     }
-    const apiBase = this.resolveApiBaseUrl(connection);
-    const baseUrl = await validateProviderUrl(apiBase, this.networkOptions);
-    const response = await providerFetch(new URL("/adrive/v1.0/user/getDriveInfo", baseUrl), {
-      method: "POST",
-      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-      body: "{}",
-    }, this.networkOptions, signal);
-    const payload = await response.json() as {
+    const payload = await this.requestAliyunJson<{
       default_drive_id?: string;
       resource_drive_id?: string;
       backup_drive_id?: string;
-    };
+    }>(connection, "/adrive/v1.0/user/getDriveInfo", {}, persistConnection, signal);
     const info: AliyunDriveInfo = {
       defaultDriveId: `${payload.default_drive_id ?? payload.resource_drive_id ?? payload.backup_drive_id ?? ""}`.trim(),
       resourceDriveId: `${payload.resource_drive_id ?? ""}`.trim(),
@@ -341,7 +339,8 @@ export class AliyunDriveProvider implements ProviderAdapter {
     if (info.resourceDriveId.length === 0) {
       info.resourceDriveId = info.defaultDriveId;
     }
-    this.cachedDriveInfo = { accessToken, info };
+    const responseAccessToken = requireConnectionString(connection, "accessToken", "Access Token");
+    this.cachedDriveInfo = { accessToken: responseAccessToken, info };
     return info;
   }
 
@@ -351,19 +350,74 @@ export class AliyunDriveProvider implements ProviderAdapter {
     return configured || "https://openapi.alipan.com";
   }
 
-  /** 临近过期时使用云端持有的 Refresh Token 刷新，并原位保存同一凭据修订。 */
+  /** 统一请求阿里开放接口；Access Token 被明确拒绝时强制刷新一次后重试原请求。 */
+  private async requestAliyunJson<T>(
+    connection: Record<string, unknown>,
+    path: string,
+    body: Record<string, unknown>,
+    persistConnection?: (connection: Record<string, unknown>) => Promise<void>,
+    signal?: AbortSignal,
+    retriedAuthentication = false,
+  ): Promise<T> {
+    await this.ensureValidToken(connection, persistConnection, signal);
+    const accessToken = requireConnectionString(connection, "accessToken", "Access Token");
+    const baseUrl = await validateProviderUrl(this.resolveApiBaseUrl(connection), this.networkOptions);
+    try {
+      const response = await providerFetch(new URL(path, baseUrl), {
+        method: "POST",
+        headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }, this.networkOptions, signal);
+      return await response.json() as T;
+    } catch (error) {
+      if (!retriedAuthentication && error instanceof ApiError && error.code === "provider_authentication_failed") {
+        // 同一连接已经由并发请求刷新时直接复用，避免重复提交 Refresh Token。
+        if (String(connection.accessToken ?? "").trim() === accessToken) {
+          await this.ensureValidToken(connection, persistConnection, signal, true);
+        }
+        return this.requestAliyunJson<T>(connection, path, body, persistConnection, signal, true);
+      }
+      throw error;
+    }
+  }
+
+  /** 临近过期或上游明确拒绝时刷新令牌，并原位保存同一凭据修订。 */
   private async ensureValidToken(
     connection: Record<string, unknown>,
     persistConnection?: (connection: Record<string, unknown>) => Promise<void>,
     signal?: AbortSignal,
+    forceRefresh = false,
   ): Promise<void> {
     const accessToken = typeof connection.accessToken === "string" ? connection.accessToken.trim() : "";
     const expiresAt = Number(connection.expiresAt ?? 0);
-    if (accessToken && (expiresAt <= 0 || Date.now() + TOKEN_REFRESH_AHEAD_MS < expiresAt)) return;
+    if (!forceRefresh && accessToken && (expiresAt <= 0 || Date.now() + TOKEN_REFRESH_AHEAD_MS < expiresAt)) return;
     const refreshToken = requireConnectionString(connection, "refreshToken", "Refresh Token");
     const configuredRefreshUrl = typeof connection.refreshUrl === "string" && connection.refreshUrl.trim()
       ? connection.refreshUrl.trim()
       : DEFAULT_ALIYUN_REFRESH_URL;
+    // 强制刷新把被拒绝的 Access Token 纳入键，避免复用刚刚被上游判定失效的近期结果。
+    const refreshCoordinationKey = forceRefresh
+      ? `${configuredRefreshUrl}\n${refreshToken}\n${accessToken}`
+      : `${configuredRefreshUrl}\n${refreshToken}`;
+    const sharedRefresh = await this.tokenRefreshCoordinator.execute(
+      refreshCoordinationKey,
+      // 轮换独立使用 Provider 的30秒超时，避免首个等待任务取消后丢失已经轮换的令牌。
+      () => this.performTokenRefresh(refreshToken, configuredRefreshUrl),
+    );
+    connection.accessToken = sharedRefresh.result.accessToken;
+    connection.refreshToken = sharedRefresh.result.refreshToken;
+    connection.expiresAt = sharedRefresh.result.expiresAt;
+    connection.refreshUrl = sharedRefresh.result.refreshUrl;
+    this.cachedDriveInfo = null;
+    await persistConnection?.(connection);
+  }
+
+  /** 向阿里刷新端点提交一次旧 Refresh Token，只返回结果，不修改调用方连接。 */
+  private async performTokenRefresh(
+    refreshToken: string,
+    configuredRefreshUrl: string,
+    signal?: AbortSignal,
+  ): Promise<AliyunTokenRefreshResult> {
     const refreshUrl = new URL(configuredRefreshUrl);
     if (refreshUrl.protocol !== "https:") throw validationError("refreshUrl", "阿里云盘 Token 刷新地址必须使用 HTTPS");
     refreshUrl.searchParams.set("refresh_ui", refreshToken);
@@ -374,7 +428,9 @@ export class AliyunDriveProvider implements ProviderAdapter {
     const payload = await response.json() as Record<string, unknown>;
     const nextAccessToken = typeof payload.access_token === "string" ? payload.access_token.trim()
       : typeof payload.accessToken === "string" ? payload.accessToken.trim() : "";
-    if (!nextAccessToken) throw new Error("阿里云盘令牌刷新接口未返回 Access Token");
+    if (!nextAccessToken) {
+      throw new ApiError(410, "aliyundrive_refresh_expired", "阿里云盘登录已失效，请重新登录");
+    }
     const nextRefreshToken = typeof payload.refresh_token === "string" && payload.refresh_token.trim()
       ? payload.refresh_token.trim()
       : typeof payload.refreshToken === "string" && payload.refreshToken.trim()
@@ -382,11 +438,11 @@ export class AliyunDriveProvider implements ProviderAdapter {
     // 关键变量：刷新站响应可能不包含有效期，避免将 NaN 写入加密连接。
     const rawExpiresIn = Number(payload.expires_in ?? payload.expiresIn ?? 0);
     const expiresIn = Number.isFinite(rawExpiresIn) ? Math.max(0, rawExpiresIn) : 0;
-    connection.accessToken = nextAccessToken;
-    connection.refreshToken = nextRefreshToken;
-    connection.expiresAt = expiresIn > 0 ? Date.now() + expiresIn * 1000 : 0;
-    connection.refreshUrl = configuredRefreshUrl;
-    this.cachedDriveInfo = null;
-    await persistConnection?.(connection);
+    return {
+      accessToken: nextAccessToken,
+      refreshToken: nextRefreshToken,
+      expiresAt: expiresIn > 0 ? Date.now() + expiresIn * 1000 : 0,
+      refreshUrl: configuredRefreshUrl,
+    };
   }
 }

@@ -360,6 +360,11 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     reply.header("X-Content-Type-Options", "nosniff");
     reply.header("Referrer-Policy", "same-origin");
     reply.header("X-Frame-Options", "DENY");
+    // 动态API尤其是410鉴权结果不能缓存；图片等明确设置缓存策略的接口继续保留原响应头。
+    if (request.url.startsWith("/api/") && !reply.hasHeader("Cache-Control")) {
+      reply.header("Cache-Control", "private, no-store");
+      reply.header("Pragma", "no-cache");
+    }
     if (!request.url.startsWith("/api/")) {
       reply.header(
         "Content-Security-Policy",
@@ -371,9 +376,10 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
 
   server.setErrorHandler((error, request, reply) => {
     if (error instanceof ApiError) {
+      const requestPath = request.url.split("?", 1)[0] ?? request.url;
       logger("warn", {
         事件: "业务请求失败",
-        请求路径: request.url.split("?", 1)[0] ?? request.url,
+        请求路径: requestPath,
         错误码: error.code,
         状态码: error.statusCode,
       });

@@ -46,6 +46,7 @@ async function buildServiceAccessSettings(runtime: ApiRuntime, serviceId: string
       "emby_download_enabled",
       "emby_region_libraries_enabled",
       "navidrome_enabled",
+      "navidrome_relay_playback_enabled",
       "navidrome_path_suffix",
     )
     .where({ service_id: serviceId })
@@ -80,6 +81,7 @@ async function buildServiceAccessSettings(runtime: ApiRuntime, serviceId: string
     embyRegionLibrariesEnabled: Number(library?.emby_region_libraries_enabled) === 1,
     embyAccounts,
     navidromeSupported,
+    navidromeRelayPlaybackEnabled: Number(library?.navidrome_relay_playback_enabled ?? 1) === 1,
     navidromeEnabled: navidromeSupported && Number(library?.navidrome_enabled) === 1,
     navidromeUrl: navidromeSupported ? await runtime.publicAccess.buildNavidromeUrl(navidromePathSuffix) : null,
     navidromePath,
@@ -398,11 +400,15 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       }
       const changesEnabled = request.body.navidromeEnabled !== undefined;
       const changesPathSuffix = request.body.navidromePathSuffix !== undefined;
-      if (!changesEnabled && !changesPathSuffix) {
+      const changesRelay = request.body.navidromeRelayPlaybackEnabled !== undefined;
+      if (!changesEnabled && !changesPathSuffix && !changesRelay) {
         throw new ApiError(422, "navidrome_settings_empty", "没有需要保存的 Navidrome 设置");
       }
       if (changesEnabled && typeof request.body.navidromeEnabled !== "boolean") {
         throw new ApiError(422, "navidrome_enabled_invalid", "Navidrome 开关必须是布尔值");
+      }
+      if (changesRelay && typeof request.body.navidromeRelayPlaybackEnabled !== "boolean") {
+        throw new ApiError(422, "navidrome_relay_playback_invalid", "Navidrome 中转开关必须是布尔值");
       }
       const pathSuffix = changesPathSuffix ? validateNavidromePathSuffix(request.body.navidromePathSuffix) : null;
       if (pathSuffix) {
@@ -414,6 +420,7 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
         if (duplicate) throw new ApiError(409, "navidrome_path_suffix_conflict", "该 Navidrome 地址后缀已被使用，请更换后缀");
       }
       const updateValues: Record<string, unknown> = { updated_at: new Date().toISOString() };
+      if (changesRelay) updateValues.navidrome_relay_playback_enabled = request.body.navidromeRelayPlaybackEnabled ? 1 : 0;
       if (changesEnabled) updateValues.navidrome_enabled = request.body.navidromeEnabled ? 1 : 0;
       if (pathSuffix) {
         updateValues.navidrome_path_suffix = pathSuffix.value;
@@ -436,7 +443,9 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       const publicAccess = await runtime.publicAccess.getStatus();
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-flycloud-helper-navidrome",
-        事件: pathSuffix ? "更新音乐库Navidrome地址" : (request.body.navidromeEnabled ? "启用音乐库Navidrome协议" : "停用音乐库Navidrome协议"),
+        播放日志关键字: "codex-flycloud-navidrome-playback",
+        中转播放: changesRelay ? request.body.navidromeRelayPlaybackEnabled === true : null,
+        事件: changesRelay ? "更新Navidrome播放方式" : pathSuffix ? "更新音乐库Navidrome地址" : (request.body.navidromeEnabled ? "启用音乐库Navidrome协议" : "停用音乐库Navidrome协议"),
         操作用户ID: operator.id,
         基础服务ID: request.params.serviceId,
         是否已配置公开地址: Boolean(publicAccess.publicBaseUrl),

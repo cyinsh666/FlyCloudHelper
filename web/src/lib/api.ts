@@ -118,6 +118,8 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
     }
     response = await fetch(path, {
       ...init,
+      // 鉴权失败可能返回可缓存的410；API请求必须绕过浏览器和反向代理缓存，重新授权后立即读取最新状态。
+      cache: init?.cache ?? "no-store",
       credentials: "include",
       headers: requestHeaders,
     });
@@ -439,6 +441,7 @@ export interface ServiceAccessSettings {
   /** 仅音乐类型服务支持公开 Navidrome/Subsonic 协议。 */
   navidromeSupported: boolean;
   navidromeEnabled: boolean;
+  navidromeRelayPlaybackEnabled: boolean;
   navidromeUrl: string | null;
   navidromePath: string;
   /** 固定 /n/ 前缀之后的单层可编辑地址后缀。 */
@@ -978,10 +981,13 @@ export function browseServiceDirectories(
   const path = admin
     ? `/api/v1/admin/services/${serviceId}/directories`
     : `/api/v1/services/${serviceId}/directories`;
+  // 关键变量：每次目录读取使用新地址，避免浏览器或反向代理继续复用重新授权前的410响应。
+  const cacheKey = Date.now();
   return requestJson(withQuery(path, {
     resourceId: parent?.resourceId,
     displayPath: parent?.displayPath,
     driveId: parent?.driveId,
+    cacheKey,
   }));
 }
 
@@ -1533,7 +1539,7 @@ export function revokeServiceEmbyAccountSessions(serviceId: string, accountId: s
 /** 开启或关闭音乐媒体库的 Navidrome/Subsonic 公开协议。 */
 export async function updateServiceNavidromeSettings(
   serviceId: string,
-  input: { navidromeEnabled?: boolean; navidromePathSuffix?: string },
+  input: { navidromeEnabled?: boolean; navidromePathSuffix?: string; navidromeRelayPlaybackEnabled?: boolean },
   admin = false,
 ): Promise<ServiceAccessSettings> {
   const result = await requestJson<{ settings: ServiceAccessSettings }>(
@@ -1563,11 +1569,16 @@ export interface JobListFilters {
   /** active 同时表示排队、运行、等待恢复和暂停。 */
   status?: JobStatus | "active";
   jobType?: "scan" | "media_probe";
+  limit?: number;
+  offset?: number;
 }
 
 /** 读取用户或管理员作用域后台任务，并由服务端完成状态和类型筛选。 */
 export function listJobs(admin = false, filters: JobListFilters = {}): Promise<{ items: ScanJob[]; total: number }> {
-  const query = new URLSearchParams({ limit: "200" });
+  const query = new URLSearchParams({
+    limit: String(filters.limit ?? 200),
+    offset: String(filters.offset ?? 0),
+  });
   if (filters.status) query.set("status", filters.status);
   if (filters.jobType) query.set("jobType", filters.jobType);
   return requestJson(`${admin ? "/api/v1/admin/jobs" : "/api/v1/scan-jobs"}?${query.toString()}`);

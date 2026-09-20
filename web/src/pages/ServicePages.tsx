@@ -1,6 +1,7 @@
 import { Link, useNavigate } from "@tanstack/react-router";
-import { BookOpenText, CalendarClock, Film, Music2, Plus, RefreshCw, ScanLine, Settings2, Sparkles, Trash2 } from "lucide-react";
+import { BookOpenText, CalendarClock, Film, Music2, Plus, RefreshCw, ScanLine, Settings2, Sparkles, Trash2, X } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
+import { createPortal } from "react-dom";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { AdminServiceFilters } from "@/components/AdminServiceFilters";
 import { AiCleaningSettingsFields, type AiCleaningSettingsValue } from "@/components/AiCleaningSettingsFields";
@@ -9,7 +10,7 @@ import { CloudAuthorizationPanel } from "@/components/CloudAuthorizationPanel";
 import { ProviderConnectionGuide } from "@/components/ProviderConnectionGuide";
 import { getProviderSelectionDescription, ProviderSelectionIcon, SelectableServiceOption } from "@/components/ServiceCreateSelection";
 import { ServicePathPicker, toProviderDirectory } from "@/components/ServicePathPicker";
-import { ServiceConnectionAlert, ServiceStatePill, getServiceConnectionIssue } from "@/components/ServiceConnectionStatus";
+import { ServiceConnectionAlert, ServiceStateDot, ServiceStatePill, getServiceConnectionIssue } from "@/components/ServiceConnectionStatus";
 import { Panel, StatCard, StatusPill } from "@/components/ui-kit";
 import {
   ApiClientError,
@@ -279,6 +280,31 @@ function getMetadataProviderLabel(providerId: string): string {
   return `现有来源（${providerId}）`;
 }
 
+/** 返回元数据语言的简短中文名称。 */
+function getMetadataLanguageLabel(language: string): string {
+  const labels: Record<string, string> = {
+    "zh-CN": "简体中文",
+    "zh-TW": "繁体中文",
+    "en-US": "英语",
+    "ja-JP": "日语",
+    "ko-KR": "韩语",
+  };
+  return labels[language] ?? language;
+}
+
+/** 返回元数据地区的简短中文名称。 */
+function getMetadataRegionLabel(region: string): string {
+  const labels: Record<string, string> = {
+    CN: "中国大陆",
+    HK: "中国香港",
+    TW: "中国台湾",
+    US: "美国",
+    JP: "日本",
+    KR: "韩国",
+  };
+  return labels[region] ?? region;
+}
+
 /** 读取指定扫描模式的路径，并转换成路径选择器可以直接展示的目录。 */
 function readScanRoots(profile: Record<string, unknown>, mode: "incremental" | "full"): ProviderDirectory[] {
   const configuredRoots = mode === "full" ? profile.fullRoots : profile.incrementalRoots;
@@ -371,39 +397,38 @@ function ServiceCard({ service, admin, onChanged }: { service: CloudService; adm
   }
 
   return (
-    <article className="surface p-5">
+    <article className="surface p-4">
       <header className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
         <div className="flex min-w-0 items-center gap-3">
-          <span className="grid size-10 shrink-0 place-items-center rounded-xl border border-border text-xs font-semibold" style={{ backgroundImage: "var(--gradient-surface)" }}>
+          <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-border text-xs font-semibold" style={{ backgroundImage: "var(--gradient-surface)" }}>
             <ProviderSelectionIcon providerType={service.providerType} />
           </span>
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold">{service.displayName}</h2>
-            <p className="truncate font-mono text-[11px] text-muted-foreground">{getServiceProviderLabel(service)} · {service.id}{admin ? ` · ${service.ownerUsername}` : ""}</p>
+            <p className="truncate text-[11px] text-muted-foreground">{getServiceProviderLabel(service)}{admin ? ` · ${service.ownerUsername}` : ""}</p>
           </div>
         </div>
-        <ServiceStatePill service={service} />
+        <ServiceStateDot service={service} />
       </header>
       <ServiceConnectionAlert service={service} admin={admin} />
 
-      <dl className="mt-5 grid grid-cols-3 gap-3 text-center">
-        <div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">连接修订</dt><dd className="mt-1 text-xs font-medium">r{service.credentialRevision}</dd></div>
-        <div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">扫描修订</dt><dd className="mt-1 text-xs font-medium">r{service.scanProfileRevision}</dd></div>
-        <div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">最近扫描</dt><dd className="mt-1 truncate text-xs font-medium">{formatTime(service.lastScanAt)}</dd></div>
-      </dl>
-
-      <div className="mt-4 flex flex-wrap gap-2">
-        <StatusPill>{dataTypeLabels[service.dataType]}</StatusPill>
-        <StatusPill>刮削 r{service.metadataProfileRevision}</StatusPill>
+      <div className="mt-3 text-[11px] text-muted-foreground">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <StatusPill>{dataTypeLabels[service.dataType]}</StatusPill>
+          <span>连接 r{service.credentialRevision}</span>
+          <span>扫描 r{service.scanProfileRevision}</span>
+          <span>刮削 r{service.metadataProfileRevision}</span>
+        </div>
+        <p className="mt-2 truncate">最近扫描 {formatTime(service.lastScanAt)}</p>
       </div>
 
-      <footer className="mt-5 flex flex-wrap items-center gap-2">
+      <footer className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/70 pt-3">
         <button type="button" onClick={() => void triggerScan()} className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-3 py-2 text-xs text-primary-soft">
-          <ScanLine className="size-3.5" /> 触发增量扫描
+          <ScanLine className="size-3.5" /> 增量
         </button>
-        <Link to={detailPath} params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Settings2 className="size-3.5" /> 服务详情与配置</Link>
-        <button type="button" onClick={() => void deleteCardService()} disabled={deleting} className="ml-auto inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-destructive bg-destructive px-3 py-2 text-xs font-semibold text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-50">
-          <Trash2 className="size-3.5" /> {deleting ? "正在删除…" : "删除服务"}
+        <Link to={detailPath} params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Settings2 className="size-3.5" /> 配置</Link>
+        <button type="button" aria-label={deleting ? `正在删除${service.displayName}` : `删除${service.displayName}`} title={deleting ? "正在删除…" : "删除服务"} onClick={() => void deleteCardService()} disabled={deleting} className="ml-auto grid size-8 cursor-pointer place-items-center rounded-lg border border-destructive/50 bg-destructive/10 text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-50">
+          <Trash2 className="size-3.5" />
         </button>
       </footer>
       {message && <p className="mt-3 text-xs text-muted-foreground">{message}</p>}
@@ -431,7 +456,7 @@ function ServicesListPage({ admin }: { admin: boolean }) {
       />
       {admin && <AdminServiceFilters value={filters} users={filterOptions.data?.users ?? []} providers={filterOptions.data?.providers ?? []} resultCount={resource.data?.total ?? 0} onChange={setFilters} />}
       {resource.error && <Panel><p className="text-sm text-destructive">{resource.error}</p></Panel>}
-      <div className="grid gap-4 lg:grid-cols-2">
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
         {resource.data?.items.map((service) => <ServiceCard key={service.id} service={service} admin={admin} onChanged={async () => { await resource.refresh(); }} />)}
       </div>
       {!resource.loading && resource.data?.items.length === 0 && <Panel><p className="py-10 text-center text-sm text-muted-foreground">还没有云端服务</p></Panel>}
@@ -769,6 +794,10 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
   const creatingAiSupplementRef = useRef(false);
   const [backfillingMediaSpecs, setBackfillingMediaSpecs] = useState(false);
   const backfillingMediaSpecsRef = useRef(false);
+  // 关键变量：主页面仅展示摘要卡片，完整表单只在元数据 Dialog 打开时显示。
+  const [metadataDialogOpen, setMetadataDialogOpen] = useState(false);
+  // 关键变量：保存期间禁止关闭 Dialog，避免用户误以为请求已经取消。
+  const [savingMetadata, setSavingMetadata] = useState(false);
   const service = resource.data;
   const [fullScanRoots, setFullScanRoots] = useState<ProviderDirectory[]>([]);
   const [incrementalScanRoots, setIncrementalScanRoots] = useState<ProviderDirectory[]>([]);
@@ -807,6 +836,28 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     const descriptor = providers.data?.find((item) => item.type === service.providerType);
     setScanConcurrencySettings(readScanConcurrencySettings(service.scanProfile, descriptor));
   }, [serviceId, service?.id, service?.scanProfileRevision, providers.data]);
+
+  useEffect(() => {
+    if (!metadataDialogOpen) return undefined;
+    // 关键变量：保留页面原有滚动状态，Dialog 关闭后完整恢复。
+    const originalOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    /** 按 Escape 关闭元数据配置 Dialog。 */
+    const closeWithEscape = (event: KeyboardEvent): void => {
+      if (event.key !== "Escape" || savingMetadata) return;
+      if (service) {
+        setMetadataSettings(service.dataType === "music"
+          ? readMusicMetadataSettings(service.metadataProfile)
+          : readVideoMetadataSettings(service.metadataProfile));
+      }
+      setMetadataDialogOpen(false);
+    };
+    window.addEventListener("keydown", closeWithEscape);
+    return () => {
+      document.body.style.overflow = originalOverflow;
+      window.removeEventListener("keydown", closeWithEscape);
+    };
+  }, [metadataDialogOpen, savingMetadata, service]);
 
   if (!service) return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取服务详情…"}</div></Panel>;
   // 关键变量：详情已经通过空值检查，异步回调统一捕获稳定引用，避免刷新期间类型重新变为可空。
@@ -913,9 +964,29 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     }
   }
 
+  /** 打开元数据配置 Dialog，并从服务端详情重新建立本次编辑草稿。 */
+  function openMetadataDialog(): void {
+    setMetadataSettings(activeService.dataType === "music"
+      ? readMusicMetadataSettings(activeService.metadataProfile)
+      : readVideoMetadataSettings(activeService.metadataProfile));
+    setMessage(null);
+    setMetadataDialogOpen(true);
+  }
+
+  /** 放弃本次未保存的元数据修改并关闭 Dialog。 */
+  function closeMetadataDialog(): void {
+    if (savingMetadata) return;
+    setMetadataSettings(activeService.dataType === "music"
+      ? readMusicMetadataSettings(activeService.metadataProfile)
+      : readVideoMetadataSettings(activeService.metadataProfile));
+    setMetadataDialogOpen(false);
+  }
+
   /** 保存当前服务类型对应的元数据来源与刮削配置。 */
   async function saveMetadataProfile(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
+    if (savingMetadata) return;
+    setSavingMetadata(true);
     setMessage("正在保存元数据配置…");
     try {
       const profile = activeService.dataType === "music"
@@ -926,6 +997,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
         ? "音乐元数据配置已保存，之后的扫描会读取内嵌标签并按所选来源补全"
         : "元数据配置已保存，规格开关只影响之后执行的扫描刮削任务");
       await resource.refresh();
+      setMetadataDialogOpen(false);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "元数据配置保存失败";
       console.warn("codex-metadata-profile-form", {
@@ -943,6 +1015,8 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
         错误信息: errorMessage,
       });
       setMessage(errorMessage);
+    } finally {
+      setSavingMetadata(false);
     }
   }
 
@@ -1068,6 +1142,23 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
   // 关键变量：删除服务前必须先处理排队、运行、重试等待或暂停中的任务。
   const hasUnfinishedJob = service.recentJobs.some((job) =>
     job.status === "queued" || job.status === "running" || job.status === "retry_waiting" || job.status === "paused");
+  // 关键变量：详情页只展示元数据摘要，具体字段统一放进 Dialog 编辑。
+  const metadataSummaryItems: Array<{ label: string; value: string }> = service.dataType === "music"
+    ? [
+      { label: "元数据来源", value: getMetadataProviderLabel(metadataSettings.providerId) },
+      { label: "聚合方式", value: metadataSettings.providerId === "auto" ? metadataSettings.aggregateMode === "fast" ? "最快命中" : "完整聚合" : "指定来源" },
+      { label: "歌词补全", value: metadataSettings.providerId === "local" ? "不适用" : metadataSettings.syncLyrics ? "已开启" : "已关闭" },
+      { label: "内嵌标签", value: "优先读取" },
+    ]
+    : [
+      { label: "元数据来源", value: getMetadataProviderLabel(metadataSettings.providerId) },
+      { label: "语言与地区", value: `${getMetadataLanguageLabel(metadataSettings.language)} · ${getMetadataRegionLabel(metadataSettings.region)}` },
+      { label: "本地 NFO", value: metadataSettings.useNfo ? "优先使用" : "已忽略" },
+      {
+        label: "增强能力",
+        value: `已开启 ${[metadataSettings.syncDetails, metadataSettings.analyzeMediaSpecs, metadataSettings.aiCleaning.enabled].filter(Boolean).length} 项`,
+      },
+    ];
 
   return (
     <>
@@ -1102,7 +1193,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
       </div>
       <ServiceConnectionAlert service={service} admin={admin} />
       <Panel title="配置修订与范围" className="mt-4">
-        <div className="grid gap-3 md:grid-cols-2">
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
           <div className="rounded-xl border border-border bg-secondary/40 p-4">
             <p className="text-xs text-muted-foreground">配置修订</p>
             <div className="mt-3 flex flex-wrap gap-2"><StatusPill>{dataTypeLabels[service.dataType]}</StatusPill><StatusPill>连接 r{service.credentialRevision}</StatusPill><StatusPill>扫描 r{service.scanProfileRevision}</StatusPill><StatusPill>元数据 r{service.metadataProfileRevision}</StatusPill></div>
@@ -1110,47 +1201,39 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
           </div>
           <div className="rounded-xl border border-border bg-secondary/40 p-4"><p className="text-xs text-muted-foreground">连接管理</p><p className="mt-2 text-sm">重连、重新授权或替换完整连接。</p><Link to={admin ? "/admin/services/$serviceId/connection" : "/app/services/$serviceId/connection"} params={{ serviceId }} className="mt-3 inline-flex items-center gap-1 text-xs text-primary-soft">打开连接管理 <Settings2 className="size-3.5" /></Link></div>
           <div className="rounded-xl border border-border bg-secondary/40 p-4"><p className="text-xs text-muted-foreground">后台定时任务</p><p className="mt-2 text-sm">分别设置全量扫描、增量扫描和视频规格分析的间隔、每日、每周或每月计划。</p><Link to={admin ? "/admin/services/$serviceId/scan-schedules" : "/app/services/$serviceId/scan-schedules"} params={{ serviceId }} className="mt-3 inline-flex items-center gap-1 text-xs text-primary-soft">打开定时任务 <CalendarClock className="size-3.5" /></Link></div>
+          <div className="rounded-xl border border-border bg-secondary/40 p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-xs text-muted-foreground">任务通知</p>
+                <p className="mt-2 text-sm">后台任务完成后推送结果。</p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={service.notificationEnabled}
+                aria-label="启用任务完成通知"
+                disabled={updatingNotification}
+                onClick={() => void toggleNotification()}
+                className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${service.notificationEnabled ? "border-foreground/30 bg-foreground" : "border-border bg-secondary"}`}
+              >
+                <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-background shadow-sm transition-transform ${service.notificationEnabled ? "translate-x-5" : "translate-x-0"}`} />
+              </button>
+            </div>
+            <p className="mt-3 text-xs leading-5 text-muted-foreground">
+              {service.notificationEnabled ? "已启用" : "已关闭"} · Telegram 渠道由系统设置统一管理
+            </p>
+          </div>
         </div>
       </Panel>
       <div className="mt-4 grid gap-4 xl:grid-cols-2">
-        <Panel
-          title="任务通知"
-          description="按服务单独控制后台任务完成后是否向系统设置中已启用的 Telegram 渠道推送消息。"
-          className="xl:col-span-2"
-        >
-          <div className="flex items-start justify-between gap-4 rounded-xl border border-border bg-secondary/40 p-4">
-            <div>
-              <p className="text-sm font-medium">启用任务完成通知</p>
-              <p className="mt-2 text-xs leading-5 text-muted-foreground">
-                {service.dataType === "music"
-                  ? "音乐扫描完成后，通知会展示本次新增入库的歌曲、专辑和艺术家数量。"
-                  : service.dataType === "video"
-                    ? "影视扫描完成后展示新增入库内容数量；视频规格扫描和 AI 补充完成后分别展示完成文件数和完成影片数。"
-                    : "扫描任务完成后，会推送当前服务的任务结果。"}
-              </p>
-              <p className="mt-2 text-xs leading-5 text-muted-foreground">Telegram 渠道未在系统设置中启用或目标未配置时，不会发送外部通知。</p>
-            </div>
-            <button
-              type="button"
-              role="switch"
-              aria-checked={service.notificationEnabled}
-              aria-label="启用任务完成通知"
-              disabled={updatingNotification}
-              onClick={() => void toggleNotification()}
-              className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${service.notificationEnabled ? "border-foreground/30 bg-foreground" : "border-border bg-secondary"}`}
-            >
-              <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-background shadow-sm transition-transform ${service.notificationEnabled ? "translate-x-5" : "translate-x-0"}`} />
-            </button>
-          </div>
-        </Panel>
-        <Panel title="扫描路径" description="全量和增量任务分别选择网盘目录，不需要手动输入路径。" className="xl:col-span-2">
-          <div key={service.scanProfileRevision} className="grid gap-4 lg:grid-cols-2">
+        <Panel title="扫描路径" description="全量和增量任务分别选择网盘目录，不需要手动输入路径。">
+          <div key={service.scanProfileRevision} className="grid gap-4 2xl:grid-cols-2">
             <ServicePathPicker serviceId={serviceId} admin={admin} label="全量扫描目录" value={fullScanRoots} onConfirm={(directories) => saveScanPaths("full", directories)} />
             <ServicePathPicker serviceId={serviceId} admin={admin} label="增量扫描目录" value={incrementalScanRoots} onConfirm={(directories) => saveScanPaths("incremental", directories)} />
-            <p className="text-xs text-muted-foreground lg:col-span-2">在目录选择 Dialog 中点击“确定”会立即验证并保存对应扫描目录；未选择目录的扫描模式不能创建任务。</p>
+            <p className="text-xs text-muted-foreground 2xl:col-span-2">在目录选择 Dialog 中点击“确定”会立即验证并保存对应扫描目录；未选择目录的扫描模式不能创建任务。</p>
           </div>
         </Panel>
-        <Panel title="扫描与刮削任务并发" className="xl:col-span-2">
+        <Panel title="扫描与刮削任务并发">
           <form onSubmit={(event) => void saveScanConcurrency(event)} className="grid gap-4 md:grid-cols-2">
             <label className="block">
               <span className="text-xs text-muted-foreground">扫描任务数</span>
@@ -1169,13 +1252,47 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
             <div className="flex justify-end md:col-span-2"><PrimaryButton type="submit">保存任务并发</PrimaryButton></div>
           </form>
         </Panel>
-        <Panel title="元数据配置" description={service.dataType === "music" ? "扫描时先读取音频内嵌标签，再按所选来源补全歌曲、专辑和艺术家信息。" : "配置影视数据的刮削来源。"}>
-          <form onSubmit={(event) => void saveMetadataProfile(event)} className="space-y-4">
+      </div>
+      <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(240px,1fr)]">
+        <Panel title="元数据配置" description="点击任意卡片修改配置。">
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            {metadataSummaryItems.map((item) => (
+              <button
+                key={item.label}
+                type="button"
+                onClick={openMetadataDialog}
+                className="group flex min-w-0 items-center justify-between gap-3 rounded-lg border border-border bg-secondary/20 px-3.5 py-3 text-left transition-colors hover:bg-secondary/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <span className="min-w-0 text-xs text-muted-foreground">{item.label}</span>
+                <span className="truncate text-sm font-semibold">{item.value}</span>
+              </button>
+            ))}
+          </div>
+        </Panel>
+        <Panel title="危险操作" description="删除服务及其媒体库。" className="self-start">
+          <button type="button" onClick={() => void deleteCurrentService()} disabled={hasUnfinishedJob || deletingService} title={hasUnfinishedJob ? "请先终止该服务未结束的后台任务" : undefined} className="inline-flex w-full cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive bg-destructive px-4 py-2.5 text-sm font-semibold text-destructive-foreground shadow-sm transition-colors hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {deletingService ? "正在删除…" : "删除服务"}</button>
+          {hasUnfinishedJob && <p className="mt-3 text-xs leading-5 text-warning">仍有未结束的后台任务，请先终止后再删除。</p>}
+        </Panel>
+      </div>
+      {metadataDialogOpen && createPortal(
+        <div className="fixed inset-0 z-[1000] grid place-items-center bg-black/65 p-3 backdrop-blur-sm sm:p-6" onMouseDown={(event) => { if (event.target === event.currentTarget) closeMetadataDialog(); }}>
+          <section role="dialog" aria-modal="true" aria-label="元数据配置" className="relative flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-border bg-background shadow-2xl">
+            <header className="flex items-start justify-between gap-4 border-b border-border px-4 py-3.5 sm:px-5">
+              <div>
+                <h2 className="text-lg font-semibold">元数据配置</h2>
+                <p className="mt-1 text-xs text-muted-foreground">{service.dataType === "music" ? "设置音乐标签读取与在线补全方式。" : "设置影视刮削来源和附加处理能力。"}</p>
+              </div>
+              <button type="button" aria-label="关闭元数据配置" onClick={closeMetadataDialog} disabled={savingMetadata} className="grid size-9 shrink-0 place-items-center rounded-lg border border-border text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"><X className="size-4" /></button>
+            </header>
+            <form onSubmit={(event) => void saveMetadataProfile(event)} className="flex min-h-0 flex-1 flex-col">
+              <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4 [scrollbar-gutter:stable] sm:p-5">
+                {message && <p className="rounded-lg bg-secondary/45 px-3 py-2.5 text-xs text-muted-foreground">{message}</p>}
             {service.dataType === "music" ? (
               <>
-                <label className="block">
+                <div className="grid gap-3 sm:grid-cols-2">
+                <label className={metadataSettings.providerId === "auto" ? "block" : "block sm:col-span-2"}>
                   <span className="text-xs text-muted-foreground">音乐元数据来源</span>
-                  <select value={metadataSettings.providerId} onChange={(event) => setMetadataSettings((current) => ({ ...current, providerId: event.target.value }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm">
+                  <select value={metadataSettings.providerId} onChange={(event) => setMetadataSettings((current) => ({ ...current, providerId: event.target.value }))} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm">
                     <option value="auto">多平台自动补全</option>
                     <option value="musicbrainz">MusicBrainz</option>
                     <option value="netease">网易云音乐</option>
@@ -1189,37 +1306,39 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
                 </label>
                 {metadataSettings.providerId === "auto" && <label className="block">
                   <span className="text-xs text-muted-foreground">自动聚合方式</span>
-                  <select value={metadataSettings.aggregateMode} onChange={(event) => setMetadataSettings((current) => ({ ...current, aggregateMode: event.target.value === "fast" ? "fast" : "complete" }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm">
+                  <select value={metadataSettings.aggregateMode} onChange={(event) => setMetadataSettings((current) => ({ ...current, aggregateMode: event.target.value === "fast" ? "fast" : "complete" }))} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm">
                     <option value="complete">完整聚合（等待全部平台）</option>
                     <option value="fast">最快命中（首个完整结果）</option>
                   </select>
-                  <p className="mt-2 text-xs text-muted-foreground">完整聚合会综合六个平台选择更可信且图片更完整的结果；最快命中扫描更快。</p>
                 </label>}
-                {metadataSettings.providerId !== "local" && <div className="flex items-center justify-between gap-4 rounded-xl border border-border bg-secondary/35 p-4">
-                  <div><p className="text-sm font-medium">同步歌词</p><p className="mt-1 text-xs text-muted-foreground">开启后为每首歌曲从 LRCLIB 补充普通歌词和逐行歌词，扫描时间会增加。</p></div>
+                </div>
+                <div className="divide-y divide-border overflow-hidden rounded-xl border border-border">
+                {metadataSettings.providerId !== "local" && <div className="flex items-center justify-between gap-4 px-3.5 py-3">
+                  <div><p className="text-sm font-medium">同步歌词</p><p className="mt-0.5 text-xs text-muted-foreground">从 LRCLIB 补充普通歌词和逐行歌词。</p></div>
                   <button type="button" role="switch" aria-checked={metadataSettings.syncLyrics} aria-label="同步歌词" onClick={() => setMetadataSettings((current) => ({ ...current, syncLyrics: !current.syncLyrics }))} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${metadataSettings.syncLyrics ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
                     <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${metadataSettings.syncLyrics ? "translate-x-5" : "translate-x-0"}`} />
                   </button>
                 </div>}
-                <div className="rounded-xl border border-border bg-secondary/35 p-4">
+                <div className="px-3.5 py-3">
                   <p className="text-sm font-medium">内嵌标签读取</p>
-                  <p className="mt-2 text-xs leading-6 text-muted-foreground">云助手会优先读取标题、艺术家、专辑、曲号、年份、流派、MusicBrainz 编号和内嵌封面；文件中缺少的信息再由所选平台补全，歌曲继承专辑封面并同步补充艺术家图片。</p>
+                  <p className="mt-0.5 text-xs leading-5 text-muted-foreground">优先读取音频标签和封面，缺少的信息再由所选平台补全。</p>
+                </div>
                 </div>
               </>
             ) : (
               <>
-            <label className="block">
+            <div className="grid gap-3 sm:grid-cols-3">
+            <label className="block sm:col-span-3">
               <span className="text-xs text-muted-foreground">元数据来源</span>
-              <select value={metadataSettings.providerId} onChange={(event) => setMetadataSettings((current) => ({ ...current, providerId: event.target.value }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm">
+              <select value={metadataSettings.providerId} onChange={(event) => setMetadataSettings((current) => ({ ...current, providerId: event.target.value }))} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm">
                 <option value="builtin.tmdb">TMDB 在线刮削</option>
                 <option value="local">仅使用本地 NFO 和文件名</option>
                 {metadataSettings.providerId !== "builtin.tmdb" && metadataSettings.providerId !== "local" && <option value={metadataSettings.providerId}>{getMetadataProviderLabel(metadataSettings.providerId)}</option>}
               </select>
             </label>
-            <div className="grid gap-4 sm:grid-cols-2">
               <label className="block">
                 <span className="text-xs text-muted-foreground">元数据语言</span>
-                <select value={metadataSettings.language} onChange={(event) => setMetadataSettings((current) => ({ ...current, language: event.target.value }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm">
+                <select value={metadataSettings.language} onChange={(event) => setMetadataSettings((current) => ({ ...current, language: event.target.value }))} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm">
                   <option value="zh-CN">简体中文</option>
                   <option value="zh-TW">繁体中文</option>
                   <option value="en-US">英语</option>
@@ -1230,7 +1349,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
               </label>
               <label className="block">
                 <span className="text-xs text-muted-foreground">内容地区</span>
-                <select value={metadataSettings.region} onChange={(event) => setMetadataSettings((current) => ({ ...current, region: event.target.value }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm">
+                <select value={metadataSettings.region} onChange={(event) => setMetadataSettings((current) => ({ ...current, region: event.target.value }))} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm">
                   <option value="CN">中国大陆</option>
                   <option value="HK">中国香港</option>
                   <option value="TW">中国台湾</option>
@@ -1241,34 +1360,31 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
                 </select>
               </label>
             </div>
-            <div className="rounded-xl border border-border bg-secondary/35 p-4">
-              <div className="flex items-center justify-between gap-4">
-                <div><p className="text-sm font-medium">使用本地 NFO</p><p className="mt-1 text-xs text-muted-foreground">{metadataSettings.useNfo ? "优先读取同目录 NFO，没有可用信息时再使用上方来源。" : "忽略同目录 NFO，直接使用上方元数据来源。"}</p></div>
+            <div className="divide-y divide-border overflow-hidden rounded-xl border border-border">
+              <div className="flex items-center justify-between gap-4 px-3.5 py-3">
+                <div><p className="text-sm font-medium">使用本地 NFO</p><p className="mt-0.5 text-xs text-muted-foreground">{metadataSettings.useNfo ? "优先读取同目录 NFO。" : "直接使用所选元数据来源。"}</p></div>
                 <button type="button" role="switch" aria-checked={metadataSettings.useNfo} aria-label="使用本地 NFO" onClick={() => setMetadataSettings((current) => ({ ...current, useNfo: !current.useNfo }))} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${metadataSettings.useNfo ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
                   <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${metadataSettings.useNfo ? "translate-x-5" : "translate-x-0"}`} />
                 </button>
               </div>
-            </div>
-            <div className="rounded-xl border border-border bg-secondary/35 p-4">
-              <div className="flex items-center justify-between gap-4">
-                <div><p className="text-sm font-medium">同步刮削详情</p><p className="mt-1 text-xs text-muted-foreground">{metadataSettings.syncDetails ? "扫描匹配后同步读取详情、演职人员和节目单集信息，保持原有云助手模式。" : "仅在扫描时完成匹配；打开影片详情时再实时向 TMDB 查询，与 APP 扫描方式一致。"}</p></div>
+              <div className="flex items-center justify-between gap-4 px-3.5 py-3">
+                <div><p className="text-sm font-medium">同步刮削详情</p><p className="mt-0.5 text-xs text-muted-foreground">{metadataSettings.syncDetails ? "扫描时同步详情和演职人员。" : "打开详情时再实时查询。"}</p></div>
                 <button type="button" role="switch" aria-checked={metadataSettings.syncDetails} aria-label="同步刮削详情" onClick={() => setMetadataSettings((current) => ({ ...current, syncDetails: !current.syncDetails }))} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${metadataSettings.syncDetails ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
                   <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${metadataSettings.syncDetails ? "translate-x-5" : "translate-x-0"}`} />
                 </button>
               </div>
-            </div>
-            <div className="rounded-xl border border-border bg-secondary/35 p-4">
+              <div className="px-3.5 py-3">
               <div className="flex items-center justify-between gap-4">
-                <div><p className="text-sm font-medium">扫描时读取视频规格（ffprobe）</p><p className="mt-1 text-xs text-muted-foreground">{metadataSettings.analyzeMediaSpecs ? "后续扫描刮削会为新发现或变化的视频自动读取时长、编码、分辨率、音轨和字幕。" : "后续扫描刮削不自动读取视频规格；已有规格仍会用于网页、Jellyfin 和 APP 展示。"}</p></div>
+                <div><p className="text-sm font-medium">读取视频规格</p><p className="mt-0.5 text-xs text-muted-foreground">{metadataSettings.analyzeMediaSpecs ? "扫描时读取时长、编码、分辨率和音轨。" : "扫描时不自动读取视频规格。"}</p></div>
                 <button type="button" role="switch" aria-checked={metadataSettings.analyzeMediaSpecs} aria-label="分析视频规格" onClick={() => setMetadataSettings((current) => ({ ...current, analyzeMediaSpecs: !current.analyzeMediaSpecs }))} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${metadataSettings.analyzeMediaSpecs ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
                   <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${metadataSettings.analyzeMediaSpecs ? "translate-x-5" : "translate-x-0"}`} />
                 </button>
               </div>
-              <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border/70 pt-4">
-                <p className="text-xs text-muted-foreground">需要补充历史数据时单独执行，不受上方扫描开关影响。</p>
+              <div className="mt-2 flex justify-end">
                 <SecondaryButton type="button" onClick={() => void backfillMediaSpecs()} disabled={backfillingMediaSpecs}>
                   <ScanLine className="size-4" /> {backfillingMediaSpecs ? "正在创建任务…" : "分析已有缺失规格视频"}
                 </SecondaryButton>
+              </div>
               </div>
             </div>
             <AiCleaningSettingsFields state={{
@@ -1279,16 +1395,16 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
             }} />
               </>
             )}
-            <div className="flex justify-end"><PrimaryButton type="submit">保存元数据配置</PrimaryButton></div>
-          </form>
-        </Panel>
-        <Panel title="危险操作" description="删除服务会同时删除其媒体库，需要二次确认。">
-          <div className="flex flex-wrap gap-2">
-            <button type="button" onClick={() => void deleteCurrentService()} disabled={hasUnfinishedJob || deletingService} title={hasUnfinishedJob ? "请先终止该服务未结束的后台任务" : undefined} className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive bg-destructive px-4 py-2.5 text-sm font-semibold text-destructive-foreground shadow-sm transition-colors hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {deletingService ? "正在删除…" : "删除服务"}</button>
-          </div>
-          {hasUnfinishedJob && <p className="mt-3 text-xs text-warning">该服务仍有未结束的后台任务，请先终止任务后再删除服务。</p>}
-        </Panel>
-      </div>
+              </div>
+              <footer className="flex items-center justify-between gap-4 border-t border-border px-4 py-3.5 sm:px-5">
+                <SecondaryButton type="button" onClick={closeMetadataDialog} disabled={savingMetadata}>取消</SecondaryButton>
+                <PrimaryButton type="submit" disabled={savingMetadata}>{savingMetadata ? "正在保存…" : "保存元数据配置"}</PrimaryButton>
+              </footer>
+            </form>
+          </section>
+        </div>,
+        document.body,
+      )}
     </>
   );
 }

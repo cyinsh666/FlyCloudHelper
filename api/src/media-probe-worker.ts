@@ -4,6 +4,7 @@ import type { FlyCloudHelperDatabase } from "./database.js";
 import { parseJsonObject } from "./domain.js";
 import { parseFfprobeOutput, type MediaProbeResult } from "./media/media-probe.js";
 import type { ProviderRegistry } from "./providers/registry.js";
+import { isProviderAuthenticationErrorCode } from "./providers/authentication-errors.js";
 import type { ProviderConnectionContext, ProviderFileStreamAccess } from "./providers/types.js";
 import type { CredentialVault } from "./secrets.js";
 import type { ServiceRepository } from "./service-repository.js";
@@ -406,16 +407,33 @@ export class MediaProbeWorker {
       const retryDelays = [60_000, 5 * 60_000, 30 * 60_000];
       const retryDelay = retryDelays[attemptCount - 1];
       const failureCode = readProbeFailureCode(error);
-      if (failureCode === "provider_authentication_failed") {
-        const stoppedJobIds = await this.repository.failMediaProbeJobsForAuthentication(job.serviceId, job.userId);
+      if (isProviderAuthenticationErrorCode(failureCode)) {
+        const authenticationFailure = await this.repository.failMediaProbeJobsForAuthentication(
+          job.serviceId, job.userId, job.credentialRevision);
+        if (authenticationFailure.ignoredStaleCredential) {
+          // 关键变量：让旧凭据任务的当前文件回到待领取状态，下一次直接使用重新扫码后的当前凭据。
+          await this.database.query("media_file_probes").where({
+            source_file_id: job.sourceFileId,
+            fingerprint: job.fingerprint,
+            status: "running",
+          }).update({
+            status: "retry_waiting",
+            error_code: null,
+            error_message: null,
+            next_retry_at: null,
+            started_at: null,
+            updated_at: new Date().toISOString(),
+          });
+          return;
+        }
         // 关键变量：同一服务可能配置多个规格并发，服务级鉴权失败后立即中断其余正在取地址或分析的文件。
-        for (const stoppedJobId of stoppedJobIds) this.interruptJobControl(stoppedJobId, "cancel");
+        for (const stoppedJobId of authenticationFailure.stoppedJobIds) this.interruptJobControl(stoppedJobId, "cancel");
         this.logger.warn({
           日志关键字: "codex-media-ffprobe",
           事件: "Provider鉴权失效停止规格后台任务",
           服务ID: job.serviceId,
           后台任务ID: job.batchJobId,
-          停止任务数量: stoppedJobIds.length,
+          停止任务数量: authenticationFailure.stoppedJobIds.length,
           错误码: failureCode,
           处理说明: "等待APP同步有效登录信息后自动恢复",
         });

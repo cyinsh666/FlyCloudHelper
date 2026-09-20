@@ -1,6 +1,7 @@
 import { acquireMusicBudget } from "./request-budget.js";
 import { randomBytes, randomUUID } from "node:crypto";
 import { ApiError } from "../errors.js";
+import { CredentialRefreshCoordinator } from "./credential-refresh-coordinator.js";
 import {
   PROVIDER_RATE_LIMIT_MAX_RETRIES,
   readProviderRateLimitDelayMs,
@@ -189,7 +190,8 @@ function readDownloadExpiresAt(data: JsonRecord, signedUrl: string): string | nu
 
 /** 光鸭网页接口客户端，复用官网的扫码登录、文件列表和下载请求契约。 */
 export class GuangyaWebApiClient {
-  private readonly refreshPromises = new WeakMap<Record<string, unknown>, Promise<void>>();
+  /** 按旧 Refresh Token 合并不同 HTTP 请求解密出的连接副本。 */
+  private readonly tokenRefreshCoordinator = new CredentialRefreshCoordinator<Record<string, unknown>>();
   private listRequestReservation: Promise<void> = Promise.resolve();
   private nextListRequestAtMs = 0;
 
@@ -433,9 +435,10 @@ export class GuangyaWebApiClient {
       needSubFolderStat: true,
     };
     const path = "/userres/v1/file/get_file_list";
+    const requestAccessToken = typeof connection.accessToken === "string" ? connection.accessToken.trim() : "";
     let response = await this.requestBusinessJsonWithRateLimitRetry(path, requestBody, connection, signal);
     if (this.requiresTokenRefresh(response)) {
-      await this.refreshConnection(connection, persistConnection, signal, true);
+      await this.refreshConnection(connection, persistConnection, signal, true, requestAccessToken);
       await this.reserveListRequestSlot();
       response = await this.requestBusinessJsonWithRateLimitRetry(path, requestBody, connection, signal);
     }
@@ -453,9 +456,10 @@ export class GuangyaWebApiClient {
     if (!fileId.trim()) throw new ApiError(422, "provider_file_locator_invalid", "光鸭文件定位无效");
     await this.ensureValidToken(connection, persistConnection, signal);
     const path = "/userres/v1/get_res_download_url";
+    const requestAccessToken = typeof connection.accessToken === "string" ? connection.accessToken.trim() : "";
     let response = await this.requestBusinessJsonWithRateLimitRetry(path, { fileId }, connection, signal);
     if (this.requiresTokenRefresh(response)) {
-      await this.refreshConnection(connection, persistConnection, signal, true);
+      await this.refreshConnection(connection, persistConnection, signal, true, requestAccessToken);
       response = await this.requestBusinessJsonWithRateLimitRetry(path, { fileId }, connection, signal);
     }
     this.requireSuccessfulBusinessResponse(response, path);
@@ -492,39 +496,41 @@ export class GuangyaWebApiClient {
     await this.refreshConnection(connection, persistConnection, signal, false);
   }
 
-  /** 合并并去重同一连接的并发 Token 刷新。 */
+  /** 合并并去重同一旧 Refresh Token 的跨请求刷新。 */
   private async refreshConnection(
     connection: Record<string, unknown>,
     persistConnection?: PersistGuangyaConnection,
     signal?: AbortSignal,
     forceRefresh = false,
+    failedAccessToken = "",
   ): Promise<void> {
+    const currentAccessToken = typeof connection.accessToken === "string" ? connection.accessToken.trim() : "";
+    // 同一连接对象已被另一个请求刷新时，当前失败响应直接使用新 Token 重试。
+    if (forceRefresh && failedAccessToken && currentAccessToken && currentAccessToken !== failedAccessToken) return;
     if (!forceRefresh) {
-      const accessToken = typeof connection.accessToken === "string" ? connection.accessToken.trim() : "";
       const expiresAt = Number(connection.expiresAt ?? 0);
-      if (accessToken && (!Number.isFinite(expiresAt) || expiresAt <= 0 || Date.now() + GUANGYA_TOKEN_REFRESH_AHEAD_MS < expiresAt)) {
+      if (currentAccessToken && (!Number.isFinite(expiresAt) || expiresAt <= 0 || Date.now() + GUANGYA_TOKEN_REFRESH_AHEAD_MS < expiresAt)) {
         return;
       }
     }
-    const existingPromise = this.refreshPromises.get(connection);
-    if (existingPromise) return existingPromise;
-    const refreshPromise = this.performRefresh(connection, persistConnection, signal)
-      .finally(() => this.refreshPromises.delete(connection));
-    this.refreshPromises.set(connection, refreshPromise);
-    return refreshPromise;
+    const refreshToken = typeof connection.refreshToken === "string" ? connection.refreshToken.trim() : "";
+    if (!refreshToken) throw new ApiError(410, "provider_authentication_failed", "光鸭登录已失效，请重新登录");
+    const sharedRefresh = await this.tokenRefreshCoordinator.execute(
+      refreshToken,
+      // 轮换不绑定首个等待任务的取消信号，避免上游成功后本地丢失新令牌。
+      () => this.performRefresh(connection, refreshToken),
+    );
+    Object.assign(connection, sharedRefresh.result);
+    if (persistConnection) await persistConnection(connection);
   }
 
-  /** 调用 refresh_token grant 并持久化轮换后的完整连接。 */
+  /** 调用 refresh_token grant，只返回轮换后的完整连接字段。 */
   private async performRefresh(
     connection: Record<string, unknown>,
-    persistConnection?: PersistGuangyaConnection,
+    refreshToken: string,
     signal?: AbortSignal,
-  ): Promise<void> {
-    const refreshToken = typeof connection.refreshToken === "string" ? connection.refreshToken.trim() : "";
+  ): Promise<Record<string, unknown>> {
     const deviceId = typeof connection.deviceId === "string" ? connection.deviceId.trim() : "";
-    if (!refreshToken) {
-      throw new ApiError(410, "provider_authentication_failed", "光鸭登录已失效，请重新登录");
-    }
     const response = await this.requestJson(`${GUANGYA_AUTH_BASE_URL}/token`, {
       method: "POST",
       headers: this.createAuthHeaders(deviceId),
@@ -540,8 +546,7 @@ export class GuangyaWebApiClient {
     if (!response.ok || !nextConnection) {
       throw new ApiError(410, "provider_authentication_failed", "光鸭刷新令牌已失效，请重新登录");
     }
-    Object.assign(connection, nextConnection);
-    if (persistConnection) await persistConnection(connection);
+    return nextConnection;
   }
 
   /** 把 Token 响应映射成可加密保存的连接对象。 */

@@ -1,6 +1,7 @@
 import { acquireMusicBudget } from "./request-budget.js";
 import { createHash, randomBytes } from "node:crypto";
 import { ApiError } from "../errors.js";
+import { CredentialRefreshCoordinator } from "./credential-refresh-coordinator.js";
 import {
   PROVIDER_RATE_LIMIT_MAX_RETRIES,
   readProviderRateLimitDelayMs,
@@ -86,7 +87,8 @@ function readDownloadExpiresAt(data: JsonRecord, signedUrl: string): string | nu
  * 连接由 Flymby APP 完成官方授权后同步，Fly云助手只负责刷新、签名和文件访问。
  */
 export class GuangyaOpenApiClient {
-  private readonly refreshPromises = new WeakMap<Record<string, unknown>, Promise<void>>();
+  /** 按旧 Refresh Token 合并不同 HTTP 请求解密出的连接副本。 */
+  private readonly tokenRefreshCoordinator = new CredentialRefreshCoordinator<Record<string, unknown>>();
   private listRequestReservation: Promise<void> = Promise.resolve();
   private nextListRequestAtMs = 0;
 
@@ -108,9 +110,10 @@ export class GuangyaOpenApiClient {
     const query = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
     if (parentId) query.set("parentId", parentId);
     const path = "/file/get_file_list";
+    const requestAccessToken = this.readConnectionText(connection, "accessToken");
     let response = await this.requestBusinessJsonWithRateLimitRetry(path, query, connection, signal);
     if (this.requiresTokenRefresh(response)) {
-      await this.refreshConnection(connection, persistConnection, signal, true);
+      await this.refreshConnection(connection, persistConnection, signal, true, requestAccessToken);
       await this.reserveListRequestSlot();
       response = await this.requestBusinessJsonWithRateLimitRetry(path, query, connection, signal);
     }
@@ -129,9 +132,10 @@ export class GuangyaOpenApiClient {
     await this.ensureValidToken(connection, persistConnection, signal);
     const query = new URLSearchParams({ fileId });
     const path = "/file/get_res_download_url";
+    const requestAccessToken = this.readConnectionText(connection, "accessToken");
     let response = await this.requestBusinessJsonWithRateLimitRetry(path, query, connection, signal);
     if (this.requiresTokenRefresh(response)) {
-      await this.refreshConnection(connection, persistConnection, signal, true);
+      await this.refreshConnection(connection, persistConnection, signal, true, requestAccessToken);
       response = await this.requestBusinessJsonWithRateLimitRetry(path, query, connection, signal);
     }
     this.requireSuccessfulBusinessResponse(response, path);
@@ -168,36 +172,40 @@ export class GuangyaOpenApiClient {
     await this.refreshConnection(connection, persistConnection, signal, false);
   }
 
-  /** 合并同一连接的并发刷新，避免刷新令牌被重复轮换。 */
+  /** 合并同一旧 Refresh Token 的跨请求刷新，避免刷新令牌被重复轮换。 */
   private async refreshConnection(
     connection: Record<string, unknown>,
     persistConnection?: PersistGuangyaConnection,
     signal?: AbortSignal,
     forceRefresh = false,
+    failedAccessToken = "",
   ): Promise<void> {
+    const currentAccessToken = this.readConnectionText(connection, "accessToken");
+    // 同一连接对象已被另一个请求刷新时，当前失败响应直接使用新 Token 重试。
+    if (forceRefresh && failedAccessToken && currentAccessToken && currentAccessToken !== failedAccessToken) return;
     if (!forceRefresh) {
-      const accessToken = this.readConnectionText(connection, "accessToken");
       const expiresAt = Number(connection.expiresAt ?? 0);
-      if (accessToken && (!Number.isFinite(expiresAt) || expiresAt <= 0 || Date.now() + GUANGYA_TOKEN_REFRESH_AHEAD_MS < expiresAt)) return;
+      if (currentAccessToken && (!Number.isFinite(expiresAt) || expiresAt <= 0 || Date.now() + GUANGYA_TOKEN_REFRESH_AHEAD_MS < expiresAt)) return;
     }
-    const existingPromise = this.refreshPromises.get(connection);
-    if (existingPromise) return existingPromise;
-    const refreshPromise = this.performRefresh(connection, persistConnection, signal)
-      .finally(() => this.refreshPromises.delete(connection));
-    this.refreshPromises.set(connection, refreshPromise);
-    return refreshPromise;
+    const refreshToken = this.requireConnectionText(connection, "refreshToken", "光鸭官方 API 登录已失效，请在 Flymby APP 重新授权并同步");
+    const sharedRefresh = await this.tokenRefreshCoordinator.execute(
+      refreshToken,
+      // 轮换不绑定首个等待任务的取消信号，避免上游成功后本地丢失新令牌。
+      () => this.performRefresh(connection, refreshToken),
+    );
+    Object.assign(connection, sharedRefresh.result);
+    if (persistConnection) await persistConnection(connection);
   }
 
-  /** 调用 APP 官方 API 同源 refresh_token 接口并持久化轮换后的令牌。 */
+  /** 调用 APP 官方 API 同源 refresh_token 接口，只返回轮换后的连接字段。 */
   private async performRefresh(
     connection: Record<string, unknown>,
-    persistConnection?: PersistGuangyaConnection,
+    refreshToken: string,
     signal?: AbortSignal,
-  ): Promise<void> {
+  ): Promise<Record<string, unknown>> {
     const clientId = this.requireConnectionText(connection, "clientId", "光鸭官方 API clientId 缺失");
     const projectId = this.requireConnectionText(connection, "projectId", "光鸭官方 API projectId 缺失");
     const deviceId = this.requireConnectionText(connection, "deviceId", "光鸭官方 API deviceId 缺失");
-    const refreshToken = this.requireConnectionText(connection, "refreshToken", "光鸭官方 API 登录已失效，请在 Flymby APP 重新授权并同步");
     const response = await this.requestJson(`${GUANGYA_OPEN_AUTH_BASE_URL}/token`, {
       method: "POST",
       headers: {
@@ -222,7 +230,7 @@ export class GuangyaOpenApiClient {
     }
     const expiresIn = readFirstNumber(data, ["expires_in", "expiresIn"]);
     const rawExpiresAt = readFirstNumber(data, ["expires_at", "expiresAt"]);
-    Object.assign(connection, {
+    return {
       authMode: "official_api",
       accessToken,
       refreshToken: readFirstText(data, ["refresh_token", "refreshToken"]) || refreshToken,
@@ -231,8 +239,7 @@ export class GuangyaOpenApiClient {
         ? rawExpiresAt < 1_000_000_000_000 ? rawExpiresAt * 1_000 : rawExpiresAt
         : expiresIn > 0 ? Date.now() + expiresIn * 1_000 : 0,
       userId: readFirstText(data, ["sub", "user_id", "userId"]) || this.readConnectionText(connection, "userId"),
-    });
-    if (persistConnection) await persistConnection(connection);
+    };
   }
 
   /** 发送带开放平台签名的 GET 请求。 */

@@ -352,6 +352,9 @@ export async function registerServiceMigrationRoutes(
       const clientDeviceId = requireString(request.body, "clientDeviceId", "客户端设备 ID", 200);
       const clientServiceId = requireString(request.body, "clientServiceId", "客户端服务 ID", 200);
       const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+      if (service.dataType !== "video") {
+        throw new ApiError(422, "migration_snapshot_data_type_unsupported", "音乐库关联不上传 APP 本地快照");
+      }
       if (!["webdav", "guangya", "aliyundrive", "baidupan", "cloud115", "cloud123", "cloud189", "quark", "cloud139"].includes(service.providerType)) {
         throw new ApiError(422, "migration_provider_unsupported", "当前网盘类型暂不支持迁移");
       }
