@@ -2,7 +2,7 @@ import { Link } from "@tanstack/react-router";
 import { Bell, Music2, Plus, Puzzle, RefreshCw, Save, ServerCog, Trash2, Upload } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
-import { Panel, ProgressMeter, StatCard, StatusPill } from "@/components/ui-kit";
+import { Panel, ProgressMeter, StatusPill } from "@/components/ui-kit";
 import {
   clearAdminTmdbCache,
   createAdminUser,
@@ -75,16 +75,18 @@ function SystemSummaryItem({
   value,
   status,
   tone = "neutral",
+  compact = false,
 }: {
   label: string;
   value: string;
   status: string;
   tone?: "neutral" | "primary" | "success" | "warning" | "danger" | "info";
+  compact?: boolean;
 }) {
   return (
-    <div className="rounded-xl border border-border bg-secondary/40 p-4">
+    <div className={`rounded-xl border border-border bg-secondary/40 ${compact ? "p-3" : "p-4"}`}>
       <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0"><p className="text-xs text-muted-foreground">{label}</p><p className="mt-2 truncate text-sm font-medium">{value}</p></div>
+        <div className="min-w-0"><p className={compact ? "text-[10px] text-muted-foreground" : "text-xs text-muted-foreground"}>{label}</p><p className={`${compact ? "mt-1 text-xs" : "mt-2 text-sm"} truncate font-medium`}>{value}</p></div>
         <StatusPill tone={tone}>{status}</StatusPill>
       </div>
     </div>
@@ -92,19 +94,27 @@ function SystemSummaryItem({
 }
 
 /** 将后台脱敏配置转换为中文系统摘要，不展示 JSON 原文。 */
-function SystemConfigurationSummary({ config }: { config: AdminConfigStatus }) {
+function SystemConfigurationSummary({ config, compact = false }: { config: AdminConfigStatus; compact?: boolean }) {
   const tmdbConfigured = config.tmdb.configuredCount > 0;
   return (
-    <div className="grid gap-3 sm:grid-cols-2">
-      <SystemSummaryItem label="数据库" value={`${databaseTypeLabels[config.database.type]} · 架构 v${config.database.schemaVersion}`} status="正常" tone="success" />
-      <SystemSummaryItem label="TMDB" value={`${config.tmdb.healthyCount}/${config.tmdb.configuredCount} 个 Key 可用 · 并发 ${config.tmdb.effectiveConcurrency} · 配置 r${config.tmdb.configurationRevision}`} status={tmdbConfigured ? "已配置" : "未配置"} tone={tmdbConfigured ? "success" : "warning"} />
-      <SystemSummaryItem label="音乐刮削" value={`已启用 ${config.music.sources.enabledSources.length} / 6 个来源`} status={config.music.sources.enabledSources.length > 0 ? "可用" : "已关闭"} tone={config.music.sources.enabledSources.length > 0 ? "success" : "warning"} />
-      <SystemSummaryItem label="凭据主密钥" value={configurationSourceLabels[config.credentials.source]} status={config.credentials.configured ? "已配置" : "未配置"} tone={config.credentials.configured ? "success" : "danger"} />
-      <SystemSummaryItem label="元数据插件" value={`已启用 ${config.plugins.enabledCount} / 已安装 ${config.plugins.installedCount}`} status={config.plugins.directoryReady ? "目录正常" : "目录异常"} tone={config.plugins.directoryReady ? "success" : "danger"} />
-      <SystemSummaryItem label="AI 模型" value={`已启用 ${config.aiModels.enabledCount} / 已配置 ${config.aiModels.configuredCount}`} status={config.aiModels.availableCount > 0 ? `${config.aiModels.availableCount} 个可用` : "尚无可用模型"} tone={config.aiModels.availableCount > 0 ? "success" : config.aiModels.configuredCount > 0 ? "warning" : "neutral"} />
-      <SystemSummaryItem label="扫描 Worker" value={`活动 ${config.worker.activeWorkers} / 并发 ${config.worker.concurrency}`} status={config.worker.running ? "运行中" : "已停止"} tone={config.worker.running ? "success" : "warning"} />
+    <div className={`grid sm:grid-cols-2 ${compact ? "gap-2" : "gap-3"}`}>
+      <SystemSummaryItem compact={compact} label="数据库" value={`${databaseTypeLabels[config.database.type]} · 架构 v${config.database.schemaVersion}`} status="正常" tone="success" />
+      <SystemSummaryItem compact={compact} label="TMDB" value={`${config.tmdb.healthyCount}/${config.tmdb.configuredCount} 个 Key 可用 · 并发 ${config.tmdb.effectiveConcurrency} · 配置 r${config.tmdb.configurationRevision}`} status={tmdbConfigured ? "已配置" : "未配置"} tone={tmdbConfigured ? "success" : "warning"} />
+      <SystemSummaryItem compact={compact} label="音乐刮削" value={`已启用 ${config.music.sources.enabledSources.length} / 6 个来源`} status={config.music.sources.enabledSources.length > 0 ? "可用" : "已关闭"} tone={config.music.sources.enabledSources.length > 0 ? "success" : "warning"} />
+      <SystemSummaryItem compact={compact} label="凭据主密钥" value={configurationSourceLabels[config.credentials.source]} status={config.credentials.configured ? "已配置" : "未配置"} tone={config.credentials.configured ? "success" : "danger"} />
+      <SystemSummaryItem compact={compact} label="元数据插件" value={`已启用 ${config.plugins.enabledCount} / 已安装 ${config.plugins.installedCount}`} status={config.plugins.directoryReady ? "目录正常" : "目录异常"} tone={config.plugins.directoryReady ? "success" : "danger"} />
+      <SystemSummaryItem compact={compact} label="AI 模型" value={`已启用 ${config.aiModels.enabledCount} / 已配置 ${config.aiModels.configuredCount}`} status={config.aiModels.availableCount > 0 ? `${config.aiModels.availableCount} 个可用` : "尚无可用模型"} tone={config.aiModels.availableCount > 0 ? "success" : config.aiModels.configuredCount > 0 ? "warning" : "neutral"} />
+      <SystemSummaryItem compact={compact} label="扫描 Worker" value={`活动 ${config.worker.activeWorkers} / 并发 ${config.worker.concurrency}`} status={config.worker.running ? "运行中" : "已停止"} tone={config.worker.running ? "success" : "warning"} />
     </div>
   );
+}
+
+/** 将概览任务状态转换成服务标题后的圆点颜色。 */
+function getOverviewJobStatusDotClass(status: JobStatus): string {
+  if (status === "completed") return "bg-success";
+  if (status === "failed" || status === "cancelled") return "bg-destructive";
+  if (status === "queued" || status === "retry_waiting" || status === "paused") return "bg-warning";
+  return "animate-pulse bg-primary";
 }
 
 /** 展示管理端运行状态中的关键指标。 */
@@ -145,41 +155,47 @@ export function AdminOverviewPage() {
 
   if (!resource.data) return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取管理概览…"}</div></Panel>;
   const { status, services, jobs, config } = resource.data;
+  // 关键变量：概览统计使用页面专用紧凑卡片，避免修改其他详情页共享的 StatCard。
+  const overviewStats = [
+    { label: "用户", value: status.userCount.toLocaleString(), hint: "全部账号" },
+    { label: "服务", value: status.serviceCount.toLocaleString(), hint: `${services.filter((item) => item.status !== "active").length} 个需处理` },
+    { label: "媒体", value: status.mediaCount.toLocaleString(), hint: "全部用户" },
+    { label: "活动任务", value: status.activeJobCount.toLocaleString(), hint: `失败 ${status.failedJobCount}` },
+  ];
+  const attentionServices = services.filter((service) => service.status !== "active" || service.connectionStatus !== "valid");
   return (
     <>
       <PageHeader title="管理概览" actions={<><Link to="/admin/users"><PrimaryButton><Plus className="size-4" /> 用户管理</PrimaryButton></Link><Link to="/admin/plugins"><SecondaryButton><Puzzle className="size-4" /> 插件管理</SecondaryButton></Link><Link to="/admin/system"><SecondaryButton><ServerCog className="size-4" /> 系统状态</SecondaryButton></Link></>} />
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="用户总数" value={String(status.userCount)} hint="全部已注册账号" tone="primary" />
-        <StatCard label="服务总数" value={String(status.serviceCount)} hint={`${services.filter((item) => item.status !== "active").length} 个需处理`} tone="warning" />
-        <StatCard label="媒体总数" value={status.mediaCount.toLocaleString()} hint="跨全部用户" tone="info" />
-        <StatCard label="活动任务" value={String(status.activeJobCount)} hint={`失败 ${status.failedJobCount}`} tone="muted" />
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        {overviewStats.map((item) => <article key={item.label} className="surface p-4">
+          <p className="text-[11px] text-muted-foreground">{item.label}</p>
+          <div className="mt-1 flex items-end justify-between gap-3"><p className="font-display text-2xl font-semibold tabular-nums">{item.value}</p><p className="pb-0.5 text-[10px] text-muted-foreground">{item.hint}</p></div>
+        </article>)}
       </div>
-      <div className="mt-4 grid gap-4 xl:grid-cols-3">
-        <Panel title="系统摘要" description="组件健康状态，只显示脱敏信息">
-          <SystemConfigurationSummary config={config} />
+      <div className="mt-3 grid gap-3 xl:grid-cols-2">
+        <Panel className="p-4 sm:p-4" title="系统摘要" description="组件健康状态，只显示脱敏信息">
+          <SystemConfigurationSummary config={config} compact />
         </Panel>
-        <Panel title="最近任务" description="跨用户任务进度" className="xl:col-span-2">
-          <ul className="space-y-2.5">
+        <Panel title="最近任务" description="跨用户任务进度" className="p-4 sm:p-4">
+          <ul className="grid gap-2 sm:grid-cols-2">
             {jobs.slice(0, 8).map((job) => (
-              <li key={job.id} className="rounded-xl border border-border bg-secondary/40 p-3.5">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <p className="truncate text-sm">{job.serviceName}</p>
-                    <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">{job.id} · {job.ownerUsername} · {job.jobType === "media_probe" ? "视频规格分析" : "扫描刮削"} · {job.stage}</p>
-                  </div>
-                  <StatusPill tone={job.status === "failed" ? "danger" : job.status === "completed" ? "success" : job.status === "retry_waiting" || job.status === "paused" || job.status === "queued" ? "warning" : "primary"}>{job.status === "retry_waiting" && job.jobType === "media_probe" ? "等待重试" : jobStatusLabels[job.status]}</StatusPill>
+              <li key={job.id} className="rounded-xl border border-border bg-secondary/40 p-3">
+                <div className="flex min-w-0 items-center gap-2">
+                  <p className="truncate text-sm font-semibold">{job.serviceName}</p>
+                  <span role="status" aria-label={jobStatusLabels[job.status]} title={jobStatusLabels[job.status]} className={`size-2 shrink-0 rounded-full ${getOverviewJobStatusDotClass(job.status)}`} />
                 </div>
-                <div className="mt-1.5 grid gap-1 text-[11px] text-muted-foreground sm:grid-cols-2">
-                  <span>开始时间：{formatJobDateTime(job.startedAt)}</span>
-                  <span>结束时间：{formatJobDateTime(job.finishedAt)}</span>
-                </div>
-                <div className="mt-2.5"><ProgressMeter value={job.processedCount} total={job.totalCount} /></div>
+                <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{job.ownerUsername} · {job.jobType === "media_probe" ? "视频规格分析" : "扫描刮削"}</p>
+                <p className="mt-1 truncate text-[10px] text-muted-foreground">开始时间 {formatJobDateTime(job.startedAt)}</p>
+                <div className="mt-1.5"><ProgressMeter value={job.status === "completed" ? 1 : job.processedCount} total={job.status === "completed" ? 1 : job.totalCount} /></div>
               </li>
             ))}
           </ul>
         </Panel>
       </div>
-      <Panel title="需要处理的服务" className="mt-4"><div className="overflow-x-auto"><table className="w-full min-w-[620px] text-left text-xs"><thead className="text-[10px] text-muted-foreground uppercase"><tr><th className="pb-2.5">服务</th><th className="pb-2.5">所属用户</th><th className="pb-2.5">Provider</th><th className="pb-2.5">状态</th></tr></thead><tbody className="divide-y divide-border">{services.filter((service) => service.status !== "active" || service.connectionStatus !== "valid").map((service) => <tr key={service.id}><td className="py-3">{service.displayName}</td><td className="py-3 text-muted-foreground">{service.ownerUsername}</td><td className="py-3 font-mono text-muted-foreground">{service.providerType}</td><td className="py-3"><StatusPill tone="warning">{service.status}</StatusPill></td></tr>)}</tbody></table></div></Panel>
+      <Panel title="需要处理的服务" className="mt-3 p-4 sm:p-4">{attentionServices.length === 0
+        ? <p className="text-xs text-muted-foreground">当前没有需要处理的服务</p>
+        : <div className="overflow-x-auto"><table className="w-full min-w-[620px] text-left text-xs"><thead className="text-[10px] text-muted-foreground uppercase"><tr><th className="pb-2.5">服务</th><th className="pb-2.5">所属用户</th><th className="pb-2.5">Provider</th><th className="pb-2.5">状态</th></tr></thead><tbody className="divide-y divide-border">{attentionServices.map((service) => <tr key={service.id}><td className="py-2.5">{service.displayName}</td><td className="py-2.5 text-muted-foreground">{service.ownerUsername}</td><td className="py-2.5 font-mono text-muted-foreground">{service.providerType}</td><td className="py-2.5"><StatusPill tone="warning">{service.status}</StatusPill></td></tr>)}</tbody></table></div>}
+      </Panel>
     </>
   );
 }
