@@ -23,9 +23,17 @@ FlyCloudHelper 是一个可自部署的网盘媒体扫描、元数据刮削、�
 
 ![FlyCloudHelper 管理概览](assets/readme/admin-overview.jpg)
 
-### 媒体库
+### 服务与媒体库
 
-![FlyCloudHelper 媒体库](assets/readme/media-library.jpg)
+| 服务管理 | 媒体库管理 |
+| --- | --- |
+| ![FlyCloudHelper 服务管理](assets/readme/services.jpg) | ![FlyCloudHelper 媒体库管理](assets/readme/media-library.jpg) |
+
+### 后台任务与音乐库设置
+
+| 后台任务 | 音乐库与 Navidrome 设置 |
+| --- | --- |
+| ![FlyCloudHelper 后台任务](assets/readme/background-jobs.jpg) | ![FlyCloudHelper 音乐库与 Navidrome 设置](assets/readme/music-library-settings.jpg) |
 
 ## 主要功能
 
