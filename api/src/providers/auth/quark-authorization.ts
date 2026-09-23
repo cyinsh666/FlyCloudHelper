@@ -10,6 +10,14 @@ const QUARK_DRIVE = "https://drive.quark.cn/1/clouddrive";
 const QUARK_LOGIN_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36";
 const QUARK_CLIENT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4";
 
+/** 夸克 CAS 将扫码 token 和确认票据都放在 data.members 中。 */
+function readQuarkMembers(payload: Record<string, unknown>): Record<string, unknown> {
+  const members = readAuthData(payload).members;
+  return members && typeof members === "object" && !Array.isArray(members)
+    ? members as Record<string, unknown>
+    : {};
+}
+
 /** 夸克 CAS 扫码驱动，最终只向凭据仓保存业务 Cookie。 */
 export class QuarkAuthorizationDriver implements CloudAuthorizationDriver {
   public readonly providerType = "quark";
@@ -19,8 +27,13 @@ export class QuarkAuthorizationDriver implements CloudAuthorizationDriver {
     const cookies: Record<string, string> = {};
     const query = new URLSearchParams({ client_id: "532", v: "1.2", request_id: randomBytes(16).toString("hex") });
     const payload = await this.requestJson(`${QUARK_CAS}/getTokenForQrcodeLogin?${query}`, cookies, false, signal);
-    const token = readAuthText(readAuthData(payload), ["token"]);
-    if (readAuthNumber(payload.status) !== 2_000_000 || !token) throw new ApiError(502, "quark_qr_create_failed", "夸克二维码创建失败");
+    const status = readAuthNumber(payload.status);
+    const token = readAuthText(readQuarkMembers(payload), ["token"]);
+    if (status !== 2_000_000 || !token) {
+      console.warn(`[codex-quark-qr-auth] 阶段=创建二维码 结果=失败 上游状态码=${status} 是否包含令牌=${Boolean(token)}`);
+      throw new ApiError(502, "quark_qr_create_failed", "夸克二维码创建失败");
+    }
+    console.info(`[codex-quark-qr-auth] 阶段=创建二维码 结果=成功 上游状态码=${status}`);
     const qrQuery = new URLSearchParams({ token, client_id: "532", ssb: "weblogin", uc_param_str: "", uc_biz_str: "S:custom|OPT:SAREA@0|OPT:IMMERSIVE@1|OPT:BACK_BTN_STYLE@0" });
     return { authMethod: "qr", qrCodeContent: `https://su.quark.cn/4_eMHBJ?${qrQuery}`, expiresInSeconds: 300, pollIntervalSeconds: 2, driverState: { token, ticket: "", cookies } };
   }
@@ -31,9 +44,10 @@ export class QuarkAuthorizationDriver implements CloudAuthorizationDriver {
     const query = new URLSearchParams({ client_id: "532", v: "1.2", token: String(state.token ?? ""), request_id: randomBytes(16).toString("hex") });
     const payload = await this.requestJson(`${QUARK_CAS}/getServiceTicketByQrcodeToken?${query}`, state.cookies as Record<string, string>, false, signal);
     const status = readAuthNumber(payload.status);
-    const ticket = readAuthText(readAuthData(payload), ["service_ticket"]);
+    const ticket = readAuthText(readQuarkMembers(payload), ["service_ticket"]);
     if (status === 2_000_000 && ticket) {
       state.ticket = ticket;
+      console.info(`[codex-quark-qr-auth] 阶段=扫码确认 结果=成功 上游状态码=${status}`);
       return { state: "confirmed", retryAfterSeconds: 1, message: "已确认，正在完成授权" };
     }
     if ([5_000_400_2, 5_000_400_3, 5_000_400_4].includes(status)) return { state: "failed", retryAfterSeconds: 0, message: "二维码已失效，请重新扫码" };

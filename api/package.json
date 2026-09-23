@@ -1,7 +1,7 @@
 {
   "name": "@flycloud-helper/api",
   "private": true,
-  "version": "0.1.16",
+  "version": "0.2.1",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/main.ts",
