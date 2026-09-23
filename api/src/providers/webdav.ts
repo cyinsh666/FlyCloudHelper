@@ -362,10 +362,7 @@ export class WebDavProvider implements ProviderAdapter {
     };
   }
 
-  /**
-   * 为已认证 APP 返回 WebDAV 直连地址和请求头。
-   * 返回内容只经过需要 Bearer Token 的文件访问接口，不能写入日志或公开页面。
-   */
+  /** 解析 WebDAV 文件上游访问方式，仅供已授权的媒体协议播放链路使用。 */
   public async resolveFileAccess(
     connection: Record<string, unknown>,
     locator: Record<string, unknown>,

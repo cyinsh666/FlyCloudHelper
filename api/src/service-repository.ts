@@ -1497,7 +1497,7 @@ export class ServiceRepository {
     });
   }
 
-  /** 修改云端服务名称，供托管后的原 APP 服务卡片同步展示。 */
+  /** 修改网盘服务名称，供服务管理页面展示。 */
   public async updateServiceName(
     serviceId: string,
     userId: string,
@@ -5491,33 +5491,6 @@ export class ServiceRepository {
         },
       };
     });
-  }
-
-  /** 查询指定版本后的目录变更。 */
-  public async listCatalogChanges(userId: string, libraryId: string, afterVersion: number, limit: number) {
-    const library = await this.database.query("media_libraries").where({ id: libraryId, user_id: userId }).first();
-    if (!library) throw new ApiError(404, "library_not_found", "媒体库不存在");
-    const rows = await this.database.query("catalog_changes")
-      .where({ user_id: userId, library_id: libraryId })
-      .where("catalog_version", ">", afterVersion)
-      .orderBy("catalog_version", "asc")
-      .limit(limit + 1);
-    const hasMore = rows.length > limit;
-    const visibleRows = hasMore ? rows.slice(0, limit) : rows;
-    return {
-      catalogVersion: Number(library.catalog_version),
-      nextVersion: visibleRows.length > 0
-        ? Number(visibleRows[visibleRows.length - 1]?.catalog_version ?? afterVersion)
-        : afterVersion,
-      hasMore,
-      changes: visibleRows.map((row) => ({
-        version: Number(row.catalog_version),
-        entityType: row.entity_type,
-        entityId: row.entity_id,
-        changeType: row.change_type,
-        createdAt: row.created_at,
-      })),
-    };
   }
 
   /** 查询用户或全局概览统计。 */

@@ -900,7 +900,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     });
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-provider-sync",
-      事件: "更新托管服务登录状态",
+      事件: "更新网盘服务登录状态",
       用户ID: user.id,
       服务ID: service.id,
       网盘类型: service.providerType,

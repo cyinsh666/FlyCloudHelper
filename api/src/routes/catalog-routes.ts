@@ -11,38 +11,17 @@ import {
 import { hydrateRealtimeVideoDetails } from "../media/realtime-video-details.js";
 import type { ApiRuntime } from "../runtime.js";
 
-/** APP 首页当前展示的云端视频分类，数量必须与对应分类列表接口一致。 */
-const HOME_VIDEO_CATEGORY_KEYS = ["movie", "tv", "anime", "variety", "documentary"];
-/** 每个首页分类只返回少量预览条目，完整数量由数据库单独统计。 */
-const HOME_VIDEO_CATEGORY_PREVIEW_LIMIT = 18;
-/** 音乐首页三类稳定入口，key 同时供 APP 和网页识别。 */
-const HOME_MUSIC_CATEGORIES = [
-  { key: "song", itemType: "music.track" },
-  { key: "album", itemType: "music.album" },
-  { key: "artist", itemType: "music.artist" },
-];
-
 /** 查询媒体库并强制当前用户归属。 */
 async function requireLibrary(runtime: ApiRuntime, libraryId: string, userId: string) {
   const row = await runtime.database.query("media_libraries as l")
     .join("library_sources as ls", "ls.library_id", "l.id").join("cloud_services as s", "s.id", "ls.service_id")
-    .select(
-      "l.id", "ls.service_id", "s.provider_type", "l.catalog_version", "l.status",
-      "l.created_at", "l.updated_at", "s.display_name", "l.data_type", "l.last_scan_at",
-    )
+    .select("l.id", "l.catalog_version")
     .where("l.id", libraryId)
     .where("l.user_id", userId)
     .whereNull("s.deleted_at")
     .first();
   if (!row) throw new ApiError(404, "library_not_found", "媒体库不存在");
   return row;
-}
-
-/** 播放定位只允许使用 APP Bearer Token 的请求读取。 */
-function requireAppBearer(request: FastifyRequest): void {
-  if (!request.headers.authorization?.startsWith("Bearer ")) {
-    throw new ApiError(403, "app_token_required", "文件定位只提供给已登录 APP 客户端");
-  }
 }
 
 /** 验证媒体条目属于 URL 指定媒体库。 */
@@ -74,127 +53,8 @@ async function auditCatalogAction(
   });
 }
 
-/** 注册普通用户和 APP 共用的媒体目录与变更接口。 */
+/** 注册网页管理和普通用户使用的媒体目录接口。 */
 export async function registerCatalogRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
-  server.get<{
-    Params: { libraryId: string };
-    Querystring: Record<string, unknown>;
-  }>("/api/v1/libraries/:libraryId/home", async (request) => {
-    const user = await requireRequestUser(request, runtime.database);
-    const library = await requireLibrary(runtime, request.params.libraryId, user.id);
-    const includeItems = request.query.includeItems !== "false"; // 设置页只读统计时不返回海报条目。
-    const libraryMediaType = String(library.data_type) as MediaType;
-    const countedItemTypes = libraryMediaType === "music"
-      ? HOME_MUSIC_CATEGORIES.map((category) => category.itemType)
-      : ["video.movie", "video.series"];
-    // 关键变量：同一次首页请求并行读取海报和库统计，避免设置页再读取 APP 本地快照。
-    const [matchedCountRows, libraryCountRows, episodeCountRow, sourceFileCountRow, sections, categorySections] = await Promise.all([
-      runtime.database.query("media_items")
-        .select("item_type")
-        .count<Array<{ item_type: string; count: string | number }>>({ count: "id" })
-        .where({ user_id: user.id, library_id: request.params.libraryId, match_state: "matched" })
-        .whereNull("deleted_at")
-        .whereIn("item_type", countedItemTypes)
-        .groupBy("item_type"),
-      runtime.database.query("media_items")
-        .select("item_type")
-        .count<Array<{ item_type: string; count: string | number }>>({ count: "id" })
-        .where({ user_id: user.id, library_id: request.params.libraryId })
-        .whereNull("deleted_at")
-        .whereIn("item_type", countedItemTypes)
-        .groupBy("item_type"),
-      runtime.database.query("media_items")
-        .count<{ count: string | number }[]>({ count: "id" })
-        .where({ user_id: user.id, library_id: request.params.libraryId, item_type: libraryMediaType === "music" ? "music.track" : "video.episode" })
-        .whereNull("deleted_at")
-        .first(),
-      runtime.database.query("source_files")
-        .count<{ count: string | number }[]>({ count: "id" })
-        .where({ user_id: user.id, library_id: request.params.libraryId, status: "active" })
-        .first(),
-      includeItems ? Promise.all(([libraryMediaType] as MediaType[]).map(async (mediaType) => {
-        const result = await runtime.repository.listCatalogItems({
-          userId: user.id,
-          libraryId: request.params.libraryId,
-          mediaType,
-          matchState: "matched",
-          sort: "updated_desc",
-          limit: 96,
-          offset: 0,
-          includeFileCounts: false,
-        });
-        return { mediaType, total: result.total, items: result.items };
-      })) : Promise.resolve([]),
-      includeItems ? Promise.all((libraryMediaType === "music"
-        ? HOME_MUSIC_CATEGORIES
-        : HOME_VIDEO_CATEGORY_KEYS.map((key) => ({ key, itemType: undefined }))).map(async (category) => {
-        const result = await runtime.repository.listCatalogItems({
-          userId: user.id,
-          libraryId: request.params.libraryId,
-          mediaType: libraryMediaType,
-          itemType: category.itemType,
-          categoryKey: libraryMediaType === "video" ? category.key : undefined,
-          sort: "updated_desc",
-          limit: HOME_VIDEO_CATEGORY_PREVIEW_LIMIT,
-          offset: 0,
-          includeFileCounts: false,
-        });
-        return { key: category.key, total: result.total, items: result.items };
-      })) : Promise.resolve([]),
-    ]);
-    const movieCount = Number(matchedCountRows.find((row) => row.item_type === "video.movie")?.count ?? 0);
-    const showCount = Number(matchedCountRows.find((row) => row.item_type === "video.series")?.count ?? 0);
-    const songCount = Number(matchedCountRows.find((row) => row.item_type === "music.track")?.count ?? 0);
-    const albumCount = Number(matchedCountRows.find((row) => row.item_type === "music.album")?.count ?? 0);
-    const artistCount = Number(matchedCountRows.find((row) => row.item_type === "music.artist")?.count ?? 0);
-    request.log.info({
-      日志关键字: "codex-flycloud-home-category",
-      事件: "首页分类统计完成",
-      媒体库ID: request.params.libraryId,
-      分类数量: categorySections.map((section) => `${section.key}:${section.total}`).join(","),
-    });
-    return {
-      catalogVersion: Number(library.catalog_version),
-      total: libraryMediaType === "music" ? songCount : movieCount + showCount,
-      movieCount,
-      showCount,
-      songCount,
-      albumCount,
-      artistCount,
-      libraryMovieCount: Number(libraryCountRows.find((row) => row.item_type === "video.movie")?.count ?? 0),
-      libraryShowCount: Number(libraryCountRows.find((row) => row.item_type === "video.series")?.count ?? 0),
-      librarySongCount: Number(libraryCountRows.find((row) => row.item_type === "music.track")?.count ?? 0),
-      libraryAlbumCount: Number(libraryCountRows.find((row) => row.item_type === "music.album")?.count ?? 0),
-      libraryArtistCount: Number(libraryCountRows.find((row) => row.item_type === "music.artist")?.count ?? 0),
-      episodeCount: libraryMediaType === "music" ? 0 : Number(episodeCountRow?.count ?? 0),
-      sourceFileCount: Number(sourceFileCountRow?.count ?? 0),
-      sections,
-      categorySections,
-    };
-  });
-
-  server.get<{ Params: { libraryId: string }; Querystring: Record<string, unknown> }>("/api/v1/libraries/:libraryId/facets", async (request) => {
-    const user = await requireRequestUser(request, runtime.database);
-    const library = await requireLibrary(runtime, request.params.libraryId, user.id);
-    const rows = await runtime.database.query("media_items")
-      .select("media_type", "item_type", "match_state")
-      .count<{ count: string | number }[]>({ count: "id" })
-      .where({ user_id: user.id, library_id: request.params.libraryId })
-      .whereNull("deleted_at")
-      .groupBy("media_type", "item_type", "match_state");
-    return {
-      catalogVersion: Number(library.catalog_version),
-      mediaTypes: [String(library.data_type)],
-      sorts: ["created_desc", "year_desc", "premiere_date_desc", "title_asc"],
-      combinations: rows.map((row) => ({
-        mediaType: row.media_type,
-        itemType: row.item_type,
-        matchState: row.match_state,
-        count: Number(row.count),
-      })),
-    };
-  });
-
   /** 执行带媒体库作用域的目录列表和搜索。 */
   const listLibraryItems = async (
     request: FastifyRequest<{ Params: { libraryId: string }; Querystring: Record<string, unknown> }>,
@@ -343,98 +203,5 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
     const updatedItem = await clearManualVideoMatch(runtime, item);
     await auditCatalogAction(runtime, user, "clear_media_item_match", item.id);
     return { item: updatedItem };
-  });
-
-  server.get<{ Params: { libraryId: string; itemId: string } }>("/api/v1/libraries/:libraryId/items/:itemId/files", async (request) => {
-    requireAppBearer(request);
-    const user = await requireRequestUser(request, runtime.database);
-    const library = await requireLibrary(runtime, request.params.libraryId, user.id);
-    await requireLibraryItem(runtime, user.id, request.params.libraryId, request.params.itemId);
-    return {
-      schemaVersion: 1,
-      providerType: library.provider_type,
-      items: await runtime.repository.listItemFiles(request.params.itemId, user.id),
-    };
-  });
-
-  server.post<{ Params: { libraryId: string; itemId: string; fileId: string } }>(
-    "/api/v1/libraries/:libraryId/items/:itemId/files/:fileId/access",
-    async (request) => {
-      requireAppBearer(request);
-      const user = await requireRequestUser(request, runtime.database);
-      const library = await requireLibrary(runtime, request.params.libraryId, user.id);
-      await requireLibraryItem(runtime, user.id, request.params.libraryId, request.params.itemId);
-      const files = await runtime.repository.listItemFiles(request.params.itemId, user.id);
-      // 关键变量：只能为当前媒体条目已绑定的源文件签发访问地址，禁止跨服务猜测 fileId。
-      const sourceFile = files.find((file) => String(file.fileId) === request.params.fileId);
-      if (!sourceFile) throw new ApiError(404, "source_file_not_found", "媒体源文件不存在");
-      const adapter = runtime.providers.get(String(library.provider_type));
-      if (!adapter.resolveFileAccess) {
-        throw new ApiError(422, "provider_file_access_unsupported", "当前网盘类型暂不支持服务端文件访问");
-      }
-      const service = await runtime.repository.getServiceDetail(String(library.service_id), user.id);
-      const connection = runtime.vault.decrypt(
-        await runtime.repository.getActiveEncryptedConnection(service.id, user.id),
-      );
-      const locator = sourceFile.playbackLocator && typeof sourceFile.playbackLocator === "object"
-        ? sourceFile.playbackLocator as Record<string, unknown>
-        : {};
-      const access = await adapter.resolveFileAccess(connection, locator, undefined, {
-        persistConnection: async (nextConnection) => {
-          await runtime.repository.refreshActiveEncryptedConnection({
-            serviceId: service.id,
-            userId: user.id,
-            credentialRevision: service.credentialRevision,
-            encryptedConnection: runtime.vault.encrypt(nextConnection),
-          });
-          runtime.logBusinessEvent("info", {
-            日志关键字: "codex-flycloud-provider-token-refresh",
-            事件: "文件访问期间保存Provider刷新令牌",
-            用户ID: user.id,
-            服务ID: service.id,
-            凭据修订: service.credentialRevision,
-          });
-        },
-      });
-      // 临时诊断：APP 关联直连直接接收 Provider 请求头，不经过 Jellyfin 的307跳转检查。
-      runtime.logBusinessEvent("info", {
-        日志关键字: "codex-flycloud-app-direct",
-        事件: "关联服务直连地址与请求头下发",
-        服务ID: service.id,
-        网盘类型: String(library.provider_type),
-        媒体条目ID: request.params.itemId,
-        源文件ID: request.params.fileId,
-        请求头名称: Object.keys(access.headers).join(","),
-        是否携带UA: Object.keys(access.headers).some((name) => name.toLowerCase() === "user-agent"),
-      });
-      if (String(library.provider_type) === "baidupan") {
-        runtime.logBusinessEvent("info", {
-          日志关键字: "codex-baidupan-cloud-playback",
-          事件: "百度网盘直连播放地址下发成功",
-          用户ID: user.id,
-          服务ID: service.id,
-          媒体条目ID: request.params.itemId,
-          源文件ID: request.params.fileId,
-          播放地址是否包含临时令牌: true,
-          请求头名称: "User-Agent",
-        });
-      }
-      return {
-        schemaVersion: 1,
-        accessType: "temporary_url",
-        url: access.url,
-        headers: access.headers,
-        expiresAt: access.expiresAt,
-      };
-    },
-  );
-
-  server.get<{ Params: { libraryId: string }; Querystring: Record<string, unknown> }>("/api/v1/libraries/:libraryId/changes", async (request) => {
-    const user = await requireRequestUser(request, runtime.database);
-    const library = await requireLibrary(runtime, request.params.libraryId, user.id);
-    const afterVersion = Math.max(0, Number.parseInt(String(request.query.afterVersion ?? "0"), 10) || 0);
-    const limit = Math.min(1000, Math.max(1, Number.parseInt(String(request.query.limit ?? "500"), 10) || 500));
-    const result = await runtime.repository.listCatalogChanges(user.id, request.params.libraryId, afterVersion, limit);
-    return { ...result, catalogVersion: Number(library.catalog_version) };
   });
 }

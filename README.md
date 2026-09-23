@@ -399,11 +399,7 @@ Content-Type: application/json
 
 授权完成后先从网盘服务快速创建媒体库，再在媒体库设置中选择目录并创建全量或增量扫描任务。光鸭文件枚举结果进入与 WebDAV 相同的媒体处理管线。
 
-客户端可使用以下接口访问结果：
-
-- `GET /api/v1/libraries/:libraryId/items/:itemId/files`：读取影片绑定的源文件及稳定定位。
-- `POST /api/v1/libraries/:libraryId/items/:itemId/files/:fileId/access`：用用户 Bearer Token 换取短期文件下载地址；响应不会包含光鸭账号 Token。
-- `GET/HEAD /api/v1/libraries/:libraryId/items/:itemId/files/:fileId/stream`：按媒体库协议设置通过 FlyCloudHelper 流式读取源文件，支持 HTTP Range。
+客户端通过媒体库启用的 Jellyfin、Emby 或 Navidrome 协议访问扫描结果。旧版 APP 托管同步卡片使用的目录增量、源文件定位和临时直链接口已下架。
 
 APP 上传接口只接收本地网盘服务基础信息、登录凭据和来源幂等标识，不接收媒体目录。云助手不再提供媒体库快照导出。
 
@@ -411,7 +407,7 @@ APP 上传接口只接收本地网盘服务基础信息、登录凭据和来源�
 
 右上角通知中心会持久化展示扫描任务结果，以及新账号注册、服务删除、媒体库清空、密码重置、角色或状态修改、会话撤销等敏感操作。通知严格按用户归属读取，每 10 秒刷新一次，支持单条清除和全部清除；通知清除不会删除审计日志。
 
-文件访问接口返回 `accessType=temporary_url`、`url`、`headers` 和 `expiresAt`，协议客户端可在地址过期前直连网盘/CDN，或按媒体库的 Jellyfin、Emby、Navidrome 播放设置使用云助手中转。服务端只转发字节流，不转码、不缓存媒体正文，也不会向客户端返回网盘密码、Token 或上游认证头。
+协议客户端按媒体库的 Jellyfin、Emby、Navidrome 播放设置直连网盘/CDN 或使用云助手中转。服务端只转发字节流，不转码、不缓存媒体正文，也不会向客户端返回网盘密码、Token 或上游认证头。
 
 ## 实现进度与后续计划
 
