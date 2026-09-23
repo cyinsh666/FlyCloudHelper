@@ -123,20 +123,21 @@ async function authenticateRequest(
   query: Record<string, unknown>,
 ): Promise<NavidromeContext> {
   const service = await runtime.database.query("cloud_services as s")
-    .join("media_libraries as l", "l.id", "s.library_id")
+    .join("library_sources as ls", "ls.service_id", "s.id").join("media_libraries as l", "l.id", "ls.library_id")
     .select(
-      "s.id", "s.user_id", "s.library_id", "s.display_name", "s.status", "s.provider_type", "s.credential_revision",
+      "s.id", "s.user_id", "ls.library_id as library_id", "s.display_name", "s.status", "s.provider_type", "s.credential_revision",
       "l.navidrome_enabled", "l.navidrome_relay_playback_enabled",
     )
     .where("l.navidrome_path_suffix_lookup", pathSuffix.toLowerCase())
-    .where("s.data_type", "music")
+    .where("l.data_type", "music")
     .whereNull("s.deleted_at")
     .first();
   if (!service || Number(service.navidrome_enabled) !== 1 || service.status === "disabled") {
     throw new ApiError(404, "navidrome_service_disabled", "Navidrome 音乐服务未启用");
   }
-  const serviceId = String(service.id); // 关键变量：公开地址后缀只用于寻址，后续数据隔离始终使用真实服务 ID。
-  const account = await runtime.serviceAccess.authenticateSubsonic(serviceId, {
+  const serviceId = String(service.id); // 关键变量：来源服务 ID 只用于网盘取址。
+  const libraryId = String(service.library_id); // 关键变量：账号、播放状态和播放列表全部按媒体库隔离。
+  const account = await runtime.serviceAccess.authenticateSubsonic(libraryId, {
     username: readQueryString(query.u),
     password: query.p === undefined ? undefined : readQueryString(query.p),
     token: query.t === undefined ? undefined : readQueryString(query.t),
@@ -145,7 +146,7 @@ async function authenticateRequest(
   return {
     serviceId,
     ownerUserId: String(service.user_id),
-    libraryId: String(service.library_id),
+    libraryId,
     libraryName: String(service.display_name),
     accountId: account.id,
     accountUsername: account.username,
@@ -300,13 +301,13 @@ async function loadSongAccountStates(
 ): Promise<Map<string, { starredAt: string | null; rating: number; playCount: number; lastPlayedAt: string | null }>> {
   if (songIds.length === 0) return new Map();
   const [preferences, progressRows] = await Promise.all([
-    runtime.database.query("service_item_preferences")
+    runtime.database.query("library_item_preferences")
       .select("item_id", "starred_at", "rating")
-      .where({ service_id: context.serviceId, account_id: context.accountId })
+      .where({ library_id: context.libraryId, account_id: context.accountId })
       .whereIn("item_id", songIds),
-    runtime.database.query("service_playback_progress")
+    runtime.database.query("library_playback_progress")
       .select("item_id", "play_count", "last_played_at")
-      .where({ service_id: context.serviceId, account_id: context.accountId })
+      .where({ library_id: context.libraryId, account_id: context.accountId })
       .whereIn("item_id", songIds),
   ]);
   const result = new Map<string, { starredAt: string | null; rating: number; playCount: number; lastPlayedAt: string | null }>();
@@ -331,9 +332,9 @@ async function loadItemPreferences(
   itemIds: string[],
 ): Promise<Map<string, { starredAt: string | null; rating: number }>> {
   if (itemIds.length === 0) return new Map();
-  const rows = await runtime.database.query("service_item_preferences")
+  const rows = await runtime.database.query("library_item_preferences")
     .select("item_id", "starred_at", "rating")
-    .where({ service_id: context.serviceId, account_id: context.accountId })
+    .where({ library_id: context.libraryId, account_id: context.accountId })
     .whereIn("item_id", itemIds);
   return new Map(rows.map((row) => [String(row.item_id), {
     starredAt: row.starred_at ? String(row.starred_at) : null,
@@ -571,18 +572,18 @@ async function updateStarredItems(runtime: ApiRuntime, context: NavidromeContext
   const now = new Date().toISOString();
   await runtime.database.query.transaction(async (transaction) => {
     for (const item of items) {
-      const existing = await transaction("service_item_preferences")
-        .where({ service_id: context.serviceId, account_id: context.accountId, item_id: item.id })
+      const existing = await transaction("library_item_preferences")
+        .where({ library_id: context.libraryId, account_id: context.accountId, item_id: item.id })
         .first();
       if (existing) {
-        await transaction("service_item_preferences").where({ id: existing.id }).update({
+        await transaction("library_item_preferences").where({ id: existing.id }).update({
           starred_at: starred ? now : null,
           updated_at: now,
         });
       } else if (starred) {
-        await transaction("service_item_preferences").insert({
+        await transaction("library_item_preferences").insert({
           id: randomUUID(),
-          service_id: context.serviceId,
+          library_id: context.libraryId,
           account_id: context.accountId,
           item_id: item.id,
           starred_at: now,
@@ -599,14 +600,14 @@ async function updateItemRating(runtime: ApiRuntime, context: NavidromeContext, 
   const item = await requireMusicItem(runtime, context, itemId);
   if (!Number.isInteger(rating) || rating < 0 || rating > 5) throw new ApiError(422, "navidrome_rating_invalid", "评分必须是 0 至 5 的整数");
   const now = new Date().toISOString();
-  const existing = await runtime.database.query("service_item_preferences")
-    .where({ service_id: context.serviceId, account_id: context.accountId, item_id: item.id })
+  const existing = await runtime.database.query("library_item_preferences")
+    .where({ library_id: context.libraryId, account_id: context.accountId, item_id: item.id })
     .first();
   if (existing) {
-    await runtime.database.query("service_item_preferences").where({ id: existing.id }).update({ rating, updated_at: now });
+    await runtime.database.query("library_item_preferences").where({ id: existing.id }).update({ rating, updated_at: now });
   } else {
-    await runtime.database.query("service_item_preferences").insert({
-      id: randomUUID(), service_id: context.serviceId, account_id: context.accountId, item_id: item.id,
+    await runtime.database.query("library_item_preferences").insert({
+      id: randomUUID(), library_id: context.libraryId, account_id: context.accountId, item_id: item.id,
       starred_at: null, rating, updated_at: now,
     });
   }
@@ -619,22 +620,22 @@ async function recordScrobble(runtime: ApiRuntime, context: NavidromeContext, so
   const now = new Date().toISOString();
   await runtime.database.query.transaction(async (transaction) => {
     if (!submission) {
-      await transaction("service_playback_sessions")
-        .where({ service_id: context.serviceId, account_id: context.accountId, item_id: song.id, status: "active" })
+      await transaction("library_playback_sessions")
+        .where({ library_id: context.libraryId, account_id: context.accountId, item_id: song.id, status: "active" })
         .update({ status: "stopped", stopped_at: now, updated_at: now });
-      await transaction("service_playback_sessions").insert({
-        id: randomUUID(), service_id: context.serviceId, account_id: context.accountId, item_id: song.id,
+      await transaction("library_playback_sessions").insert({
+        id: randomUUID(), library_id: context.libraryId, account_id: context.accountId, item_id: song.id,
         media_source_id: null, status: "active", position_ticks: 0, paused: 0,
         started_at: now, updated_at: now, stopped_at: null,
       });
       return;
     }
 
-    const progress = await transaction("service_playback_progress")
-      .where({ service_id: context.serviceId, account_id: context.accountId, item_id: song.id })
+    const progress = await transaction("library_playback_progress")
+      .where({ library_id: context.libraryId, account_id: context.accountId, item_id: song.id })
       .first();
     if (progress) {
-      await transaction("service_playback_progress").where({ id: progress.id }).update({
+      await transaction("library_playback_progress").where({ id: progress.id }).update({
         position_ticks: 0,
         played: 1,
         play_count: Number(progress.play_count ?? 0) + 1,
@@ -642,21 +643,21 @@ async function recordScrobble(runtime: ApiRuntime, context: NavidromeContext, so
         updated_at: now,
       });
     } else {
-      await transaction("service_playback_progress").insert({
-        id: randomUUID(), service_id: context.serviceId, account_id: context.accountId, item_id: song.id,
+      await transaction("library_playback_progress").insert({
+        id: randomUUID(), library_id: context.libraryId, account_id: context.accountId, item_id: song.id,
         media_source_id: null, position_ticks: 0, played: 1, hidden_from_resume: 0,
         play_count: 1, last_played_at: now, updated_at: now,
       });
     }
-    const activeSession = await transaction("service_playback_sessions")
-      .where({ service_id: context.serviceId, account_id: context.accountId, item_id: song.id, status: "active" })
+    const activeSession = await transaction("library_playback_sessions")
+      .where({ library_id: context.libraryId, account_id: context.accountId, item_id: song.id, status: "active" })
       .orderBy("started_at", "desc")
       .first();
     if (activeSession) {
-      await transaction("service_playback_sessions").where({ id: activeSession.id }).update({ status: "stopped", stopped_at: now, updated_at: now });
+      await transaction("library_playback_sessions").where({ id: activeSession.id }).update({ status: "stopped", stopped_at: now, updated_at: now });
     }
-    await transaction("service_playback_history").insert({
-      id: randomUUID(), service_id: context.serviceId, account_id: context.accountId, item_id: song.id,
+    await transaction("library_playback_history").insert({
+      id: randomUUID(), library_id: context.libraryId, account_id: context.accountId, item_id: song.id,
       play_session_id: randomUUID(), position_ticks: 0, completed: 1,
       started_at: activeSession?.started_at ?? now, stopped_at: now,
     });
@@ -665,9 +666,9 @@ async function recordScrobble(runtime: ApiRuntime, context: NavidromeContext, so
 
 /** 读取当前账号的收藏条目并按收藏时间倒序返回。 */
 async function listStarredItems(runtime: ApiRuntime, context: NavidromeContext): Promise<Array<{ item: MediaItemRecord; starredAt: string }>> {
-  const rows = await runtime.database.query("service_item_preferences")
+  const rows = await runtime.database.query("library_item_preferences")
     .select("item_id", "starred_at")
-    .where({ service_id: context.serviceId, account_id: context.accountId })
+    .where({ library_id: context.libraryId, account_id: context.accountId })
     .whereNotNull("starred_at")
     .orderBy("starred_at", "desc")
     .limit(5000);
@@ -685,12 +686,12 @@ async function listRecentlyPlayedAlbums(
   offset: number,
   limit: number,
 ): Promise<MediaItemRecord[]> {
-  const rows = await runtime.database.query("service_playback_history as h")
+  const rows = await runtime.database.query("library_playback_history as h")
     .join("media_relations as r", function joinAlbumRelation() {
       this.on("r.child_item_id", "=", "h.item_id").andOnVal("r.relation_type", "=", "album_track");
     })
     .select("r.parent_item_id", "h.stopped_at")
-    .where({ "h.service_id": context.serviceId, "h.account_id": context.accountId, "r.library_id": context.libraryId })
+    .where({ "h.library_id": context.libraryId, "h.account_id": context.accountId, "r.library_id": context.libraryId })
     .orderBy("h.stopped_at", "desc")
     .limit(Math.min(5000, offset + limit + 500));
   const albumIds: string[] = [];
@@ -720,9 +721,9 @@ async function listAccountSelectedAlbums(
       .slice(offset, offset + limit);
   }
   if (type === "highest") {
-    const preferences = await runtime.database.query("service_item_preferences")
+    const preferences = await runtime.database.query("library_item_preferences")
       .select("item_id")
-      .where({ service_id: context.serviceId, account_id: context.accountId })
+      .where({ library_id: context.libraryId, account_id: context.accountId })
       .where("rating", ">", 0)
       .orderBy("rating", "desc")
       .orderBy("updated_at", "desc")
@@ -730,9 +731,9 @@ async function listAccountSelectedAlbums(
     const items = await Promise.all(preferences.map((row) => runtime.repository.getCatalogItem(String(row.item_id), context.ownerUserId)));
     return items.filter((item) => item.libraryId === context.libraryId && item.itemType === "music.album").slice(offset, offset + limit);
   }
-  const progressRows = await runtime.database.query("service_playback_progress")
+  const progressRows = await runtime.database.query("library_playback_progress")
     .select("item_id", "play_count")
-    .where({ service_id: context.serviceId, account_id: context.accountId })
+    .where({ library_id: context.libraryId, account_id: context.accountId })
     .where("play_count", ">", 0)
     .limit(5000);
   const songIds = progressRows.map((row) => String(row.item_id));
@@ -751,8 +752,8 @@ async function listAccountSelectedAlbums(
 
 /** 校验并读取当前账号拥有的播放列表。 */
 async function requirePlaylist(runtime: ApiRuntime, context: NavidromeContext, playlistId: string): Promise<Record<string, unknown>> {
-  const playlist = await runtime.database.query("service_music_playlists")
-    .where({ id: playlistId, service_id: context.serviceId, account_id: context.accountId })
+  const playlist = await runtime.database.query("library_music_playlists")
+    .where({ id: playlistId, library_id: context.libraryId, account_id: context.accountId })
     .first();
   if (!playlist) throw new ApiError(404, "navidrome_playlist_not_found", "播放列表不存在");
   return playlist;
@@ -760,7 +761,7 @@ async function requirePlaylist(runtime: ApiRuntime, context: NavidromeContext, p
 
 /** 按播放列表顺序读取当前音乐库中的歌曲。 */
 async function listPlaylistSongs(runtime: ApiRuntime, context: NavidromeContext, playlistId: string): Promise<MediaItemRecord[]> {
-  const rows = await runtime.database.query("service_music_playlist_items")
+  const rows = await runtime.database.query("library_music_playlist_items")
     .select("item_id")
     .where({ playlist_id: playlistId })
     .orderBy("sort_order", "asc");
@@ -804,12 +805,12 @@ async function createPlaylist(runtime: ApiRuntime, context: NavidromeContext, na
   const playlistId = randomUUID();
   const now = new Date().toISOString();
   await runtime.database.query.transaction(async (transaction) => {
-    await transaction("service_music_playlists").insert({
-      id: playlistId, service_id: context.serviceId, account_id: context.accountId,
+    await transaction("library_music_playlists").insert({
+      id: playlistId, library_id: context.libraryId, account_id: context.accountId,
       name: playlistName, comment: null, is_public: 0, created_at: now, updated_at: now,
     });
     if (songs.length > 0) {
-      await transaction("service_music_playlist_items").insert(songs.map((song, index) => ({
+      await transaction("library_music_playlist_items").insert(songs.map((song, index) => ({
         id: randomUUID(), playlist_id: playlistId, item_id: song.id, sort_order: index, created_at: now,
       })));
     }
@@ -825,7 +826,7 @@ async function updatePlaylist(
   input: { name?: string; comment?: string; isPublic?: boolean; removeIndexes: number[]; addSongIds: string[] },
 ): Promise<void> {
   const playlist = await requirePlaylist(runtime, context, playlistId);
-  const existingRows = await runtime.database.query("service_music_playlist_items")
+  const existingRows = await runtime.database.query("library_music_playlist_items")
     .select("item_id")
     .where({ playlist_id: playlistId })
     .orderBy("sort_order", "asc");
@@ -844,10 +845,10 @@ async function updatePlaylist(
   if (input.comment !== undefined) patch.comment = input.comment.slice(0, 5000);
   if (input.isPublic !== undefined) patch.is_public = input.isPublic ? 1 : 0;
   await runtime.database.query.transaction(async (transaction) => {
-    await transaction("service_music_playlists").where({ id: playlist.id }).update(patch);
-    await transaction("service_music_playlist_items").where({ playlist_id: playlistId }).delete();
+    await transaction("library_music_playlists").where({ id: playlist.id }).update(patch);
+    await transaction("library_music_playlist_items").where({ playlist_id: playlistId }).delete();
     if (itemIds.length > 0) {
-      await transaction("service_music_playlist_items").insert(itemIds.map((itemId, index) => ({
+      await transaction("library_music_playlist_items").insert(itemIds.map((itemId, index) => ({
         id: randomUUID(), playlist_id: playlistId, item_id: itemId, sort_order: index, created_at: now,
       })));
     }
@@ -1208,9 +1209,9 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
         }
         if (method === "getNowPlaying") {
           const activeSince = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-          const sessions = await runtime.database.query("service_playback_sessions")
+          const sessions = await runtime.database.query("library_playback_sessions")
             .select("item_id", "started_at")
-            .where({ service_id: context.serviceId, account_id: context.accountId, status: "active" })
+            .where({ library_id: context.libraryId, account_id: context.accountId, status: "active" })
             .where("updated_at", ">=", activeSince)
             .orderBy("updated_at", "desc")
             .limit(100);
@@ -1243,8 +1244,8 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
           } });
         }
         if (method === "getPlaylists") {
-          const playlists = await runtime.database.query("service_music_playlists")
-            .where({ service_id: context.serviceId, account_id: context.accountId })
+          const playlists = await runtime.database.query("library_music_playlists")
+            .where({ library_id: context.libraryId, account_id: context.accountId })
             .orderBy("updated_at", "desc")
             .limit(1000);
           const mapped = await Promise.all(playlists.map(async (playlist) => mapPlaylist(
@@ -1289,7 +1290,7 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
         }
         if (method === "deletePlaylist") {
           const playlist = await requirePlaylist(runtime, context, readQueryString(query.id));
-          await runtime.database.query("service_music_playlists").where({ id: playlist.id }).delete();
+          await runtime.database.query("library_music_playlists").where({ id: playlist.id }).delete();
           runtime.logBusinessEvent("info", {
             日志关键字: "codex-flycloud-helper-navidrome", 事件: "删除Navidrome账号播放列表",
             服务ID: context.serviceId, 服务访问账号ID: context.accountId, 播放列表ID: String(playlist.id),

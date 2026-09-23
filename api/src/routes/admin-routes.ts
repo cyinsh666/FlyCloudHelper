@@ -33,6 +33,7 @@ import {
   validateTmdbKeyList,
 } from "../system-settings.js";
 import { streamJobEvents } from "./event-stream.js";
+import { attachLibrarySourceId } from "./library-routes.js";
 import {
   consumeProviderAuthorization,
   attachConnectionAuthMode,
@@ -476,7 +477,6 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       await Promise.all([
         removeUserOwnedDirectory(runtime.config.exportDirectory, targetUser.id),
         removeUserOwnedDirectory(path.join(runtime.config.exportDirectory, "scan-failures"), targetUser.id),
-        removeUserOwnedDirectory(runtime.config.migrationDirectory, targetUser.id),
       ]);
       await runtime.database.purgePendingUser(targetUser.id);
       await audit(runtime, operator, "purge_user", "user", null);
@@ -518,10 +518,10 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     return { ...result, items };
   });
 
+  /** 管理员代用户创建只包含基础信息和登录凭据的网盘服务。 */
   server.post<{ Body: Record<string, unknown> }>("/api/v1/admin/services", async (request, reply) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const owner = await runtime.database.findPublicUserById(requireString(request.body, "userId", "目标用户 ID", 100));
-    const dataType = validateServiceDataType(request.body.dataType);
     const provider = requireObject(request.body, "provider", "Provider");
     const providerType = requireString(provider, "type", "Provider 类型", 64);
     const resolvedConnection = resolveProviderConnection(
@@ -531,76 +531,31 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       providerType,
       requireObject(provider, "connection", "连接配置"),
     );
-    const connection = resolvedConnection.connection;
     const adapter = runtime.providers.get(providerType);
-    validateProviderDataType(adapter, dataType);
-    const scanProfile = validateScanProfile(
-      request.body.scan === undefined
-        ? { fullRoots: [], incrementalRoots: [] }
-        : requireObject(request.body, "scan", "扫描配置"),
-      providerType,
-      dataType,
-      adapter.descriptor.recommendedScanSettings,
-    );
-    await validateProviderAccess(adapter, connection, scanProfile);
-    const metadataProfile = validateMetadataProfile(
-      requireObject(request.body, "metadata", "元数据配置"),
-      dataType,
-    );
-    await runtime.aiModels.validateMetadataProfile(metadataProfile);
-    const creation = await runtime.repository.createService({
+    await validateProviderAccess(adapter, resolvedConnection.connection, { fullRoots: [], incrementalRoots: [] });
+    const service = await runtime.repository.createService({
       serviceId: randomUUID(),
-      libraryId: randomUUID(),
       userId: owner.id,
       displayName: requireString(request.body, "displayName", "服务名称", 100),
       providerType,
-      dataType,
-      encryptedConnection: runtime.vault.encrypt(connection),
+      encryptedConnection: runtime.vault.encrypt(resolvedConnection.connection),
       providerSchemaVersion: adapter.descriptor.credentialSchemaVersion,
-      scanProfile,
-      metadataProfile,
     });
-    const service = creation.service;
     consumeProviderAuthorization(runtime, operator.id, resolvedConnection.authorizationSessionId);
     runtime.logBusinessEvent("info", {
-      日志关键字: "codex-flycloud-helper-service-data-type",
-      事件: "管理员创建云端服务",
-      用户ID: operator.id,
+      日志关键字: "codex-flycloud-service-upload",
+      阶段: "管理员创建网盘服务",
+      管理员ID: operator.id,
+      目标用户ID: owner.id,
       服务ID: service.id,
       网盘类型: providerType,
-      数据类型: dataType,
-      自动创建扫描任务: false,
+      结果: "成功",
     });
-    if (providerType === "guangya" && connection.authMode === "official_api") {
-      runtime.logBusinessEvent("info", {
-        日志关键字: "codex-flycloud-helper-guangya-official-api",
-        事件: "管理员同步光鸭官方API连接并创建服务",
-        管理员ID: operator.id,
-        目标用户ID: owner.id,
-        服务ID: service.id,
-      });
-    }
-    if (hasHttpProviderAddress(connection)) {
-      runtime.logBusinessEvent("info", {
-        日志关键字: "codex-flycloud-helper-provider-http",
-        事件: "管理员使用HTTP地址创建Provider服务",
-        用户ID: operator.id,
-        服务ID: service.id,
-        网盘类型: providerType,
-      });
-    }
     await audit(runtime, operator, "create_service", "service", service.id, {
       目标用户ID: owner.id,
       网盘类型: providerType,
-      数据类型: dataType,
     });
-    return reply.status(201).send({
-      service,
-      serviceAccessCredentials: {
-        username: creation.accessCredentials.account.username,
-        password: creation.accessCredentials.password,
-      },
-    });
+    return reply.status(201).send({ service });
   });
 
   server.get<{ Params: { serviceId: string } }>("/api/v1/admin/services/:serviceId", async (request) => {
@@ -608,72 +563,6 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     const service = await runtime.repository.getServiceDetail(request.params.serviceId);
     return { service: await attachConnectionAuthMode(runtime, service) };
   });
-
-  server.get<{
-    Params: { serviceId: string };
-    Querystring: Record<string, unknown>;
-  }>("/api/v1/admin/services/:serviceId/exports", async (request) => {
-    await requireSuperAdmin(request, runtime.database);
-    const service = await runtime.repository.getServiceDetail(request.params.serviceId);
-    const limit = Math.min(100, Math.max(1, Number.parseInt(String(request.query.limit ?? "20"), 10) || 20));
-    const records = await runtime.exports.listExports(service.userId, service.libraryId, limit);
-    return { exports: records.map((record) => ({ ...record, filePath: undefined })) };
-  });
-
-  server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(
-    "/api/v1/admin/services/:serviceId/exports",
-    async (request, reply) => {
-      const operator = await requireSuperAdmin(request, runtime.database);
-      const service = await runtime.repository.getServiceDetail(request.params.serviceId);
-      const exportType = request.body.exportType ?? "snapshot";
-      if (exportType !== "snapshot") {
-        throw new ApiError(422, "export_type_not_supported", "当前只支持完整目录 snapshot 导出");
-      }
-      const record = await runtime.exports.createSnapshotTask(service.userId, service.libraryId);
-      await audit(runtime, operator, "create_library_snapshot", "library_export", record.id, {
-        媒体库ID: service.libraryId,
-        所属用户ID: service.userId,
-        服务ID: service.id,
-      });
-      runtime.logBusinessEvent("info", {
-        日志关键字: "codex-flycloud-snapshot-task",
-        事件: "管理员从网页创建云端快照",
-        管理员ID: operator.id,
-        所属用户ID: service.userId,
-        服务ID: service.id,
-        导出ID: record.id,
-      });
-      return reply.status(202).send({ export: { ...record, filePath: undefined } });
-    },
-  );
-
-  server.delete<{ Params: { exportId: string }; Body: Record<string, unknown> }>(
-    "/api/v1/admin/exports/:exportId",
-    async (request, reply) => {
-      const operator = await requireSuperAdmin(request, runtime.database);
-      requireConfirmation(request.body, request.params.exportId);
-      try {
-        const record = await runtime.exports.deleteExport(request.params.exportId);
-        await audit(runtime, operator, "delete_library_snapshot", "library_export", record.id, {
-          媒体库ID: record.libraryId,
-          所属用户ID: record.userId,
-          快照状态: record.status,
-        });
-      } catch (error) {
-        runtime.logBusinessEvent("warn", {
-          日志关键字: "codex-flycloud-snapshot-delete",
-          事件: "管理员删除云端快照失败",
-          管理员ID: operator.id,
-          导出ID: request.params.exportId,
-          错误码: error && typeof error === "object" && "code" in error
-            ? String((error as { code?: string }).code)
-            : "snapshot_delete_failed",
-        });
-        throw error;
-      }
-      return reply.status(204).send();
-    },
-  );
 
   server.get<{ Params: { serviceId: string }; Querystring: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/directories", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
@@ -742,7 +631,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     );
     const connection = resolvedConnection.connection;
     const adapter = runtime.providers.get(service.providerType);
-    await validateProviderAccess(adapter, connection, service.scanProfile);
+    await validateProviderAccess(adapter, connection, { fullRoots: [], incrementalRoots: [] });
     const currentConnection = runtime.vault.decrypt(
       await runtime.repository.getActiveEncryptedConnection(service.id, service.userId),
     );
@@ -784,7 +673,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       await runtime.repository.getActiveEncryptedConnection(service.id, service.userId),
     );
     try {
-      await validateProviderAccess(adapter, connection, service.scanProfile, {
+      await validateProviderAccess(adapter, connection, { fullRoots: [], incrementalRoots: [] }, {
         persistConnection: async (nextConnection) => {
           await runtime.repository.refreshActiveEncryptedConnection({
             serviceId: service.id,
@@ -829,24 +718,26 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     return { service: updated };
   });
 
-  server.put<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/scan-profile", async (request) => {
+  server.put<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/admin/libraries/:libraryId/scan-profile", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
-    const service = await runtime.repository.getServiceDetail(request.params.serviceId);
+    const library = await runtime.repository.getLibrary(request.params.libraryId);
+    const service = await runtime.repository.getServiceDetail(library.sourceServiceId, library.userId);
     const updateScope = request.body.updateScope === "paths" ? "paths" : "profile";
     const scanProfile = validateScanProfile(
       requireObject(request.body, "scan", "扫描配置"),
-      service.providerType,
-      service.dataType,
-      runtime.providers.get(service.providerType).descriptor.recommendedScanSettings,
+      library.providerType,
+      library.dataType,
+      runtime.providers.get(library.providerType).descriptor.recommendedScanSettings,
       updateScope === "paths",
     );
-    const recommendedSettings = runtime.providers.get(service.providerType).descriptor.recommendedScanSettings;
-    const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(service.id, service.userId));
-    await validateConfiguredScanRoots(runtime.providers.get(service.providerType), connection, scanProfile, {
+    const nextScanProfile = attachLibrarySourceId(scanProfile, library.sourceId);
+    const recommendedSettings = runtime.providers.get(library.providerType).descriptor.recommendedScanSettings;
+    const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(service.id, library.userId));
+    await validateConfiguredScanRoots(runtime.providers.get(library.providerType), connection, nextScanProfile, {
       persistConnection: async (nextConnection) => {
         await runtime.repository.refreshActiveEncryptedConnection({
           serviceId: service.id,
-          userId: service.userId,
+          userId: library.userId,
           credentialRevision: service.credentialRevision,
           encryptedConnection: runtime.vault.encrypt(nextConnection),
         });
@@ -860,170 +751,149 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       },
     });
     const updated = await runtime.repository.updateScanProfile(
-      service.id,
-      service.userId,
-      scanProfile,
+      library.id,
+      library.userId,
+      nextScanProfile,
     );
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-scan-concurrency",
-      事件: updateScope === "paths" ? "管理员保存扫描路径并保留服务任务数" : "管理员按服务配置保存无上限任务数",
+      事件: updateScope === "paths" ? "管理员保存媒体库扫描路径并保留任务数" : "管理员保存媒体库任务数",
       管理员ID: operator.id,
       服务ID: service.id,
-      扫描任务数: Number(scanProfile.scanDirectoryConcurrency),
-      刮削任务数: Number(scanProfile.scrapeTaskConcurrency),
+      媒体库ID: library.id,
+      扫描任务数: Number(nextScanProfile.scanDirectoryConcurrency),
+      刮削任务数: Number(nextScanProfile.scrapeTaskConcurrency),
       Provider默认扫描任务数: recommendedSettings.scanDirectoryConcurrency.default,
       Provider默认刮削任务数: recommendedSettings.scrapeTaskConcurrency.default,
     });
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-scan-path",
-      事件: "管理员更新服务扫描路径",
+      事件: "管理员更新媒体库扫描路径",
       用户ID: operator.id,
       服务ID: service.id,
-      全量路径数: getScanRootsForMode(scanProfile, "full").length,
-      增量路径数: getScanRootsForMode(scanProfile, "incremental").length,
-      扫描目录并发: Number(scanProfile.scanDirectoryConcurrency ?? 0),
-      刮削任务并发: Number(scanProfile.scrapeTaskConcurrency ?? 0),
+      媒体库ID: library.id,
+      全量路径数: getScanRootsForMode(nextScanProfile, "full").length,
+      增量路径数: getScanRootsForMode(nextScanProfile, "incremental").length,
+      扫描目录并发: Number(nextScanProfile.scanDirectoryConcurrency ?? 0),
+      刮削任务并发: Number(nextScanProfile.scrapeTaskConcurrency ?? 0),
     });
-    await audit(runtime, operator, "update_service_scan_profile", "service", service.id);
-    return { service: updated };
+    await audit(runtime, operator, "update_library_scan_profile", "library", library.id, { 服务ID: service.id });
+    return { library: updated };
   });
 
-  server.put<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/metadata-profile", async (request) => {
+  server.put<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/admin/libraries/:libraryId/metadata-profile", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
-    const service = await runtime.repository.getServiceDetail(request.params.serviceId);
-    const profile = validateMetadataProfile(requireObject(request.body, "metadata", "元数据配置"), service.dataType);
+    const library = await runtime.repository.getLibrary(request.params.libraryId);
+    const profile = validateMetadataProfile(requireObject(request.body, "metadata", "元数据配置"), library.dataType);
     await runtime.aiModels.validateMetadataProfile(profile);
     const updated = await runtime.repository.updateMetadataProfile(
-      service.id,
-      service.userId,
+      library.id,
+      library.userId,
       profile,
     );
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-metadata-profile",
-      事件: service.dataType === "music" ? "管理员更新音乐元数据配置" : "管理员更新影视元数据配置",
+      事件: library.dataType === "music" ? "管理员更新音乐元数据配置" : "管理员更新影视元数据配置",
       管理员ID: operator.id,
-      服务ID: service.id,
-      ...(service.dataType === "music"
-        ? readMusicMetadataLogFields(updated.metadataProfile)
-        : readVideoMetadataLogFields(updated.metadataProfile)),
+      媒体库ID: library.id,
+      服务ID: library.sourceServiceId,
+      ...(library.dataType === "music"
+        ? readMusicMetadataLogFields(profile)
+        : readVideoMetadataLogFields(profile)),
     });
-    await audit(runtime, operator, "update_service_metadata_profile", "service", service.id);
-    return { service: updated };
+    await audit(runtime, operator, "update_library_metadata_profile", "library", library.id);
+    return { library: updated };
   });
 
-  /** 管理员手动为服务中已有但缺少规格的视频建立独立后台任务。 */
-  server.post<{ Params: { serviceId: string } }>("/api/v1/admin/services/:serviceId/media-probes/backfill", async (request, reply) => {
+  /** 管理员手动为媒体库中已有但缺少规格的视频建立独立后台任务。 */
+  server.post<{ Params: { libraryId: string } }>("/api/v1/admin/libraries/:libraryId/media-probes/backfill", async (request, reply) => {
     const operator = await requireSuperAdmin(request, runtime.database);
-    const service = await runtime.repository.getServiceDetail(request.params.serviceId);
-    if (service.dataType !== "video") throw new ApiError(409, "media_probe_video_only", "只有影视服务可以分析视频规格");
-    if (service.status !== "active" && service.status !== "reauthorization_required") {
-      throw new ApiError(409, "service_not_active", "请先启用服务，再分析已有视频规格");
-    }
+    const library = await runtime.repository.getLibrary(request.params.libraryId);
+    if (library.dataType !== "video") throw new ApiError(409, "media_probe_video_only", "只有影视媒体库可以分析视频规格");
+    if (library.status !== "active") throw new ApiError(409, "library_not_active", "请先启用媒体库，再分析已有视频规格");
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-media-ffprobe-backfill",
       事件: "开始创建已有视频规格后台任务",
       管理员ID: operator.id,
-      目标用户ID: service.userId,
-      服务ID: service.id,
+      目标用户ID: library.userId,
+      媒体库ID: library.id,
+      服务ID: library.sourceServiceId,
     });
-    const result = await runtime.repository.enqueueExistingServiceMediaProbes(service.id, service.userId, operator.id);
+    const result = await runtime.repository.enqueueExistingServiceMediaProbes(library.sourceServiceId, library.userId, operator.id);
     const job = result.jobId
-      ? service.status === "reauthorization_required"
-        ? await runtime.repository.waitMediaProbeJobForReauthorization(result.jobId)
-        : await runtime.repository.getJob(result.jobId)
+      ? await runtime.repository.getJob(result.jobId)
       : null;
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-media-ffprobe-backfill",
       事件: "管理员触发已有视频规格分析",
       管理员ID: operator.id,
-      目标用户ID: service.userId,
-      服务ID: service.id,
+      目标用户ID: library.userId,
+      媒体库ID: library.id,
+      服务ID: library.sourceServiceId,
       后台任务ID: result.jobId,
       入队文件数量: result.queuedCount,
-      是否等待重新授权: service.status === "reauthorization_required",
     });
-    await audit(runtime, operator, "backfill_media_probes", "background_job", result.jobId ?? service.id, {
-      服务ID: service.id,
+    await audit(runtime, operator, "backfill_media_probes", "background_job", result.jobId ?? library.id, {
+      媒体库ID: library.id,
+      服务ID: library.sourceServiceId,
       入队文件数量: result.queuedCount,
     });
     return reply.status(result.jobId ? 202 : 200).send({ job, queuedCount: result.queuedCount });
   });
 
-  server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/playback-settings", async (request) => {
-    const operator = await requireSuperAdmin(request, runtime.database);
-    if (typeof request.body.relayPlaybackEnabled !== "boolean") {
-      throw validationError("relayPlaybackEnabled", "APP 专用中转播放开关必须是布尔值");
-    }
-    const service = await runtime.repository.getServiceDetail(request.params.serviceId);
-    if (request.body.relayPlaybackEnabled
-      && !runtime.providers.get(service.providerType).descriptor.capabilities.some((capability) => capability === "relayPlayback" || capability === "relay")) {
-      throw new ApiError(422, "provider_relay_playback_unsupported", "当前网盘类型暂不支持中转播放");
-    }
-    const updated = await runtime.repository.updateRelayPlaybackEnabled(
-      service.id,
-      service.userId,
-      request.body.relayPlaybackEnabled,
-    );
-    runtime.logBusinessEvent("info", {
-      日志关键字: "codex-flycloud-helper-relay-playback-setting",
-      事件: "管理员通过兼容接口更新媒体库APP专用中转开关",
-      管理员ID: operator.id,
-      服务ID: service.id,
-      是否启用APP专用中转: updated.relayPlaybackEnabled,
-    });
-    await audit(runtime, operator, "update_service_relay_playback", "service", service.id, {
-      是否启用APP专用中转: updated.relayPlaybackEnabled,
-    });
-    return { service: updated };
-  });
-
-  /** 管理员保存任意服务的任务完成通知开关。 */
-  server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/notification-settings", async (request) => {
+  /** 管理员保存任意媒体库的任务完成通知开关。 */
+  server.patch<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/admin/libraries/:libraryId/notification-settings", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     if (typeof request.body.notificationEnabled !== "boolean") {
       throw validationError("notificationEnabled", "任务完成通知开关必须是布尔值");
     }
-    const service = await runtime.repository.updateServiceNotificationEnabled(
-      request.params.serviceId,
+    const library = await runtime.repository.updateServiceNotificationEnabled(
+      request.params.libraryId,
       undefined,
       request.body.notificationEnabled,
     );
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-service-notification",
-      事件: "管理员更新服务任务通知开关",
+      事件: "管理员更新媒体库任务通知开关",
       管理员ID: operator.id,
-      目标用户ID: service.userId,
-      服务ID: service.id,
-      是否启用任务通知: service.notificationEnabled,
+      目标用户ID: library.userId,
+      媒体库ID: library.id,
+      服务ID: library.sourceServiceId,
+      是否启用任务通知: library.notificationEnabled,
     });
-    await audit(runtime, operator, "update_service_notification", "service", service.id, {
-      是否启用任务通知: service.notificationEnabled,
+    await audit(runtime, operator, "update_library_notification", "library", library.id, {
+      是否启用任务通知: library.notificationEnabled,
     });
-    return { service };
+    return { library };
   });
 
-  server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/scan-jobs", async (request, reply) => {
+  server.post<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/admin/libraries/:libraryId/scan-jobs", async (request, reply) => {
     const operator = await requireSuperAdmin(request, runtime.database);
-    const service = await runtime.repository.getServiceDetail(request.params.serviceId);
+    const library = await runtime.repository.getLibrary(request.params.libraryId);
+    const profiles = await runtime.repository.getLibraryProfiles(library.id, library.userId);
     const scanMode = request.body.scanMode;
     if (scanMode !== "incremental" && scanMode !== "full") throw validationError("scanMode", "扫描模式无效");
-    if (getScanRootsForMode(service.scanProfile, scanMode).length === 0) {
+    if (library.status !== "active") throw new ApiError(409, "library_not_active", "请先启用媒体库");
+    if (await runtime.repository.findUnfinishedLibraryScanJob(library.id, library.userId)) {
+      throw new ApiError(409, "scan_job_conflict", "当前媒体库已有未结束任务，不能重复启动");
+    }
+    if (getScanRootsForMode(profiles.scanProfile, scanMode).length === 0) {
       throw new ApiError(409, "scan_paths_not_configured", `请先配置${scanMode === "full" ? "全量" : "增量"}扫描路径`);
     }
     const job = await runtime.repository.createScanJob({
       jobId: randomUUID(),
-      userId: service.userId,
-      serviceId: service.id,
+      userId: library.userId,
+      libraryId: library.id,
       requestedByUserId: operator.id,
       requestId: requireString(request.body, "requestId", "请求 ID", 200),
       clientDeviceId: typeof request.body.clientDeviceId === "string" ? request.body.clientDeviceId : `admin:${operator.id}`,
       scanMode,
       runtimeRevision: "scanner-worker-v1",
       tmdbKeyPoolRevision: runtime.tmdb.revision,
-      aiModel: await runtime.aiModels.buildTaskSnapshot(service.metadataProfile),
-      pluginVersions: await runtime.plugins.buildTaskSnapshots(service.metadataProfile),
+      aiModel: await runtime.aiModels.buildTaskSnapshot(profiles.metadataProfile),
+      pluginVersions: await runtime.plugins.buildTaskSnapshots(profiles.metadataProfile),
     });
-    await audit(runtime, operator, "create_scan_job", "scan_job", job.id, { 服务ID: service.id });
+    await audit(runtime, operator, "create_scan_job", "scan_job", job.id, { 媒体库ID: library.id, 服务ID: library.sourceServiceId });
     return reply.status(202).send({ job });
   });
 
@@ -1040,7 +910,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     const operator = await requireSuperAdmin(request, runtime.database);
     requireConfirmation(request.body, request.params.serviceId);
     // 关键变量：删除后无法再读取服务归属，先保存通知需要的用户和服务名称。
-    const service = await runtime.repository.getServiceDetail(request.params.serviceId);
+    const service = await runtime.repository.getServiceMediaContext(request.params.serviceId);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-service-delete",
       事件: "管理员开始删除云端服务",
@@ -1085,50 +955,6 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       excludeUserId: service.userId,
     });
     return reply.status(204).send();
-  });
-
-  server.delete<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/catalog", async (request) => {
-    const operator = await requireSuperAdmin(request, runtime.database);
-    requireConfirmation(request.body, request.params.serviceId);
-    const service = await runtime.repository.getServiceDetail(request.params.serviceId);
-    const clearStartedAtMs = Date.now();
-    runtime.logBusinessEvent("info", {
-      日志关键字: "codex-flycloud-helper-catalog-clear",
-      事件: "管理员开始清空服务媒体库",
-      管理员ID: operator.id,
-      服务ID: request.params.serviceId,
-    });
-    const cleared = await runtime.repository.clearServiceCatalog(request.params.serviceId);
-    await audit(runtime, operator, "clear_service_catalog", "service", request.params.serviceId, {
-      清空媒体条目数: cleared.mediaItemCount,
-      清空源文件数: cleared.sourceFileCount,
-      清空耗时毫秒: Date.now() - clearStartedAtMs,
-    });
-    runtime.logBusinessEvent("info", {
-      日志关键字: "codex-flycloud-helper-catalog-clear",
-      事件: "管理员清空服务媒体库",
-      管理员ID: operator.id,
-      服务ID: request.params.serviceId,
-      清空媒体条目数: cleared.mediaItemCount,
-      清空源文件数: cleared.sourceFileCount,
-    });
-    await runtime.database.createNotificationSafely({
-      userId: service.userId,
-      category: "security",
-      tone: "warning",
-      title: "媒体库数据已被管理员清空",
-      message: `服务“${service.displayName}”的媒体库数据已由超级管理员“${operator.username}”清空。`,
-      actionPath: `/app/services/${service.id}`,
-    });
-    await runtime.database.createSuperAdminNotificationsSafely({
-      category: "security",
-      tone: "warning",
-      title: "管理员清空媒体库",
-      message: `超级管理员“${operator.username}”清空了账号“${service.ownerUsername}”的服务“${service.displayName}”。`,
-      actionPath: `/admin/services/${service.id}`,
-      excludeUserId: service.userId,
-    });
-    return cleared;
   });
 
   server.get<{ Querystring: Record<string, unknown> }>("/api/v1/admin/jobs", async (request) => {
@@ -1281,7 +1107,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     if (sourceJob.status !== "failed" && sourceJob.status !== "cancelled") {
       throw new ApiError(409, "job_not_retryable", "只有失败或已取消任务可以重试");
     }
-    const service = await runtime.repository.getServiceDetail(sourceJob.serviceId, sourceJob.userId);
+    const service = await runtime.repository.getServiceMediaContext(sourceJob.serviceId, sourceJob.userId);
     const retriesAiSupplement = sourceJob.snapshot.taskPurpose === "ai_supplement_unmatched";
     const aiModelSnapshot = retriesAiSupplement
       ? await runtime.aiModels.buildUnmatchedSupplementTaskSnapshot(service.metadataProfile)
@@ -1292,7 +1118,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     const job = await runtime.repository.createScanJob({
       jobId: randomUUID(),
       userId: sourceJob.userId,
-      serviceId: sourceJob.serviceId,
+      libraryId: sourceJob.libraryId,
       requestedByUserId: operator.id,
       requestId: requireString(request.body, "requestId", "请求 ID", 200),
       clientDeviceId: typeof request.body.clientDeviceId === "string" ? request.body.clientDeviceId : `admin:${operator.id}`,

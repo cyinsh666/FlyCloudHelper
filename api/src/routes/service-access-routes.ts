@@ -6,13 +6,14 @@ import { buildEmbyPath, validateEmbyPathSuffix } from "../emby-path.js";
 import { buildNavidromePath, validateNavidromePathSuffix } from "../navidrome-path.js";
 import type { ApiRuntime } from "../runtime.js";
 
-/** 通过基础服务校验媒体库归属，并返回一对一关联记录。 */
-async function requireManagedService(runtime: ApiRuntime, request: FastifyRequest, serviceId: string, admin: boolean) {
+/** 校验媒体库归属，并解析本次唯一来源服务。 */
+async function requireManagedLibrary(runtime: ApiRuntime, request: FastifyRequest, libraryId: string, admin: boolean) {
   const operator = admin
     ? await requireSuperAdmin(request, runtime.database)
     : await requireRequestUser(request, runtime.database);
-  const service = await runtime.repository.getServiceDetail(serviceId, admin ? undefined : operator.id);
-  return { operator, service };
+  const library = await runtime.repository.getLibrary(libraryId, admin ? undefined : operator.id);
+  const service = await runtime.repository.getServiceDetail(library.sourceServiceId, admin ? undefined : operator.id);
+  return { operator, service, library };
 }
 
 /** 判断 Provider 是否具备媒体中转能力，兼容现有两种能力标识。 */
@@ -27,16 +28,17 @@ function supportsNavidrome(runtime: ApiRuntime, providerType: string, dataType: 
     && runtime.providers.get(providerType).descriptor.supportedDataTypes.includes("music");
 }
 
-/** 构造媒体库协议配置。 */
-async function buildServiceAccessSettings(runtime: ApiRuntime, serviceId: string) {
-  const service = await runtime.repository.getServiceDetail(serviceId);
-  const accounts = await runtime.serviceAccess.listByService(serviceId);
-  const account = accounts[0]; // 关键变量：保留旧响应字段指向历史最早账号，兼容已经发布的客户端。
-  if (!account) throw new ApiError(404, "service_access_account_not_found", "服务访问账号不存在");
+/** 构造媒体库协议配置；账号、会话和观看状态全部按媒体库隔离。 */
+async function buildLibraryAccessSettings(runtime: ApiRuntime, libraryId: string) {
+  const libraryRecord = await runtime.repository.getLibrary(libraryId);
+  const service = await runtime.repository.getServiceDetail(libraryRecord.sourceServiceId);
+  const accounts = await runtime.serviceAccess.listByLibrary(libraryId);
+  const account = accounts[0];
+  if (!account) throw new ApiError(404, "service_access_account_not_found", "协议访问账号不存在");
   const library = await runtime.database.query("media_libraries")
     .select(
+      "jellyfin_enabled",
       "jellyfin_path_suffix",
-      "app_relay_playback_enabled",
       "jellyfin_relay_playback_enabled",
       "jellyfin_download_enabled",
       "jellyfin_region_libraries_enabled",
@@ -49,42 +51,36 @@ async function buildServiceAccessSettings(runtime: ApiRuntime, serviceId: string
       "navidrome_relay_playback_enabled",
       "navidrome_path_suffix",
     )
-    .where({ service_id: serviceId })
+    .where({ id: libraryId })
     .first();
-  // 关键变量：数据库升级尚未完成时临时回退服务 ID，保证设置页仍可读取。
-  const jellyfinPathSuffix = String(library?.jellyfin_path_suffix ?? "").trim() || serviceId;
-  const jellyfinPath = buildJellyfinPath(jellyfinPathSuffix);
-  const navidromePathSuffix = String(library?.navidrome_path_suffix ?? "").trim() || serviceId;
-  const navidromePath = buildNavidromePath(navidromePathSuffix);
-  const embyPathSuffix = String(library?.emby_path_suffix ?? "").trim() || serviceId;
-  const embyPath = buildEmbyPath(embyPathSuffix);
-  const navidromeSupported = supportsNavidrome(runtime, service.providerType, service.dataType);
-  // 关键变量：Emby 账号始终从独立服务读取，禁止把 Jellyfin account/accounts 回传给 Emby 客户端。
-  const embyAccounts = await runtime.embyAccess.listByService(serviceId);
+  if (!library) throw new ApiError(404, "library_not_found", "媒体库不存在");
+  const jellyfinPathSuffix = String(library.jellyfin_path_suffix ?? "").trim() || libraryId;
+  const navidromePathSuffix = String(library.navidrome_path_suffix ?? "").trim() || libraryId;
+  const embyPathSuffix = String(library.emby_path_suffix ?? "").trim() || libraryId;
+  const navidromeSupported = supportsNavidrome(runtime, service.providerType, libraryRecord.dataType);
+  const embyAccounts = await runtime.embyAccess.listByLibrary(libraryId);
   return {
     relayPlaybackSupported: supportsRelayPlayback(runtime, service.providerType),
-    appRelayPlaybackEnabled: Number(library?.app_relay_playback_enabled) === 1,
-    jellyfinRelayPlaybackEnabled: Number(library?.jellyfin_relay_playback_enabled) === 1,
-    jellyfinDownloadEnabled: library?.jellyfin_download_enabled === undefined
-      || Number(library.jellyfin_download_enabled) === 1,
-    jellyfinRegionLibrariesEnabled: Number(library?.jellyfin_region_libraries_enabled) === 1,
-    jellyfinEnabled: service.jellyfinEnabled,
+    jellyfinRelayPlaybackEnabled: Number(library.jellyfin_relay_playback_enabled) === 1,
+    jellyfinDownloadEnabled: library.jellyfin_download_enabled === undefined || Number(library.jellyfin_download_enabled) === 1,
+    jellyfinRegionLibrariesEnabled: Number(library.jellyfin_region_libraries_enabled) === 1,
+    jellyfinEnabled: Number(library.jellyfin_enabled) === 1,
     jellyfinUrl: await runtime.publicAccess.buildJellyfinUrl(jellyfinPathSuffix),
-    jellyfinPath,
+    jellyfinPath: buildJellyfinPath(jellyfinPathSuffix),
     jellyfinPathSuffix,
-    embyEnabled: Number(library?.emby_enabled) === 1,
+    embyEnabled: Number(library.emby_enabled) === 1,
     embyUrl: await runtime.publicAccess.buildEmbyUrl(embyPathSuffix),
-    embyPath,
+    embyPath: buildEmbyPath(embyPathSuffix),
     embyPathSuffix,
-    embyRelayPlaybackEnabled: Number(library?.emby_relay_playback_enabled) === 1,
-    embyDownloadEnabled: library?.emby_download_enabled === undefined || Number(library.emby_download_enabled) === 1,
-    embyRegionLibrariesEnabled: Number(library?.emby_region_libraries_enabled) === 1,
+    embyRelayPlaybackEnabled: Number(library.emby_relay_playback_enabled) === 1,
+    embyDownloadEnabled: library.emby_download_enabled === undefined || Number(library.emby_download_enabled) === 1,
+    embyRegionLibrariesEnabled: Number(library.emby_region_libraries_enabled) === 1,
     embyAccounts,
     navidromeSupported,
-    navidromeRelayPlaybackEnabled: Number(library?.navidrome_relay_playback_enabled ?? 1) === 1,
-    navidromeEnabled: navidromeSupported && Number(library?.navidrome_enabled) === 1,
+    navidromeRelayPlaybackEnabled: Number(library.navidrome_relay_playback_enabled ?? 1) === 1,
+    navidromeEnabled: navidromeSupported && Number(library.navidrome_enabled) === 1,
     navidromeUrl: navidromeSupported ? await runtime.publicAccess.buildNavidromeUrl(navidromePathSuffix) : null,
-    navidromePath,
+    navidromePath: buildNavidromePath(navidromePathSuffix),
     navidromePathSuffix,
     account,
     accounts,
@@ -94,50 +90,50 @@ async function buildServiceAccessSettings(runtime: ApiRuntime, serviceId: string
 /** 注册用户端与管理端共用的服务协议设置接口。 */
 export async function registerServiceAccessRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
   const registerScopedRoutes = (prefix: string, admin: boolean) => {
-    server.get<{ Params: { serviceId: string } }>(`${prefix}/:serviceId/access-account`, async (request) => {
-      await requireManagedService(runtime, request, request.params.serviceId, admin);
-      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId) };
+    server.get<{ Params: { libraryId: string } }>(`${prefix}/:libraryId/access-account`, async (request) => {
+      const { service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
+      return { settings: await buildLibraryAccessSettings(runtime, library.id) };
     });
 
-    server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/access-account`, async (request) => {
-      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
-      const currentAccount = await runtime.serviceAccess.getByService(request.params.serviceId);
-      const account = await runtime.serviceAccess.updateCredentials(request.params.serviceId, currentAccount.id, {
+    server.patch<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(`${prefix}/:libraryId/access-account`, async (request) => {
+      const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
+      const currentAccount = await runtime.serviceAccess.getByLibrary(library.id);
+      const account = await runtime.serviceAccess.updateCredentials(library.id, currentAccount.id, {
         username: request.body.username,
         password: request.body.password,
       });
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-service-access-credential", 事件: "修改服务访问凭据并撤销旧会话",
-        操作用户ID: operator.id, 服务ID: request.params.serviceId, 凭据修订: account.credentialRevision,
+        操作用户ID: operator.id, 服务ID: service.id, 凭据修订: account.credentialRevision,
         是否需要密码: account.hasPassword,
       });
-      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId) };
+      return { settings: await buildLibraryAccessSettings(runtime, library.id) };
     });
 
-    server.post<{ Params: { serviceId: string } }>(`${prefix}/:serviceId/access-account/reset-password`, async (request) => {
-      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
-      const currentAccount = await runtime.serviceAccess.getByService(request.params.serviceId);
-      const generated = await runtime.serviceAccess.resetPassword(request.params.serviceId, currentAccount.id);
+    server.post<{ Params: { libraryId: string } }>(`${prefix}/:libraryId/access-account/reset-password`, async (request) => {
+      const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
+      const currentAccount = await runtime.serviceAccess.getByLibrary(library.id);
+      const generated = await runtime.serviceAccess.resetPassword(library.id, currentAccount.id);
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-jellyfin-compat", 事件: "重置服务访问密码并撤销旧会话",
-        操作用户ID: operator.id, 服务ID: request.params.serviceId, 凭据修订: generated.account.credentialRevision,
+        操作用户ID: operator.id, 服务ID: service.id, 凭据修订: generated.account.credentialRevision,
       });
-      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId), password: generated.password };
+      return { settings: await buildLibraryAccessSettings(runtime, library.id), password: generated.password };
     });
 
-    server.post<{ Params: { serviceId: string } }>(`${prefix}/:serviceId/access-account/revoke-sessions`, async (request) => {
-      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
-      const revokedCount = await runtime.serviceAccess.revokeSessions(request.params.serviceId);
+    server.post<{ Params: { libraryId: string } }>(`${prefix}/:libraryId/access-account/revoke-sessions`, async (request) => {
+      const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
+      const revokedCount = await runtime.serviceAccess.revokeSessions(library.id);
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-jellyfin-compat", 事件: "撤销服务全部协议会话",
-        操作用户ID: operator.id, 服务ID: request.params.serviceId, 撤销会话数: revokedCount,
+        操作用户ID: operator.id, 服务ID: service.id, 撤销会话数: revokedCount,
       });
       return { revokedCount };
     });
 
-    server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/access-accounts`, async (request) => {
-      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
-      const account = await runtime.serviceAccess.createAccount(request.params.serviceId, {
+    server.post<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(`${prefix}/:libraryId/access-accounts`, async (request) => {
+      const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
+      const account = await runtime.serviceAccess.createAccount(library.id, {
         username: request.body.username,
         password: request.body.password,
       });
@@ -145,16 +141,16 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
         日志关键字: "codex-jellyfin-account-management",
         事件: "创建Jellyfin账号",
         操作用户ID: operator.id,
-        服务ID: request.params.serviceId,
+        服务ID: service.id,
         Jellyfin账号ID: account.id,
         是否需要密码: account.hasPassword,
       });
-      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId), account };
+      return { settings: await buildLibraryAccessSettings(runtime, library.id), account };
     });
 
-    server.patch<{ Params: { serviceId: string; accountId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/access-accounts/:accountId`, async (request) => {
-      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
-      let account = await runtime.serviceAccess.getById(request.params.serviceId, request.params.accountId);
+    server.patch<{ Params: { libraryId: string; accountId: string }; Body: Record<string, unknown> }>(`${prefix}/:libraryId/access-accounts/:accountId`, async (request) => {
+      const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
+      let account = await runtime.serviceAccess.getById(library.id, request.params.accountId);
       const changesCredentials = request.body.username !== undefined || request.body.password !== undefined;
       const changesStatus = request.body.status !== undefined;
       if (!changesCredentials && !changesStatus) {
@@ -164,57 +160,57 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
         throw new ApiError(422, "service_access_account_update_mixed", "账号凭据和启停状态需要分别保存");
       }
       if (changesCredentials) {
-        account = await runtime.serviceAccess.updateCredentials(request.params.serviceId, request.params.accountId, {
+        account = await runtime.serviceAccess.updateCredentials(library.id, request.params.accountId, {
           username: request.body.username,
           password: request.body.password,
         });
       }
       if (changesStatus) {
-        account = await runtime.serviceAccess.updateStatus(request.params.serviceId, request.params.accountId, request.body.status);
+        account = await runtime.serviceAccess.updateStatus(library.id, request.params.accountId, request.body.status);
       }
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-jellyfin-account-management",
         事件: "修改Jellyfin账号",
         操作用户ID: operator.id,
-        服务ID: request.params.serviceId,
+        服务ID: service.id,
         Jellyfin账号ID: account.id,
         账号状态: account.status,
         是否修改凭据: changesCredentials,
       });
-      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId), account };
+      return { settings: await buildLibraryAccessSettings(runtime, library.id), account };
     });
 
-    server.delete<{ Params: { serviceId: string; accountId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/access-accounts/:accountId`, async (request, reply) => {
-      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
+    server.delete<{ Params: { libraryId: string; accountId: string }; Body: Record<string, unknown> }>(`${prefix}/:libraryId/access-accounts/:accountId`, async (request, reply) => {
+      const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
       requireConfirmation(request.body, request.params.accountId);
-      await runtime.serviceAccess.deleteAccount(request.params.serviceId, request.params.accountId);
+      await runtime.serviceAccess.deleteAccount(library.id, request.params.accountId);
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-jellyfin-account-management",
         事件: "删除Jellyfin账号及独立观看记录",
         操作用户ID: operator.id,
-        服务ID: request.params.serviceId,
+        服务ID: service.id,
         Jellyfin账号ID: request.params.accountId,
       });
       return reply.status(204).send();
     });
 
-    server.post<{ Params: { serviceId: string; accountId: string } }>(`${prefix}/:serviceId/access-accounts/:accountId/revoke-sessions`, async (request) => {
-      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
-      await runtime.serviceAccess.getById(request.params.serviceId, request.params.accountId);
-      const revokedCount = await runtime.serviceAccess.revokeSessions(request.params.serviceId, undefined, request.params.accountId);
+    server.post<{ Params: { libraryId: string; accountId: string } }>(`${prefix}/:libraryId/access-accounts/:accountId/revoke-sessions`, async (request) => {
+      const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
+      await runtime.serviceAccess.getById(library.id, request.params.accountId);
+      const revokedCount = await runtime.serviceAccess.revokeSessions(library.id, undefined, request.params.accountId);
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-jellyfin-account-management",
         事件: "撤销指定Jellyfin账号会话",
         操作用户ID: operator.id,
-        服务ID: request.params.serviceId,
+        服务ID: service.id,
         Jellyfin账号ID: request.params.accountId,
         撤销会话数: revokedCount,
       });
       return { revokedCount };
     });
 
-    server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/jellyfin-settings`, async (request) => {
-      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
+    server.patch<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(`${prefix}/:libraryId/jellyfin-settings`, async (request) => {
+      const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
       const changesJellyfinEnabled = request.body.jellyfinEnabled !== undefined;
       const changesPathSuffix = request.body.jellyfinPathSuffix !== undefined;
       const changesRegionLibraries = request.body.jellyfinRegionLibrariesEnabled !== undefined;
@@ -236,9 +232,9 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       const now = new Date().toISOString();
       if (pathSuffix) {
         const duplicate = await runtime.database.query("media_libraries")
-          .select("service_id")
+          .select("id")
           .where({ jellyfin_path_suffix_lookup: pathSuffix.lookup })
-          .whereNot({ service_id: request.params.serviceId })
+          .whereNot({ id: library.id })
           .first();
         if (duplicate) throw new ApiError(409, "jellyfin_path_suffix_conflict", "该 Jellyfin 地址后缀已被使用，请更换后缀");
       }
@@ -255,7 +251,7 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
         updateValues.jellyfin_path_suffix_lookup = pathSuffix.lookup;
       }
       try {
-        await runtime.database.query("media_libraries").where({ service_id: request.params.serviceId }).update(updateValues);
+        await runtime.database.query("media_libraries").where({ id: library.id }).update(updateValues);
       } catch (error) {
         const databaseError = error as Error & { code?: string };
         const duplicateSuffix = databaseError.code === "23505"
@@ -265,7 +261,7 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
         throw error;
       }
       const disabledJellyfin = changesJellyfinEnabled && request.body.jellyfinEnabled === false;
-      const revokedCount = disabledJellyfin ? await runtime.serviceAccess.revokeSessions(request.params.serviceId, "jellyfin") : 0;
+      const revokedCount = disabledJellyfin ? await runtime.serviceAccess.revokeSessions(library.id, "jellyfin") : 0;
       const jellyfinSettingsEvent = pathSuffix
         ? "更新媒体库Jellyfin地址"
         : changesJellyfinEnabled
@@ -275,7 +271,7 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
             : "更新Jellyfin下载权限";
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-jellyfin-path", 事件: jellyfinSettingsEvent,
-        操作用户ID: operator.id, 基础服务ID: request.params.serviceId, 撤销会话数: revokedCount,
+        操作用户ID: operator.id, 基础服务ID: service.id, 撤销会话数: revokedCount,
         Jellyfin地址后缀: pathSuffix?.value ?? null,
         公开地址来源: publicAccess.source, 是否使用云助手请求地址: !publicAccess.publicBaseUrl,
       });
@@ -284,16 +280,16 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
           日志关键字: "codex-jellyfin-download",
           事件: request.body.jellyfinDownloadEnabled ? "开启Jellyfin影片下载" : "关闭Jellyfin影片下载",
           操作用户ID: operator.id,
-          基础服务ID: request.params.serviceId,
+          基础服务ID: service.id,
           是否允许下载: request.body.jellyfinDownloadEnabled === true,
         });
       }
-      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId) };
+      return { settings: await buildLibraryAccessSettings(runtime, library.id) };
     });
 
     /** 保存独立 Emby 协议开关、地址、下载和地区虚拟媒体库设置。 */
-    server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/emby-settings`, async (request) => {
-      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
+    server.patch<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(`${prefix}/:libraryId/emby-settings`, async (request) => {
+      const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
       const changesEnabled = request.body.embyEnabled !== undefined;
       const changesPathSuffix = request.body.embyPathSuffix !== undefined;
       const changesDownload = request.body.embyDownloadEnabled !== undefined;
@@ -313,9 +309,9 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       const pathSuffix = changesPathSuffix ? validateEmbyPathSuffix(request.body.embyPathSuffix) : null;
       if (pathSuffix) {
         const duplicate = await runtime.database.query("media_libraries")
-          .select("service_id")
+          .select("id")
           .where({ emby_path_suffix_lookup: pathSuffix.lookup })
-          .whereNot({ service_id: request.params.serviceId })
+          .whereNot({ id: library.id })
           .first();
         if (duplicate) throw new ApiError(409, "emby_path_suffix_conflict", "该 Emby 地址后缀已被使用，请更换后缀");
       }
@@ -328,7 +324,7 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
         values.emby_path_suffix_lookup = pathSuffix.lookup;
       }
       try {
-        const changed = await runtime.database.query("media_libraries").where({ service_id: request.params.serviceId }).update(values);
+        const changed = await runtime.database.query("media_libraries").where({ id: library.id }).update(values);
         if (changed !== 1) throw new ApiError(404, "library_not_found", "媒体库不存在");
       } catch (error) {
         const databaseError = error as Error & { code?: string };
@@ -337,65 +333,65 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
         }
         throw error;
       }
-      if (changesEnabled && request.body.embyEnabled === true) await runtime.embyAccess.ensureForService(request.params.serviceId);
+      if (changesEnabled && request.body.embyEnabled === true) await runtime.embyAccess.ensureForLibrary(library.id);
       const revokedCount = changesEnabled && request.body.embyEnabled === false
-        ? await runtime.embyAccess.revokeSessions(request.params.serviceId)
+        ? await runtime.embyAccess.revokeSessions(library.id)
         : 0;
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-emby-settings",
         事件: changesEnabled ? (request.body.embyEnabled ? "启用媒体库Emby协议" : "停用媒体库Emby协议") : pathSuffix ? "更新媒体库Emby地址" : changesDownload ? "更新Emby下载权限" : "更新Emby节目地区分组",
         操作用户ID: operator.id,
-        服务ID: request.params.serviceId,
+        服务ID: service.id,
         Emby地址后缀: pathSuffix?.value ?? null,
         撤销Emby会话数: revokedCount,
       });
-      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId) };
+      return { settings: await buildLibraryAccessSettings(runtime, library.id) };
     });
 
     /** 创建同一 Emby 服务地址下、状态彼此独立的登录账号。 */
-    server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/emby-access-accounts`, async (request) => {
-      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
-      const account = await runtime.embyAccess.createAccount(request.params.serviceId, {
+    server.post<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(`${prefix}/:libraryId/emby-access-accounts`, async (request) => {
+      const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
+      const account = await runtime.embyAccess.createAccount(library.id, {
         username: request.body.username,
         password: request.body.password,
       });
-      runtime.logBusinessEvent("info", { 日志关键字: "codex-emby-account", 事件: "创建Emby账号", 操作用户ID: operator.id, 服务ID: request.params.serviceId, Emby账号ID: account.id });
-      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId), account };
+      runtime.logBusinessEvent("info", { 日志关键字: "codex-emby-account", 事件: "创建Emby账号", 操作用户ID: operator.id, 服务ID: service.id, Emby账号ID: account.id });
+      return { settings: await buildLibraryAccessSettings(runtime, library.id), account };
     });
 
     /** 修改、启停或删除独立 Emby 账号。 */
-    server.patch<{ Params: { serviceId: string; accountId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/emby-access-accounts/:accountId`, async (request) => {
-      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
+    server.patch<{ Params: { libraryId: string; accountId: string }; Body: Record<string, unknown> }>(`${prefix}/:libraryId/emby-access-accounts/:accountId`, async (request) => {
+      const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
       const changesCredentials = request.body.username !== undefined || request.body.password !== undefined;
       const changesStatus = request.body.status !== undefined;
       if (changesCredentials === changesStatus) throw new ApiError(422, "emby_account_update_invalid", "请单独保存 Emby 账号凭据或启停状态");
       const account = changesCredentials
-        ? await runtime.embyAccess.updateCredentials(request.params.serviceId, request.params.accountId, {
+        ? await runtime.embyAccess.updateCredentials(library.id, request.params.accountId, {
           username: request.body.username,
           password: request.body.password,
         })
-        : await runtime.embyAccess.updateStatus(request.params.serviceId, request.params.accountId, request.body.status);
-      runtime.logBusinessEvent("info", { 日志关键字: "codex-emby-account", 事件: "修改Emby账号", 操作用户ID: operator.id, 服务ID: request.params.serviceId, Emby账号ID: account.id, 账号状态: account.status });
-      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId), account };
+        : await runtime.embyAccess.updateStatus(library.id, request.params.accountId, request.body.status);
+      runtime.logBusinessEvent("info", { 日志关键字: "codex-emby-account", 事件: "修改Emby账号", 操作用户ID: operator.id, 服务ID: service.id, Emby账号ID: account.id, 账号状态: account.status });
+      return { settings: await buildLibraryAccessSettings(runtime, library.id), account };
     });
 
-    server.delete<{ Params: { serviceId: string; accountId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/emby-access-accounts/:accountId`, async (request, reply) => {
-      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
+    server.delete<{ Params: { libraryId: string; accountId: string }; Body: Record<string, unknown> }>(`${prefix}/:libraryId/emby-access-accounts/:accountId`, async (request, reply) => {
+      const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
       requireConfirmation(request.body, request.params.accountId);
-      await runtime.embyAccess.deleteAccount(request.params.serviceId, request.params.accountId);
-      runtime.logBusinessEvent("info", { 日志关键字: "codex-emby-account", 事件: "删除Emby账号及独立观看记录", 操作用户ID: operator.id, 服务ID: request.params.serviceId, Emby账号ID: request.params.accountId });
+      await runtime.embyAccess.deleteAccount(library.id, request.params.accountId);
+      runtime.logBusinessEvent("info", { 日志关键字: "codex-emby-account", 事件: "删除Emby账号及独立观看记录", 操作用户ID: operator.id, 服务ID: service.id, Emby账号ID: request.params.accountId });
       return reply.status(204).send();
     });
 
-    server.post<{ Params: { serviceId: string; accountId: string } }>(`${prefix}/:serviceId/emby-access-accounts/:accountId/revoke-sessions`, async (request) => {
-      await requireManagedService(runtime, request, request.params.serviceId, admin);
-      await runtime.embyAccess.getById(request.params.serviceId, request.params.accountId);
-      return { revokedCount: await runtime.embyAccess.revokeSessions(request.params.serviceId, request.params.accountId) };
+    server.post<{ Params: { libraryId: string; accountId: string } }>(`${prefix}/:libraryId/emby-access-accounts/:accountId/revoke-sessions`, async (request) => {
+      const { service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
+      await runtime.embyAccess.getById(library.id, request.params.accountId);
+      return { revokedCount: await runtime.embyAccess.revokeSessions(library.id, request.params.accountId) };
     });
 
-    server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/navidrome-settings`, async (request) => {
-      const { operator, service } = await requireManagedService(runtime, request, request.params.serviceId, admin);
-      if (!supportsNavidrome(runtime, service.providerType, service.dataType)) {
+    server.patch<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(`${prefix}/:libraryId/navidrome-settings`, async (request) => {
+      const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
+      if (!supportsNavidrome(runtime, service.providerType, library.dataType)) {
         throw new ApiError(422, "navidrome_music_service_required", "只有音乐类型服务可以启用 Navidrome 协议");
       }
       const changesEnabled = request.body.navidromeEnabled !== undefined;
@@ -413,9 +409,9 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       const pathSuffix = changesPathSuffix ? validateNavidromePathSuffix(request.body.navidromePathSuffix) : null;
       if (pathSuffix) {
         const duplicate = await runtime.database.query("media_libraries")
-          .select("service_id")
+          .select("id")
           .where({ navidrome_path_suffix_lookup: pathSuffix.lookup })
-          .whereNot({ service_id: request.params.serviceId })
+          .whereNot({ id: library.id })
           .first();
         if (duplicate) throw new ApiError(409, "navidrome_path_suffix_conflict", "该 Navidrome 地址后缀已被使用，请更换后缀");
       }
@@ -429,7 +425,7 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       let changed = 0;
       try {
         changed = await runtime.database.query("media_libraries")
-          .where({ service_id: request.params.serviceId })
+          .where({ id: library.id })
           .update(updateValues);
       } catch (error) {
         const databaseError = error as Error & { code?: string };
@@ -447,23 +443,19 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
         中转播放: changesRelay ? request.body.navidromeRelayPlaybackEnabled === true : null,
         事件: changesRelay ? "更新Navidrome播放方式" : pathSuffix ? "更新音乐库Navidrome地址" : (request.body.navidromeEnabled ? "启用音乐库Navidrome协议" : "停用音乐库Navidrome协议"),
         操作用户ID: operator.id,
-        基础服务ID: request.params.serviceId,
+        基础服务ID: service.id,
         是否已配置公开地址: Boolean(publicAccess.publicBaseUrl),
         Navidrome地址后缀: pathSuffix?.value ?? null,
       });
-      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId) };
+      return { settings: await buildLibraryAccessSettings(runtime, library.id) };
     });
 
-    server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/library-playback-settings`, async (request) => {
-      const { service } = await requireManagedService(runtime, request, request.params.serviceId, admin);
-      const changesAppRelay = request.body.appRelayPlaybackEnabled !== undefined;
+    server.patch<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(`${prefix}/:libraryId/library-playback-settings`, async (request) => {
+      const { service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
       const changesJellyfinRelay = request.body.jellyfinRelayPlaybackEnabled !== undefined;
       const changesEmbyRelay = request.body.embyRelayPlaybackEnabled !== undefined;
-      if (!changesAppRelay && !changesJellyfinRelay && !changesEmbyRelay) {
+      if (!changesJellyfinRelay && !changesEmbyRelay) {
         throw new ApiError(422, "library_playback_settings_empty", "没有需要保存的媒体库播放设置");
-      }
-      if (changesAppRelay && typeof request.body.appRelayPlaybackEnabled !== "boolean") {
-        throw new ApiError(422, "app_relay_playback_invalid", "APP 专用中转开关必须是布尔值");
       }
       if (changesJellyfinRelay && typeof request.body.jellyfinRelayPlaybackEnabled !== "boolean") {
         throw new ApiError(422, "jellyfin_relay_playback_invalid", "Jellyfin 中转开关必须是布尔值");
@@ -471,26 +463,24 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       if (changesEmbyRelay && typeof request.body.embyRelayPlaybackEnabled !== "boolean") {
         throw new ApiError(422, "emby_relay_playback_invalid", "Emby 中转开关必须是布尔值");
       }
-      const enablesRelay = request.body.appRelayPlaybackEnabled === true
-        || request.body.jellyfinRelayPlaybackEnabled === true
+      const enablesRelay = request.body.jellyfinRelayPlaybackEnabled === true
         || request.body.embyRelayPlaybackEnabled === true;
       if (enablesRelay && !supportsRelayPlayback(runtime, service.providerType)) {
         throw new ApiError(422, "provider_relay_playback_unsupported", "当前网盘类型暂不支持中转播放");
       }
       const updateValues: Record<string, unknown> = { updated_at: new Date().toISOString() };
-      if (changesAppRelay) updateValues.app_relay_playback_enabled = request.body.appRelayPlaybackEnabled ? 1 : 0;
       if (changesJellyfinRelay) updateValues.jellyfin_relay_playback_enabled = request.body.jellyfinRelayPlaybackEnabled ? 1 : 0;
       if (changesEmbyRelay) updateValues.emby_relay_playback_enabled = request.body.embyRelayPlaybackEnabled ? 1 : 0;
       const changed = await runtime.database.query("media_libraries")
-        .where({ service_id: request.params.serviceId })
+        .where({ id: library.id })
         .update(updateValues);
       if (changed !== 1) throw new ApiError(404, "library_not_found", "媒体库不存在");
-      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId) };
+      return { settings: await buildLibraryAccessSettings(runtime, library.id) };
     });
   };
 
-  registerScopedRoutes("/api/v1/services", false);
-  registerScopedRoutes("/api/v1/admin/services", true);
+  registerScopedRoutes("/api/v1/libraries", false);
+  registerScopedRoutes("/api/v1/admin/libraries", true);
 
   server.get("/api/v1/admin/config/public-access", async (request) => {
     await requireSuperAdmin(request, runtime.database);

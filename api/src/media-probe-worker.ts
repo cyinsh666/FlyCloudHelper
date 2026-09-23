@@ -290,8 +290,9 @@ export class MediaProbeWorker {
         .join("source_files as f", "f.id", "p.source_file_id")
         .join("media_probe_jobs as j", "j.id", "p.probe_job_id")
         .join("cloud_services as s", "s.id", "p.service_id")
-        .join("service_metadata_profiles as mp", function joinCurrentProfile() {
-          this.on("mp.service_id", "s.id").andOn("mp.revision", "s.metadata_profile_revision");
+        .join("media_libraries as l", "l.id", "f.library_id")
+        .join("library_metadata_profiles as mp", function joinCurrentProfile() {
+          this.on("mp.library_id", "l.id").andOn("mp.revision", "l.metadata_profile_revision");
         })
         .select(
           "p.source_file_id", "p.user_id", "p.service_id", "p.probe_job_id", "p.fingerprint", "p.attempt_count",

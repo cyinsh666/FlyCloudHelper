@@ -21,16 +21,7 @@ export type CatalogSort =
   | "title_asc"
   | "title_desc";
 export type MatchState = "matched" | "needs_review" | "unmatched" | "processing";
-export type ServiceMigrationStatus =
-  | "preparing"
-  | "uploading"
-  | "queued"
-  | "validating"
-  | "importing"
-  | "finalizing"
-  | "completed"
-  | "failed"
-  | "cancelled";
+
 
 export interface PublicUserRecord {
   id: string;
@@ -69,19 +60,38 @@ export interface CloudServiceRecord {
   id: string;
   userId: string;
   ownerUsername: string;
-  libraryId: string;
   displayName: string;
   providerType: string;
-  dataType: MediaType;
   status: ServiceStatus;
   connectionStatus: string;
-  /** 当前媒体库是否允许 APP 通过 FlyCloudHelper 专用接口中转媒体文件。 */
-  relayPlaybackEnabled: boolean;
-  /** 当前服务的后台任务结果是否允许投递到外部通知渠道。 */
-  notificationEnabled: boolean;
-  /** 当前服务是否对外提供 Jellyfin 兼容接口。 */
-  jellyfinEnabled: boolean;
   credentialRevision: number;
+  /** 未建立媒体库来源关系时允许从服务详情打开快速创建媒体库页面。 */
+  canCreateLibrary: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ServiceDetailRecord extends CloudServiceRecord {
+  credentialConfigured: boolean;
+}
+
+/** 媒体库及本次唯一来源服务的公开摘要。 */
+export interface MediaLibraryRecord {
+  id: string;
+  userId: string;
+  ownerUsername: string;
+  displayName: string;
+  dataType: MediaType;
+  status: "active" | "disabled";
+  sourceId: string;
+  sourceServiceId: string;
+  sourceServiceName: string;
+  providerType: string;
+  sourceConnectionStatus: string;
+  notificationEnabled: boolean;
+  jellyfinEnabled: boolean;
+  embyEnabled: boolean;
+  navidromeEnabled: boolean;
   scanProfileRevision: number;
   metadataProfileRevision: number;
   catalogVersion: number;
@@ -89,14 +99,6 @@ export interface CloudServiceRecord {
   lastScanAt: string | null;
   createdAt: string;
   updatedAt: string;
-}
-
-export interface ServiceDetailRecord extends CloudServiceRecord {
-  scanProfile: Record<string, unknown>;
-  metadataProfile: Record<string, unknown>;
-  credentialConfigured: boolean;
-  bindings: Array<Record<string, unknown>>;
-  recentJobs: ScanJobRecord[];
 }
 
 export interface JobWaitTargetRecord {
@@ -159,12 +161,12 @@ export interface ScanJobRecord {
   updatedAt: string;
 }
 
-/** 服务级扫描或视频规格分析定时计划。 */
+/** 媒体库级扫描或视频规格分析定时计划。 */
 export interface ScanScheduleRecord {
   id: string;
   userId: string;
-  serviceId: string;
-  /** 保留 scanMode 字段兼容现有客户端，media_probe 表示独立 ffprobe 规格任务。 */
+  libraryId: string;
+  /** media_probe 表示独立 ffprobe 规格任务。 */
   scanMode: "incremental" | "full" | "media_probe";
   enabled: boolean;
   scheduleType: ScanScheduleType;
@@ -195,43 +197,13 @@ export interface MediaProbeFailureRecord {
   errorMessage: string;
 }
 
-/** APP 本地媒体库迁移到云助手的持久化状态。 */
-export interface ServiceMigrationRecord {
-  id: string;
-  userId: string;
-  serviceId: string;
-  libraryId: string;
-  requestId: string;
-  clientDeviceId: string;
-  clientServiceId: string;
-  providerType: string;
-  /** 当前迁移取消时是否需要同时回收由迁移创建的云端服务。 */
-  ownsService: boolean;
-  status: ServiceMigrationStatus;
-  stage: ServiceMigrationStatus;
-  progressPercent: number;
-  currentOperation: string;
-  processedCount: number;
-  totalCount: number;
-  uploadedBytes: number;
-  totalBytes: number;
-  uploadedChunkCount: number;
-  totalChunkCount: number;
-  activeDurationMs: number;
-  error: { code: string; message: string } | null;
-  retryable: boolean;
-  checkpoint: Record<string, unknown>;
-  result: Record<string, unknown> | null;
-  createdAt: string;
-  updatedAt: string;
-  finishedAt: string | null;
-}
-
 export interface SourceFileRecord {
   id: string;
   userId: string;
   serviceId: string;
   libraryId: string;
+  /** 文件所属的稳定媒体库来源。 */
+  librarySourceId: string;
   providerResourceId: string;
   parentResourceId: string | null;
   path: string;
@@ -304,26 +276,6 @@ export interface JobEventRecord {
   eventType: string;
   payload: Record<string, unknown>;
   createdAt: string;
-}
-
-export interface ExportRecord {
-  id: string;
-  userId: string;
-  libraryId: string;
-  exportType: "binding" | "snapshot";
-  status: "queued" | "running" | "completed" | "failed";
-  stage: string;
-  progressPercent: number;
-  processedCount: number;
-  totalCount: number;
-  catalogVersion: number;
-  formatVersion: number;
-  filePath: string | null;
-  fileSize: number | null;
-  errorMessage: string | null;
-  createdAt: string;
-  updatedAt: string;
-  completedAt: string | null;
 }
 
 export interface PluginVersionRecord {

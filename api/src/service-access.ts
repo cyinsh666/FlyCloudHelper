@@ -5,9 +5,9 @@ import { ApiError, validationError } from "./errors.js";
 import type { CredentialVault } from "./secrets.js";
 
 /** 服务访问账号的公开状态；密码哈希永不离开服务端。 */
-export interface ServiceAccessAccountRecord {
+export interface LibraryAccessAccountRecord {
   id: string;
-  serviceId: string;
+  libraryId: string;
   username: string;
   hasPassword: boolean;
   /** 是否已经保存 Subsonic token+salt 认证所需的加密协议密码。 */
@@ -19,8 +19,8 @@ export interface ServiceAccessAccountRecord {
 }
 
 /** 创建服务或重置密码时返回给用户的访问凭据；免密码账号的 password 为空。 */
-export interface GeneratedServiceAccessCredentials {
-  account: ServiceAccessAccountRecord;
+export interface GeneratedLibraryAccessCredentials {
+  account: LibraryAccessAccountRecord;
   password: string;
 }
 
@@ -55,18 +55,18 @@ export class ServiceAccessService {
   ) {}
 
   /** 为升级前已经存在的服务补齐默认免密码账号。 */
-  public async ensureExistingServices(): Promise<number> {
-    const services = await this.database.query("cloud_services as s")
-      .leftJoin("service_access_accounts as a", "a.service_id", "s.id")
-      .select("s.id").whereNull("s.deleted_at").whereNull("a.id");
-    for (const service of services) await this.createForService(String(service.id));
+  public async ensureExistingLibraries(): Promise<number> {
+    const services = await this.database.query("media_libraries as l")
+      .leftJoin("library_access_accounts as a", "a.library_id", "l.id")
+      .select("l.id").whereNull("a.id");
+    for (const service of services) await this.createForLibrary(String(service.id));
     // 关键变量：免密码历史账号的真实密码可确定为空，直接补齐摘要认证所需的加密值。
-    const passwordlessAccounts = await this.database.query("service_access_accounts")
+    const passwordlessAccounts = await this.database.query("library_access_accounts")
       .select("id")
       .where({ password_required: 0 })
       .whereNull("protocol_password_encrypted");
     for (const account of passwordlessAccounts) {
-      await this.database.query("service_access_accounts").where({ id: account.id }).update({
+      await this.database.query("library_access_accounts").where({ id: account.id }).update({
         protocol_password_encrypted: this.vault.encrypt({ password: "" }),
       });
     }
@@ -74,14 +74,14 @@ export class ServiceAccessService {
   }
 
   /** 为新服务创建稳定的默认免密码账号。 */
-  public async createForService(serviceId: string, transaction = this.database.query): Promise<GeneratedServiceAccessCredentials> {
+  public async createForLibrary(libraryId: string, transaction = this.database.query): Promise<GeneratedLibraryAccessCredentials> {
     const password = ""; // 关键变量：新服务默认允许 Jellyfin 免密码登录，用户仍可在详情页主动设置密码。
-    const username = `flymby_${serviceId.replaceAll("-", "").slice(0, 8)}`;
+    const username = `flymby_${libraryId.replaceAll("-", "").slice(0, 8)}`;
     const accountId = randomUUID();
     const now = new Date().toISOString();
-    await transaction("service_access_accounts").insert({
+    await transaction("library_access_accounts").insert({
       id: accountId,
-      service_id: serviceId,
+      library_id: libraryId,
       username,
       username_lookup: createUsernameLookup(username),
       password_hash: await hashPassword(password),
@@ -93,24 +93,24 @@ export class ServiceAccessService {
       updated_at: now,
     });
     return {
-      account: { id: accountId, serviceId, username, hasPassword: false, subsonicTokenAuthReady: true, credentialRevision: 1, status: "active", createdAt: now, updatedAt: now },
+      account: { id: accountId, libraryId, username, hasPassword: false, subsonicTokenAuthReady: true, credentialRevision: 1, status: "active", createdAt: now, updatedAt: now },
       password,
     };
   }
 
   /** 按创建时间读取一个服务的全部协议账号，历史账号始终排在第一位。 */
-  public async listByService(serviceId: string): Promise<ServiceAccessAccountRecord[]> {
-    const rows = await this.database.query("service_access_accounts")
-      .where({ service_id: serviceId })
+  public async listByLibrary(libraryId: string): Promise<LibraryAccessAccountRecord[]> {
+    const rows = await this.database.query("library_access_accounts")
+      .where({ library_id: libraryId })
       .orderBy("created_at", "asc")
       .orderBy("id", "asc");
     return rows.map((row) => this.mapAccount(row));
   }
 
   /** 读取服务账号公开状态。 */
-  public async getByService(serviceId: string): Promise<ServiceAccessAccountRecord> {
-    const row = await this.database.query("service_access_accounts")
-      .where({ service_id: serviceId })
+  public async getByLibrary(libraryId: string): Promise<LibraryAccessAccountRecord> {
+    const row = await this.database.query("library_access_accounts")
+      .where({ library_id: libraryId })
       .orderBy("created_at", "asc")
       .orderBy("id", "asc")
       .first();
@@ -119,15 +119,15 @@ export class ServiceAccessService {
   }
 
   /** 为同一 Jellyfin 地址创建新的独立登录账号。 */
-  public async createAccount(serviceId: string, input: { username: unknown; password?: unknown }): Promise<ServiceAccessAccountRecord> {
+  public async createAccount(libraryId: string, input: { username: unknown; password?: unknown }): Promise<LibraryAccessAccountRecord> {
     const username = validateServiceAccessUsername(input.username);
     const password = input.password === undefined ? "" : validateServiceAccessPassword(input.password);
     const accountId = randomUUID();
     const now = new Date().toISOString();
     try {
-      await this.database.query("service_access_accounts").insert({
+      await this.database.query("library_access_accounts").insert({
         id: accountId,
-        service_id: serviceId,
+        library_id: libraryId,
         username,
         username_lookup: createUsernameLookup(username),
         password_hash: await hashPassword(password),
@@ -141,26 +141,26 @@ export class ServiceAccessService {
     } catch (error) {
       this.throwUsernameConflict(error);
     }
-    return this.getById(serviceId, accountId);
+    return this.getById(libraryId, accountId);
   }
 
   /** 读取服务下的指定协议账号，避免账号 ID 越过媒体库边界。 */
-  public async getById(serviceId: string, accountId: string): Promise<ServiceAccessAccountRecord> {
-    const row = await this.database.query("service_access_accounts").where({ id: accountId, service_id: serviceId }).first();
+  public async getById(libraryId: string, accountId: string): Promise<LibraryAccessAccountRecord> {
+    const row = await this.database.query("library_access_accounts").where({ id: accountId, library_id: libraryId }).first();
     if (!row) throw new ApiError(404, "service_access_account_not_found", "Jellyfin 账号不存在");
     return this.mapAccount(row);
   }
 
   /** 验证当前服务的协议登录账号密码。 */
-  public async authenticate(serviceId: string, username: unknown, password: unknown): Promise<ServiceAccessAccountRecord> {
+  public async authenticate(libraryId: string, username: unknown, password: unknown): Promise<LibraryAccessAccountRecord> {
     let validatedUsername: string;
     try {
       validatedUsername = validateServiceAccessUsername(username);
     } catch {
       throw new ApiError(401, "service_login_failed", "用户名或密码错误");
     }
-    const row = await this.database.query("service_access_accounts")
-      .where({ service_id: serviceId, username_lookup: createUsernameLookup(validatedUsername), status: "active" })
+    const row = await this.database.query("library_access_accounts")
+      .where({ library_id: libraryId, username_lookup: createUsernameLookup(validatedUsername), status: "active" })
       .first();
     const passwordRequired = Number(row?.password_required ?? 1) !== 0; // 关键变量：历史账号在字段缺失时仍按需要密码处理。
     const passwordMatched = !passwordRequired || (typeof password === "string"
@@ -173,17 +173,17 @@ export class ServiceAccessService {
 
   /** 验证 Subsonic/Navidrome 请求中的明文、enc 十六进制或 token+salt 凭据。 */
   public async authenticateSubsonic(
-    serviceId: string,
+    libraryId: string,
     input: { username: unknown; password: unknown; token: unknown; salt: unknown },
-  ): Promise<ServiceAccessAccountRecord> {
+  ): Promise<LibraryAccessAccountRecord> {
     let username: string;
     try {
       username = validateServiceAccessUsername(input.username);
     } catch {
       throw new ApiError(401, "subsonic_login_failed", "用户名或密码错误");
     }
-    const row = await this.database.query("service_access_accounts")
-      .where({ service_id: serviceId, username_lookup: createUsernameLookup(username), status: "active" })
+    const row = await this.database.query("library_access_accounts")
+      .where({ library_id: libraryId, username_lookup: createUsernameLookup(username), status: "active" })
       .first();
     if (!row) throw new ApiError(401, "subsonic_login_failed", "用户名或密码错误");
 
@@ -210,9 +210,9 @@ export class ServiceAccessService {
   }
 
   /** 修改用户名或密码，并让所有协议的旧会话立即失效。 */
-  public async updateCredentials(serviceId: string, accountId: string, input: { username?: unknown; password?: unknown }): Promise<ServiceAccessAccountRecord> {
+  public async updateCredentials(libraryId: string, accountId: string, input: { username?: unknown; password?: unknown }): Promise<LibraryAccessAccountRecord> {
     return this.database.query.transaction(async (transaction) => {
-      const row = await transaction("service_access_accounts").where({ id: accountId, service_id: serviceId }).first();
+      const row = await transaction("library_access_accounts").where({ id: accountId, library_id: libraryId }).first();
       if (!row) throw new ApiError(404, "service_access_account_not_found", "服务访问账号不存在");
       const patch: Record<string, unknown> = { credential_revision: Number(row.credential_revision) + 1, updated_at: new Date().toISOString() };
       if (input.username !== undefined) {
@@ -229,32 +229,32 @@ export class ServiceAccessService {
         throw validationError("credentials", "至少需要修改用户名或密码中的一项");
       }
       try {
-        await transaction("service_access_accounts").where({ id: row.id }).update(patch);
+        await transaction("library_access_accounts").where({ id: row.id }).update(patch);
       } catch (error) {
         this.throwUsernameConflict(error);
       }
-      await transaction("service_protocol_sessions").where({ account_id: row.id }).whereNull("revoked_at").update({ revoked_at: String(patch.updated_at) });
+      await transaction("library_protocol_sessions").where({ account_id: row.id }).whereNull("revoked_at").update({ revoked_at: String(patch.updated_at) });
       return this.mapAccount({ ...row, ...patch });
     });
   }
 
   /** 重置随机密码，明文只在本次响应中返回。 */
-  public async resetPassword(serviceId: string, accountId: string): Promise<GeneratedServiceAccessCredentials> {
+  public async resetPassword(libraryId: string, accountId: string): Promise<GeneratedLibraryAccessCredentials> {
     const password = generateServiceAccessPassword();
-    const account = await this.updateCredentials(serviceId, accountId, { password });
+    const account = await this.updateCredentials(libraryId, accountId, { password });
     return { account, password };
   }
 
   /** 启用或停用指定账号；停用时撤销该账号全部协议会话。 */
-  public async updateStatus(serviceId: string, accountId: string, status: unknown): Promise<ServiceAccessAccountRecord> {
+  public async updateStatus(libraryId: string, accountId: string, status: unknown): Promise<LibraryAccessAccountRecord> {
     if (status !== "active" && status !== "disabled") {
       throw validationError("status", "Jellyfin 账号状态不正确");
     }
-    const account = await this.getById(serviceId, accountId);
+    const account = await this.getById(libraryId, accountId);
     if (account.status === status) return account;
     if (status === "disabled") {
-      const activeCountRow = await this.database.query("service_access_accounts")
-        .where({ service_id: serviceId, status: "active" })
+      const activeCountRow = await this.database.query("library_access_accounts")
+        .where({ library_id: libraryId, status: "active" })
         .count<{ count: string | number }[]>({ count: "id" })
         .first();
       if (Number(activeCountRow?.count ?? 0) <= 1) {
@@ -263,32 +263,32 @@ export class ServiceAccessService {
     }
     const now = new Date().toISOString();
     await this.database.query.transaction(async (transaction) => {
-      await transaction("service_access_accounts").where({ id: accountId, service_id: serviceId }).update({ status, updated_at: now });
+      await transaction("library_access_accounts").where({ id: accountId, library_id: libraryId }).update({ status, updated_at: now });
       if (status === "disabled") {
-        await transaction("service_protocol_sessions").where({ account_id: accountId }).whereNull("revoked_at").update({ revoked_at: now });
+        await transaction("library_protocol_sessions").where({ account_id: accountId }).whereNull("revoked_at").update({ revoked_at: now });
       }
     });
-    return this.getById(serviceId, accountId);
+    return this.getById(libraryId, accountId);
   }
 
   /** 删除指定账号及其独立会话和观看记录，但始终保留至少一个账号。 */
-  public async deleteAccount(serviceId: string, accountId: string): Promise<void> {
-    await this.getById(serviceId, accountId);
-    const countRow = await this.database.query("service_access_accounts")
-      .where({ service_id: serviceId })
+  public async deleteAccount(libraryId: string, accountId: string): Promise<void> {
+    await this.getById(libraryId, accountId);
+    const countRow = await this.database.query("library_access_accounts")
+      .where({ library_id: libraryId })
       .count<{ count: string | number }[]>({ count: "id" })
       .first();
     if (Number(countRow?.count ?? 0) <= 1) {
       throw new ApiError(409, "last_service_access_account", "至少需要保留一个 Jellyfin 账号");
     }
-    const deleted = await this.database.query("service_access_accounts").where({ id: accountId, service_id: serviceId }).delete();
+    const deleted = await this.database.query("library_access_accounts").where({ id: accountId, library_id: libraryId }).delete();
     if (deleted !== 1) throw new ApiError(404, "service_access_account_not_found", "Jellyfin 账号不存在");
   }
 
   /** 撤销当前服务的指定协议会话，不删除播放记录。 */
-  public async revokeSessions(serviceId: string, protocol?: "jellyfin" | "emby", accountId?: string): Promise<number> {
+  public async revokeSessions(libraryId: string, protocol?: "jellyfin" | "emby", accountId?: string): Promise<number> {
     const now = new Date().toISOString();
-    const query = this.database.query("service_protocol_sessions").where({ service_id: serviceId }).whereNull("revoked_at");
+    const query = this.database.query("library_protocol_sessions").where({ library_id: libraryId }).whereNull("revoked_at");
     if (protocol) query.where({ protocol });
     if (accountId) query.where({ account_id: accountId });
     return query.update({ revoked_at: now });
@@ -315,9 +315,9 @@ export class ServiceAccessService {
   }
 
   /** 将数据库行转换为公开账号状态。 */
-  private mapAccount(row: Record<string, unknown>): ServiceAccessAccountRecord {
+  private mapAccount(row: Record<string, unknown>): LibraryAccessAccountRecord {
     return {
-      id: String(row.id), serviceId: String(row.service_id), username: String(row.username),
+      id: String(row.id), libraryId: String(row.library_id), username: String(row.username),
       hasPassword: Number(row.password_required ?? 1) !== 0,
       subsonicTokenAuthReady: Number(row.password_required ?? 1) === 0 || Boolean(row.protocol_password_encrypted),
       credentialRevision: Number(row.credential_revision), status: String(row.status) as "active" | "disabled",

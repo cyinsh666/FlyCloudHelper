@@ -44,15 +44,12 @@ export interface ApiConfig {
   ffprobeProbeSizeBytes: number;
   pluginDirectory: string;
   exportDirectory: string;
-  migrationDirectory: string;
   /** 音频内嵌封面的内容寻址缓存目录。 */
   musicArtworkDirectory: string;
   webDistDirectory: string;
   allowInsecureProviderHttp: boolean;
   pluginMaxBytes: number;
   pluginMaxFiles: number;
-  migrationChunkMaxBytes: number;
-  migrationSnapshotMaxBytes: number;
   /** 可选的华为账号绑定凭证验签密钥；配置后 APP 注册必须携带受信任签名。 */
   huaweiBindingProofSecret: string | null;
   /** 115 OpenAPI 公开应用 ID，不是应用 Secret。 */
@@ -360,10 +357,6 @@ export function loadApiConfig(): ApiConfig {
     ffprobeProbeSizeBytes: readPositiveInteger("FLYCLOUDHELPER_FFPROBE_PROBE_SIZE_BYTES", 10 * 1024 * 1024),
     pluginDirectory: resolveProjectPath(readEnvironmentValue("FLYCLOUDHELPER_PLUGIN_DIR"), "data/plugins"),
     exportDirectory: resolveProjectPath(readEnvironmentValue("FLYCLOUDHELPER_EXPORT_DIR"), "data/exports"),
-    migrationDirectory: resolveProjectPath(
-      readEnvironmentValue("FLYCLOUDHELPER_MIGRATION_DIR"),
-      "data/migrations",
-    ),
     musicArtworkDirectory: resolveProjectPath(
       readEnvironmentValue("FLYCLOUDHELPER_MUSIC_ARTWORK_DIR"),
       "data/music-artwork",
@@ -372,14 +365,6 @@ export function loadApiConfig(): ApiConfig {
     allowInsecureProviderHttp: readBoolean("FLYCLOUDHELPER_ALLOW_INSECURE_HTTP", true),
     pluginMaxBytes: readPositiveInteger("FLYCLOUDHELPER_PLUGIN_MAX_BYTES", 10 * 1024 * 1024),
     pluginMaxFiles: readPositiveInteger("FLYCLOUDHELPER_PLUGIN_MAX_FILES", 100),
-    migrationChunkMaxBytes: readPositiveInteger(
-      "FLYCLOUDHELPER_MIGRATION_CHUNK_MAX_BYTES",
-      8 * 1024 * 1024,
-    ),
-    migrationSnapshotMaxBytes: readPositiveInteger(
-      "FLYCLOUDHELPER_MIGRATION_SNAPSHOT_MAX_BYTES",
-      2 * 1024 * 1024 * 1024,
-    ),
     huaweiBindingProofSecret: huaweiBindingProofSecret.value,
     cloud115ClientId: readEnvironmentValue("FLYCLOUDHELPER_CLOUD115_CLIENT_ID") || "100195125",
   };

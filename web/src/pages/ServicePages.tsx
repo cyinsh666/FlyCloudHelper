@@ -1,52 +1,34 @@
 import { Link, useNavigate } from "@tanstack/react-router";
-import { BookOpenText, CalendarClock, Film, Music2, Plus, RefreshCw, ScanLine, Settings2, Sparkles, Trash2, X } from "lucide-react";
+import { Plus, RefreshCw, Settings2, Trash2, X } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { createPortal } from "react-dom";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { AdminServiceFilters } from "@/components/AdminServiceFilters";
-import { AiCleaningSettingsFields, type AiCleaningSettingsValue } from "@/components/AiCleaningSettingsFields";
 import { GuangyaAuthorizationPanel } from "@/components/GuangyaAuthorizationPanel";
 import { CloudAuthorizationPanel } from "@/components/CloudAuthorizationPanel";
 import { ProviderConnectionGuide } from "@/components/ProviderConnectionGuide";
 import { getProviderSelectionDescription, ProviderSelectionIcon, SelectableServiceOption } from "@/components/ServiceCreateSelection";
-import { ServicePathPicker, toProviderDirectory } from "@/components/ServicePathPicker";
 import { ServiceConnectionAlert, ServiceStateDot, ServiceStatePill, getServiceConnectionIssue } from "@/components/ServiceConnectionStatus";
-import { Panel, StatCard, StatusPill } from "@/components/ui-kit";
+import { Panel, StatusPill } from "@/components/ui-kit";
 import {
   ApiClientError,
-  backfillExistingMediaProbes,
-  createManualAiSupplementJob,
-  createScanJob,
   createService,
   deleteCloudService,
   getService,
   listAdminUsers,
-  listAvailableAiModels,
   listProviders,
   listServices,
   reconnectServiceConnection,
   updateServiceConnection,
-  updateServiceMetadataProfile,
-  updateServiceNotificationSettings,
-  updateServiceScanProfile,
-  updateServiceStatus,
   type CloudService,
   type CloudAuthorizationStatus,
   type CreateCloudServiceInput,
-  type JobStatus,
   type GuangyaAuthorizationStatus,
   type MediaType,
-  type ProviderDirectory,
   type ProviderDescriptor,
   type ServiceListFilters,
 } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
-
-const dataTypeLabels: Record<MediaType, string> = {
-  video: "影视",
-  music: "音乐",
-  audiobook: "有声书",
-};
 
 const guangyaLoginModeLabels: Record<"official_api" | "web_qr" | "web_sms", string> = {
   official_api: "官方光鸭",
@@ -62,272 +44,6 @@ function getServiceProviderLabel(service: CloudService): string {
   return "光鸭";
 }
 
-// 关键变量：服务详情最近任务卡片只展示中文状态，不修改接口返回的原始状态值。
-const jobStatusLabels: Record<JobStatus, string> = {
-  queued: "排队中",
-  running: "运行中",
-  retry_waiting: "等待 TMDB 恢复",
-  paused: "已暂停",
-  completed: "已完成",
-  failed: "失败",
-  cancelled: "已取消",
-};
-
-const jobStageLabels: Record<string, string> = {
-  queued: "等待执行",
-  enumerating: "扫描与刮削",
-  classifying: "识别媒体",
-  scraping: "扫描刮削",
-  persisting: "写入目录",
-  probing: "分析视频规格",
-  reading_tags: "读取音乐标签",
-  grouping_music: "整理歌曲专辑艺术家",
-  scraping_music: "刮削音乐信息",
-  completed: "已完成",
-};
-
-/** 把 ISO 时间转换为控制台可读时间。 */
-function formatTime(value: string | null): string {
-  return value ? new Date(value).toLocaleString("zh-CN") : "尚未扫描";
-}
-
-/** 将任务阶段转换为中文；未知的新阶段统一显示为处理中，避免页面泄露英文枚举。 */
-function getJobStageLabel(stage: string): string {
-  return jobStageLabels[stage] ?? "处理中";
-}
-
-interface ScanRootValue {
-  resourceId?: string;
-  displayPath?: string;
-  driveId?: string;
-  mediaTypes?: string[];
-}
-
-interface VideoMetadataSettings {
-  providerId: string;
-  /** 音乐自动来源采用最快命中或等待完整聚合。 */
-  aggregateMode: "fast" | "complete";
-  /** 音乐刮削是否同时从 LRCLIB 补充歌词。 */
-  syncLyrics: boolean;
-  language: string;
-  region: string;
-  useNfo: boolean;
-  /** 扫描时是否同步读取 TMDB 详情、演职人员和节目单集信息。 */
-  syncDetails: boolean;
-  /** 是否在扫描结束后异步使用 ffprobe 分析实际媒体规格。 */
-  analyzeMediaSpecs: boolean;
-  /** 只作用于影视刮削查询词的 AI 补充配置。 */
-  aiCleaning: AiCleaningSettingsValue;
-}
-
-interface ScanConcurrencySettings {
-  musicFileConcurrency: number;
-  scanDirectoryConcurrency: number;
-  scrapeTaskConcurrency: number;
-}
-
-/** 读取服务并发配置；旧服务缺少字段时直接采用当前 Provider 推荐值。 */
-function readScanConcurrencySettings(
-  profile: Record<string, unknown>,
-  descriptor: ProviderDescriptor | undefined,
-): ScanConcurrencySettings {
-  const recommended = descriptor?.recommendedScanSettings;
-  const scanDefault = recommended?.scanDirectoryConcurrency.default ?? 8;
-  const scrapeDefault = recommended?.scrapeTaskConcurrency.default ?? 4;
-  return {
-    musicFileConcurrency: typeof profile.musicFileConcurrency === "number" ? profile.musicFileConcurrency : 4,
-    scanDirectoryConcurrency: typeof profile.scanDirectoryConcurrency === "number"
-      ? profile.scanDirectoryConcurrency
-      : scanDefault,
-    scrapeTaskConcurrency: typeof profile.scrapeTaskConcurrency === "number"
-      ? profile.scrapeTaskConcurrency
-      : scrapeDefault,
-  };
-}
-
-/** 读取影视元数据配置，并兼容早期 sources 数组。 */
-function readVideoMetadataSettings(profile: Record<string, unknown>): VideoMetadataSettings {
-  const profiles = profile.profiles && typeof profile.profiles === "object" && !Array.isArray(profile.profiles)
-    ? profile.profiles as Record<string, unknown>
-    : {};
-  const videoProfile = profiles.video && typeof profiles.video === "object" && !Array.isArray(profiles.video)
-    ? profiles.video as Record<string, unknown>
-    : {};
-  const firstSource = Array.isArray(videoProfile.sources)
-    ? videoProfile.sources.find((item): item is string => typeof item === "string")
-    : undefined;
-  const configuredProvider = typeof videoProfile.providerId === "string" ? videoProfile.providerId : firstSource;
-  const aiCleaning = videoProfile.aiCleaning && typeof videoProfile.aiCleaning === "object" && !Array.isArray(videoProfile.aiCleaning)
-    ? videoProfile.aiCleaning as Record<string, unknown>
-    : {};
-  return {
-    providerId: configuredProvider === "tmdb" || !configuredProvider ? "builtin.tmdb" : configuredProvider,
-    aggregateMode: "complete",
-    syncLyrics: false,
-    language: typeof videoProfile.language === "string" ? videoProfile.language : "zh-CN",
-    region: typeof videoProfile.region === "string" ? videoProfile.region : "CN",
-    useNfo: videoProfile.useNfo !== false,
-    // 关键变量：旧服务缺少该字段时必须保持关闭，扫描行为才能与 APP 一致。
-    syncDetails: videoProfile.syncDetails === true,
-    // 关键变量：旧服务默认不读取视频字节，只有用户明确开启后才进入独立队列。
-    analyzeMediaSpecs: videoProfile.analyzeMediaSpecs === true,
-    aiCleaning: {
-      enabled: aiCleaning.enabled === true,
-      modelId: typeof aiCleaning.modelId === "string" ? aiCleaning.modelId : "",
-      triggerMode: aiCleaning.triggerMode === "weak_only" ? "weak_only" : "weak_or_unmatched",
-      minConfidence: typeof aiCleaning.minConfidence === "number" ? aiCleaning.minConfidence : 0.75,
-    },
-  };
-}
-
-/** 将中文表单字段写回元数据 Profile，同时保留以后扩展的未知配置。 */
-function buildVideoMetadataProfile(
-  profile: Record<string, unknown>,
-  settings: VideoMetadataSettings,
-): Record<string, unknown> {
-  const profiles = profile.profiles && typeof profile.profiles === "object" && !Array.isArray(profile.profiles)
-    ? profile.profiles as Record<string, unknown>
-    : {};
-  const videoProfile = profiles.video && typeof profiles.video === "object" && !Array.isArray(profiles.video)
-    ? profiles.video as Record<string, unknown>
-    : {};
-  return {
-    ...profile,
-    profiles: {
-      ...profiles,
-      video: {
-        ...videoProfile,
-        providerId: settings.providerId,
-        sources: undefined,
-        language: settings.language,
-        region: settings.region,
-        useNfo: settings.useNfo,
-        syncDetails: settings.syncDetails,
-        analyzeMediaSpecs: settings.analyzeMediaSpecs,
-        aiCleaning: settings.aiCleaning,
-      },
-    },
-  };
-}
-
-/** 读取音乐元数据配置，并复用页面状态结构承载来源选择。 */
-function readMusicMetadataSettings(profile: Record<string, unknown>): VideoMetadataSettings {
-  const profiles = profile.profiles && typeof profile.profiles === "object" && !Array.isArray(profile.profiles)
-    ? profile.profiles as Record<string, unknown>
-    : {};
-  const musicProfile = profiles.music && typeof profiles.music === "object" && !Array.isArray(profiles.music)
-    ? profiles.music as Record<string, unknown>
-    : {};
-  return {
-    providerId: typeof musicProfile.providerId === "string" && musicProfile.providerId !== "builtin.musicbrainz"
-      ? musicProfile.providerId
-      : "auto",
-    aggregateMode: musicProfile.aggregateMode === "fast" ? "fast" : "complete",
-    syncLyrics: Boolean(musicProfile.requiredFields && typeof musicProfile.requiredFields === "object"
-      && !Array.isArray(musicProfile.requiredFields)
-      && (musicProfile.requiredFields as Record<string, unknown>).lyrics === true),
-    language: "",
-    region: "",
-    useNfo: false,
-    syncDetails: true,
-    analyzeMediaSpecs: false,
-    aiCleaning: { enabled: false, modelId: "", triggerMode: "weak_or_unmatched", minConfidence: 0.75 },
-  };
-}
-
-/** 写回音乐元数据来源，同时保留服务内已有的未知扩展字段。 */
-function buildMusicMetadataProfile(profile: Record<string, unknown>, settings: VideoMetadataSettings): Record<string, unknown> {
-  const profiles = profile.profiles && typeof profile.profiles === "object" && !Array.isArray(profile.profiles)
-    ? profile.profiles as Record<string, unknown>
-    : {};
-  const musicProfile = profiles.music && typeof profiles.music === "object" && !Array.isArray(profiles.music)
-    ? profiles.music as Record<string, unknown>
-    : {};
-  return {
-    ...profile,
-    profiles: {
-      ...profiles,
-      music: {
-        ...musicProfile,
-        providerId: settings.providerId,
-        aggregateMode: settings.aggregateMode,
-        requiredFields: {
-          ...(musicProfile.requiredFields && typeof musicProfile.requiredFields === "object"
-            ? musicProfile.requiredFields as Record<string, unknown>
-            : {}),
-          artist: true,
-          album: true,
-          cover: true,
-          lyrics: settings.syncLyrics,
-        },
-      },
-    },
-  };
-}
-
-/** 返回当前元数据来源的中文名称。 */
-function getMetadataProviderLabel(providerId: string): string {
-  if (providerId === "builtin.tmdb" || providerId === "tmdb") return "TMDB 在线刮削";
-  if (providerId === "auto" || providerId === "builtin.music-platforms") return "多平台自动补全";
-  if (providerId === "builtin.musicbrainz" || providerId === "musicbrainz") return "MusicBrainz 在线刮削";
-  if (providerId === "netease") return "网易云音乐";
-  if (providerId === "qmusic") return "QQ音乐";
-  if (providerId === "kugou") return "酷狗音乐";
-  if (providerId === "migu") return "咪咕音乐";
-  if (providerId === "kuwo") return "酷我音乐";
-  if (providerId === "local") return "仅使用本地 NFO 和文件名";
-  if (providerId.startsWith("plugin:")) return `元数据插件（${providerId.slice("plugin:".length)}）`;
-  return `现有来源（${providerId}）`;
-}
-
-/** 返回元数据语言的简短中文名称。 */
-function getMetadataLanguageLabel(language: string): string {
-  const labels: Record<string, string> = {
-    "zh-CN": "简体中文",
-    "zh-TW": "繁体中文",
-    "en-US": "英语",
-    "ja-JP": "日语",
-    "ko-KR": "韩语",
-  };
-  return labels[language] ?? language;
-}
-
-/** 返回元数据地区的简短中文名称。 */
-function getMetadataRegionLabel(region: string): string {
-  const labels: Record<string, string> = {
-    CN: "中国大陆",
-    HK: "中国香港",
-    TW: "中国台湾",
-    US: "美国",
-    JP: "日本",
-    KR: "韩国",
-  };
-  return labels[region] ?? region;
-}
-
-/** 读取指定扫描模式的路径，并转换成路径选择器可以直接展示的目录。 */
-function readScanRoots(profile: Record<string, unknown>, mode: "incremental" | "full"): ProviderDirectory[] {
-  const configuredRoots = mode === "full" ? profile.fullRoots : profile.incrementalRoots;
-  const roots = Array.isArray(configuredRoots)
-    ? configuredRoots
-    : Array.isArray(profile.roots) ? profile.roots : [];
-  return roots
-    .filter((root): root is ScanRootValue => Boolean(root && typeof root === "object"))
-    .map((root) => {
-      const displayPath = root.displayPath || root.resourceId || "/";
-      return toProviderDirectory({
-        resourceId: root.resourceId || displayPath,
-        displayPath,
-        ...(root.driveId ? { driveId: root.driveId } : {}),
-      });
-    });
-}
-
-/** 返回扫描路径供摘要区域展示。 */
-function getScanRootLabel(root: ScanRootValue): string {
-  return root.displayPath || root.resourceId || "未命名路径";
-}
-
 /** 渲染单个云端服务卡片。 */
 function ServiceCard({ service, admin, onChanged }: { service: CloudService; admin: boolean; onChanged: () => Promise<void> }) {
   const [message, setMessage] = useState<string | null>(null);
@@ -336,20 +52,12 @@ function ServiceCard({ service, admin, onChanged }: { service: CloudService; adm
   const deletingRef = useRef(false);
   const detailPath = admin ? "/admin/services/$serviceId" : "/app/services/$serviceId";
 
-  /** 创建默认增量扫描任务。 */
-  async function triggerScan(): Promise<void> {
-    setMessage("正在创建扫描任务…");
-    try {
-      const job = await createScanJob(service.id, "incremental", admin);
-      setMessage(`任务 ${job.id} 已进入队列`);
-      await onChanged();
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "扫描任务创建失败");
-    }
-  }
-
   /** 二次确认后从服务卡片删除服务，并同步刷新服务列表。 */
   async function deleteCardService(): Promise<void> {
+    if (!service.canCreateLibrary) {
+      setMessage("请先在媒体库管理中删除关联媒体库，再删除网盘服务");
+      return;
+    }
     if (deletingRef.current) {
       console.warn("codex-flycloud-helper-service-delete", {
         事件: "服务卡片拦截重复删除请求",
@@ -358,7 +66,7 @@ function ServiceCard({ service, admin, onChanged }: { service: CloudService; adm
       return;
     }
     const confirmed = window.confirm(
-      `确定删除“${service.displayName}”吗？该服务、媒体库以及对应的 Jellyfin 账号、会话和播放记录都会被删除，此操作无法撤销。`,
+      `确定删除“${service.displayName}”吗？删除后登录凭据无法恢复。已关联媒体库时需要先删除媒体库。`,
     );
     if (!confirmed) return;
 
@@ -414,23 +122,19 @@ function ServiceCard({ service, admin, onChanged }: { service: CloudService; adm
 
       <div className="mt-3 text-[11px] text-muted-foreground">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-          <StatusPill>{dataTypeLabels[service.dataType]}</StatusPill>
           <span>连接 r{service.credentialRevision}</span>
-          <span>扫描 r{service.scanProfileRevision}</span>
-          <span>刮削 r{service.metadataProfileRevision}</span>
+          <span>{service.connectionStatus === "valid" ? "登录有效" : "需要重新登录"}</span>
         </div>
-        <p className="mt-2 truncate">最近扫描 {formatTime(service.lastScanAt)}</p>
       </div>
 
       <footer className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/70 pt-3">
-        <button type="button" onClick={() => void triggerScan()} className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-3 py-2 text-xs text-primary-soft">
-          <ScanLine className="size-3.5" /> 增量
-        </button>
         <Link to={detailPath} params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Settings2 className="size-3.5" /> 配置</Link>
-        <button type="button" aria-label={deleting ? `正在删除${service.displayName}` : `删除${service.displayName}`} title={deleting ? "正在删除…" : "删除服务"} onClick={() => void deleteCardService()} disabled={deleting} className="ml-auto grid size-8 cursor-pointer place-items-center rounded-lg border border-destructive/50 bg-destructive/10 text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-50">
+        {service.canCreateLibrary && !admin && <Link to="/app/libraries/new/$serviceId" params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-3 py-2 text-xs text-primary-soft"><Plus className="size-3.5" /> 创建媒体库</Link>}
+        <button type="button" aria-label={deleting ? `正在删除${service.displayName}` : `删除${service.displayName}`} title={!service.canCreateLibrary ? "请先删除关联媒体库" : deleting ? "正在删除…" : "删除服务"} onClick={() => void deleteCardService()} disabled={deleting || !service.canCreateLibrary} className="ml-auto grid size-8 cursor-pointer place-items-center rounded-lg border border-destructive/50 bg-destructive/10 text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-50">
           <Trash2 className="size-3.5" />
         </button>
       </footer>
+      {!service.canCreateLibrary && <p className="mt-2 text-[11px] text-muted-foreground">请先删除关联媒体库，再删除网盘服务。</p>}
       {message && <p className="mt-3 text-xs text-muted-foreground">{message}</p>}
     </article>
   );
@@ -490,14 +194,6 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
       setMessage("请选择 Provider 类型");
       return;
     }
-    if (dataType !== "video" && dataType !== "music") {
-      setMessage("当前仅支持影视或音乐数据类型");
-      return;
-    }
-    if (!descriptor.supportedDataTypes.includes(dataType)) {
-      setMessage(`${descriptor.displayName}暂不支持${dataType === "music" ? "音乐" : "影视"}服务`);
-      return;
-    }
     const connection: Record<string, string> = {};
     if (descriptor.authenticationMode === "web_qr") {
       if (guangyaAuthorization?.status !== "authorized") {
@@ -519,40 +215,8 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
     }
     const input: CreateCloudServiceInput = {
       displayName: String(form.get("displayName") ?? "").trim(),
-      dataType,
       provider: { type: selectedType, connection },
-      scan: {
-        fullRoots: [],
-        incrementalRoots: [],
-        mediaTypes: [dataType],
-        removedRootPolicy: "protect",
-        scanDirectoryConcurrency: dataType === "music" ? 4 : descriptor.recommendedScanSettings.scanDirectoryConcurrency.default,
-        ...(dataType === "music" ? { musicFileConcurrency: 4 } : {}),
-        scrapeTaskConcurrency: dataType === "music" ? 2 : descriptor.recommendedScanSettings.scrapeTaskConcurrency.default,
-      },
-      metadata: dataType === "music" ? {
-        profiles: {
-          music: {
-            providerId: "auto",
-            aggregateMode: "fast",
-            requiredFields: { artist: true, album: true, cover: true, lyrics: false },
-          },
-        },
-      } : {
-        profiles: {
-          video: {
-            providerId: "builtin.tmdb",
-            language: "zh-CN",
-            region: "CN",
-            useNfo: true,
-            syncDetails: false,
-            analyzeMediaSpecs: false,
-            aiCleaning: { enabled: false, modelId: "", triggerMode: "weak_or_unmatched", minConfidence: 0.75 },
-          },
-        },
-      },
-    };
-    if (admin) input.userId = adminTargetUserId;
+    };    if (admin) input.userId = adminTargetUserId;
     setMessage("正在验证连接并创建服务，不会自动开始扫描…");
     try {
       const creation = await createService(input, admin);
@@ -577,14 +241,6 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
         <form onSubmit={(event) => void submit(event)} className="grid gap-5 lg:grid-cols-2">
           {admin && <label className="block"><span className="text-xs text-muted-foreground">所属用户</span><select name="userId" required value={adminTargetUserId} onChange={(event) => setAdminTargetUserId(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm"><option value="">选择目标用户</option>{users.data?.items.map((user) => <option key={user.userId} value={user.userId}>{user.username}</option>)}</select></label>}
           <label className="block"><span className="text-xs text-muted-foreground">服务名称</span><input name="displayName" required maxLength={100} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
-          <fieldset className="lg:col-span-2 pb-2">
-            <legend className="mb-3 text-xs text-muted-foreground">数据类型</legend>
-            <div role="radiogroup" aria-label="数据类型" className="grid gap-3 sm:grid-cols-3">
-              <SelectableServiceOption title="影视" description="电影、电视剧和短剧" icon={<Film className="size-5" />} selected={dataType === "video"} onSelect={() => setDataType("video")} />
-              <SelectableServiceOption title="音乐" description="歌曲、专辑和歌手" icon={<Music2 className="size-5" />} selected={dataType === "music"} onSelect={() => setDataType("music")} />
-              <SelectableServiceOption title="有声书" description="暂未支持" icon={<BookOpenText className="size-5" />} selected={dataType === "audiobook"} disabled onSelect={() => setDataType("audiobook")} />
-            </div>
-          </fieldset>
           <fieldset className="lg:col-span-2 pb-3">
             <legend className="mb-3 text-xs text-muted-foreground">Provider 类型</legend>
             <div role="radiogroup" aria-label="Provider 类型" className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -596,7 +252,6 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
                   description={getProviderSelectionDescription(provider)}
                   icon={<ProviderSelectionIcon providerType={provider.type} />}
                   selected={selectedProvider?.type === provider.type}
-                  disabled={dataType === "audiobook" || !provider.supportedDataTypes.includes(dataType)}
                   onSelect={() => selectProvider(provider.type)}
                 />
               ))}
@@ -607,9 +262,8 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
             : selectedProvider?.authenticationMode === "authorization_session"
               ? <CloudAuthorizationPanel descriptor={selectedProvider} admin={admin} targetUserId={adminTargetUserId || undefined} resetKey={`${selectedProvider.type}:${adminTargetUserId}`} onAuthorizationChange={setCloudAuthorization} />
             : selectedProvider?.connectionFields.map((field) => <label key={field.name} className="block"><span className="text-xs text-muted-foreground">{field.label}</span><input name={`connection.${field.name}`} type={field.type === "password" ? "password" : field.type} required={field.required} autoComplete="off" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>)}
-          {selectedProvider && <div className="rounded-xl border border-border bg-secondary/35 p-4 lg:col-span-2"><p className="text-sm font-medium">默认任务并发</p><p className="mt-2 text-xs text-muted-foreground">{dataType === "music" ? "目录 4，文件 4，在线 2" : `扫描任务 ${selectedProvider.recommendedScanSettings.scanDirectoryConcurrency.default}，刮削任务 ${selectedProvider.recommendedScanSettings.scrapeTaskConcurrency.default}`}。创建后可以在服务详情中修改。</p></div>}
           {selectedProvider && <ProviderConnectionGuide providerType={selectedProvider.type} />}
-          <div className="lg:col-span-2 flex items-center justify-between gap-4"><p className="text-xs text-muted-foreground">创建成功后不会自动扫描或刮削，需要先在服务详情中设置扫描路径。</p><PrimaryButton type="submit" disabled={(selectedProvider?.authenticationMode === "web_qr" && guangyaAuthorization?.status !== "authorized") || (selectedProvider?.authenticationMode === "authorization_session" && cloudAuthorization?.state !== "authorized")}>验证连接并创建服务</PrimaryButton></div>
+          <div className="lg:col-span-2 flex items-center justify-between gap-4"><p className="text-xs text-muted-foreground">创建后仅保存网盘基础信息和登录凭据，可从服务卡片快速创建媒体库。</p><PrimaryButton type="submit" disabled={(selectedProvider?.authenticationMode === "web_qr" && guangyaAuthorization?.status !== "authorized") || (selectedProvider?.authenticationMode === "authorization_session" && cloudAuthorization?.state !== "authorized")}>验证连接并创建服务</PrimaryButton></div>
           {message && <p className="lg:col-span-2 text-sm text-muted-foreground">{message}</p>}
         </form>
       </Panel>
@@ -774,643 +428,6 @@ export function ServiceConnectionPage({ serviceId, admin = false }: { serviceId:
 }
 
 /** 云端服务详情与配置页面。 */
-export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: string; admin?: boolean }) {
-  const navigate = useNavigate();
-  const resource = useApiResource(() => getService(serviceId, admin), [serviceId, admin]);
-  const providers = useApiResource(() => listProviders(), []);
-  const availableAiModels = useApiResource(() => listAvailableAiModels(serviceId), [serviceId]);
-  const [message, setMessage] = useState<string | null>(null);
-  const [updatingStatus, setUpdatingStatus] = useState(false);
-  const updatingStatusRef = useRef(false);
-  const [updatingNotification, setUpdatingNotification] = useState(false);
-  const updatingNotificationRef = useRef(false);
-  const [deletingService, setDeletingService] = useState(false);
-  // 关键变量：同步占用删除操作，避免 React 按钮状态尚未刷新时重复提交。
-  const deletingServiceRef = useRef(false);
-  const [creatingScanMode, setCreatingScanMode] = useState<"full" | "incremental" | null>(null);
-  const creatingScanModeRef = useRef<"full" | "incremental" | null>(null);
-  const [creatingAiSupplement, setCreatingAiSupplement] = useState(false);
-  // 关键变量：同步占用手动 AI 补充入口，避免与扫描按钮在状态刷新前同时创建任务。
-  const creatingAiSupplementRef = useRef(false);
-  const [backfillingMediaSpecs, setBackfillingMediaSpecs] = useState(false);
-  const backfillingMediaSpecsRef = useRef(false);
-  // 关键变量：主页面仅展示摘要卡片，完整表单只在元数据 Dialog 打开时显示。
-  const [metadataDialogOpen, setMetadataDialogOpen] = useState(false);
-  // 关键变量：保存期间禁止关闭 Dialog，避免用户误以为请求已经取消。
-  const [savingMetadata, setSavingMetadata] = useState(false);
-  const service = resource.data;
-  const [fullScanRoots, setFullScanRoots] = useState<ProviderDirectory[]>([]);
-  const [incrementalScanRoots, setIncrementalScanRoots] = useState<ProviderDirectory[]>([]);
-  const [metadataSettings, setMetadataSettings] = useState<VideoMetadataSettings>({
-    providerId: "builtin.tmdb",
-    aggregateMode: "complete",
-    syncLyrics: false,
-    language: "zh-CN",
-    region: "CN",
-    useNfo: true,
-    syncDetails: false,
-    analyzeMediaSpecs: false,
-    aiCleaning: { enabled: false, modelId: "", triggerMode: "weak_or_unmatched", minConfidence: 0.75 },
-  });
-  const [scanConcurrencySettings, setScanConcurrencySettings] = useState<ScanConcurrencySettings>({
-    musicFileConcurrency: 4,
-    scanDirectoryConcurrency: 8,
-    scrapeTaskConcurrency: 4,
-  });
-
-  useEffect(() => {
-    if (!service) return;
-    setFullScanRoots(readScanRoots(service.scanProfile, "full"));
-    setIncrementalScanRoots(readScanRoots(service.scanProfile, "incremental"));
-  }, [serviceId, service?.id, service?.scanProfileRevision]);
-
-  useEffect(() => {
-    if (!service) return;
-    setMetadataSettings(service.dataType === "music"
-      ? readMusicMetadataSettings(service.metadataProfile)
-      : readVideoMetadataSettings(service.metadataProfile));
-  }, [serviceId, service?.id, service?.metadataProfileRevision]);
-
-  useEffect(() => {
-    if (!service) return;
-    const descriptor = providers.data?.find((item) => item.type === service.providerType);
-    setScanConcurrencySettings(readScanConcurrencySettings(service.scanProfile, descriptor));
-  }, [serviceId, service?.id, service?.scanProfileRevision, providers.data]);
-
-  useEffect(() => {
-    if (!metadataDialogOpen) return undefined;
-    // 关键变量：保留页面原有滚动状态，Dialog 关闭后完整恢复。
-    const originalOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    /** 按 Escape 关闭元数据配置 Dialog。 */
-    const closeWithEscape = (event: KeyboardEvent): void => {
-      if (event.key !== "Escape" || savingMetadata) return;
-      if (service) {
-        setMetadataSettings(service.dataType === "music"
-          ? readMusicMetadataSettings(service.metadataProfile)
-          : readVideoMetadataSettings(service.metadataProfile));
-      }
-      setMetadataDialogOpen(false);
-    };
-    window.addEventListener("keydown", closeWithEscape);
-    return () => {
-      document.body.style.overflow = originalOverflow;
-      window.removeEventListener("keydown", closeWithEscape);
-    };
-  }, [metadataDialogOpen, savingMetadata, service]);
-
-  if (!service) return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取服务详情…"}</div></Panel>;
-  // 关键变量：详情已经通过空值检查，异步回调统一捕获稳定引用，避免刷新期间类型重新变为可空。
-  const activeService = service;
-
-  /** 从详情页创建用户选择的扫描任务。 */
-  async function trigger(mode: "incremental" | "full"): Promise<void> {
-    if (creatingScanModeRef.current || creatingAiSupplementRef.current) {
-      console.warn("codex-flycloud-helper-job-operation", {
-        事件: "拦截重复创建扫描任务",
-        服务ID: serviceId,
-        正在创建模式: creatingAiSupplementRef.current ? "AI补充未识别内容" : creatingScanModeRef.current,
-        本次模式: mode,
-      });
-      return;
-    }
-    creatingScanModeRef.current = mode;
-    setCreatingScanMode(mode);
-    setMessage("正在创建扫描任务…");
-    try {
-      const job = await createScanJob(serviceId, mode, admin);
-      setMessage(`任务 ${job.id} 已进入队列`);
-      await resource.refresh();
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "创建任务失败");
-    } finally {
-      creatingScanModeRef.current = null;
-      setCreatingScanMode(null);
-    }
-  }
-
-  /** 从服务详情页手动创建未识别内容 AI 补充任务。 */
-  async function triggerAiSupplement(): Promise<void> {
-    if (creatingAiSupplementRef.current || creatingScanModeRef.current) {
-      console.warn("codex-flycloud-helper-ai-clean", {
-        事件: "拦截重复创建未识别内容AI补充任务",
-        服务ID: serviceId,
-        正在创建扫描模式: creatingScanModeRef.current ?? "AI补充未识别内容",
-      });
-      return;
-    }
-    creatingAiSupplementRef.current = true;
-    setCreatingAiSupplement(true);
-    setMessage("正在创建 AI 补充任务…");
-    try {
-      const job = await createManualAiSupplementJob(serviceId, admin);
-      setMessage(`AI 补充任务 ${job.id} 已进入队列，只处理媒体库现有未匹配内容，不会重新扫描网盘`);
-      await resource.refresh();
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : "创建 AI 补充任务失败";
-      console.warn("codex-flycloud-helper-ai-clean", {
-        事件: "服务详情创建未识别内容AI补充任务失败",
-        服务ID: serviceId,
-        错误信息: errorMessage,
-      });
-      setMessage(errorMessage);
-    } finally {
-      creatingAiSupplementRef.current = false;
-      setCreatingAiSupplement(false);
-    }
-  }
-
-  /** 在单个路径选择 Dialog 确认时立即保存全量或增量扫描目录。 */
-  async function saveScanPaths(mode: "incremental" | "full", selectedRoots: ProviderDirectory[]): Promise<void> {
-    const nextFullScanRoots = mode === "full" ? selectedRoots : fullScanRoots;
-    const nextIncrementalScanRoots = mode === "incremental" ? selectedRoots : incrementalScanRoots;
-    const nextProfile = {
-      ...activeService.scanProfile,
-      roots: undefined,
-      fullRoots: nextFullScanRoots,
-      incrementalRoots: nextIncrementalScanRoots,
-      mediaTypes: [activeService.dataType],
-    };
-    setMessage(`正在验证并保存${mode === "full" ? "全量" : "增量"}扫描目录…`);
-    try {
-      await updateServiceScanProfile(serviceId, nextProfile, admin, "paths");
-      setFullScanRoots(nextFullScanRoots);
-      setIncrementalScanRoots(nextIncrementalScanRoots);
-      setMessage(`扫描路径已保存：全量 ${nextFullScanRoots.length} 条，增量 ${nextIncrementalScanRoots.length} 条`);
-      await resource.refresh();
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : "扫描路径保存失败";
-      setMessage(errorMessage);
-      throw error;
-    }
-  }
-
-  /** 保存服务级目录扫描和元数据刮削并发。 */
-  async function saveScanConcurrency(event: FormEvent<HTMLFormElement>): Promise<void> {
-    event.preventDefault();
-    const nextProfile = {
-      ...activeService.scanProfile,
-      scanDirectoryConcurrency: scanConcurrencySettings.scanDirectoryConcurrency,
-      scrapeTaskConcurrency: scanConcurrencySettings.scrapeTaskConcurrency,
-      ...(activeService.dataType === "music" ? { musicFileConcurrency: scanConcurrencySettings.musicFileConcurrency } : {}),
-    };
-    setMessage("正在保存扫描与刮削任务并发…");
-    try {
-      await updateServiceScanProfile(serviceId, nextProfile, admin);
-      setMessage(`任务并发已保存：目录 ${scanConcurrencySettings.scanDirectoryConcurrency}${activeService.dataType === "music" ? `，文件 ${scanConcurrencySettings.musicFileConcurrency}` : ""}，${activeService.dataType === "music" ? "在线" : "刮削"} ${scanConcurrencySettings.scrapeTaskConcurrency}`);
-      await resource.refresh();
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "任务并发保存失败");
-    }
-  }
-
-  /** 打开元数据配置 Dialog，并从服务端详情重新建立本次编辑草稿。 */
-  function openMetadataDialog(): void {
-    setMetadataSettings(activeService.dataType === "music"
-      ? readMusicMetadataSettings(activeService.metadataProfile)
-      : readVideoMetadataSettings(activeService.metadataProfile));
-    setMessage(null);
-    setMetadataDialogOpen(true);
-  }
-
-  /** 放弃本次未保存的元数据修改并关闭 Dialog。 */
-  function closeMetadataDialog(): void {
-    if (savingMetadata) return;
-    setMetadataSettings(activeService.dataType === "music"
-      ? readMusicMetadataSettings(activeService.metadataProfile)
-      : readVideoMetadataSettings(activeService.metadataProfile));
-    setMetadataDialogOpen(false);
-  }
-
-  /** 保存当前服务类型对应的元数据来源与刮削配置。 */
-  async function saveMetadataProfile(event: FormEvent<HTMLFormElement>): Promise<void> {
-    event.preventDefault();
-    if (savingMetadata) return;
-    setSavingMetadata(true);
-    setMessage("正在保存元数据配置…");
-    try {
-      const profile = activeService.dataType === "music"
-        ? buildMusicMetadataProfile(activeService.metadataProfile, metadataSettings)
-        : buildVideoMetadataProfile(activeService.metadataProfile, metadataSettings);
-      await updateServiceMetadataProfile(serviceId, profile, admin);
-      setMessage(activeService.dataType === "music"
-        ? "音乐元数据配置已保存，之后的扫描会读取内嵌标签并按所选来源补全"
-        : "元数据配置已保存，规格开关只影响之后执行的扫描刮削任务");
-      await resource.refresh();
-      setMetadataDialogOpen(false);
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : "元数据配置保存失败";
-      console.warn("codex-metadata-profile-form", {
-        事件: "保存元数据配置失败",
-        服务ID: serviceId,
-        元数据来源: metadataSettings.providerId,
-        语言: metadataSettings.language,
-        地区: metadataSettings.region,
-        使用本地NFO: metadataSettings.useNfo,
-        同步刮削详情: metadataSettings.syncDetails,
-        分析媒体规格: metadataSettings.analyzeMediaSpecs,
-        启用AI清洗: metadataSettings.aiCleaning.enabled,
-        AI模型ID: metadataSettings.aiCleaning.modelId || "无",
-        AI触发策略: metadataSettings.aiCleaning.triggerMode,
-        错误信息: errorMessage,
-      });
-      setMessage(errorMessage);
-    } finally {
-      setSavingMetadata(false);
-    }
-  }
-
-  /** 手动为当前服务已有但缺少规格的视频创建独立后台任务。 */
-  async function backfillMediaSpecs(): Promise<void> {
-    if (backfillingMediaSpecsRef.current) return;
-    backfillingMediaSpecsRef.current = true;
-    setBackfillingMediaSpecs(true);
-    setMessage("正在检查已有视频的规格缺失情况…");
-    try {
-      const result = await backfillExistingMediaProbes(serviceId, admin);
-      setMessage(result.job
-        ? result.job.errorCode === "provider_authentication_failed"
-          ? `已创建视频规格后台任务，共 ${result.queuedCount.toLocaleString()} 个待分析视频；当前等待 APP 同步有效登录信息`
-          : `已创建视频规格后台任务，共 ${result.queuedCount.toLocaleString()} 个待分析视频`
-        : "已有视频均已具备规格，或已在其他后台任务中等待分析");
-      await resource.refresh();
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : "创建视频规格后台任务失败";
-      console.warn("codex-media-ffprobe-backfill", {
-        事件: "触发已有视频规格分析失败",
-        服务ID: serviceId,
-        错误信息: errorMessage,
-      });
-      setMessage(errorMessage);
-    } finally {
-      backfillingMediaSpecsRef.current = false;
-      setBackfillingMediaSpecs(false);
-    }
-  }
-
-  /** 在页面顶部启用或停用当前服务，并拦截重复点击。 */
-  async function toggleStatus(): Promise<void> {
-    if (updatingStatusRef.current) return;
-    updatingStatusRef.current = true;
-    setUpdatingStatus(true);
-    try {
-      await updateServiceStatus(serviceId, activeService.status === "disabled" ? "active" : "disabled", admin);
-      await resource.refresh();
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "服务状态修改失败");
-    } finally {
-      updatingStatusRef.current = false;
-      setUpdatingStatus(false);
-    }
-  }
-
-  /** 立即保存当前服务的任务完成通知开关，并阻止快速重复提交。 */
-  async function toggleNotification(): Promise<void> {
-    if (updatingNotificationRef.current) return;
-    updatingNotificationRef.current = true;
-    setUpdatingNotification(true);
-    const nextEnabled = !activeService.notificationEnabled;
-    setMessage(nextEnabled ? "正在启用任务完成通知…" : "正在关闭任务完成通知…");
-    try {
-      await updateServiceNotificationSettings(serviceId, nextEnabled, admin);
-      setMessage(nextEnabled ? "任务完成通知已启用" : "任务完成通知已关闭");
-      await resource.refresh();
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : "任务完成通知设置失败";
-      console.warn("codex-flycloud-helper-service-notification", {
-        事件: "服务详情保存任务通知开关失败",
-        服务ID: serviceId,
-        是否启用任务通知: nextEnabled,
-        错误信息: errorMessage,
-      });
-      setMessage(errorMessage);
-    } finally {
-      updatingNotificationRef.current = false;
-      setUpdatingNotification(false);
-    }
-  }
-
-  /** 二次确认后删除当前云端服务，并返回对应的服务列表。 */
-  async function deleteCurrentService(): Promise<void> {
-    if (deletingServiceRef.current) {
-      console.warn("codex-flycloud-helper-service-delete", { 事件: "拦截重复删除请求", 服务ID: serviceId });
-      return;
-    }
-    const confirmed = window.confirm(
-      `确定删除“${activeService.displayName}”吗？云端服务、媒体库、扫描结果以及与 APP 的关联都会被移除，此操作无法在页面中撤销。`,
-    );
-    if (!confirmed) return;
-
-    deletingServiceRef.current = true;
-    setDeletingService(true);
-    setMessage("正在删除云端服务…");
-    console.info("codex-flycloud-helper-service-delete", {
-      事件: "开始删除云端服务",
-      服务ID: serviceId,
-      服务名称: activeService.displayName,
-      操作入口: admin ? "管理员服务详情" : "用户服务详情",
-    });
-    try {
-      await deleteCloudService(serviceId, admin);
-      console.info("codex-flycloud-helper-service-delete", {
-        事件: "删除云端服务成功",
-        服务ID: serviceId,
-        操作入口: admin ? "管理员服务详情" : "用户服务详情",
-      });
-      await navigate({ to: admin ? "/admin/services" : "/app/services", replace: true });
-    } catch (error) {
-      const errorMessage = error instanceof ApiClientError && error.code === "service_has_active_job"
-        ? "服务仍有未结束的后台任务，请先终止任务后再删除"
-        : error instanceof Error ? error.message : "删除云端服务失败";
-      console.warn("codex-flycloud-helper-service-delete", {
-        事件: "删除云端服务失败",
-        服务ID: serviceId,
-        错误码: error instanceof ApiClientError ? error.code : "service_delete_failed",
-        错误信息: errorMessage,
-      });
-      setMessage(errorMessage);
-    } finally {
-      deletingServiceRef.current = false;
-      setDeletingService(false);
-    }
-  }
-
-  const providerDescriptor = providers.data?.find((item) => item.type === service.providerType);
-  const recommendedScanSettings = providerDescriptor?.recommendedScanSettings;
-  // 关键变量：最近一条任务用于服务详情顶部状态卡片。
-  const recentJob = service.recentJobs[0];
-  // 关键变量：删除服务前必须先处理排队、运行、重试等待或暂停中的任务。
-  const hasUnfinishedJob = service.recentJobs.some((job) =>
-    job.status === "queued" || job.status === "running" || job.status === "retry_waiting" || job.status === "paused");
-  // 关键变量：详情页只展示元数据摘要，具体字段统一放进 Dialog 编辑。
-  const metadataSummaryItems: Array<{ label: string; value: string }> = service.dataType === "music"
-    ? [
-      { label: "元数据来源", value: getMetadataProviderLabel(metadataSettings.providerId) },
-      { label: "聚合方式", value: metadataSettings.providerId === "auto" ? metadataSettings.aggregateMode === "fast" ? "最快命中" : "完整聚合" : "指定来源" },
-      { label: "歌词补全", value: metadataSettings.providerId === "local" ? "不适用" : metadataSettings.syncLyrics ? "已开启" : "已关闭" },
-      { label: "内嵌标签", value: "优先读取" },
-    ]
-    : [
-      { label: "元数据来源", value: getMetadataProviderLabel(metadataSettings.providerId) },
-      { label: "语言与地区", value: `${getMetadataLanguageLabel(metadataSettings.language)} · ${getMetadataRegionLabel(metadataSettings.region)}` },
-      { label: "本地 NFO", value: metadataSettings.useNfo ? "优先使用" : "已忽略" },
-      {
-        label: "增强能力",
-        value: `已开启 ${[metadataSettings.syncDetails, metadataSettings.analyzeMediaSpecs, metadataSettings.aiCleaning.enabled].filter(Boolean).length} 项`,
-      },
-    ];
-
-  return (
-    <>
-      <PageHeader
-        title={service.displayName}
-        actions={(
-          <div className="flex flex-wrap items-center gap-2">
-            <ServiceStatePill service={service} />
-            <SecondaryButton disabled={updatingStatus || service.status === "scanning" || deletingService} onClick={() => void toggleStatus()}>
-              {updatingStatus ? "正在更新…" : service.status === "disabled" ? "启用服务" : "停用服务"}
-            </SecondaryButton>
-            <SecondaryButton disabled={fullScanRoots.length === 0 || creatingScanMode !== null || creatingAiSupplement || deletingService} title={fullScanRoots.length === 0 ? "请先配置全量扫描路径" : undefined} onClick={() => void trigger("full")}>{creatingScanMode === "full" ? "正在创建…" : "全量扫描"}</SecondaryButton>
-            <PrimaryButton disabled={incrementalScanRoots.length === 0 || creatingScanMode !== null || creatingAiSupplement || deletingService} title={incrementalScanRoots.length === 0 ? "请先配置增量扫描路径" : undefined} onClick={() => void trigger("incremental")}><ScanLine className="size-4" /> {creatingScanMode === "incremental" ? "正在创建…" : "增量扫描"}</PrimaryButton>
-            {service.dataType === "video" && <SecondaryButton disabled={!metadataSettings.aiCleaning.enabled || creatingScanMode !== null || creatingAiSupplement || deletingService} title={!metadataSettings.aiCleaning.enabled ? "请先启用 AI 目录文件清洗" : undefined} onClick={() => void triggerAiSupplement()}><Sparkles className="size-4" /> {creatingAiSupplement ? "正在创建…" : "AI补充未识别内容"}</SecondaryButton>}
-          </div>
-        )}
-      />
-      {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="媒体条目" value={service.itemCount.toLocaleString()} hint="当前已入库" />
-        <StatCard label="目录版本" value={`v${service.catalogVersion}`} hint={formatTime(service.lastScanAt)} tone="info" />
-        <StatCard label="最近后台任务" value={recentJob ? recentJob.status === "retry_waiting" && recentJob.jobType === "media_probe" ? "等待重试" : jobStatusLabels[recentJob.status] : "暂无"} hint={recentJob ? `${recentJob.jobType === "media_probe" ? "视频规格分析" : "扫描刮削"} · ${getJobStageLabel(recentJob.stage)}` : "尚无任务"} tone="warning" />
-        <StatCard
-          label="连接状态"
-          value={getServiceConnectionIssue(service)?.title ?? (service.credentialConfigured ? "已配置" : "未配置")}
-          hint={service.connectionAuthMode
-            ? guangyaLoginModeLabels[service.connectionAuthMode]
-            : service.credentialConfigured ? "Secret 已配置" : "Secret 未配置"}
-          tone={getServiceConnectionIssue(service) ? "warning" : "muted"}
-          action={<Link to={admin ? "/admin/services/$serviceId/connection" : "/app/services/$serviceId/connection"} params={{ serviceId }} className="inline-flex rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">连接管理</Link>}
-        />
-      </div>
-      <ServiceConnectionAlert service={service} admin={admin} />
-      <Panel title="配置修订与范围" className="mt-4">
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-          <div className="rounded-xl border border-border bg-secondary/40 p-4">
-            <p className="text-xs text-muted-foreground">配置修订</p>
-            <div className="mt-3 flex flex-wrap gap-2"><StatusPill>{dataTypeLabels[service.dataType]}</StatusPill><StatusPill>连接 r{service.credentialRevision}</StatusPill><StatusPill>扫描 r{service.scanProfileRevision}</StatusPill><StatusPill>元数据 r{service.metadataProfileRevision}</StatusPill></div>
-            <p className="mt-4 text-xs text-muted-foreground">全量路径 {fullScanRoots.length} 条 · 增量路径 {incrementalScanRoots.length} 条</p>
-          </div>
-          <div className="rounded-xl border border-border bg-secondary/40 p-4"><p className="text-xs text-muted-foreground">连接管理</p><p className="mt-2 text-sm">重连、重新授权或替换完整连接。</p><Link to={admin ? "/admin/services/$serviceId/connection" : "/app/services/$serviceId/connection"} params={{ serviceId }} className="mt-3 inline-flex items-center gap-1 text-xs text-primary-soft">打开连接管理 <Settings2 className="size-3.5" /></Link></div>
-          <div className="rounded-xl border border-border bg-secondary/40 p-4"><p className="text-xs text-muted-foreground">后台定时任务</p><p className="mt-2 text-sm">分别设置全量扫描、增量扫描和视频规格分析的间隔、每日、每周或每月计划。</p><Link to={admin ? "/admin/services/$serviceId/scan-schedules" : "/app/services/$serviceId/scan-schedules"} params={{ serviceId }} className="mt-3 inline-flex items-center gap-1 text-xs text-primary-soft">打开定时任务 <CalendarClock className="size-3.5" /></Link></div>
-          <div className="rounded-xl border border-border bg-secondary/40 p-4">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <p className="text-xs text-muted-foreground">任务通知</p>
-                <p className="mt-2 text-sm">后台任务完成后推送结果。</p>
-              </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={service.notificationEnabled}
-                aria-label="启用任务完成通知"
-                disabled={updatingNotification}
-                onClick={() => void toggleNotification()}
-                className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${service.notificationEnabled ? "border-foreground/30 bg-foreground" : "border-border bg-secondary"}`}
-              >
-                <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-background shadow-sm transition-transform ${service.notificationEnabled ? "translate-x-5" : "translate-x-0"}`} />
-              </button>
-            </div>
-            <p className="mt-3 text-xs leading-5 text-muted-foreground">
-              {service.notificationEnabled ? "已启用" : "已关闭"} · Telegram 渠道由系统设置统一管理
-            </p>
-          </div>
-        </div>
-      </Panel>
-      <div className="mt-4 grid gap-4 xl:grid-cols-2">
-        <Panel title="扫描路径" description="全量和增量任务分别选择网盘目录，不需要手动输入路径。">
-          <div key={service.scanProfileRevision} className="grid gap-4 2xl:grid-cols-2">
-            <ServicePathPicker serviceId={serviceId} admin={admin} label="全量扫描目录" value={fullScanRoots} onConfirm={(directories) => saveScanPaths("full", directories)} />
-            <ServicePathPicker serviceId={serviceId} admin={admin} label="增量扫描目录" value={incrementalScanRoots} onConfirm={(directories) => saveScanPaths("incremental", directories)} />
-            <p className="text-xs text-muted-foreground 2xl:col-span-2">在目录选择 Dialog 中点击“确定”会立即验证并保存对应扫描目录；未选择目录的扫描模式不能创建任务。</p>
-          </div>
-        </Panel>
-        <Panel title="扫描与刮削任务并发">
-          <form onSubmit={(event) => void saveScanConcurrency(event)} className="grid gap-4 md:grid-cols-2">
-            <label className="block">
-              <span className="text-xs text-muted-foreground">扫描任务数</span>
-              <input type="number" step="1" value={scanConcurrencySettings.scanDirectoryConcurrency} onChange={(event) => setScanConcurrencySettings((current) => ({ ...current, scanDirectoryConcurrency: Number(event.target.value) }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" />
-              <p className="mt-2 text-xs text-muted-foreground">全量和增量扫描都使用该任务数。{service.dataType === "music" ? `当前音乐目录并发上限 ${Math.min(8, Math.max(1, scanConcurrencySettings.scanDirectoryConcurrency || 4))}，受账号共享请求预算约束。` : `当前服务默认值为 ${recommendedScanSettings?.scanDirectoryConcurrency.default ?? 8}，不限制最大值。`}</p>
-            </label>
-            <label className="block">
-              <span className="text-xs text-muted-foreground">刮削任务数</span>
-              <input type="number" step="1" value={scanConcurrencySettings.scrapeTaskConcurrency} onChange={(event) => setScanConcurrencySettings((current) => ({ ...current, scrapeTaskConcurrency: Number(event.target.value) }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" />
-              <p className="mt-2 text-xs text-muted-foreground">{service.dataType === "music" ? `当前在线并发上限 ${Math.min(4, Math.max(1, scanConcurrencySettings.scrapeTaskConcurrency || 2))}，同实例最多并行 4 首，仍受平台限流约束。` : `当前服务默认值为 ${recommendedScanSettings?.scrapeTaskConcurrency.default ?? 4}，不限制最大值。TMDB 网络请求仍由可用 Key 容量独立调度。`}</p>
-            </label>
-            {service.dataType === "music" && <label className="block"><span className="text-xs text-muted-foreground">文件资料读取任务数</span>
-              <input type="number" min="1" step="1" value={scanConcurrencySettings.musicFileConcurrency} onChange={(event) => setScanConcurrencySettings((current) => ({ ...current, musicFileConcurrency: Number(event.target.value) }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" />
-              <p className="mt-2 text-xs text-muted-foreground">标签、内嵌和旁挂资料共用；实际生效 {Math.min(8, Math.max(1, scanConcurrencySettings.musicFileConcurrency || 4))} 个任务。目录实际最多 8 个、在线最多 4 个，网盘限流时继续降低。</p>
-            </label>}
-            <div className="flex justify-end md:col-span-2"><PrimaryButton type="submit">保存任务并发</PrimaryButton></div>
-          </form>
-        </Panel>
-      </div>
-      <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(240px,1fr)]">
-        <Panel title="元数据配置" description="点击任意卡片修改配置。">
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            {metadataSummaryItems.map((item) => (
-              <button
-                key={item.label}
-                type="button"
-                onClick={openMetadataDialog}
-                className="group flex min-w-0 items-center justify-between gap-3 rounded-lg border border-border bg-secondary/20 px-3.5 py-3 text-left transition-colors hover:bg-secondary/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                <span className="min-w-0 text-xs text-muted-foreground">{item.label}</span>
-                <span className="truncate text-sm font-semibold">{item.value}</span>
-              </button>
-            ))}
-          </div>
-        </Panel>
-        <Panel title="危险操作" description="删除服务及其媒体库。" className="self-start">
-          <button type="button" onClick={() => void deleteCurrentService()} disabled={hasUnfinishedJob || deletingService} title={hasUnfinishedJob ? "请先终止该服务未结束的后台任务" : undefined} className="inline-flex w-full cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive bg-destructive px-4 py-2.5 text-sm font-semibold text-destructive-foreground shadow-sm transition-colors hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {deletingService ? "正在删除…" : "删除服务"}</button>
-          {hasUnfinishedJob && <p className="mt-3 text-xs leading-5 text-warning">仍有未结束的后台任务，请先终止后再删除。</p>}
-        </Panel>
-      </div>
-      {metadataDialogOpen && createPortal(
-        <div className="fixed inset-0 z-[1000] grid place-items-center bg-black/65 p-3 backdrop-blur-sm sm:p-6" onMouseDown={(event) => { if (event.target === event.currentTarget) closeMetadataDialog(); }}>
-          <section role="dialog" aria-modal="true" aria-label="元数据配置" className="relative flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-border bg-background shadow-2xl">
-            <header className="flex items-start justify-between gap-4 border-b border-border px-4 py-3.5 sm:px-5">
-              <div>
-                <h2 className="text-lg font-semibold">元数据配置</h2>
-                <p className="mt-1 text-xs text-muted-foreground">{service.dataType === "music" ? "设置音乐标签读取与在线补全方式。" : "设置影视刮削来源和附加处理能力。"}</p>
-              </div>
-              <button type="button" aria-label="关闭元数据配置" onClick={closeMetadataDialog} disabled={savingMetadata} className="grid size-9 shrink-0 place-items-center rounded-lg border border-border text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"><X className="size-4" /></button>
-            </header>
-            <form onSubmit={(event) => void saveMetadataProfile(event)} className="flex min-h-0 flex-1 flex-col">
-              <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4 [scrollbar-gutter:stable] sm:p-5">
-                {message && <p className="rounded-lg bg-secondary/45 px-3 py-2.5 text-xs text-muted-foreground">{message}</p>}
-            {service.dataType === "music" ? (
-              <>
-                <div className="grid gap-3 sm:grid-cols-2">
-                <label className={metadataSettings.providerId === "auto" ? "block" : "block sm:col-span-2"}>
-                  <span className="text-xs text-muted-foreground">音乐元数据来源</span>
-                  <select value={metadataSettings.providerId} onChange={(event) => setMetadataSettings((current) => ({ ...current, providerId: event.target.value }))} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm">
-                    <option value="auto">多平台自动补全</option>
-                    <option value="musicbrainz">MusicBrainz</option>
-                    <option value="netease">网易云音乐</option>
-                    <option value="qmusic">QQ音乐</option>
-                    <option value="kugou">酷狗音乐</option>
-                    <option value="migu">咪咕音乐</option>
-                    <option value="kuwo">酷我音乐</option>
-                    <option value="local">仅使用内嵌标签和文件路径</option>
-                    {!['auto', 'musicbrainz', 'netease', 'qmusic', 'kugou', 'migu', 'kuwo', 'local'].includes(metadataSettings.providerId) && <option value={metadataSettings.providerId}>{getMetadataProviderLabel(metadataSettings.providerId)}</option>}
-                  </select>
-                </label>
-                {metadataSettings.providerId === "auto" && <label className="block">
-                  <span className="text-xs text-muted-foreground">自动聚合方式</span>
-                  <select value={metadataSettings.aggregateMode} onChange={(event) => setMetadataSettings((current) => ({ ...current, aggregateMode: event.target.value === "fast" ? "fast" : "complete" }))} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm">
-                    <option value="complete">完整聚合（等待全部平台）</option>
-                    <option value="fast">最快命中（首个完整结果）</option>
-                  </select>
-                </label>}
-                </div>
-                <div className="divide-y divide-border overflow-hidden rounded-xl border border-border">
-                {metadataSettings.providerId !== "local" && <div className="flex items-center justify-between gap-4 px-3.5 py-3">
-                  <div><p className="text-sm font-medium">同步歌词</p><p className="mt-0.5 text-xs text-muted-foreground">从 LRCLIB 补充普通歌词和逐行歌词。</p></div>
-                  <button type="button" role="switch" aria-checked={metadataSettings.syncLyrics} aria-label="同步歌词" onClick={() => setMetadataSettings((current) => ({ ...current, syncLyrics: !current.syncLyrics }))} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${metadataSettings.syncLyrics ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
-                    <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${metadataSettings.syncLyrics ? "translate-x-5" : "translate-x-0"}`} />
-                  </button>
-                </div>}
-                <div className="px-3.5 py-3">
-                  <p className="text-sm font-medium">内嵌标签读取</p>
-                  <p className="mt-0.5 text-xs leading-5 text-muted-foreground">优先读取音频标签和封面，缺少的信息再由所选平台补全。</p>
-                </div>
-                </div>
-              </>
-            ) : (
-              <>
-            <div className="grid gap-3 sm:grid-cols-3">
-            <label className="block sm:col-span-3">
-              <span className="text-xs text-muted-foreground">元数据来源</span>
-              <select value={metadataSettings.providerId} onChange={(event) => setMetadataSettings((current) => ({ ...current, providerId: event.target.value }))} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm">
-                <option value="builtin.tmdb">TMDB 在线刮削</option>
-                <option value="local">仅使用本地 NFO 和文件名</option>
-                {metadataSettings.providerId !== "builtin.tmdb" && metadataSettings.providerId !== "local" && <option value={metadataSettings.providerId}>{getMetadataProviderLabel(metadataSettings.providerId)}</option>}
-              </select>
-            </label>
-              <label className="block">
-                <span className="text-xs text-muted-foreground">元数据语言</span>
-                <select value={metadataSettings.language} onChange={(event) => setMetadataSettings((current) => ({ ...current, language: event.target.value }))} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm">
-                  <option value="zh-CN">简体中文</option>
-                  <option value="zh-TW">繁体中文</option>
-                  <option value="en-US">英语</option>
-                  <option value="ja-JP">日语</option>
-                  <option value="ko-KR">韩语</option>
-                  {!(["zh-CN", "zh-TW", "en-US", "ja-JP", "ko-KR"] as string[]).includes(metadataSettings.language) && <option value={metadataSettings.language}>现有语言（{metadataSettings.language}）</option>}
-                </select>
-              </label>
-              <label className="block">
-                <span className="text-xs text-muted-foreground">内容地区</span>
-                <select value={metadataSettings.region} onChange={(event) => setMetadataSettings((current) => ({ ...current, region: event.target.value }))} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm">
-                  <option value="CN">中国大陆</option>
-                  <option value="HK">中国香港</option>
-                  <option value="TW">中国台湾</option>
-                  <option value="US">美国</option>
-                  <option value="JP">日本</option>
-                  <option value="KR">韩国</option>
-                  {!(["CN", "HK", "TW", "US", "JP", "KR"] as string[]).includes(metadataSettings.region) && <option value={metadataSettings.region}>现有地区（{metadataSettings.region}）</option>}
-                </select>
-              </label>
-            </div>
-            <div className="divide-y divide-border overflow-hidden rounded-xl border border-border">
-              <div className="flex items-center justify-between gap-4 px-3.5 py-3">
-                <div><p className="text-sm font-medium">使用本地 NFO</p><p className="mt-0.5 text-xs text-muted-foreground">{metadataSettings.useNfo ? "优先读取同目录 NFO。" : "直接使用所选元数据来源。"}</p></div>
-                <button type="button" role="switch" aria-checked={metadataSettings.useNfo} aria-label="使用本地 NFO" onClick={() => setMetadataSettings((current) => ({ ...current, useNfo: !current.useNfo }))} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${metadataSettings.useNfo ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
-                  <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${metadataSettings.useNfo ? "translate-x-5" : "translate-x-0"}`} />
-                </button>
-              </div>
-              <div className="flex items-center justify-between gap-4 px-3.5 py-3">
-                <div><p className="text-sm font-medium">同步刮削详情</p><p className="mt-0.5 text-xs text-muted-foreground">{metadataSettings.syncDetails ? "扫描时同步详情和演职人员。" : "打开详情时再实时查询。"}</p></div>
-                <button type="button" role="switch" aria-checked={metadataSettings.syncDetails} aria-label="同步刮削详情" onClick={() => setMetadataSettings((current) => ({ ...current, syncDetails: !current.syncDetails }))} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${metadataSettings.syncDetails ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
-                  <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${metadataSettings.syncDetails ? "translate-x-5" : "translate-x-0"}`} />
-                </button>
-              </div>
-              <div className="px-3.5 py-3">
-              <div className="flex items-center justify-between gap-4">
-                <div><p className="text-sm font-medium">读取视频规格</p><p className="mt-0.5 text-xs text-muted-foreground">{metadataSettings.analyzeMediaSpecs ? "扫描时读取时长、编码、分辨率和音轨。" : "扫描时不自动读取视频规格。"}</p></div>
-                <button type="button" role="switch" aria-checked={metadataSettings.analyzeMediaSpecs} aria-label="分析视频规格" onClick={() => setMetadataSettings((current) => ({ ...current, analyzeMediaSpecs: !current.analyzeMediaSpecs }))} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${metadataSettings.analyzeMediaSpecs ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
-                  <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${metadataSettings.analyzeMediaSpecs ? "translate-x-5" : "translate-x-0"}`} />
-                </button>
-              </div>
-              <div className="mt-2 flex justify-end">
-                <SecondaryButton type="button" onClick={() => void backfillMediaSpecs()} disabled={backfillingMediaSpecs}>
-                  <ScanLine className="size-4" /> {backfillingMediaSpecs ? "正在创建任务…" : "分析已有缺失规格视频"}
-                </SecondaryButton>
-              </div>
-              </div>
-            </div>
-            <AiCleaningSettingsFields state={{
-              value: metadataSettings.aiCleaning,
-              models: availableAiModels.data?.items ?? [],
-              loading: availableAiModels.loading,
-              onChange: (aiCleaning) => setMetadataSettings((current) => ({ ...current, aiCleaning })),
-            }} />
-              </>
-            )}
-              </div>
-              <footer className="flex items-center justify-between gap-4 border-t border-border px-4 py-3.5 sm:px-5">
-                <SecondaryButton type="button" onClick={closeMetadataDialog} disabled={savingMetadata}>取消</SecondaryButton>
-                <PrimaryButton type="submit" disabled={savingMetadata}>{savingMetadata ? "正在保存…" : "保存元数据配置"}</PrimaryButton>
-              </footer>
-            </form>
-          </section>
-        </div>,
-        document.body,
-      )}
-    </>
-  );
-}
-
 export function AdminServiceCreatePage() { return <ServiceCreatePage admin />; }
-export function UserServiceDetailPage({ serviceId }: { serviceId: string }) { return <ServiceDetailPage serviceId={serviceId} />; }
-export function AdminServiceDetailPage({ serviceId }: { serviceId: string }) { return <ServiceDetailPage serviceId={serviceId} admin />; }
 export function UserServiceConnectionPage({ serviceId }: { serviceId: string }) { return <ServiceConnectionPage serviceId={serviceId} />; }
 export function AdminServiceConnectionPage({ serviceId }: { serviceId: string }) { return <ServiceConnectionPage serviceId={serviceId} admin />; }

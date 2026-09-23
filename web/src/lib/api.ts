@@ -147,7 +147,6 @@ export type CatalogSort = "created_desc" | "year_desc" | "premiere_date_desc" | 
 export type MatchState = "matched" | "needs_review" | "unmatched" | "processing";
 export type ServiceStatus = "active" | "scanning" | "disabled" | "reauthorization_required";
 export type JobStatus = "queued" | "running" | "retry_waiting" | "paused" | "completed" | "failed" | "cancelled";
-export type LibrarySnapshotStatus = "queued" | "running" | "completed" | "failed";
 export type ScanScheduleType = "interval" | "daily" | "weekly" | "monthly";
 
 export interface OverviewResult {
@@ -279,19 +278,19 @@ export interface CloudService {
   id: string;
   userId: string;
   ownerUsername: string;
-  libraryId: string;
   displayName: string;
   providerType: string;
-  dataType: MediaType;
   status: ServiceStatus;
   connectionStatus: string;
-  /** 光鸭服务的登录类型；列表接口不返回任何授权凭据。 */
   connectionAuthMode?: "official_api" | "web_qr" | "web_sms" | null;
+  credentialRevision: number;
+  canCreateLibrary: boolean;
+  /** 旧页面编译期兼容字段；服务接口不再返回这些媒体库数据。 */
+  libraryId: string;
+  dataType: MediaType;
   relayPlaybackEnabled: boolean;
-  /** 是否把当前服务的后台任务结果投递到 Telegram 等外部通知渠道。 */
   notificationEnabled: boolean;
   jellyfinEnabled: boolean;
-  credentialRevision: number;
   scanProfileRevision: number;
   metadataProfileRevision: number;
   catalogVersion: number;
@@ -301,83 +300,36 @@ export interface CloudService {
   updatedAt: string;
 }
 
-export type AggregateProtocol = "jellyfin" | "emby";
-export type AggregateServiceStatus = "draft" | "building" | "active" | "failed" | "disabled";
-
-/** 聚合服务中的一个影视来源。 */
-export interface AggregateServiceMember {
-  id: string;
-  serviceId: string;
-  libraryId: string;
-  displayName: string;
-  providerType: string;
-  status: string;
-  priority: number;
-  enabled: boolean;
-  itemCount: number;
-  catalogVersion: number;
-  lastCatalogVersion: number;
-}
-
-/** 一个仅对外提供 Jellyfin 或 Emby 其中一种协议的聚合服务。 */
-export interface AggregateService {
+/** 媒体库及本次唯一来源服务的摘要。 */
+export interface MediaLibrary {
   id: string;
   userId: string;
+  ownerUsername: string;
   displayName: string;
-  protocol: AggregateProtocol;
-  pathSuffix: string;
-  path: string;
-  status: AggregateServiceStatus;
+  dataType: MediaType;
+  status: "active" | "disabled";
+  sourceId: string;
+  sourceServiceId: string;
+  sourceServiceName: string;
+  providerType: string;
+  sourceConnectionStatus: string;
+  notificationEnabled: boolean;
+  jellyfinEnabled: boolean;
+  embyEnabled: boolean;
+  navidromeEnabled: boolean;
+  scanProfileRevision: number;
+  metadataProfileRevision: number;
   catalogVersion: number;
   itemCount: number;
-  relayPlaybackEnabled: boolean;
-  downloadEnabled: boolean;
-  regionLibrariesEnabled: boolean;
+  lastScanAt: string | null;
   createdAt: string;
   updatedAt: string;
-  members: AggregateServiceMember[];
-  latestIndexJob: {
-    id: string;
-    status: string;
-    processedCount: number;
-    totalCount: number;
-    errorCode: string | null;
-    errorMessage: string | null;
-    createdAt: string;
-    startedAt: string | null;
-    finishedAt: string | null;
-  } | null;
 }
 
-export interface CreateAggregateServiceInput {
-  displayName: string;
-  protocol: AggregateProtocol;
-  pathSuffix: string;
-  serviceIds: string[];
-  relayPlaybackEnabled?: boolean;
-  downloadEnabled?: boolean;
-  regionLibrariesEnabled?: boolean;
-}
-
-export interface UpdateAggregateServiceInput {
-  displayName: string;
-  pathSuffix: string;
-  serviceIds: string[];
-  relayPlaybackEnabled: boolean;
-  downloadEnabled: boolean;
-  regionLibrariesEnabled: boolean;
-}
-
-/** 聚合 Jellyfin 或 Emby 地址下的独立访问账号。 */
-export interface AggregateAccessAccount {
-  id: string;
-  aggregateServiceId: string;
-  username: string;
-  hasPassword: boolean;
-  credentialRevision: number;
-  status: "active" | "disabled";
-  createdAt: string;
-  updatedAt: string;
+export interface LibraryDetailResult {
+  library: MediaLibrary;
+  scanProfile: Record<string, unknown>;
+  metadataProfile: Record<string, unknown>;
 }
 
 /** 管理端全部服务和全部媒体库共用的服务摘要筛选条件。 */
@@ -393,19 +345,22 @@ export interface ServiceListFilters {
 /** 创建云端服务时由 Web 端提交的完整配置。 */
 export interface CreateCloudServiceInput {
   displayName: string;
-  dataType: MediaType;
-  provider: {
-    type: string;
-    connection: Record<string, string>;
-  };
-  scan: Record<string, unknown>;
-  metadata: Record<string, unknown>;
+  provider: { type: string; connection: Record<string, string> };
   userId?: string;
 }
 
+export interface CreateMediaLibraryInput {
+  displayName: string;
+  dataType: MediaType;
+  sourceServiceId: string;
+  scan: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+}
+
+
 export interface ServiceAccessAccount {
   id: string;
-  serviceId: string;
+  libraryId: string;
   username: string;
   hasPassword: boolean;
   /** 旧密码账号可能需要重新设置一次密码，才能使用 Subsonic token+salt 登录。 */
@@ -418,7 +373,6 @@ export interface ServiceAccessAccount {
 
 export interface ServiceAccessSettings {
   relayPlaybackSupported: boolean;
-  appRelayPlaybackEnabled: boolean;
   jellyfinRelayPlaybackEnabled: boolean;
   /** Jellyfin 客户端是否允许下载原始影片文件。 */
   jellyfinDownloadEnabled: boolean;
@@ -452,10 +406,12 @@ export interface ServiceAccessSettings {
   accounts: ServiceAccessAccount[];
 }
 
-export interface CreateCloudServiceResult {
-  service: ServiceDetail;
-  serviceAccessCredentials: { username: string; password: string };
+export interface CreateCloudServiceResult { service: ServiceDetail; }
+export interface CreateMediaLibraryResult {
+  library: MediaLibrary;
+  accessCredentials: { account: ServiceAccessAccount; password: string };
 }
+
 
 export interface ScanJob {
   id: string;
@@ -525,11 +481,11 @@ export interface JobAiSupplementResult {
   items: AiSupplementRecord[];
 }
 
-/** 服务级扫描或视频规格分析定时任务。 */
+/** 媒体库级扫描或视频规格分析定时任务。 */
 export interface ScanSchedule {
   id: string;
   userId: string;
-  serviceId: string;
+  libraryId: string;
   scanMode: "incremental" | "full" | "media_probe";
   enabled: boolean;
   scheduleType: ScanScheduleType;
@@ -570,41 +526,15 @@ export interface MediaProbeFailure {
   errorMessage: string;
 }
 
-/** 网页服务详情展示的云端媒体库快照任务。 */
-export interface LibrarySnapshotExport {
-  id: string;
-  userId: string;
-  libraryId: string;
-  exportType: "snapshot";
-  status: LibrarySnapshotStatus;
-  stage: string;
-  progressPercent: number;
-  processedCount: number;
-  totalCount: number;
-  catalogVersion: number;
-  formatVersion: number;
-  fileSize: number | null;
-  errorMessage: string | null;
-  createdAt: string;
-  updatedAt: string;
-  completedAt: string | null;
-}
-
 export interface ServiceDetail extends CloudService {
-  /** 光鸭服务当前使用的登录类型；其他 Provider 为 null。 */
   connectionAuthMode: "official_api" | "web_qr" | "web_sms" | null;
+  credentialConfigured: boolean;
   scanProfile: Record<string, unknown>;
   metadataProfile: Record<string, unknown>;
-  credentialConfigured: boolean;
-  bindings: Array<{
-    bindingId: string;
-    clientDeviceId: string;
-    clientServiceId: string;
-    providerType: string;
-    updatedAt: string;
-  }>;
+  bindings: Array<{ bindingId: string; clientDeviceId: string; clientServiceId: string; providerType: string; updatedAt: string }>;
   recentJobs: ScanJob[];
 }
+
 
 export interface MediaItem {
   id: string;
@@ -843,92 +773,6 @@ export function listServices(
   }));
 }
 
-/** 读取当前账号已创建的全部单协议聚合服务。 */
-export async function listAggregateServices(): Promise<AggregateService[]> {
-  return (await requestJson<{ items: AggregateService[] }>("/api/v1/aggregate-services")).items;
-}
-
-/** 创建一个由多个影视来源组成的 Jellyfin 或 Emby 聚合服务。 */
-export async function createAggregateService(input: CreateAggregateServiceInput): Promise<AggregateService> {
-  const result = await requestJson<{ aggregateService: AggregateService }>("/api/v1/aggregate-services", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-  return result.aggregateService;
-}
-
-/** 读取一个聚合服务及其来源服务详情。 */
-export async function getAggregateService(aggregateServiceId: string): Promise<AggregateService> {
-  const result = await requestJson<{ aggregateService: AggregateService }>(
-    `/api/v1/aggregate-services/${aggregateServiceId}`,
-  );
-  return result.aggregateService;
-}
-
-/** 修改聚合服务名称、地址、来源成员和协议配置。 */
-export async function updateAggregateService(
-  aggregateServiceId: string,
-  input: UpdateAggregateServiceInput,
-): Promise<AggregateService> {
-  const result = await requestJson<{ aggregateService: AggregateService }>(
-    `/api/v1/aggregate-services/${aggregateServiceId}`,
-    { method: "PATCH", body: JSON.stringify(input) },
-  );
-  return result.aggregateService;
-}
-
-/** 手动重新构建聚合服务目录索引。 */
-export async function rebuildAggregateService(aggregateServiceId: string): Promise<AggregateService> {
-  const result = await requestJson<{ aggregateService: AggregateService; indexJobId: string }>(
-    `/api/v1/aggregate-services/${aggregateServiceId}/rebuild`,
-    { method: "POST", body: JSON.stringify({}) },
-  );
-  return result.aggregateService;
-}
-
-/** 删除聚合服务及其独立账号、索引和观看状态，不删除来源服务。 */
-export async function deleteAggregateService(aggregateServiceId: string): Promise<void> {
-  await requestJson<void>(`/api/v1/aggregate-services/${aggregateServiceId}`, { method: "DELETE" });
-}
-
-/** 读取同一聚合地址下的全部独立账号。 */
-export async function listAggregateAccessAccounts(aggregateServiceId: string): Promise<AggregateAccessAccount[]> {
-  const result = await requestJson<{ accounts: AggregateAccessAccount[] }>(
-    `/api/v1/aggregate-services/${aggregateServiceId}/accounts`,
-  );
-  return result.accounts;
-}
-
-/** 为一个聚合地址创建额外的独立账号。 */
-export async function createAggregateAccessAccount(
-  aggregateServiceId: string,
-  input: { username: string; password: string },
-): Promise<AggregateAccessAccount> {
-  const result = await requestJson<{ account: AggregateAccessAccount }>(
-    `/api/v1/aggregate-services/${aggregateServiceId}/accounts`,
-    { method: "POST", body: JSON.stringify(input) },
-  );
-  return result.account;
-}
-
-/** 修改聚合访问账号的凭据或启用状态。 */
-export async function updateAggregateAccessAccount(
-  aggregateServiceId: string,
-  accountId: string,
-  input: { username?: string; password?: string; status?: "active" | "disabled" },
-): Promise<AggregateAccessAccount> {
-  const result = await requestJson<{ account: AggregateAccessAccount }>(
-    `/api/v1/aggregate-services/${aggregateServiceId}/accounts/${accountId}`,
-    { method: "PATCH", body: JSON.stringify(input) },
-  );
-  return result.account;
-}
-
-/** 删除聚合服务的一个额外账号。 */
-export async function deleteAggregateAccessAccount(aggregateServiceId: string, accountId: string): Promise<void> {
-  await requestJson<void>(`/api/v1/aggregate-services/${aggregateServiceId}/accounts/${accountId}`, { method: "DELETE" });
-}
-
 /** 读取用户或管理端服务详情。 */
 export async function getService(serviceId: string, admin = false): Promise<ServiceDetail> {
   const result = await requestJson<{ service: ServiceDetail }>(
@@ -937,38 +781,74 @@ export async function getService(serviceId: string, admin = false): Promise<Serv
   return result.service;
 }
 
-/** 读取当前服务最近的云端快照任务，管理员接口自动使用服务所属用户。 */
-export async function listServiceSnapshots(
-  serviceId: string,
-  libraryId: string,
-  admin = false,
-): Promise<LibrarySnapshotExport[]> {
-  const path = admin
-    ? `/api/v1/admin/services/${serviceId}/exports?limit=20`
-    : `/api/v1/libraries/${libraryId}/exports?limit=20`;
-  return (await requestJson<{ exports: LibrarySnapshotExport[] }>(path)).exports;
+/** 读取媒体库列表。 */
+export function listLibraries(admin = false, filters: ServiceListFilters = {}): Promise<{ items: MediaLibrary[]; total: number }> {
+  return requestJson(withQuery(admin ? "/api/v1/admin/libraries" : "/api/v1/libraries", {
+    search: filters.search,
+    userId: admin ? filters.userId : undefined,
+    dataType: filters.dataType,
+    status: filters.status === "active" || filters.status === "disabled" ? filters.status : undefined,
+    limit: 200,
+  }));
 }
 
-/** 从用户端或管理端网页创建当前服务的云端快照后台任务。 */
-export async function createServiceSnapshot(
-  serviceId: string,
-  libraryId: string,
-  admin = false,
-): Promise<LibrarySnapshotExport> {
-  const path = admin
-    ? `/api/v1/admin/services/${serviceId}/exports`
-    : `/api/v1/libraries/${libraryId}/exports`;
-  return (await requestJson<{ export: LibrarySnapshotExport }>(path, {
-    method: "POST",
-    body: JSON.stringify({ exportType: "snapshot" }),
-  })).export;
+/** 读取单个媒体库及其当前配置。 */
+export function getLibrary(libraryId: string, admin = false): Promise<LibraryDetailResult> {
+  return requestJson(admin ? `/api/v1/admin/libraries/${libraryId}` : `/api/v1/libraries/${libraryId}`);
 }
 
-/** 二次确认后删除已完成或失败的云端快照。 */
-export async function deleteLibrarySnapshot(exportId: string, admin = false): Promise<void> {
-  await requestJson<void>(admin ? `/api/v1/admin/exports/${exportId}` : `/api/v1/exports/${exportId}`, {
+/** 从一个尚未关联的网盘服务创建媒体库。 */
+export function createLibrary(input: CreateMediaLibraryInput): Promise<CreateMediaLibraryResult> {
+  return requestJson("/api/v1/libraries", { method: "POST", body: JSON.stringify(input) });
+}
+
+/** 保存媒体库扫描配置，并返回服务端最终媒体库摘要。 */
+export async function updateLibraryScanProfile(
+  libraryId: string,
+  scan: Record<string, unknown>,
+  admin = false,
+  updateScope: "paths" | "profile" = "profile",
+): Promise<MediaLibrary> {
+  const result = await requestJson<{ library: MediaLibrary }>(
+    admin ? `/api/v1/admin/libraries/${libraryId}/scan-profile` : `/api/v1/libraries/${libraryId}/scan-profile`,
+    { method: "PUT", body: JSON.stringify({ scan, updateScope }) },
+  );
+  return result.library;
+}
+
+/** 保存媒体库元数据配置，并返回服务端最终媒体库摘要。 */
+export async function updateLibraryMetadataProfile(
+  libraryId: string,
+  metadata: Record<string, unknown>,
+  admin = false,
+): Promise<MediaLibrary> {
+  const result = await requestJson<{ library: MediaLibrary }>(
+    admin ? `/api/v1/admin/libraries/${libraryId}/metadata-profile` : `/api/v1/libraries/${libraryId}/metadata-profile`,
+    { method: "PUT", body: JSON.stringify({ metadata }) },
+  );
+  return result.library;
+}
+
+/** 保存媒体库任务完成通知开关。 */
+export async function updateLibraryNotificationSettings(
+  libraryId: string,
+  notificationEnabled: boolean,
+  admin = false,
+): Promise<MediaLibrary> {
+  const result = await requestJson<{ library: MediaLibrary }>(
+    admin
+      ? `/api/v1/admin/libraries/${libraryId}/notification-settings`
+      : `/api/v1/libraries/${libraryId}/notification-settings`,
+    { method: "PATCH", body: JSON.stringify({ notificationEnabled }) },
+  );
+  return result.library;
+}
+
+/** 删除媒体库并保留来源网盘服务。 */
+export function deleteLibrary(libraryId: string, admin = false): Promise<void> {
+  return requestJson(admin ? `/api/v1/admin/libraries/${libraryId}` : `/api/v1/libraries/${libraryId}`, {
     method: "DELETE",
-    body: JSON.stringify({ confirmation: exportId }),
+    body: JSON.stringify({ confirmation: libraryId }),
   });
 }
 
@@ -1121,7 +1001,7 @@ export async function createService(
 /** 创建扫描任务；Web 控制台使用稳定设备标识和随机请求 ID。 */
 export async function createScanJob(serviceId: string, scanMode: "incremental" | "full", admin = false): Promise<ScanJob> {
   const result = await requestJson<{ job: ScanJob }>(
-    admin ? `/api/v1/admin/services/${serviceId}/scan-jobs` : `/api/v1/services/${serviceId}/scan-jobs`,
+    admin ? `/api/v1/admin/libraries/${serviceId}/scan-jobs` : `/api/v1/libraries/${serviceId}/scan-jobs`,
     {
       method: "POST",
       body: JSON.stringify({
@@ -1134,25 +1014,25 @@ export async function createScanJob(serviceId: string, scanMode: "incremental" |
   return result.job;
 }
 
-/** 读取服务的扫描和视频规格分析计划。 */
-export async function getServiceScanSchedules(serviceId: string, admin = false): Promise<ScanSchedule[]> {
+/** 读取媒体库的扫描和视频规格分析计划。 */
+export async function getLibraryScanSchedules(libraryId: string, admin = false): Promise<ScanSchedule[]> {
   const result = await requestJson<{ schedules: ScanSchedule[] }>(
-    admin ? `/api/v1/admin/services/${serviceId}/scan-schedules` : `/api/v1/services/${serviceId}/scan-schedules`,
+    admin ? `/api/v1/admin/libraries/${libraryId}/scan-schedules` : `/api/v1/libraries/${libraryId}/scan-schedules`,
   );
   return result.schedules;
 }
 
-/** 保存一种后台任务的定时计划。 */
-export async function updateServiceScanSchedule(
-  serviceId: string,
+/** 保存媒体库一种后台任务的定时计划。 */
+export async function updateLibraryScanSchedule(
+  libraryId: string,
   scanMode: "incremental" | "full" | "media_probe",
   input: UpdateScanScheduleInput,
   admin = false,
 ): Promise<ScanSchedule> {
   const result = await requestJson<{ schedule: ScanSchedule }>(
     admin
-      ? `/api/v1/admin/services/${serviceId}/scan-schedules/${scanMode}`
-      : `/api/v1/services/${serviceId}/scan-schedules/${scanMode}`,
+      ? `/api/v1/admin/libraries/${libraryId}/scan-schedules/${scanMode}`
+      : `/api/v1/libraries/${libraryId}/scan-schedules/${scanMode}`,
     { method: "PUT", body: JSON.stringify(input) },
   );
   return result.schedule;
@@ -1262,11 +1142,11 @@ export function getJobAiSupplements(jobId: string, admin = false): Promise<JobAi
 }
 
 /** 创建一次只读取媒体库未匹配记录、并强制刷新 AI 结果的后台任务。 */
-export async function createManualAiSupplementJob(serviceId: string, admin = false): Promise<ScanJob> {
+export async function createManualAiSupplementJob(libraryId: string, admin = false): Promise<ScanJob> {
   const result = await requestJson<{ job: ScanJob }>(
     admin
-      ? `/api/v1/admin/services/${encodeURIComponent(serviceId)}/ai-supplements/retry`
-      : `/api/v1/services/${encodeURIComponent(serviceId)}/ai-supplements/retry`,
+      ? `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/ai-supplements/retry`
+      : `/api/v1/libraries/${encodeURIComponent(libraryId)}/ai-supplements/retry`,
     {
       method: "POST",
       body: JSON.stringify({
@@ -1283,7 +1163,7 @@ export function clearServiceCatalog(
   serviceId: string,
   admin = false,
 ): Promise<{ mediaItemCount: number; sourceFileCount: number }> {
-  return requestJson(admin ? `/api/v1/admin/services/${serviceId}/catalog` : `/api/v1/services/${serviceId}/catalog`, {
+  return requestJson(admin ? `/api/v1/admin/libraries/${serviceId}/catalog` : `/api/v1/libraries/${serviceId}/catalog`, {
     method: "DELETE",
     body: JSON.stringify({ confirmation: serviceId }),
   });
@@ -1332,7 +1212,7 @@ export async function updateServiceScanProfile(
   updateScope: "paths" | "profile" = "profile",
 ): Promise<ServiceDetail> {
   const result = await requestJson<{ service: ServiceDetail }>(
-    admin ? `/api/v1/admin/services/${serviceId}/scan-profile` : `/api/v1/services/${serviceId}/scan-profile`,
+    admin ? `/api/v1/admin/libraries/${serviceId}/scan-profile` : `/api/v1/libraries/${serviceId}/scan-profile`,
     { method: "PUT", body: JSON.stringify({ scan, updateScope }) },
   );
   return result.service;
@@ -1345,7 +1225,7 @@ export async function updateServiceMetadataProfile(
   admin = false,
 ): Promise<ServiceDetail> {
   const result = await requestJson<{ service: ServiceDetail }>(
-    admin ? `/api/v1/admin/services/${serviceId}/metadata-profile` : `/api/v1/services/${serviceId}/metadata-profile`,
+    admin ? `/api/v1/admin/libraries/${serviceId}/metadata-profile` : `/api/v1/libraries/${serviceId}/metadata-profile`,
     { method: "PUT", body: JSON.stringify({ metadata }) },
   );
   return result.service;
@@ -1358,8 +1238,8 @@ export function backfillExistingMediaProbes(
 ): Promise<{ job: ScanJob | null; queuedCount: number }> {
   return requestJson(
     admin
-      ? `/api/v1/admin/services/${serviceId}/media-probes/backfill`
-      : `/api/v1/services/${serviceId}/media-probes/backfill`,
+      ? `/api/v1/admin/libraries/${serviceId}/media-probes/backfill`
+      : `/api/v1/libraries/${serviceId}/media-probes/backfill`,
     { method: "POST", body: JSON.stringify({}) },
   );
 }
@@ -1385,8 +1265,8 @@ export async function updateServiceNotificationSettings(
 ): Promise<ServiceDetail> {
   const result = await requestJson<{ service: ServiceDetail }>(
     admin
-      ? `/api/v1/admin/services/${serviceId}/notification-settings`
-      : `/api/v1/services/${serviceId}/notification-settings`,
+      ? `/api/v1/admin/libraries/${serviceId}/notification-settings`
+      : `/api/v1/libraries/${serviceId}/notification-settings`,
     { method: "PATCH", body: JSON.stringify({ notificationEnabled }) },
   );
   return result.service;
@@ -1409,13 +1289,13 @@ export async function updateServiceRelayPlayback(
 
 /** 读取当前服务的协议账号和 Jellyfin 地址。 */
 export async function getServiceAccessSettings(serviceId: string, admin = false): Promise<ServiceAccessSettings> {
-  const result = await requestJson<{ settings: ServiceAccessSettings }>(admin ? `/api/v1/admin/services/${serviceId}/access-account` : `/api/v1/services/${serviceId}/access-account`);
+  const result = await requestJson<{ settings: ServiceAccessSettings }>(admin ? `/api/v1/admin/libraries/${serviceId}/access-account` : `/api/v1/libraries/${serviceId}/access-account`);
   return result.settings;
 }
 
 /** 修改服务协议用户名或密码。 */
 export async function updateServiceAccessCredentials(serviceId: string, input: { username?: string; password?: string }, admin = false): Promise<ServiceAccessSettings> {
-  const result = await requestJson<{ settings: ServiceAccessSettings }>(admin ? `/api/v1/admin/services/${serviceId}/access-account` : `/api/v1/services/${serviceId}/access-account`, { method: "PATCH", body: JSON.stringify(input) });
+  const result = await requestJson<{ settings: ServiceAccessSettings }>(admin ? `/api/v1/admin/libraries/${serviceId}/access-account` : `/api/v1/libraries/${serviceId}/access-account`, { method: "PATCH", body: JSON.stringify(input) });
   return result.settings;
 }
 
@@ -1426,7 +1306,7 @@ export async function createServiceAccessAccount(
   admin = false,
 ): Promise<ServiceAccessSettings> {
   const result = await requestJson<{ settings: ServiceAccessSettings }>(
-    admin ? `/api/v1/admin/services/${serviceId}/access-accounts` : `/api/v1/services/${serviceId}/access-accounts`,
+    admin ? `/api/v1/admin/libraries/${serviceId}/access-accounts` : `/api/v1/libraries/${serviceId}/access-accounts`,
     { method: "POST", body: JSON.stringify(input) },
   );
   return result.settings;
@@ -1440,7 +1320,7 @@ export async function updateServiceAccessAccount(
   admin = false,
 ): Promise<ServiceAccessSettings> {
   const result = await requestJson<{ settings: ServiceAccessSettings }>(
-    admin ? `/api/v1/admin/services/${serviceId}/access-accounts/${accountId}` : `/api/v1/services/${serviceId}/access-accounts/${accountId}`,
+    admin ? `/api/v1/admin/libraries/${serviceId}/access-accounts/${accountId}` : `/api/v1/libraries/${serviceId}/access-accounts/${accountId}`,
     { method: "PATCH", body: JSON.stringify(input) },
   );
   return result.settings;
@@ -1449,7 +1329,7 @@ export async function updateServiceAccessAccount(
 /** 删除指定 Jellyfin 账号及其独立观看记录。 */
 export function deleteServiceAccessAccount(serviceId: string, accountId: string, admin = false): Promise<void> {
   return requestJson(
-    admin ? `/api/v1/admin/services/${serviceId}/access-accounts/${accountId}` : `/api/v1/services/${serviceId}/access-accounts/${accountId}`,
+    admin ? `/api/v1/admin/libraries/${serviceId}/access-accounts/${accountId}` : `/api/v1/libraries/${serviceId}/access-accounts/${accountId}`,
     { method: "DELETE", body: JSON.stringify({ confirmation: accountId }) },
   );
 }
@@ -1457,19 +1337,19 @@ export function deleteServiceAccessAccount(serviceId: string, accountId: string,
 /** 仅撤销指定 Jellyfin 账号的全部登录会话。 */
 export function revokeServiceAccessAccountSessions(serviceId: string, accountId: string, admin = false): Promise<{ revokedCount: number }> {
   return requestJson(
-    admin ? `/api/v1/admin/services/${serviceId}/access-accounts/${accountId}/revoke-sessions` : `/api/v1/services/${serviceId}/access-accounts/${accountId}/revoke-sessions`,
+    admin ? `/api/v1/admin/libraries/${serviceId}/access-accounts/${accountId}/revoke-sessions` : `/api/v1/libraries/${serviceId}/access-accounts/${accountId}/revoke-sessions`,
     { method: "POST", body: "{}" },
   );
 }
 
 /** 重置服务协议密码，明文只在本次响应返回。 */
 export function resetServiceAccessPassword(serviceId: string, admin = false): Promise<{ settings: ServiceAccessSettings; password: string }> {
-  return requestJson(admin ? `/api/v1/admin/services/${serviceId}/access-account/reset-password` : `/api/v1/services/${serviceId}/access-account/reset-password`, { method: "POST", body: "{}" });
+  return requestJson(admin ? `/api/v1/admin/libraries/${serviceId}/access-account/reset-password` : `/api/v1/libraries/${serviceId}/access-account/reset-password`, { method: "POST", body: "{}" });
 }
 
 /** 撤销当前服务的全部 Jellyfin/Emby 兼容会话。 */
 export function revokeServiceAccessSessions(serviceId: string, admin = false): Promise<{ revokedCount: number }> {
-  return requestJson(admin ? `/api/v1/admin/services/${serviceId}/access-account/revoke-sessions` : `/api/v1/services/${serviceId}/access-account/revoke-sessions`, { method: "POST", body: "{}" });
+  return requestJson(admin ? `/api/v1/admin/libraries/${serviceId}/access-account/revoke-sessions` : `/api/v1/libraries/${serviceId}/access-account/revoke-sessions`, { method: "POST", body: "{}" });
 }
 
 /** 修改单个媒体库的 Jellyfin 开关、自定义地址后缀、下载权限或节目地区分组。 */
@@ -1483,7 +1363,7 @@ export async function updateServiceJellyfinSettings(
   },
   admin = false,
 ): Promise<ServiceAccessSettings> {
-  const result = await requestJson<{ settings: ServiceAccessSettings }>(admin ? `/api/v1/admin/services/${serviceId}/jellyfin-settings` : `/api/v1/services/${serviceId}/jellyfin-settings`, { method: "PATCH", body: JSON.stringify(input) });
+  const result = await requestJson<{ settings: ServiceAccessSettings }>(admin ? `/api/v1/admin/libraries/${serviceId}/jellyfin-settings` : `/api/v1/libraries/${serviceId}/jellyfin-settings`, { method: "PATCH", body: JSON.stringify(input) });
   return result.settings;
 }
 
@@ -1499,7 +1379,7 @@ export async function updateServiceEmbySettings(
   admin = false,
 ): Promise<ServiceAccessSettings> {
   const result = await requestJson<{ settings: ServiceAccessSettings }>(
-    admin ? `/api/v1/admin/services/${serviceId}/emby-settings` : `/api/v1/services/${serviceId}/emby-settings`,
+    admin ? `/api/v1/admin/libraries/${serviceId}/emby-settings` : `/api/v1/libraries/${serviceId}/emby-settings`,
     { method: "PATCH", body: JSON.stringify(input) },
   );
   return result.settings;
@@ -1508,7 +1388,7 @@ export async function updateServiceEmbySettings(
 /** 创建独立 Emby 协议账号；不会创建或修改 Jellyfin 账号。 */
 export async function createServiceEmbyAccount(serviceId: string, input: { username: string; password: string }, admin = false): Promise<ServiceAccessSettings> {
   const result = await requestJson<{ settings: ServiceAccessSettings }>(
-    admin ? `/api/v1/admin/services/${serviceId}/emby-access-accounts` : `/api/v1/services/${serviceId}/emby-access-accounts`,
+    admin ? `/api/v1/admin/libraries/${serviceId}/emby-access-accounts` : `/api/v1/libraries/${serviceId}/emby-access-accounts`,
     { method: "POST", body: JSON.stringify(input) },
   );
   return result.settings;
@@ -1517,7 +1397,7 @@ export async function createServiceEmbyAccount(serviceId: string, input: { usern
 /** 修改独立 Emby 账号凭据或状态。 */
 export async function updateServiceEmbyAccount(serviceId: string, accountId: string, input: { username?: string; password?: string; status?: "active" | "disabled" }, admin = false): Promise<ServiceAccessSettings> {
   const result = await requestJson<{ settings: ServiceAccessSettings }>(
-    admin ? `/api/v1/admin/services/${serviceId}/emby-access-accounts/${accountId}` : `/api/v1/services/${serviceId}/emby-access-accounts/${accountId}`,
+    admin ? `/api/v1/admin/libraries/${serviceId}/emby-access-accounts/${accountId}` : `/api/v1/libraries/${serviceId}/emby-access-accounts/${accountId}`,
     { method: "PATCH", body: JSON.stringify(input) },
   );
   return result.settings;
@@ -1525,13 +1405,13 @@ export async function updateServiceEmbyAccount(serviceId: string, accountId: str
 
 /** 删除独立 Emby 账号及其 Emby 用户状态。 */
 export function deleteServiceEmbyAccount(serviceId: string, accountId: string, admin = false): Promise<void> {
-  return requestJson(admin ? `/api/v1/admin/services/${serviceId}/emby-access-accounts/${accountId}` : `/api/v1/services/${serviceId}/emby-access-accounts/${accountId}`, { method: "DELETE", body: JSON.stringify({ confirmation: accountId }) });
+  return requestJson(admin ? `/api/v1/admin/libraries/${serviceId}/emby-access-accounts/${accountId}` : `/api/v1/libraries/${serviceId}/emby-access-accounts/${accountId}`, { method: "DELETE", body: JSON.stringify({ confirmation: accountId }) });
 }
 
 /** 撤销一个 Emby 账号的全部 Emby 会话，不影响 Jellyfin 登录会话。 */
 export function revokeServiceEmbyAccountSessions(serviceId: string, accountId: string, admin = false): Promise<{ revokedCount: number }> {
   return requestJson(
-    admin ? `/api/v1/admin/services/${serviceId}/emby-access-accounts/${accountId}/revoke-sessions` : `/api/v1/services/${serviceId}/emby-access-accounts/${accountId}/revoke-sessions`,
+    admin ? `/api/v1/admin/libraries/${serviceId}/emby-access-accounts/${accountId}/revoke-sessions` : `/api/v1/libraries/${serviceId}/emby-access-accounts/${accountId}/revoke-sessions`,
     { method: "POST", body: "{}" },
   );
 }
@@ -1543,7 +1423,7 @@ export async function updateServiceNavidromeSettings(
   admin = false,
 ): Promise<ServiceAccessSettings> {
   const result = await requestJson<{ settings: ServiceAccessSettings }>(
-    admin ? `/api/v1/admin/services/${serviceId}/navidrome-settings` : `/api/v1/services/${serviceId}/navidrome-settings`,
+    admin ? `/api/v1/admin/libraries/${serviceId}/navidrome-settings` : `/api/v1/libraries/${serviceId}/navidrome-settings`,
     { method: "PATCH", body: JSON.stringify(input) },
   );
   return result.settings;
@@ -1552,13 +1432,13 @@ export async function updateServiceNavidromeSettings(
 /** 分别修改媒体库的 APP 专用中转与 Jellyfin 中转开关。 */
 export async function updateLibraryPlaybackSettings(
   serviceId: string,
-  input: { appRelayPlaybackEnabled?: boolean; jellyfinRelayPlaybackEnabled?: boolean; embyRelayPlaybackEnabled?: boolean },
+  input: { jellyfinRelayPlaybackEnabled?: boolean; embyRelayPlaybackEnabled?: boolean },
   admin = false,
 ): Promise<ServiceAccessSettings> {
   const result = await requestJson<{ settings: ServiceAccessSettings }>(
     admin
-      ? `/api/v1/admin/services/${serviceId}/library-playback-settings`
-      : `/api/v1/services/${serviceId}/library-playback-settings`,
+      ? `/api/v1/admin/libraries/${serviceId}/library-playback-settings`
+      : `/api/v1/libraries/${serviceId}/library-playback-settings`,
     { method: "PATCH", body: JSON.stringify(input) },
   );
   return result.settings;
@@ -1835,8 +1715,8 @@ export function listAdminAiModels(): Promise<{ items: AiModel[]; total: number }
 }
 
 /** 读取服务可选择的启用模型，并保留当前已选停用模型用于回显。 */
-export function listAvailableAiModels(serviceId: string): Promise<{ items: AvailableAiModel[]; total: number }> {
-  return requestJson(`/api/v1/ai-models/available?serviceId=${encodeURIComponent(serviceId)}`);
+export function listAvailableAiModels(libraryId: string): Promise<{ items: AvailableAiModel[]; total: number }> {
+  return requestJson(`/api/v1/ai-models/available?libraryId=${encodeURIComponent(libraryId)}`);
 }
 
 /** 创建 AI 模型和第一份配置修订。 */

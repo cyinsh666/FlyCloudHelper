@@ -16,7 +16,7 @@ type ScheduledTaskMode = "incremental" | "full" | "media_probe";
 interface ScanScheduleRow {
   id: string;
   user_id: string;
-  service_id: string;
+  library_id: string;
   scan_mode: ScheduledTaskMode;
   enabled: number | string | boolean;
   schedule_type: ScanScheduleType;
@@ -73,7 +73,7 @@ function mapScanSchedule(row: ScanScheduleRow): ScanScheduleRecord {
   return {
     id: row.id,
     userId: row.user_id,
-    serviceId: row.service_id,
+    libraryId: row.library_id,
     scanMode: row.scan_mode,
     enabled: Number(row.enabled) === 1 || row.enabled === true,
     scheduleType: row.schedule_type,
@@ -97,14 +97,14 @@ function mapScanSchedule(row: ScanScheduleRow): ScanScheduleRecord {
 /** 生成尚未保存的默认关闭计划，便于页面同时展示全量和增量配置。 */
 function createDefaultSchedule(
   userId: string,
-  serviceId: string,
+  libraryId: string,
   scanMode: ScheduledTaskMode,
 ): ScanScheduleRecord {
   const now = new Date().toISOString();
   return {
     id: "",
     userId,
-    serviceId,
+    libraryId,
     scanMode,
     enabled: false,
     scheduleType: "interval",
@@ -248,29 +248,29 @@ export function calculateNextScanRunAt(
   return new Date(postponeQuietCandidate(candidate, configuration)).toISOString();
 }
 
-/** 持久化服务级后台计划，并提供执行器需要的原子领取操作。 */
+/** 持久化媒体库级后台计划，并提供执行器需要的原子领取操作。 */
 export class ScanScheduleStore {
   public constructor(private readonly database: FlyCloudHelperDatabase) {}
 
-  /** 读取一个服务的扫描和视频规格计划；缺失模式返回默认关闭配置。 */
-  public async listServiceSchedules(userId: string, serviceId: string): Promise<ScanScheduleRecord[]> {
-    const rows = await this.database.query("service_scan_schedules")
-      .where({ user_id: userId, service_id: serviceId }) as ScanScheduleRow[];
+  /** 读取一个媒体库的扫描和视频规格计划；缺失模式返回默认关闭配置。 */
+  public async listLibrarySchedules(userId: string, libraryId: string): Promise<ScanScheduleRecord[]> {
+    const rows = await this.database.query("library_scan_schedules")
+      .where({ user_id: userId, library_id: libraryId }) as ScanScheduleRow[];
     const mapped = rows.map(mapScanSchedule);
     return (["full", "incremental", "media_probe"] as const).map((scanMode) =>
-      mapped.find((item) => item.scanMode === scanMode) ?? createDefaultSchedule(userId, serviceId, scanMode));
+      mapped.find((item) => item.scanMode === scanMode) ?? createDefaultSchedule(userId, libraryId, scanMode));
   }
 
   /** 新增或覆盖一个扫描模式的计划，保留最近执行结果。 */
-  public async saveServiceSchedule(input: {
+  public async saveLibrarySchedule(input: {
     userId: string;
-    serviceId: string;
+    libraryId: string;
     scanMode: ScheduledTaskMode;
     configuration: ScanScheduleConfiguration;
   }): Promise<ScanScheduleRecord> {
-    const existing = await this.database.query("service_scan_schedules").where({
+    const existing = await this.database.query("library_scan_schedules").where({
       user_id: input.userId,
-      service_id: input.serviceId,
+      library_id: input.libraryId,
       scan_mode: input.scanMode,
     }).first() as ScanScheduleRow | undefined;
     const now = new Date();
@@ -291,12 +291,12 @@ export class ScanScheduleStore {
       updated_at: now.toISOString(),
     };
     if (existing) {
-      await this.database.query("service_scan_schedules").where({ id: existing.id }).update(values);
+      await this.database.query("library_scan_schedules").where({ id: existing.id }).update(values);
     } else {
-      await this.database.query("service_scan_schedules").insert({
+      await this.database.query("library_scan_schedules").insert({
         id: randomUUID(),
         user_id: input.userId,
-        service_id: input.serviceId,
+        library_id: input.libraryId,
         scan_mode: input.scanMode,
         ...values,
         last_triggered_at: null,
@@ -304,9 +304,9 @@ export class ScanScheduleStore {
         created_at: now.toISOString(),
       });
     }
-    const saved = await this.database.query("service_scan_schedules").where({
+    const saved = await this.database.query("library_scan_schedules").where({
       user_id: input.userId,
-      service_id: input.serviceId,
+      library_id: input.libraryId,
       scan_mode: input.scanMode,
     }).first() as ScanScheduleRow;
     return mapScanSchedule(saved);
@@ -314,7 +314,7 @@ export class ScanScheduleStore {
 
   /** 查询已经到期并仍处于启用状态的计划。 */
   public async listDueSchedules(now: string, limit: number): Promise<ScanScheduleRecord[]> {
-    const rows = await this.database.query("service_scan_schedules")
+    const rows = await this.database.query("library_scan_schedules")
       .where({ enabled: 1 })
       .whereNotNull("next_run_at")
       .where("next_run_at", "<=", now)
@@ -328,7 +328,7 @@ export class ScanScheduleStore {
     // 最终执行闸门：即使旧计划或冲突重试时间落入禁扫时段，也只顺延自动计划，不创建扫描任务。
     const postponedRunAt = postponeQuietCandidate(now.getTime(), schedule);
     if (postponedRunAt > now.getTime()) {
-      await this.database.query("service_scan_schedules")
+      await this.database.query("library_scan_schedules")
         .where({ id: schedule.id, enabled: 1, next_run_at: schedule.nextRunAt })
         .update({
           next_run_at: new Date(postponedRunAt).toISOString(),
@@ -337,7 +337,7 @@ export class ScanScheduleStore {
       return false;
     }
     const nextRunAt = calculateNextScanRunAt(schedule, now);
-    const updated = await this.database.query("service_scan_schedules")
+    const updated = await this.database.query("library_scan_schedules")
       .where({ id: schedule.id, enabled: 1, next_run_at: schedule.nextRunAt })
       .update({
         next_run_at: nextRunAt,
@@ -350,7 +350,7 @@ export class ScanScheduleStore {
 
   /** 保存定时计划本次创建的后台任务；没有待分析文件时任务 ID 为空。 */
   public async markTriggeredJob(scheduleId: string, jobId: string | null): Promise<void> {
-    await this.database.query("service_scan_schedules").where({ id: scheduleId }).update({
+    await this.database.query("library_scan_schedules").where({ id: scheduleId }).update({
       last_job_id: jobId,
       last_error: null,
       updated_at: new Date().toISOString(),
@@ -360,7 +360,7 @@ export class ScanScheduleStore {
   /** 保存一次计划执行失败；任务冲突时短暂推迟，避免丢失本轮计划。 */
   public async markTriggerFailure(scheduleId: string, errorMessage: string, retrySoon: boolean): Promise<void> {
     const now = new Date();
-    await this.database.query("service_scan_schedules").where({ id: scheduleId }).update({
+    await this.database.query("library_scan_schedules").where({ id: scheduleId }).update({
       last_error: errorMessage,
       ...(retrySoon ? { next_run_at: new Date(now.getTime() + 5 * 60_000).toISOString() } : {}),
       updated_at: now.toISOString(),
@@ -439,7 +439,7 @@ export class ScanScheduleWorker {
         this.options.logger("info", {
           日志关键字: "codex-flycloud-scan-schedule",
           事件: "自动任务命中每日禁扫时段",
-          服务ID: schedule.serviceId,
+          媒体库ID: schedule.libraryId,
           定时任务类型: readScheduledTaskName(schedule.scanMode),
           顺延至: new Date(postponedRunAt).toISOString(),
         });
@@ -447,7 +447,8 @@ export class ScanScheduleWorker {
       return;
     }
     try {
-      const service = await this.options.repository.getServiceDetail(schedule.serviceId, schedule.userId);
+      const library = await this.options.repository.getLibrary(schedule.libraryId, schedule.userId);
+      const service = await this.options.repository.getServiceMediaContext(library.sourceServiceId, schedule.userId);
       if (schedule.scanMode === "media_probe") {
         if (service.dataType !== "video") {
           throw new ApiError(409, "media_probe_video_only", "只有影视服务可以定时分析视频规格");
@@ -466,7 +467,7 @@ export class ScanScheduleWorker {
           日志关键字: "codex-flycloud-scan-schedule",
           事件: result.jobId ? "定时视频规格任务创建成功" : "定时视频规格任务没有待分析文件",
           用户ID: schedule.userId,
-          服务ID: schedule.serviceId,
+          媒体库ID: schedule.libraryId,
           计划ID: schedule.id,
           任务ID: result.jobId,
           入队文件数量: result.queuedCount,
@@ -480,7 +481,7 @@ export class ScanScheduleWorker {
       const job = await this.options.repository.createScanJob({
         jobId: randomUUID(),
         userId: schedule.userId,
-        serviceId: schedule.serviceId,
+        libraryId: service.libraryId,
         requestedByUserId: schedule.userId,
         requestId: `schedule:${schedule.id}:${schedule.nextRunAt ?? now.toISOString()}`,
         clientDeviceId: "flycloud-helper-scheduler",
@@ -495,7 +496,7 @@ export class ScanScheduleWorker {
         日志关键字: "codex-flycloud-scan-schedule",
         事件: "定时扫描任务创建成功",
         用户ID: schedule.userId,
-        服务ID: schedule.serviceId,
+        媒体库ID: schedule.libraryId,
         计划ID: schedule.id,
         定时任务类型: readScheduledTaskName(schedule.scanMode),
         任务ID: job.id,
@@ -508,7 +509,7 @@ export class ScanScheduleWorker {
         日志关键字: "codex-flycloud-scan-schedule",
         事件: "定时后台任务创建失败",
         用户ID: schedule.userId,
-        服务ID: schedule.serviceId,
+        媒体库ID: schedule.libraryId,
         计划ID: schedule.id,
         定时任务类型: readScheduledTaskName(schedule.scanMode),
         是否等待任务空闲后重试: retrySoon,

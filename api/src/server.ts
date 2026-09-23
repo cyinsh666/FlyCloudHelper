@@ -8,7 +8,6 @@ import { AiModelManager } from "./ai/ai-model-manager.js";
 import { projectRoot, type ApiConfig } from "./config.js";
 import { FlyCloudHelperDatabase } from "./database.js";
 import { ApiError } from "./errors.js";
-import { LibraryExportService } from "./export-service.js";
 import { MusicBrainzClient } from "./metadata/musicbrainz.js";
 import { TmdbMetadataCache } from "./metadata/tmdb-cache.js";
 import { TmdbKeyPool } from "./metadata/tmdb.js";
@@ -21,7 +20,6 @@ import { registerAuthRoutes } from "./routes/auth-routes.js";
 import { registerCatalogRoutes } from "./routes/catalog-routes.js";
 import { registerGuangyaAuthRoutes } from "./routes/guangya-auth-routes.js";
 import { registerCloudAuthorizationRoutes } from "./routes/cloud-authorization-routes.js";
-import { registerMediaStreamRoutes } from "./routes/media-stream-routes.js";
 import { registerMusicArtworkRoutes } from "./routes/music-artwork-routes.js";
 import { registerNavidromeRoutes } from "./routes/navidrome-routes.js";
 import { registerNotificationRoutes } from "./routes/notification-routes.js";
@@ -32,21 +30,15 @@ import { ServiceAccessService } from "./service-access.js";
 import { EmbyAccessService } from "./emby-access.js";
 import { registerScanFailureReportRoutes } from "./routes/scan-failure-report-routes.js";
 import { registerServiceRoutes } from "./routes/service-routes.js";
-import { registerServiceMigrationRoutes } from "./routes/service-migration-routes.js";
+import { registerLibraryRoutes } from "./routes/library-routes.js";
 import { registerServiceAccessRoutes } from "./routes/service-access-routes.js";
 import { registerJellyfinRoutes } from "./routes/jellyfin-routes.js";
 import { registerEmbyRoutes } from "./routes/emby-routes.js";
-import { registerAggregateServiceRoutes } from "./routes/aggregate-service-routes.js";
-import { AggregateServiceRepository } from "./aggregate-service-repository.js";
-import { AggregateIndexService } from "./aggregate-index-service.js";
-import { AggregateAccessService } from "./aggregate-access-service.js";
 import type { ApiRuntime } from "./runtime.js";
 import { ScanScheduleStore, ScanScheduleWorker } from "./scan-schedule-service.js";
 import { ScanFailureReportService } from "./scan-failure-report-service.js";
 import { CredentialVault } from "./secrets.js";
 import { ServiceRepository } from "./service-repository.js";
-import { ServiceMigrationRepository } from "./service-migration-repository.js";
-import { ServiceMigrationWorker } from "./service-migration-worker.js";
 import { loadTmdbBaseUrls, loadTmdbKeys } from "./system-settings.js";
 import { ScanWorker } from "./worker.js";
 import { MediaProbeWorker } from "./media-probe-worker.js";
@@ -146,7 +138,6 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     bodyLimit: Math.max(
       1024 * 1024,
       config.pluginMaxBytes + 1024 * 1024,
-      config.migrationChunkMaxBytes + 1024 * 1024,
     ),
   });
   const database = new FlyCloudHelperDatabase(config, (level, fields) => {
@@ -165,38 +156,26 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   database.setNotificationDeliveryHandler((notification) => telegramNotifications.enqueue(notification));
   const serviceAccess = new ServiceAccessService(database, vault);
   const embyAccess = new EmbyAccessService(database);
-  const aggregateServices = new AggregateServiceRepository(database);
-  const aggregateIndex = new AggregateIndexService(database, logger);
-  const aggregateAccess = new AggregateAccessService(database);
-  const backfilledAggregateAccounts = await aggregateAccess.ensureExistingServices();
-  if (backfilledAggregateAccounts > 0) {
-    logger("info", {
-      日志关键字: "codex-aggregate-account",
-      事件: "补齐聚合服务初始访问账号",
-      补齐账号数量: backfilledAggregateAccounts,
-    });
-  }
   const repository = new ServiceRepository(database, serviceAccess, logger, {
     scanWorkerConcurrency: config.workerConcurrency,
     mediaProbeConcurrency: config.mediaProbeConcurrency,
   });
   const publicAccess = new PublicAccessService(database, config);
-  const backfilledServiceAccessAccounts = await serviceAccess.ensureExistingServices();
-  const backfilledEmbyAccessAccounts = await embyAccess.ensureExistingServices();
+  const backfilledServiceAccessAccounts = await serviceAccess.ensureExistingLibraries();
+  const backfilledEmbyAccessAccounts = await embyAccess.ensureExistingLibraries();
   if (backfilledServiceAccessAccounts > 0) {
     logger("info", {
-      日志关键字: "codex-jellyfin-compat", 事件: "为历史服务补齐独立访问账号",
+      日志关键字: "codex-jellyfin-compat", 事件: "为历史媒体库补齐独立访问账号",
       补齐账号数量: backfilledServiceAccessAccounts,
     });
   }
   if (backfilledEmbyAccessAccounts > 0) {
     logger("info", {
       日志关键字: "codex-emby-account",
-      事件: "为历史服务补齐独立Emby访问账号",
+      事件: "为历史媒体库补齐独立Emby访问账号",
       补齐账号数量: backfilledEmbyAccessAccounts,
     });
   }
-  const migrations = new ServiceMigrationRepository(database);
   const tmdbCache = new TmdbMetadataCache(database, logger);
   const tmdbBaseUrls = await loadTmdbBaseUrls(database); // 关键变量：启动时一次读取当前 TMDB API 与图片地址。
   const tmdb = new TmdbKeyPool(
@@ -216,13 +195,6 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   const plugins = new MetadataPluginManager(database, config, vault);
   const aiModels = new AiModelManager(database, vault);
   const failureReports = new ScanFailureReportService(config, server.log);
-  const exports = new LibraryExportService(database, config, (level, fields) => {
-    if (level === "warn") {
-      server.log.warn(fields);
-      return;
-    }
-    server.log.info(fields);
-  });
   const worker = new ScanWorker({
     database,
     repository,
@@ -233,7 +205,6 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     plugins,
     aiModels,
     failureReports,
-    aggregateIndex,
     logger: server.log,
     config,
   });
@@ -254,19 +225,10 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     tmdb,
     logger,
   });
-  const migrationWorker = new ServiceMigrationWorker({
-    database,
-    repository: migrations,
-    exports,
-    config,
-    logger: server.log,
-  });
   const runtime: ApiRuntime = {
     config,
     database,
     repository,
-    migrations,
-    migrationWorker,
     providers,
     vault,
     tmdbCache,
@@ -278,23 +240,17 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     scanScheduleWorker,
     plugins,
     aiModels,
-    exports,
     failureReports,
     publicAccess,
     serviceAccess,
     embyAccess,
-    aggregateServices,
-    aggregateIndex,
-    aggregateAccess,
     telegramNotifications,
     logBusinessEvent: logger,
   };
-  await aggregateIndex.start();
-
   await server.register(cookie);
   await server.register(multipart, {
     limits: {
-      fileSize: Math.max(config.pluginMaxBytes, config.migrationChunkMaxBytes),
+      fileSize: config.pluginMaxBytes,
       files: 1,
       fields: 10,
       parts: 12,
@@ -303,7 +259,6 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   server.addHook("onClose", async () => {
     await telegramNotifications.close();
     await scanScheduleWorker.stop();
-    await migrationWorker.stop();
     await worker.stop();
     await mediaProbeWorker.stop();
     await tmdbCache.close();
@@ -476,14 +431,13 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerGuangyaAuthRoutes(server, runtime);
   await registerCloudAuthorizationRoutes(server, runtime);
   await registerServiceRoutes(server, runtime);
+  await registerLibraryRoutes(server, runtime);
   await registerScanScheduleRoutes(server, runtime, scanSchedules);
   await registerServiceAccessRoutes(server, runtime);
-  await registerAggregateServiceRoutes(server, runtime);
-  await registerServiceMigrationRoutes(server, runtime);
   await registerScanFailureReportRoutes(server, runtime);
   await registerCatalogRoutes(server, runtime);
+  server.log.info({ 日志关键字: "codex-library-route-registration", 路由: "GET /api/v1/libraries/:libraryId", 结果: "唯一注册" });
   await registerMusicArtworkRoutes(server, runtime);
-  await registerMediaStreamRoutes(server, runtime);
   await registerJellyfinRoutes(server, runtime);
   await registerEmbyRoutes(server, runtime);
   await registerNavidromeRoutes(server, runtime);
@@ -511,14 +465,6 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   if (recoveredJobs > 0) {
     logger("warn", { 事件: "恢复中断扫描任务", 任务数量: recoveredJobs });
   }
-  const recoveredMigrations = await migrations.recoverInterrupted();
-  if (recoveredMigrations > 0) {
-    logger("warn", {
-      日志关键字: "codex-flycloud-service-migration",
-      事件: "恢复中断服务迁移",
-      迁移数量: recoveredMigrations,
-    });
-  }
   const recoveredMediaProbes = await mediaProbeWorker.recoverInterrupted();
   if (recoveredMediaProbes > 0) {
     logger("warn", {
@@ -527,7 +473,6 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
       任务数量: recoveredMediaProbes,
     });
   }
-  migrationWorker.start();
   worker.start();
   mediaProbeWorker.start();
   scanScheduleWorker.start();

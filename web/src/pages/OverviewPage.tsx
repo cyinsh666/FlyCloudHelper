@@ -6,6 +6,7 @@ import {
   getOverview,
   listJobs,
   listLibraryItems,
+  listLibraries,
   listServices,
   type JobStatus,
   type ServiceStatus,
@@ -33,22 +34,23 @@ const jobStatusLabels: Record<JobStatus, string> = {
 /** 普通用户个人概览页面。 */
 export function OverviewPage() {
   const resource = useApiResource(async () => {
-    const [overview, services, jobs] = await Promise.all([
+    const [overview, services, libraries, jobs] = await Promise.all([
       getOverview(),
       listServices(),
+      listLibraries(),
       listJobs(),
     ]);
-    const recentCatalogs = await Promise.all(services.items.slice(0, 4).map((service) => (
-      listLibraryItems(service.libraryId, { limit: 6 }).catch(() => ({ items: [], total: 0, catalogVersion: 0 }))
+    const recentCatalogs = await Promise.all(libraries.items.slice(0, 4).map((library) => (
+      listLibraryItems(library.id, { limit: 6 }).catch(() => ({ items: [], total: 0, catalogVersion: 0 }))
     )));
-    return { overview, services: services.items, jobs: jobs.items, recentItems: recentCatalogs.flatMap((item) => item.items).slice(0, 6) };
+    return { overview, services: services.items, libraries: libraries.items, jobs: jobs.items, recentItems: recentCatalogs.flatMap((item) => item.items).slice(0, 6) };
   }, []);
 
   if (!resource.data) {
     return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取个人概览…"}</div></Panel>;
   }
 
-  const { overview, services, jobs, recentItems } = resource.data;
+  const { overview, services, libraries, jobs, recentItems } = resource.data;
   const abnormalServices = services.filter((service) => service.status !== "active" || service.connectionStatus !== "valid");
 
   return (
@@ -121,12 +123,16 @@ export function OverviewPage() {
               </div>
               <p className="mt-1 font-mono text-[11px] text-muted-foreground">{service.providerType} · {service.id}</p>
               <div className="mt-3 flex items-center justify-between text-[11px] text-muted-foreground">
-                <span>连接 r{service.credentialRevision} · 扫描 r{service.scanProfileRevision}</span>
+                <span>连接 r{service.credentialRevision}</span>
                 <Link to="/app/services/$serviceId" params={{ serviceId: service.id }} className="text-primary-soft">服务设置</Link>
               </div>
             </div>
           ))}
         </div>
+      </Panel>
+
+      <Panel title="我的媒体库" className="mt-4" action={<Link to="/app/catalog" className="inline-flex items-center gap-1 text-xs text-primary-soft">管理媒体库 <ArrowUpRight className="size-3.5" /></Link>}>
+        <div className="grid gap-3 sm:grid-cols-2">{libraries.map((library) => <div key={library.id} className="rounded-xl border border-border bg-secondary/40 p-4"><div className="flex items-center justify-between gap-3"><p className="truncate text-sm font-medium">{library.displayName}</p><StatusPill>{library.dataType === "music" ? "音乐" : "影视"}</StatusPill></div><p className="mt-1 text-[11px] text-muted-foreground">来源：{library.sourceServiceName} · 条目 {library.itemCount.toLocaleString()}</p></div>)}</div>
       </Panel>
 
       <Panel title="最近入库" description="只展示服务端媒体目录，不提供播放与下载" className="mt-4">

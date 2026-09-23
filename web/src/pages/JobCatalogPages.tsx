@@ -1,12 +1,11 @@
 import { MusicScanStages } from "../components/MusicScanStages";
 import { Link } from "@tanstack/react-router";
-import { Download, Images, Layers3, Pause, Play, Radio, RefreshCw, RotateCcw, Settings2, Sparkles, Square, Trash2 } from "lucide-react";
+import { Download, Images, Pause, Play, Plus, Radio, RefreshCw, RotateCcw, Settings2, Sparkles, Square, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { AdminServiceFilters } from "@/components/AdminServiceFilters";
 import { AiSupplementDialog } from "@/components/AiSupplementDialog";
 import { ProviderSelectionIcon } from "@/components/ServiceCreateSelection";
-import { ServiceStateDot } from "@/components/ServiceConnectionStatus";
 import { FilterChip, Panel, ProgressMeter, StatusPill, type StatusTone } from "@/components/ui-kit";
 import {
   cancelScanJob,
@@ -17,10 +16,9 @@ import {
   getJobAiSupplements,
   listJobs,
   listAdminUsers,
-  listAggregateServices,
   listMediaProbeJobFailures,
   listProviders,
-  listServices,
+  listLibraries,
   pauseScanJob,
   resumeScanJob,
   retryScanJob,
@@ -820,7 +818,7 @@ export function AdminJobsPage() { return <JobsView admin />; }
 function CatalogServiceSelector({ admin }: { admin: boolean }) {
   const [filters, setFilters] = useState<ServiceListFilters>({});
   const resource = useApiResource(
-    () => listServices(admin, admin ? filters : {}),
+    () => listLibraries(admin, admin ? filters : {}),
     [admin, filters.search, filters.userId, filters.providerType, filters.dataType, filters.status],
   );
   const filterOptions = useApiResource(async () => {
@@ -828,61 +826,49 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
     const [users, providers] = await Promise.all([listAdminUsers(), listProviders()]);
     return { users: users.items, providers };
   }, [admin]);
-  // 关键变量：普通用户媒体库入口直接显示已经创建的聚合服务数量；管理端不发起该用户接口请求。
-  const aggregateServices = useApiResource(
-    () => admin ? Promise.resolve([]) : listAggregateServices(),
-    [admin],
-  );
-  const services = resource.data?.items ?? [];
+  const libraries = resource.data?.items ?? [];
   return (
     <>
       <PageHeader
         title={admin ? "媒体库管理" : "我的媒体库"}
         actions={(
           <div className="flex flex-wrap gap-2">
-            {!admin && (
-              <Link to="/app/catalog/aggregate">
-                <SecondaryButton>
-                  <Layers3 className="size-4" /> 聚合服务
-                  <StatusPill>{aggregateServices.data?.length ?? 0}</StatusPill>
-                </SecondaryButton>
-              </Link>
-            )}
             <SecondaryButton onClick={() => void resource.refresh()}><RefreshCw className="size-4" /> 刷新</SecondaryButton>
+            {!admin && <Link to="/app/libraries/new"><PrimaryButton><Plus className="size-4" /> 创建媒体库</PrimaryButton></Link>}
           </div>
         )}
       />
       {admin && <AdminServiceFilters value={filters} users={filterOptions.data?.users ?? []} providers={filterOptions.data?.providers ?? []} resultCount={resource.data?.total ?? 0} onChange={setFilters} />}
       {resource.error && <Panel className="mb-4"><p className="text-sm text-destructive">{resource.error}</p></Panel>}
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-        {services.map((service) => (
-          <article key={service.id} className="surface p-4">
+        {libraries.map((library) => (
+          <article key={library.id} className="surface p-4">
             <header className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
               <div className="flex min-w-0 items-center gap-3">
                 <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-border text-xs font-semibold" style={{ backgroundImage: "var(--gradient-surface)" }}>
-                  <ProviderSelectionIcon providerType={service.providerType} />
+                  <ProviderSelectionIcon providerType={library.providerType} />
                 </span>
                 <div className="min-w-0">
-                  <h2 className="truncate text-sm font-semibold">{service.displayName}</h2>
-                  <p className="truncate text-[11px] text-muted-foreground">{service.providerType}{admin ? ` · ${service.ownerUsername}` : ""}</p>
+                  <h2 className="truncate text-sm font-semibold">{library.displayName}</h2>
+                  <p className="truncate text-[11px] text-muted-foreground">{library.sourceServiceName} · {library.providerType}{admin ? ` · ${library.ownerUsername}` : ""}</p>
                 </div>
               </div>
-              <ServiceStateDot service={service} />
+              <span className={`mt-1 size-2.5 rounded-full ${library.status === "active" && library.sourceConnectionStatus === "valid" ? "bg-success" : "bg-warning"}`} title={library.status === "active" ? "媒体库已启用" : "媒体库已停用"} />
             </header>
             <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-              <StatusPill>{catalogDataTypeLabels[service.dataType] ?? service.dataType}</StatusPill>
-              <span>条目 {service.itemCount.toLocaleString()}</span>
-              <span>版本 v{service.catalogVersion}</span>
-              {service.dataType !== "music" && <span>Jellyfin {service.jellyfinEnabled ? "已启用" : "未启用"}</span>}
+              <StatusPill>{catalogDataTypeLabels[library.dataType] ?? library.dataType}</StatusPill>
+              <span>条目 {library.itemCount.toLocaleString()}</span>
+              <span>版本 v{library.catalogVersion}</span>
+              {library.dataType === "music" ? <span>Navidrome {library.navidromeEnabled ? "已启用" : "未启用"}</span> : <span>Jellyfin {library.jellyfinEnabled ? "已启用" : "未启用"}</span>}
             </div>
             <footer className="mt-3 flex flex-wrap gap-2 border-t border-border/70 pt-3">
-              <Link to={admin ? "/admin/libraries/$serviceId/catalog" : "/app/libraries/$serviceId/catalog"} params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Images className="size-3.5" /> 海报</Link>
-              <Link to={admin ? "/admin/libraries/$serviceId/settings" : "/app/libraries/$serviceId/settings"} params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Settings2 className="size-3.5" /> 设置</Link>
+              <Link to={admin ? "/admin/libraries/$serviceId/catalog" : "/app/libraries/$serviceId/catalog"} params={{ serviceId: library.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Images className="size-3.5" /> 海报</Link>
+              <Link to={admin ? "/admin/libraries/$serviceId/settings" : "/app/libraries/$serviceId/settings"} params={{ serviceId: library.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Settings2 className="size-3.5" /> 设置</Link>
             </footer>
           </article>
         ))}
       </div>
-      {!resource.loading && services.length === 0 && <Panel><p className="py-12 text-center text-sm text-muted-foreground">还没有可用的云端服务</p></Panel>}
+      {!resource.loading && libraries.length === 0 && <Panel><p className="py-12 text-center text-sm text-muted-foreground">还没有媒体库</p></Panel>}
     </>
   );
 }

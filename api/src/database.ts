@@ -245,7 +245,7 @@ export class FlyCloudHelperDatabase {
     } else {
       await ensureRemoteDatabase(this.config, this.bootstrapLogger);
     }
-    await migrateDatabase(this.query);
+    await migrateDatabase(this.query, this.config.exportDirectory);
   }
 
   /** 关闭数据库连接池。 */
@@ -1015,43 +1015,38 @@ export class FlyCloudHelperDatabase {
         await transaction("scan_root_runs").whereIn("job_id", scanJobIds).delete();
       }
 
-      const migrationRows = await transaction("service_migrations").select("id").where({ user_id: userId });
-      const migrationIds = migrationRows.map((row) => String(row.id));
-      if (migrationIds.length > 0) {
-        await transaction("service_migration_chunks").whereIn("migration_id", migrationIds).delete();
-      }
 
-      const serviceRows = await transaction("cloud_services").select("id").where({ user_id: userId });
-      const serviceIds = serviceRows.map((row) => String(row.id));
-      if (serviceIds.length > 0) {
+
+      const libraryRows = await transaction("media_libraries").select("id").where({ user_id: userId });
+      const libraryIds = libraryRows.map((row) => String(row.id));
+      if (libraryIds.length > 0) {
         // 关键变量：Emby 是独立协议数据，用户彻底删除时必须显式清除，不能依赖 Jellyfin 表的级联关系。
-        await transaction("service_emby_playback_history").whereIn("service_id", serviceIds).delete();
-        await transaction("service_emby_playback_sessions").whereIn("service_id", serviceIds).delete();
-        await transaction("service_emby_playback_progress").whereIn("service_id", serviceIds).delete();
-        await transaction("service_emby_item_preferences").whereIn("service_id", serviceIds).delete();
-        await transaction("service_emby_virtual_preferences").whereIn("service_id", serviceIds).delete();
-        await transaction("service_emby_sessions").whereIn("service_id", serviceIds).delete();
-        await transaction("service_emby_accounts").whereIn("service_id", serviceIds).delete();
-        await transaction("service_playback_progress").whereIn("service_id", serviceIds).delete();
-        await transaction("service_playback_sessions").whereIn("service_id", serviceIds).delete();
-        await transaction("service_playback_history").whereIn("service_id", serviceIds).delete();
-        await transaction("service_protocol_sessions").whereIn("service_id", serviceIds).delete();
-        await transaction("service_access_accounts").whereIn("service_id", serviceIds).delete();
+        await transaction("library_emby_playback_history").whereIn("library_id", libraryIds).delete();
+        await transaction("library_emby_playback_sessions").whereIn("library_id", libraryIds).delete();
+        await transaction("library_emby_playback_progress").whereIn("library_id", libraryIds).delete();
+        await transaction("library_emby_item_preferences").whereIn("library_id", libraryIds).delete();
+        await transaction("library_emby_virtual_preferences").whereIn("library_id", libraryIds).delete();
+        await transaction("library_emby_sessions").whereIn("library_id", libraryIds).delete();
+        await transaction("library_emby_accounts").whereIn("library_id", libraryIds).delete();
+        await transaction("library_playback_progress").whereIn("library_id", libraryIds).delete();
+        await transaction("library_playback_sessions").whereIn("library_id", libraryIds).delete();
+        await transaction("library_playback_history").whereIn("library_id", libraryIds).delete();
+        await transaction("library_protocol_sessions").whereIn("library_id", libraryIds).delete();
+        await transaction("library_access_accounts").whereIn("library_id", libraryIds).delete();
       }
 
-      await transaction("library_exports").where({ user_id: userId }).delete();
       await transaction("catalog_changes").where({ user_id: userId }).delete();
       await transaction("file_links").where({ user_id: userId }).delete();
       await transaction("media_relations").where({ user_id: userId }).delete();
       await transaction("media_file_probes").where({ user_id: userId }).delete();
       await transaction("media_probe_jobs").where({ user_id: userId }).delete();
       await transaction("scan_jobs").where({ user_id: userId }).delete();
-      await transaction("service_migrations").where({ user_id: userId }).delete();
       await transaction("source_files").where({ user_id: userId }).delete();
       await transaction("media_items").where({ user_id: userId }).delete();
-      await transaction("client_service_links").where({ user_id: userId }).delete();
-      await transaction("service_metadata_profiles").where({ user_id: userId }).delete();
-      await transaction("service_scan_profiles").where({ user_id: userId }).delete();
+      await transaction("library_metadata_profiles").where({ user_id: userId }).delete();
+      await transaction("library_scan_profiles").where({ user_id: userId }).delete();
+      await transaction("library_sources").where({ user_id: userId }).delete();
+      await transaction("service_import_sources").where({ user_id: userId }).delete();
       await transaction("service_credentials").where({ user_id: userId }).delete();
       await transaction("media_libraries").where({ user_id: userId }).delete();
       await transaction("cloud_services").where({ user_id: userId }).delete();
@@ -1088,16 +1083,11 @@ export class FlyCloudHelperDatabase {
     }
 
     const activeJobStatuses = ["queued", "running", "retry_waiting", "paused"];
-    const [scanJob, mediaProbeJob, migration, libraryExport] = await Promise.all([
+    const [scanJob, mediaProbeJob] = await Promise.all([
       transaction("scan_jobs").where({ user_id: userId }).whereIn("status", activeJobStatuses).first(),
       transaction("media_probe_jobs").where({ user_id: userId }).whereIn("status", activeJobStatuses).first(),
-      transaction("service_migrations")
-        .where({ user_id: userId })
-        .whereIn("status", ["preparing", "uploading", "queued", "validating", "importing", "finalizing"])
-        .first(),
-      transaction("library_exports").where({ user_id: userId }).whereIn("status", ["queued", "running"]).first(),
     ]);
-    if (scanJob || mediaProbeJob || migration || libraryExport) {
+    if (scanJob || mediaProbeJob) {
       throw new ApiError(409, "user_has_active_background_job", "该用户仍有未结束后台任务，请先终止后再彻底删除");
     }
     return user;

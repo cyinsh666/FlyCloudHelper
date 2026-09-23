@@ -1,11 +1,9 @@
 import type { IncomingHttpHeaders, IncomingMessage } from "node:http";
-import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyReply, FastifyRequest } from "fastify";
 import { ApiError } from "../errors.js";
-import { requireRequestUser } from "../http.js";
 import { providerStream } from "../providers/network.js";
 import type { ProviderConnectionContext, ProviderFileStreamAccess } from "../providers/types.js";
 import type { ApiRuntime } from "../runtime.js";
-
 export interface RelayLibraryRow {
   id: string;
   service_id: string;
@@ -181,109 +179,5 @@ function observeRelayStream(
       错误类型: error.name,
       中转时长毫秒: Date.now() - fields.startedAt,
     });
-  });
-}
-
-/** 注册 APP 使用的服务端媒体中转接口。 */
-export async function registerMediaStreamRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
-  server.route<{ Params: RelayStreamParams }>({
-    method: ["GET", "HEAD"],
-    url: "/api/v1/libraries/:libraryId/items/:itemId/files/:fileId/stream",
-    handler: async (request, reply) => {
-      requireAppBearer(request);
-      const user = await requireRequestUser(request, runtime.database);
-      const library = await runtime.database.query("media_libraries as l")
-        .join("cloud_services as s", "s.id", "l.service_id")
-        .select(
-          "l.id",
-          "l.service_id",
-          "l.provider_type",
-          "s.status as service_status",
-          "l.app_relay_playback_enabled as relay_playback_enabled",
-          "s.credential_revision",
-        )
-        .where("l.id", request.params.libraryId)
-        .where("l.user_id", user.id)
-        .whereNull("s.deleted_at")
-        .first() as RelayLibraryRow | undefined;
-      if (!library) throw new ApiError(404, "library_not_found", "媒体库不存在");
-      if (!isRelayPlaybackEnabled(library.relay_playback_enabled)) {
-        throw new ApiError(409, "relay_playback_disabled", "当前媒体库未启用 APP 专用中转播放");
-      }
-      if (library.service_status === "disabled") {
-        throw new ApiError(409, "service_disabled", "当前服务已停用，不能中转播放");
-      }
-
-      const mediaItem = await runtime.repository.getCatalogItem(request.params.itemId, user.id);
-      if (mediaItem.libraryId !== request.params.libraryId) {
-        throw new ApiError(404, "media_item_not_found", "媒体条目不存在");
-      }
-      const files = await runtime.repository.listItemFiles(request.params.itemId, user.id);
-      const sourceFile = files.find((file) => String(file.fileId) === request.params.fileId);
-      if (!sourceFile) throw new ApiError(404, "source_file_not_found", "媒体源文件不存在");
-
-      const startedAt = Date.now();
-      const abortController = new AbortController();
-      const abortUpstream = () => {
-        if (!reply.raw.writableEnded) abortController.abort();
-      };
-      request.raw.once("aborted", abortUpstream);
-      reply.raw.once("close", abortUpstream);
-      let upstreamBody: IncomingMessage | null = null;
-      try {
-        const locator = sourceFile.playbackLocator && typeof sourceFile.playbackLocator === "object"
-          ? sourceFile.playbackLocator as Record<string, unknown>
-          : {};
-        const access = await resolveRelayAccess(runtime, library, user.id, locator, abortController.signal);
-        const upstream = await providerStream(access.url, {
-          method: request.method,
-          headers: buildUpstreamHeaders(request, access.headers),
-        }, {
-          allowInsecureHttp: runtime.config.allowInsecureProviderHttp,
-          logConnectionFailure: (fields) => runtime.logBusinessEvent("warn", fields),
-        }, abortController.signal);
-        upstreamBody = upstream.body;
-        upstream.body.once("close", () => {
-          removeClientAbortListeners(request, reply, abortUpstream);
-        });
-        observeRelayStream(runtime, upstream.body, {
-          userId: user.id,
-          serviceId: library.service_id,
-          itemId: request.params.itemId,
-          fileId: request.params.fileId,
-          startedAt,
-        });
-        runtime.logBusinessEvent("info", {
-          日志关键字: "codex-flycloud-helper-media-stream",
-          事件: "媒体中转连接建立",
-          用户ID: user.id,
-          服务ID: library.service_id,
-          媒体条目ID: request.params.itemId,
-          源文件ID: request.params.fileId,
-          请求方式: request.method,
-          是否Range请求: Boolean(request.headers.range),
-          上游状态码: upstream.statusCode,
-          建立耗时毫秒: Date.now() - startedAt,
-        });
-        copyMediaResponseHeaders(reply, upstream.headers);
-        reply.status(upstream.statusCode);
-        return reply.send(upstream.body);
-      } catch (error) {
-        if (!upstreamBody) removeClientAbortListeners(request, reply, abortUpstream);
-        runtime.logBusinessEvent("warn", {
-          日志关键字: "codex-flycloud-helper-media-stream",
-          事件: "媒体中转请求失败",
-          用户ID: user.id,
-          服务ID: library.service_id,
-          媒体条目ID: request.params.itemId,
-          源文件ID: request.params.fileId,
-          错误码: error && typeof error === "object" && "code" in error
-            ? String((error as { code?: string }).code)
-            : "relay_playback_failed",
-          已等待毫秒: Date.now() - startedAt,
-        });
-        throw error;
-      }
-    },
   });
 }

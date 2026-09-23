@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import type { CreateAiModelInput, UpdateAiModelInput } from "../ai/ai-model-manager.js";
 import { readAiCleaningSettings } from "../ai/ai-model-manager.js";
-import type { AiModelRecord, ServiceDetailRecord } from "../domain.js";
+import type { AiModelRecord } from "../domain.js";
 import { ApiError } from "../errors.js";
 import { requireRequestUser, requireString, requireSuperAdmin } from "../http.js";
 import type { ApiRuntime } from "../runtime.js";
@@ -93,11 +93,11 @@ async function readJobAiSupplements(
 /** 为媒体库现有未识别内容创建一次不访问 Provider 的 AI 补充后台任务。 */
 async function createManualAiSupplementJob(
   runtime: ApiRuntime,
-  service: ServiceDetailRecord,
+  service: Awaited<ReturnType<ApiRuntime["repository"]["getLibraryMediaContext"]>>,
   requestedByUserId: string,
   body: Record<string, unknown>,
 ) {
-  const unfinishedJob = await runtime.repository.findUnfinishedScanJob(service.id, service.userId);
+  const unfinishedJob = await runtime.repository.findUnfinishedLibraryScanJob(service.libraryId, service.userId);
   if (service.status === "scanning" || unfinishedJob) {
     throw new ApiError(409, "scan_job_conflict", "当前服务正在扫描或已有未结束任务，不能启动 AI 补充");
   }
@@ -110,7 +110,7 @@ async function createManualAiSupplementJob(
   const job = await runtime.repository.createScanJob({
     jobId: randomUUID(),
     userId: service.userId,
-    serviceId: service.id,
+    libraryId: service.libraryId,
     requestedByUserId,
     requestId: requireString(body, "requestId", "请求 ID", 200),
     clientDeviceId: requireString(body, "clientDeviceId", "客户端设备 ID", 200),
@@ -141,13 +141,13 @@ async function createManualAiSupplementJob(
 /** 注册超级管理员 AI 模型配置、启停和可用性测试接口。 */
 export async function registerAiModelRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
   /** 返回服务配置页可选择的模型；已停用但仍被服务选中的模型仅用于回显。 */
-  server.get<{ Querystring: { serviceId?: string } }>("/api/v1/ai-models/available", async (request) => {
+  server.get<{ Querystring: { libraryId?: string } }>("/api/v1/ai-models/available", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     let selectedModelId: string | undefined;
-    if (request.query.serviceId) {
+    if (request.query.libraryId) {
       const service = user.role === "super_admin"
-        ? await runtime.repository.getServiceDetail(request.query.serviceId)
-        : await runtime.repository.getServiceDetail(request.query.serviceId, user.id);
+        ? await runtime.repository.getLibraryMediaContext(request.query.libraryId)
+        : await runtime.repository.getLibraryMediaContext(request.query.libraryId, user.id);
       selectedModelId = readAiCleaningSettings(service.metadataProfile).modelId ?? undefined;
     }
     const models = await runtime.aiModels.listAvailableModels(selectedModelId);
@@ -164,21 +164,21 @@ export async function registerAiModelRoutes(server: FastifyInstance, runtime: Ap
     return readJobAiSupplements(runtime, request.params.jobId);
   });
 
-  server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(
-    "/api/v1/services/:serviceId/ai-supplements/retry",
+  server.post<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(
+    "/api/v1/libraries/:libraryId/ai-supplements/retry",
     async (request, reply) => {
       const user = await requireRequestUser(request, runtime.database);
-      const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+      const service = await runtime.repository.getLibraryMediaContext(request.params.libraryId, user.id);
       const job = await createManualAiSupplementJob(runtime, service, user.id, request.body ?? {});
       return reply.status(202).send({ job });
     },
   );
 
-  server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(
-    "/api/v1/admin/services/:serviceId/ai-supplements/retry",
+  server.post<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(
+    "/api/v1/admin/libraries/:libraryId/ai-supplements/retry",
     async (request, reply) => {
       const operator = await requireSuperAdmin(request, runtime.database);
-      const service = await runtime.repository.getServiceDetail(request.params.serviceId);
+      const service = await runtime.repository.getLibraryMediaContext(request.params.libraryId);
       const job = await createManualAiSupplementJob(runtime, service, operator.id, request.body ?? {});
       return reply.status(202).send({ job });
     },

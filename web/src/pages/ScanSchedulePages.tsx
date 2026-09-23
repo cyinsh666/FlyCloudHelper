@@ -4,9 +4,9 @@ import { useEffect, useState } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, StatusPill } from "@/components/ui-kit";
 import {
-  getService,
-  getServiceScanSchedules,
-  updateServiceScanSchedule,
+  getLibrary,
+  getLibraryScanSchedules,
+  updateLibraryScanSchedule,
   type ScanSchedule,
   type ScanScheduleType,
 } from "@/lib/api";
@@ -118,7 +118,7 @@ function ScheduleEditor({
     setSaving(true);
     setMessage("正在保存定时任务…");
     try {
-      const saved = await updateServiceScanSchedule(schedule.serviceId, schedule.scanMode, {
+      const saved = await updateLibraryScanSchedule(schedule.libraryId, schedule.scanMode, {
         enabled: form.enabled,
         scheduleType: form.scheduleType,
         intervalMinutes: toIntervalMinutes(form),
@@ -134,7 +134,7 @@ function ScheduleEditor({
       setMessage(`${getScheduledTaskName(saved.scanMode)}计划已保存`);
       console.info("codex-flycloud-scan-schedule", {
         事件: "网页保存扫描定时任务成功",
-        服务ID: saved.serviceId,
+        媒体库ID: saved.libraryId,
         定时任务类型: getScheduledTaskName(saved.scanMode),
         是否启用: saved.enabled,
       });
@@ -143,7 +143,7 @@ function ScheduleEditor({
       setMessage(errorMessage);
       console.warn("codex-flycloud-scan-schedule", {
         事件: "网页保存扫描定时任务失败",
-        服务ID: schedule.serviceId,
+        媒体库ID: schedule.libraryId,
         定时任务类型: getScheduledTaskName(schedule.scanMode),
         错误信息: errorMessage,
       });
@@ -204,20 +204,20 @@ function ScheduleEditor({
   );
 }
 
-/** 服务扫描和视频规格分析定时任务独立设置页面。 */
-export function ServiceScanSchedulePage({ serviceId, admin = false }: { serviceId: string; admin?: boolean }) {
-  const service = useApiResource(() => getService(serviceId, admin), [serviceId, admin]);
-  const schedules = useApiResource(() => getServiceScanSchedules(serviceId, admin), [serviceId, admin]);
-  const detailPath = admin ? "/admin/services/$serviceId" : "/app/services/$serviceId";
+/** 媒体库扫描和视频规格分析定时任务独立设置页面。 */
+export function LibraryScanSchedulePage({ libraryId, admin = false }: { libraryId: string; admin?: boolean }) {
+  const library = useApiResource(() => getLibrary(libraryId, admin), [libraryId, admin]);
+  const schedules = useApiResource(() => getLibraryScanSchedules(libraryId, admin), [libraryId, admin]);
+  const settingsPath = admin ? "/admin/libraries/$serviceId/settings" : "/app/libraries/$serviceId/settings";
 
   /** 保存后读取服务端最终计划和下次执行时间。 */
   function applySaved(_saved: ScanSchedule): void {
     void schedules.refresh();
   }
 
-  if (!service.data || !schedules.data) return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{service.error ?? schedules.error ?? "正在读取定时任务…"}</div></Panel>;
-  return <><PageHeader title={`${service.data.displayName} · 定时任务`} actions={<Link to={detailPath} params={{ serviceId }}><SecondaryButton>返回服务详情</SecondaryButton></Link>} /><Panel className="mb-4"><div className="flex items-start gap-3"><CalendarClock className="mt-0.5 size-5 text-muted-foreground" /><div><p className="text-sm font-medium">计划由云助手后台执行</p><p className="mt-1 text-xs text-muted-foreground">全量扫描、增量扫描和视频规格分析计划互相独立；暂停时段只顺延自动任务，手动操作始终可以执行。</p></div><StatusPill>{getTimezoneLabel()}</StatusPill></div></Panel><div className="grid gap-4 xl:grid-cols-2">{schedules.data.map((schedule) => <ScheduleEditor key={schedule.scanMode} schedule={schedule} admin={admin} onSaved={applySaved} />)}</div></>;
+  if (!library.data || !schedules.data) return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{library.error ?? schedules.error ?? "正在读取定时任务…"}</div></Panel>;
+  return <><PageHeader title={`${library.data.library.displayName} · 定时任务`} actions={<Link to={settingsPath} params={{ serviceId: libraryId }}><SecondaryButton>返回媒体库设置</SecondaryButton></Link>} /><Panel className="mb-4"><div className="flex items-start gap-3"><CalendarClock className="mt-0.5 size-5 text-muted-foreground" /><div><p className="text-sm font-medium">计划由云助手后台执行</p><p className="mt-1 text-xs text-muted-foreground">全量扫描、增量扫描和视频规格分析计划互相独立；暂停时段只顺延自动任务，手动操作始终可以执行。</p></div><StatusPill>{getTimezoneLabel()}</StatusPill></div></Panel><div className="grid gap-4 xl:grid-cols-2">{schedules.data.map((schedule) => <ScheduleEditor key={schedule.scanMode} schedule={schedule} admin={admin} onSaved={applySaved} />)}</div></>;
 }
 
-export function UserServiceScanSchedulePage({ serviceId }: { serviceId: string }) { return <ServiceScanSchedulePage serviceId={serviceId} />; }
-export function AdminServiceScanSchedulePage({ serviceId }: { serviceId: string }) { return <ServiceScanSchedulePage serviceId={serviceId} admin />; }
+export function UserLibraryScanSchedulePage({ libraryId }: { libraryId: string }) { return <LibraryScanSchedulePage libraryId={libraryId} />; }
+export function AdminLibraryScanSchedulePage({ libraryId }: { libraryId: string }) { return <LibraryScanSchedulePage libraryId={libraryId} admin />; }

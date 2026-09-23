@@ -1,14 +1,17 @@
-import { Link } from "@tanstack/react-router";
-import { Copy, Images, Pencil, Plus, Settings2, Trash2 } from "lucide-react";
+import { Link, useNavigate } from "@tanstack/react-router";
+import { Bell, CalendarClock, Copy, Images, Pencil, Plus, ScanLine, Settings2, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { MediaCatalogView, type MediaCatalogQuery } from "@/components/MediaCatalogView";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, StatusPill } from "@/components/ui-kit";
+import { ServicePathPicker, toProviderDirectory } from "@/components/ServicePathPicker";
 import {
   clearServiceCatalog,
+  createScanJob,
   createServiceAccessAccount,
+  deleteLibrary,
   deleteServiceAccessAccount,
-  getService,
+  getLibrary,
   getServiceAccessSettings,
   listAdminServiceItems,
   listLibraryItems,
@@ -19,11 +22,43 @@ import {
   updateServiceEmbySettings,
   updateServiceNavidromeSettings,
   updateLibraryPlaybackSettings,
+  updateLibraryMetadataProfile,
+  updateLibraryNotificationSettings,
+  updateLibraryScanProfile,
+  type ProviderDirectory,
 } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
 
 // 关键变量：单个媒体库海报墙每页读取 60 个顶层条目，避免一次加载完整目录。
 const LIBRARY_CATALOG_PAGE_SIZE = 60;
+
+/** 把媒体库扫描配置中的根目录转换为目录选择器数据。 */
+function readLibraryScanRoots(profile: Record<string, unknown>, mode: "full" | "incremental"): ProviderDirectory[] {
+  const value = mode === "full" ? profile.fullRoots : profile.incrementalRoots;
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const root = entry as Record<string, unknown>;
+    const displayPath = typeof root.displayPath === "string" ? root.displayPath : "";
+    const resourceId = typeof root.resourceId === "string" ? root.resourceId : displayPath;
+    if (!resourceId || !displayPath) return [];
+    return [toProviderDirectory({
+      resourceId,
+      displayPath,
+      ...(typeof root.driveId === "string" && root.driveId ? { driveId: root.driveId } : {}),
+    })];
+  });
+}
+
+/** 把目录选择结果保存为后端扫描配置使用的根目录结构。 */
+function buildLibraryScanRoots(directories: ProviderDirectory[], dataType: "video" | "music" | "audiobook"): Record<string, unknown>[] {
+  return directories.map((directory) => ({
+    resourceId: directory.resourceId,
+    displayPath: directory.displayPath,
+    ...(directory.driveId ? { driveId: directory.driveId } : {}),
+    mediaTypes: [dataType],
+  }));
+}
 
 /** 复制媒体库协议地址，并兼容未开放 Clipboard API 的浏览器。 */
 async function copyLibraryText(value: string): Promise<void> {
@@ -43,27 +78,153 @@ async function copyLibraryText(value: string): Promise<void> {
 
 /** 集中管理单个媒体库的 APP 播放、协议入口和数据清理。 */
 export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: string; admin?: boolean }) {
+  const navigate = useNavigate();
   const resource = useApiResource(async () => {
-    const [service, settings] = await Promise.all([
-      getService(serviceId, admin),
+    const [libraryResult, settings] = await Promise.all([
+      getLibrary(serviceId, admin),
       getServiceAccessSettings(serviceId, admin),
     ]);
-    return { service, settings };
+    return {
+      service: { ...libraryResult.library, libraryId: libraryResult.library.id },
+      scanProfile: libraryResult.scanProfile,
+      metadataProfile: libraryResult.metadataProfile,
+      settings,
+    };
   }, [serviceId, admin]);
   const [message, setMessage] = useState<string | null>(null);
   const [updatingJellyfin, setUpdatingJellyfin] = useState(false);
   const [updatingEmby, setUpdatingEmby] = useState(false);
   const [updatingNavidrome, setUpdatingNavidrome] = useState(false);
-  const [updatingRelayPlayback, setUpdatingRelayPlayback] = useState(false);
   const [clearingCatalog, setClearingCatalog] = useState(false);
+  const [creatingScanMode, setCreatingScanMode] = useState<"full" | "incremental" | null>(null);
+  const [updatingNotification, setUpdatingNotification] = useState(false);
+  const [savingMetadata, setSavingMetadata] = useState(false);
+  const [unlinkingService, setUnlinkingService] = useState(false);
+  const [metadataProvider, setMetadataProvider] = useState("builtin.tmdb");
+  const [metadataLanguage, setMetadataLanguage] = useState("zh-CN");
+  const [metadataRegion, setMetadataRegion] = useState("CN");
+  const [useNfo, setUseNfo] = useState(true);
+  const [syncDetails, setSyncDetails] = useState(false);
+  const [analyzeMediaSpecs, setAnalyzeMediaSpecs] = useState(false);
+  const [musicAggregateMode, setMusicAggregateMode] = useState<"fast" | "complete">("fast");
+  const [syncLyrics, setSyncLyrics] = useState(false);
   // 关键变量：同步占用清空操作，避免按钮状态刷新前重复提交。
   const clearingCatalogRef = useRef(false);
   const service = resource.data?.service;
   const settings = resource.data?.settings;
+  const scanProfile = resource.data?.scanProfile ?? {};
+  const metadataProfile = resource.data?.metadataProfile ?? {};
   const catalogPath = admin ? "/admin/libraries/$serviceId/catalog" : "/app/libraries/$serviceId/catalog";
   const jellyfinPath = admin ? "/admin/libraries/$serviceId/jellyfin" : "/app/libraries/$serviceId/jellyfin";
   const embyPath = admin ? "/admin/libraries/$serviceId/emby" : "/app/libraries/$serviceId/emby";
+  const schedulePath = admin ? "/admin/libraries/$serviceId/scan-schedules" : "/app/libraries/$serviceId/scan-schedules";
   const librariesPath = admin ? "/admin/catalog" : "/app/catalog";
+
+  useEffect(() => {
+    const profiles = metadataProfile.profiles && typeof metadataProfile.profiles === "object" && !Array.isArray(metadataProfile.profiles)
+      ? metadataProfile.profiles as Record<string, unknown>
+      : {};
+    const profileKey = service?.dataType === "music" ? "music" : "video";
+    const selected = profiles[profileKey] && typeof profiles[profileKey] === "object" && !Array.isArray(profiles[profileKey])
+      ? profiles[profileKey] as Record<string, unknown>
+      : {};
+    if (typeof selected.providerId === "string") setMetadataProvider(selected.providerId);
+    if (typeof selected.language === "string") setMetadataLanguage(selected.language);
+    if (typeof selected.region === "string") setMetadataRegion(selected.region);
+    setUseNfo(selected.useNfo !== false);
+    setSyncDetails(selected.syncDetails === true);
+    setAnalyzeMediaSpecs(selected.analyzeMediaSpecs === true);
+    setMusicAggregateMode(selected.aggregateMode === "complete" ? "complete" : "fast");
+    const requiredFields = selected.requiredFields && typeof selected.requiredFields === "object" && !Array.isArray(selected.requiredFields)
+      ? selected.requiredFields as Record<string, unknown>
+      : {};
+    setSyncLyrics(requiredFields.lyrics === true);
+  }, [metadataProfile, service?.dataType]);
+
+  /** 保存全量或增量扫描路径，同时保留并发等其他扫描配置。 */
+  async function saveScanRoots(mode: "full" | "incremental", directories: ProviderDirectory[]): Promise<void> {
+    if (!service) return;
+    const roots = buildLibraryScanRoots(directories, service.dataType);
+    await updateLibraryScanProfile(serviceId, {
+      ...scanProfile,
+      ...(mode === "full" ? { fullRoots: roots } : { incrementalRoots: roots }),
+    }, admin, "paths");
+    setMessage(`${mode === "full" ? "全量" : "增量"}扫描路径已保存`);
+    await resource.refresh();
+  }
+
+  /** 手动创建当前媒体库的扫描刮削任务。 */
+  async function triggerScan(mode: "full" | "incremental"): Promise<void> {
+    if (creatingScanMode !== null) return;
+    setCreatingScanMode(mode);
+    try {
+      const job = await createScanJob(serviceId, mode, admin);
+      setMessage(`${mode === "full" ? "全量" : "增量"}扫描任务已创建：${job.id}`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "扫描任务创建失败");
+    } finally {
+      setCreatingScanMode(null);
+    }
+  }
+
+  /** 保存媒体库元数据来源和常用刮削选项。 */
+  async function saveMetadataSettings(): Promise<void> {
+    if (!service || savingMetadata) return;
+    setSavingMetadata(true);
+    try {
+      const profiles = metadataProfile.profiles && typeof metadataProfile.profiles === "object" && !Array.isArray(metadataProfile.profiles)
+        ? metadataProfile.profiles as Record<string, unknown>
+        : {};
+      const profileKey = service.dataType === "music" ? "music" : "video";
+      const currentProfile = profiles[profileKey] && typeof profiles[profileKey] === "object" && !Array.isArray(profiles[profileKey])
+        ? profiles[profileKey] as Record<string, unknown>
+        : {};
+      const currentRequiredFields = currentProfile.requiredFields && typeof currentProfile.requiredFields === "object" && !Array.isArray(currentProfile.requiredFields)
+        ? currentProfile.requiredFields as Record<string, unknown>
+        : {};
+      const profile = service.dataType === "music"
+        ? {
+          ...currentProfile,
+          providerId: metadataProvider,
+          aggregateMode: musicAggregateMode,
+          requiredFields: { ...currentRequiredFields, artist: true, album: true, cover: true, lyrics: syncLyrics },
+        }
+        : {
+          ...currentProfile,
+          providerId: metadataProvider,
+          language: metadataLanguage,
+          region: metadataRegion,
+          useNfo,
+          syncDetails,
+          analyzeMediaSpecs,
+        };
+      await updateLibraryMetadataProfile(serviceId, {
+        ...metadataProfile,
+        profiles: { ...profiles, [profileKey]: profile },
+      }, admin);
+      setMessage("元数据配置已保存");
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "元数据配置保存失败");
+    } finally {
+      setSavingMetadata(false);
+    }
+  }
+
+  /** 切换当前媒体库后台任务完成通知。 */
+  async function toggleNotification(): Promise<void> {
+    if (!service || updatingNotification) return;
+    setUpdatingNotification(true);
+    try {
+      await updateLibraryNotificationSettings(serviceId, !service.notificationEnabled, admin);
+      setMessage(`任务完成通知已${service.notificationEnabled ? "关闭" : "启用"}`);
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "任务完成通知设置失败");
+    } finally {
+      setUpdatingNotification(false);
+    }
+  }
 
   /** 立即保存当前媒体库的 Jellyfin 协议开关。 */
   async function toggleJellyfin(): Promise<void> {
@@ -111,23 +272,6 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
     }
   }
 
-  /** 独立保存 APP 专用中转播放开关。 */
-  async function toggleAppRelayPlayback(): Promise<void> {
-    if (!settings || updatingRelayPlayback) return;
-    const nextEnabled = !settings.appRelayPlaybackEnabled;
-    setUpdatingRelayPlayback(true);
-    setMessage(`正在${nextEnabled ? "启用" : "关闭"} APP 专用中转播放…`);
-    try {
-      await updateLibraryPlaybackSettings(serviceId, { appRelayPlaybackEnabled: nextEnabled }, admin);
-      setMessage(`APP 专用中转播放已${nextEnabled ? "启用" : "关闭"}`);
-      await resource.refresh();
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "媒体库中转播放设置保存失败");
-    } finally {
-      setUpdatingRelayPlayback(false);
-    }
-  }
-
   /** 二次确认后清空媒体库中的扫描和刮削结果。 */
   async function clearCatalog(): Promise<void> {
     if (!service || clearingCatalogRef.current) return;
@@ -147,6 +291,50 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
     }
   }
 
+  /** 删除媒体库并返回媒体库列表，来源网盘服务继续保留。 */
+  async function deleteCurrentLibrary(): Promise<void> {
+    if (!service || !window.confirm(`确定删除“${service.displayName}”媒体库吗？扫描结果、任务配置和协议账号会被删除，来源网盘服务会保留。`)) return;
+    try {
+      await deleteLibrary(serviceId, admin);
+      await navigate({ to: librariesPath, replace: true });
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "媒体库删除失败");
+    }
+  }
+
+  /** 取消当前唯一来源时同步删除媒体库，避免留下无法扫描和播放的空媒体库。 */
+  async function unlinkLastService(): Promise<void> {
+    if (!service || unlinkingService) return;
+    const confirmed = window.confirm(
+      `“${service.sourceServiceName}”是“${service.displayName}”的最后一个关联服务。取消关联将同时删除该媒体库及扫描结果、任务配置和协议账号，网盘服务本身会保留。确定继续吗？`,
+    );
+    if (!confirmed) return;
+    setUnlinkingService(true);
+    console.info("codex-media-library-source-unlink", {
+      事件: "取消最后一个关联服务并删除媒体库",
+      媒体库ID: serviceId,
+      服务ID: service.sourceServiceId,
+    });
+    try {
+      await deleteLibrary(serviceId, admin);
+      console.info("codex-media-library-source-unlink", {
+        事件: "取消关联完成，媒体库已删除",
+        媒体库ID: serviceId,
+        服务ID: service.sourceServiceId,
+      });
+      await navigate({ to: librariesPath, replace: true });
+    } catch (error) {
+      console.warn("codex-media-library-source-unlink", {
+        事件: "取消关联失败",
+        媒体库ID: serviceId,
+        服务ID: service.sourceServiceId,
+        错误: error instanceof Error ? error.message : String(error),
+      });
+      setMessage(error instanceof Error ? error.message : "取消关联失败");
+      setUnlinkingService(false);
+    }
+  }
+
   if (!service || !settings) {
     return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取媒体库设置…"}</div></Panel>;
   }
@@ -163,11 +351,25 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
         actions={(
           <div className="flex flex-wrap gap-2">
             <Link to={librariesPath}><SecondaryButton>返回媒体库</SecondaryButton></Link>
+            <Link to={schedulePath} params={{ serviceId }}><SecondaryButton><CalendarClock className="size-4" /> 定时任务</SecondaryButton></Link>
             <Link to={catalogPath} params={{ serviceId }}><PrimaryButton><Images className="size-4" /> 海报墙</PrimaryButton></Link>
           </div>
         )}
       />
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
+      <Panel title="关联服务" description="当前媒体库使用这个网盘服务的登录凭据读取和扫描文件。" className="mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="min-w-0">
+            <p className="truncate text-sm font-medium">{service.sourceServiceName}</p>
+            <p className="mt-1 text-xs text-muted-foreground">{service.providerType} · {service.sourceConnectionStatus === "valid" ? "连接正常" : "需要重新登录"}</p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Link to={admin ? "/admin/services/$serviceId" : "/app/services/$serviceId"} params={{ serviceId: service.sourceServiceId }}><SecondaryButton>查看服务</SecondaryButton></Link>
+            <button type="button" onClick={() => void unlinkLastService()} disabled={unlinkingService} className="inline-flex cursor-pointer items-center justify-center rounded-lg border border-destructive/50 bg-destructive/10 px-3 py-2 text-xs font-medium text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40">{unlinkingService ? "取消中…" : "取消关联"}</button>
+          </div>
+        </div>
+        <p className="mt-2 text-xs text-muted-foreground">当前只有这一个关联服务；取消关联会同时删除媒体库，网盘服务仍然保留。</p>
+      </Panel>
       <div className={`grid gap-3 sm:grid-cols-3 ${settings.navidromeSupported ? "" : "xl:grid-cols-4"}`}>
         <div className="flex items-center justify-between gap-3 rounded-xl border border-border bg-secondary/20 px-4 py-3">
           <span className="text-xs text-muted-foreground">媒体条目</span>
@@ -186,19 +388,34 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
           <span className="text-sm font-semibold">{settings.embyEnabled ? "已启用" : "未启用"}</span>
         </div>}
       </div>
+      <div className="mt-4 grid gap-4 xl:grid-cols-2">
+        <Panel title="扫描路径" description="全量与增量路径分别保存到媒体库，网盘服务只提供登录凭据。">
+          <div className="grid gap-3">
+            <ServicePathPicker serviceId={service.sourceServiceId} admin={admin} label="全量扫描目录" value={readLibraryScanRoots(scanProfile, "full")} onConfirm={(directories) => saveScanRoots("full", directories)} />
+            <ServicePathPicker serviceId={service.sourceServiceId} admin={admin} label="增量扫描目录" value={readLibraryScanRoots(scanProfile, "incremental")} onConfirm={(directories) => saveScanRoots("incremental", directories)} />
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <SecondaryButton disabled={creatingScanMode !== null || readLibraryScanRoots(scanProfile, "full").length === 0} onClick={() => void triggerScan("full")}><ScanLine className="size-4" /> {creatingScanMode === "full" ? "创建中…" : "全量扫描"}</SecondaryButton>
+            <PrimaryButton disabled={creatingScanMode !== null || readLibraryScanRoots(scanProfile, "incremental").length === 0} onClick={() => void triggerScan("incremental")}><ScanLine className="size-4" /> {creatingScanMode === "incremental" ? "创建中…" : "增量扫描"}</PrimaryButton>
+          </div>
+        </Panel>
+        <Panel title="元数据" description={service.dataType === "music" ? "配置音乐平台聚合与歌词补全。" : "配置影视刮削来源、语言和扫描增强。"}>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label><span className="text-xs text-muted-foreground">元数据来源</span><select value={metadataProvider} onChange={(event) => setMetadataProvider(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm">{service.dataType === "music" ? <><option value="auto">多平台自动补全</option><option value="musicbrainz">MusicBrainz</option><option value="netease">网易云音乐</option><option value="qmusic">QQ音乐</option><option value="kugou">酷狗音乐</option><option value="migu">咪咕音乐</option><option value="kuwo">酷我音乐</option></> : <><option value="builtin.tmdb">TMDB 在线刮削</option><option value="local">仅本地 NFO 和文件名</option></>}</select></label>
+            {service.dataType === "music" ? <label><span className="text-xs text-muted-foreground">聚合方式</span><select value={musicAggregateMode} onChange={(event) => setMusicAggregateMode(event.target.value as "fast" | "complete")} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm"><option value="fast">最快命中</option><option value="complete">完整聚合</option></select></label> : <><label><span className="text-xs text-muted-foreground">语言</span><select value={metadataLanguage} onChange={(event) => setMetadataLanguage(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm"><option value="zh-CN">简体中文</option><option value="zh-TW">繁体中文</option><option value="en-US">英语</option><option value="ja-JP">日语</option><option value="ko-KR">韩语</option></select></label><label><span className="text-xs text-muted-foreground">地区</span><select value={metadataRegion} onChange={(event) => setMetadataRegion(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm"><option value="CN">中国大陆</option><option value="HK">中国香港</option><option value="TW">中国台湾</option><option value="US">美国</option><option value="JP">日本</option><option value="KR">韩国</option></select></label></>}
+          </div>
+          <div className="mt-3 flex flex-wrap gap-4 text-xs text-muted-foreground">
+            {service.dataType === "music" ? <label className="inline-flex items-center gap-2"><input type="checkbox" checked={syncLyrics} onChange={(event) => setSyncLyrics(event.target.checked)} /> 补全歌词</label> : <><label className="inline-flex items-center gap-2"><input type="checkbox" checked={useNfo} onChange={(event) => setUseNfo(event.target.checked)} /> 优先本地 NFO</label><label className="inline-flex items-center gap-2"><input type="checkbox" checked={syncDetails} onChange={(event) => setSyncDetails(event.target.checked)} /> 同步详情</label><label className="inline-flex items-center gap-2"><input type="checkbox" checked={analyzeMediaSpecs} onChange={(event) => setAnalyzeMediaSpecs(event.target.checked)} /> 分析视频规格</label></>}
+          </div>
+          <div className="mt-4"><PrimaryButton disabled={savingMetadata} onClick={() => void saveMetadataSettings()}>{savingMetadata ? "正在保存…" : "保存元数据配置"}</PrimaryButton></div>
+        </Panel>
+      </div>
+      <Panel title="任务通知" className="mt-4">
+        <div className="flex items-center justify-between gap-4"><div className="flex items-center gap-3"><Bell className="size-5 text-muted-foreground" /><div><p className="text-sm font-medium">后台任务完成通知</p><p className="mt-1 text-xs text-muted-foreground">通知渠道由云助手系统设置统一管理。</p></div></div><button type="button" role="switch" aria-checked={service.notificationEnabled} disabled={updatingNotification} onClick={() => void toggleNotification()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:opacity-40 ${service.notificationEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}><span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${service.notificationEnabled ? "translate-x-5" : "translate-x-0"}`} /></button></div>
+      </Panel>
       <div className="mt-4 grid items-start gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(240px,1fr)]">
-        <Panel title="播放与协议" description={settings.navidromeSupported ? "管理 APP 播放和 Navidrome 客户端访问。" : "管理 APP 播放及 Jellyfin、Emby 客户端访问。"}>
+        <Panel title="播放与协议" description={settings.navidromeSupported ? "管理 Navidrome 客户端访问。" : "管理 Jellyfin、Emby 客户端访问。"}>
           <div className="divide-y divide-border overflow-hidden rounded-xl border border-border">
-            <div className="flex items-center justify-between gap-4 px-4 py-3">
-              <div className="min-w-0">
-                <p className="text-sm font-medium">APP 专用中转播放</p>
-                <p className="mt-0.5 text-xs text-muted-foreground">Flymby 通过云助手播放时由 FlyCloudHelper 转发媒体流。</p>
-                {!settings.relayPlaybackSupported && <p className="mt-1 text-xs text-warning">当前网盘类型暂不支持中转播放。</p>}
-              </div>
-              <button type="button" role="switch" aria-checked={settings.appRelayPlaybackEnabled} aria-label="启用 APP 专用中转播放" disabled={(!settings.relayPlaybackSupported && !settings.appRelayPlaybackEnabled) || updatingRelayPlayback} onClick={() => void toggleAppRelayPlayback()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.appRelayPlaybackEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
-                <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.appRelayPlaybackEnabled ? "translate-x-5" : "translate-x-0"}`} />
-              </button>
-            </div>
             {!settings.navidromeSupported && <div className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="min-w-0">
                 <p className="text-sm font-medium">Jellyfin 协议</p>
@@ -247,7 +464,8 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
           </div>
         </Panel>
         <Panel title="危险操作" description="清空媒体条目、文件索引和目录版本。" className="self-start">
-          <button type="button" onClick={() => void clearCatalog()} disabled={service.status === "scanning" || clearingCatalog} className="inline-flex w-full cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm font-medium text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {clearingCatalog ? "正在清空…" : "清空媒体库"}</button>
+          <button type="button" onClick={() => void clearCatalog()} disabled={clearingCatalog} className="inline-flex w-full cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm font-medium text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {clearingCatalog ? "正在清空…" : "清空媒体库"}</button>
+          <button type="button" onClick={() => void deleteCurrentLibrary()} className="mt-2 inline-flex w-full cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive/50 px-4 py-2.5 text-sm font-medium text-destructive transition-colors hover:bg-destructive/10"><Trash2 className="size-4" /> 删除媒体库</button>
         </Panel>
       </div>
     </>
@@ -261,7 +479,7 @@ export function AdminLibrarySettingsPage({ serviceId }: { serviceId: string }) {
 export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serviceId: string; admin?: boolean }) {
   const resource = useApiResource(async () => {
     const [service, settings] = await Promise.all([
-      getService(serviceId, admin),
+      getLibrary(serviceId, admin).then((result) => ({ ...result.library, libraryId: result.library.id })),
       getServiceAccessSettings(serviceId, admin),
     ]);
     return { service, settings };
@@ -728,7 +946,7 @@ export function LibraryCatalogPage({ serviceId, admin = false }: { serviceId: st
   });
   const [pageOffset, setPageOffset] = useState(0);
   const resource = useApiResource(async () => {
-    const service = await getService(serviceId, admin);
+    const service = await getLibrary(serviceId, admin).then((result) => ({ ...result.library, libraryId: result.library.id }));
     const selectedItemType = catalogQuery.musicItemType !== "all"
       ? catalogQuery.musicItemType
       : catalogQuery.videoItemType === "all" ? undefined : catalogQuery.videoItemType;
@@ -743,8 +961,8 @@ export function LibraryCatalogPage({ serviceId, admin = false }: { serviceId: st
       offset: pageOffset,
     };
     const catalog = admin
-      ? await listAdminServiceItems(serviceId, options)
-      : await listLibraryItems(service.libraryId, options);
+      ? await listAdminServiceItems(service.sourceServiceId, options)
+      : await listLibraryItems(service.id, options);
     return { service, catalog };
   }, [serviceId, admin, catalogQuery.search, catalogQuery.mediaType, catalogQuery.videoItemType, catalogQuery.musicItemType, catalogQuery.matchState, catalogQuery.sort, pageOffset]);
 

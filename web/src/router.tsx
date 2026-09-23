@@ -15,13 +15,13 @@ import { OverviewPage } from "@/pages/OverviewPage";
 import {
   AdminServiceConnectionPage,
   AdminServiceCreatePage,
-  AdminServiceDetailPage,
   AdminServicesPage,
   ServiceCreatePage,
   UserServiceConnectionPage,
-  UserServiceDetailPage,
   UserServicesPage,
 } from "@/pages/ServicePages";
+import { AdminServiceBasicDetailPage, UserServiceBasicDetailPage } from "@/pages/ServiceBasicDetailPage";
+import { LibraryCreatePage } from "@/pages/LibraryCreatePage";
 import {
   AdminCatalogPage,
   AdminJobsPage,
@@ -51,10 +51,9 @@ import {
 import { AdminAiModelsPage } from "@/pages/AiModelPages";
 import { AdminMusicSourcesPage } from "@/pages/MusicSourcePages";
 import { AdminNotificationSettingsPage } from "@/pages/AdminNotificationSettingsPage";
-import { AggregateServicePage } from "@/pages/AggregateServicePage";
 import {
-  AdminServiceScanSchedulePage,
-  UserServiceScanSchedulePage,
+  AdminLibraryScanSchedulePage,
+  UserLibraryScanSchedulePage,
 } from "@/pages/ScanSchedulePages";
 
 /** 根路由容器。 */
@@ -175,13 +174,7 @@ function GuangyaCaptchaCallbackPage() {
 /** 处理普通用户服务详情路由参数。 */
 function UserServiceDetailRouteComponent() {
   const { serviceId } = userServiceDetailRoute.useParams();
-  return <UserServiceDetailPage serviceId={serviceId} />;
-}
-
-/** 处理普通用户服务海报墙路由参数。 */
-function UserServiceCatalogRouteComponent() {
-  const { serviceId } = userServiceCatalogRoute.useParams();
-  return <UserLibraryCatalogPage serviceId={serviceId} />;
+  return <UserServiceBasicDetailPage serviceId={serviceId} />;
 }
 
 /** 处理普通用户服务连接管理路由参数。 */
@@ -190,10 +183,10 @@ function UserServiceConnectionRouteComponent() {
   return <UserServiceConnectionPage serviceId={serviceId} />;
 }
 
-/** 处理普通用户扫描定时任务路由参数。 */
-function UserServiceScanScheduleRouteComponent() {
-  const { serviceId } = userServiceScanScheduleRoute.useParams();
-  return <UserServiceScanSchedulePage serviceId={serviceId} />;
+/** 处理普通用户媒体库扫描定时任务路由参数。 */
+function UserLibraryScanScheduleRouteComponent() {
+  const { serviceId } = userLibraryScanScheduleRoute.useParams();
+  return <UserLibraryScanSchedulePage libraryId={serviceId} />;
 }
 
 /** 处理普通用户媒体库设置路由参数。 */
@@ -223,13 +216,18 @@ function UserLibraryJellyfinSettingsRouteComponent() {
 /** 处理管理员服务详情路由参数。 */
 function AdminServiceDetailRouteComponent() {
   const { serviceId } = adminServiceDetailRoute.useParams();
-  return <AdminServiceDetailPage serviceId={serviceId} />;
+  return <AdminServiceBasicDetailPage serviceId={serviceId} />;
 }
 
-/** 处理管理员服务海报墙路由参数。 */
-function AdminServiceCatalogRouteComponent() {
-  const { serviceId } = adminServiceCatalogRoute.useParams();
-  return <AdminLibraryCatalogPage serviceId={serviceId} />;
+/** 从网盘服务快捷创建媒体库。 */
+function UserLibraryCreateRouteComponent() {
+  const { serviceId } = userLibraryCreateRoute.useParams();
+  return <LibraryCreatePage serviceId={serviceId} />;
+}
+
+/** 从媒体库管理进入统一创建页。 */
+function UserLibraryCreateWithoutSourceRouteComponent() {
+  return <LibraryCreatePage />;
 }
 
 /** 处理管理员服务连接管理路由参数。 */
@@ -238,10 +236,10 @@ function AdminServiceConnectionRouteComponent() {
   return <AdminServiceConnectionPage serviceId={serviceId} />;
 }
 
-/** 处理管理员扫描定时任务路由参数。 */
-function AdminServiceScanScheduleRouteComponent() {
-  const { serviceId } = adminServiceScanScheduleRoute.useParams();
-  return <AdminServiceScanSchedulePage serviceId={serviceId} />;
+/** 处理管理员媒体库扫描定时任务路由参数。 */
+function AdminLibraryScanScheduleRouteComponent() {
+  const { serviceId } = adminLibraryScanScheduleRoute.useParams();
+  return <AdminLibraryScanSchedulePage libraryId={serviceId} />;
 }
 
 /** 处理管理员媒体库设置路由参数。 */
@@ -352,22 +350,10 @@ const userServiceDetailRoute = createRoute({
   component: UserServiceDetailRouteComponent,
 });
 
-const userServiceCatalogRoute = createRoute({
-  getParentRoute: () => appRoute,
-  path: "services/$serviceId/catalog",
-  component: UserServiceCatalogRouteComponent,
-});
-
 const userServiceConnectionRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "services/$serviceId/connection",
   component: UserServiceConnectionRouteComponent,
-});
-
-const userServiceScanScheduleRoute = createRoute({
-  getParentRoute: () => appRoute,
-  path: "services/$serviceId/scan-schedules",
-  component: UserServiceScanScheduleRouteComponent,
 });
 
 const userJobsRoute = createRoute({
@@ -382,23 +368,34 @@ const userCatalogRoute = createRoute({
   component: UserCatalogPage,
 });
 
-/** 普通用户查看 Grid 聚合服务列表，并创建单协议聚合服务。 */
-const userAggregateServiceRoute = createRoute({
-  getParentRoute: () => appRoute,
-  path: "catalog/aggregate",
-  component: AggregateServicePage,
-});
-
 const userLibrarySettingsRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "libraries/$serviceId/settings",
   component: UserLibrarySettingsRouteComponent,
 });
 
+const userLibraryCreateRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "libraries/new/$serviceId",
+  component: UserLibraryCreateRouteComponent,
+});
+
+const userLibraryCreateWithoutSourceRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "libraries/new",
+  component: UserLibraryCreateWithoutSourceRouteComponent,
+});
+
 const userLibraryCatalogRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "libraries/$serviceId/catalog",
   component: UserLibraryCatalogRouteComponent,
+});
+
+const userLibraryScanScheduleRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "libraries/$serviceId/scan-schedules",
+  component: UserLibraryScanScheduleRouteComponent,
 });
 
 const userLibraryJellyfinSettingsRoute = createRoute({
@@ -449,22 +446,10 @@ const adminServiceDetailRoute = createRoute({
   component: AdminServiceDetailRouteComponent,
 });
 
-const adminServiceCatalogRoute = createRoute({
-  getParentRoute: () => adminRoute,
-  path: "services/$serviceId/catalog",
-  component: AdminServiceCatalogRouteComponent,
-});
-
 const adminServiceConnectionRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "services/$serviceId/connection",
   component: AdminServiceConnectionRouteComponent,
-});
-
-const adminServiceScanScheduleRoute = createRoute({
-  getParentRoute: () => adminRoute,
-  path: "services/$serviceId/scan-schedules",
-  component: AdminServiceScanScheduleRouteComponent,
 });
 
 const adminJobsRoute = createRoute({
@@ -489,6 +474,12 @@ const adminLibraryCatalogRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "libraries/$serviceId/catalog",
   component: AdminLibraryCatalogRouteComponent,
+});
+
+const adminLibraryScanScheduleRoute = createRoute({
+  getParentRoute: () => adminRoute,
+  path: "libraries/$serviceId/scan-schedules",
+  component: AdminLibraryScanScheduleRouteComponent,
 });
 
 const adminLibraryJellyfinSettingsRoute = createRoute({
@@ -551,14 +542,14 @@ const appRouteTree = appRoute.addChildren([
   userServicesRoute,
   userServiceCreateRoute,
   userServiceDetailRoute,
-  userServiceCatalogRoute,
   userServiceConnectionRoute,
-  userServiceScanScheduleRoute,
   userJobsRoute,
   userCatalogRoute,
-  userAggregateServiceRoute,
+  userLibraryCreateRoute,
+  userLibraryCreateWithoutSourceRoute,
   userLibrarySettingsRoute,
   userLibraryCatalogRoute,
+  userLibraryScanScheduleRoute,
   userLibraryJellyfinSettingsRoute,
   userLibraryEmbySettingsRoute,
 ]);
@@ -570,13 +561,12 @@ const adminRouteTree = adminRoute.addChildren([
   adminServicesRoute,
   adminServiceCreateRoute,
   adminServiceDetailRoute,
-  adminServiceCatalogRoute,
   adminServiceConnectionRoute,
-  adminServiceScanScheduleRoute,
   adminJobsRoute,
   adminCatalogRoute,
   adminLibrarySettingsRoute,
   adminLibraryCatalogRoute,
+  adminLibraryScanScheduleRoute,
   adminLibraryJellyfinSettingsRoute,
   adminLibraryEmbySettingsRoute,
   adminPluginsRoute,

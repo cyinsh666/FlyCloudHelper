@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import type { ScanScheduleType, ServiceDetailRecord } from "../domain.js";
+import type { ScanScheduleType, MediaLibraryRecord } from "../domain.js";
 import { ApiError, validationError } from "../errors.js";
 import { requireRequestUser, requireSuperAdmin } from "../http.js";
 import type { ApiRuntime } from "../runtime.js";
@@ -88,11 +88,12 @@ function readScheduleConfiguration(body: Record<string, unknown>): ScanScheduleC
   };
 }
 
-/** 校验任务前置条件并保存一个服务的定时计划。 */
+/** 校验任务前置条件并保存一个媒体库的定时计划。 */
 async function saveSchedule(
   runtime: ApiRuntime,
   store: ScanScheduleStore,
-  service: ServiceDetailRecord,
+  library: MediaLibraryRecord,
+  profiles: { scanProfile: Record<string, unknown> },
   scanMode: string,
   body: Record<string, unknown>,
   operatorId: string,
@@ -104,18 +105,18 @@ async function saveSchedule(
   const scheduledTaskMode = scanMode as ScheduledTaskMode;
   const configuration = readScheduleConfiguration(body);
   if (scheduledTaskMode === "media_probe") {
-    if (service.dataType !== "video") {
+    if (library.dataType !== "video") {
       throw new ApiError(409, "media_probe_video_only", "只有影视服务可以配置视频规格分析定时任务");
     }
   } else {
-    const roots = readConfiguredRoots(service.scanProfile, scheduledTaskMode);
+    const roots = readConfiguredRoots(profiles.scanProfile, scheduledTaskMode);
     if (configuration.enabled && roots.length === 0) {
       throw new ApiError(409, "scan_paths_not_configured", `请先配置${scheduledTaskMode === "full" ? "全量" : "增量"}扫描路径`);
     }
   }
-  const schedule = await store.saveServiceSchedule({
-    userId: service.userId,
-    serviceId: service.id,
+  const schedule = await store.saveLibrarySchedule({
+    userId: library.userId,
+    libraryId: library.id,
     scanMode: scheduledTaskMode,
     configuration,
   });
@@ -124,7 +125,7 @@ async function saveSchedule(
     事件: "保存后台定时任务",
     操作用户ID: operatorId,
     是否管理员操作: administrator,
-    服务ID: service.id,
+    媒体库ID: library.id,
     计划ID: schedule.id,
     定时任务类型: scheduledTaskMode === "full" ? "全量扫描" :
       scheduledTaskMode === "incremental" ? "增量扫描" : "视频规格分析",
@@ -144,35 +145,39 @@ export async function registerScanScheduleRoutes(
   runtime: ApiRuntime,
   store: ScanScheduleStore,
 ): Promise<void> {
-  server.get<{ Params: { serviceId: string } }>("/api/v1/services/:serviceId/scan-schedules", async (request) => {
+  server.get<{ Params: { libraryId: string } }>("/api/v1/libraries/:libraryId/scan-schedules", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
-    const schedules = await store.listServiceSchedules(service.userId, service.id);
-    return { schedules: service.dataType === "video" ? schedules : schedules.filter((item) => item.scanMode !== "media_probe") };
+    const library = await runtime.repository.getLibrary(request.params.libraryId, user.id);
+    const profiles = await runtime.repository.getLibraryProfiles(library.id, user.id);
+    const schedules = await store.listLibrarySchedules(library.userId, library.id);
+    return { schedules: library.dataType === "video" ? schedules : schedules.filter((item) => item.scanMode !== "media_probe") };
   });
 
-  server.put<{ Params: { serviceId: string; scanMode: string }; Body: Record<string, unknown> }>(
-    "/api/v1/services/:serviceId/scan-schedules/:scanMode",
+  server.put<{ Params: { libraryId: string; scanMode: string }; Body: Record<string, unknown> }>(
+    "/api/v1/libraries/:libraryId/scan-schedules/:scanMode",
     async (request) => {
       const user = await requireRequestUser(request, runtime.database);
-      const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
-      return saveSchedule(runtime, store, service, request.params.scanMode, request.body, user.id, false);
+      const library = await runtime.repository.getLibrary(request.params.libraryId, user.id);
+      const profiles = await runtime.repository.getLibraryProfiles(library.id, library.userId);
+      return saveSchedule(runtime, store, library, profiles, request.params.scanMode, request.body, user.id, false);
     },
   );
 
-  server.get<{ Params: { serviceId: string } }>("/api/v1/admin/services/:serviceId/scan-schedules", async (request) => {
+  server.get<{ Params: { libraryId: string } }>("/api/v1/admin/libraries/:libraryId/scan-schedules", async (request) => {
     await requireSuperAdmin(request, runtime.database);
-    const service = await runtime.repository.getServiceDetail(request.params.serviceId);
-    const schedules = await store.listServiceSchedules(service.userId, service.id);
-    return { schedules: service.dataType === "video" ? schedules : schedules.filter((item) => item.scanMode !== "media_probe") };
+    const library = await runtime.repository.getLibrary(request.params.libraryId);
+    const profiles = await runtime.repository.getLibraryProfiles(library.id, library.userId);
+    const schedules = await store.listLibrarySchedules(library.userId, library.id);
+    return { schedules: library.dataType === "video" ? schedules : schedules.filter((item) => item.scanMode !== "media_probe") };
   });
 
-  server.put<{ Params: { serviceId: string; scanMode: string }; Body: Record<string, unknown> }>(
-    "/api/v1/admin/services/:serviceId/scan-schedules/:scanMode",
+  server.put<{ Params: { libraryId: string; scanMode: string }; Body: Record<string, unknown> }>(
+    "/api/v1/admin/libraries/:libraryId/scan-schedules/:scanMode",
     async (request) => {
       const operator = await requireSuperAdmin(request, runtime.database);
-      const service = await runtime.repository.getServiceDetail(request.params.serviceId);
-      return saveSchedule(runtime, store, service, request.params.scanMode, request.body, operator.id, true);
+      const library = await runtime.repository.getLibrary(request.params.libraryId);
+      const profiles = await runtime.repository.getLibraryProfiles(library.id, library.userId);
+      return saveSchedule(runtime, store, library, profiles, request.params.scanMode, request.body, operator.id, true);
     },
   );
 }

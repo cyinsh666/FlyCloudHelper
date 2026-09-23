@@ -8,6 +8,7 @@ import { JellyfinCompatibilityService, type JellyfinContext, type JellyfinLibrar
 import { providerFetch, providerStream } from "../providers/network.js";
 import type { ProviderConnectionContext, ProviderFileAccess } from "../providers/types.js";
 import type { ApiRuntime } from "../runtime.js";
+import { enqueueProtocolScan, listProtocolVirtualFolders } from "../protocol-scan-service.js";
 import {
   buildUpstreamHeaders,
   copyMediaResponseHeaders,
@@ -54,6 +55,30 @@ function isMissingProviderFileError(error: unknown): boolean {
 /** 确认 URL 中的用户 ID 就是当前服务访问账号。 */
 function requireProtocolUser(context: JellyfinContext, userId: string): void {
   if (userId !== context.accountId) throw new ApiError(403, "jellyfin_user_scope_mismatch", "不能访问其他服务账号的数据");
+}
+
+/** 转义用户名称，避免生成的 SVG 头像包含无效 XML。 */
+function escapeUserImageText(value: string): string {
+  return value.replace(/&/gu, "&amp;").replace(/</gu, "&lt;").replace(/>/gu, "&gt;").replace(/"/gu, "&quot;").replace(/'/gu, "&apos;");
+}
+
+/** 返回云助手生成的 Jellyfin 用户头像，兼容新旧两套用户图片接口。 */
+function sendUserImage(context: JellyfinContext, request: FastifyRequest, reply: FastifyReply) {
+  const avatarText = escapeUserImageText(Array.from(context.accountUsername.trim())[0] ?? "F");
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256"><rect width="256" height="256" rx="56" fill="#30343b"/><text x="128" y="142" text-anchor="middle" dominant-baseline="middle" font-family="sans-serif" font-size="128" font-weight="600" fill="#f3f4f6">${avatarText}</text></svg>`;
+  reply.header("Content-Type", "image/svg+xml; charset=utf-8").header("Cache-Control", "private, max-age=86400");
+  return request.method === "HEAD" ? reply.send() : reply.send(Buffer.from(svg));
+}
+
+/** 构造 Jellyfin 官方 Items/Root 返回的 BaseItemDto。 */
+function buildRootItem(context: JellyfinContext): Record<string, unknown> {
+  return {
+    Name: "媒体库",
+    ServerId: context.libraryId,
+    Id: context.libraryId,
+    Type: "Folder",
+    IsFolder: true,
+  };
 }
 
 /** 把服务数据库行转换为媒体中转公共上下文。 */
@@ -181,125 +206,13 @@ async function resolveFileAccess(runtime: ApiRuntime, service: Record<string, un
   return access;
 }
 
-/** 为聚合 Jellyfin 构造播放信息；每个版本始终回到其真实来源服务解析网盘访问地址。 */
-async function buildAggregatePlaybackInfo(
-  runtime: ApiRuntime,
-  compatibility: JellyfinCompatibilityService,
-  context: JellyfinContext,
-  request: FastifyRequest,
-  itemId: string,
-) {
-  const aggregateService = await compatibility.requireEnabledService(context.serviceId);
-  const { aggregateItem, files } = await compatibility.getAggregatePlaybackItem(context, itemId);
-  const protocolItemId = compatibility.toContextProtocolItemId(context, aggregateItem.aggregateItemId);
-  const requestedSource = readMediaSourceId(request);
-  const internalRequestedSource = compatibility.toContextInternalMediaSourceId(context, itemId, requestedSource);
-  const requestedFile = requestedSource
-    ? findPlaybackFile(files, aggregateItem.aggregateItemId, internalRequestedSource)
-    : undefined;
-  if (files.length === 0) throw new ApiError(404, "jellyfin_media_source_not_found", "聚合媒体条目没有可播放文件");
-  if (requestedSource && !requestedFile) throw new ApiError(404, "jellyfin_media_source_not_found", "指定媒体源不存在");
-  const candidateFiles = requestedFile
-    ? [requestedFile, ...files.filter((file) => file !== requestedFile && file.path === requestedFile.path)]
-    : files;
-  const preference = readPlaybackRoute(request);
-  const aggregateRelayEnabled = Number(aggregateService.jellyfin_relay_playback_enabled) === 1
-    || aggregateService.jellyfin_relay_playback_enabled === true;
-  const selectedRoute = preference === "server" || (preference === "auto" && aggregateRelayEnabled) ? "server" : "origin";
-  const itemProbes = files.map((file) => parseCompletedMediaProbeResult(file.mediaProbeStatus, file.mediaProbeResult));
-  const mediaSpecsReady = files.length > 0 && itemProbes.every((probe) => probe !== null);
-  const probeByFileId = new Map(files.map((file, index) => [file.fileId, mediaSpecsReady ? itemProbes[index] ?? null : null]));
-  const mediaSources: Array<Record<string, unknown>> = [];
-  let missingProviderFileCount = 0;
-  for (const file of candidateFiles) {
-    const sourceService = await compatibility.getAggregateSourceService(context, file.sourceServiceId);
-    let originAccess: ProviderFileAccess | null = null;
-    try {
-      if (selectedRoute === "origin") {
-        originAccess = await resolveFileAccess(runtime, sourceService, context.ownerUserId, file.playbackLocator, new AbortController().signal);
-      }
-      // 聚合服务的 auto 是“尽量直连”；WebDAV 等来源无法让客户端安全携带认证头时，
-      // PlaybackInfo 仍返回服务内播放地址，真正读取媒体时再自动回退中转。
-      if (selectedRoute === "origin" && (!originAccess || !/^https?:\/\//iu.test(originAccess.url)) && preference === "origin") continue;
-    } catch (error) {
-      if (isMissingProviderFileError(error)) {
-        missingProviderFileCount += 1;
-        continue;
-      }
-      if (preference === "origin") throw error;
-      runtime.logBusinessEvent("info", {
-        日志关键字: "codex-aggregate-jellyfin",
-        事件: "聚合Jellyfin播放信息允许自动回退中转",
-        聚合服务ID: context.serviceId,
-        来源服务ID: file.sourceServiceId,
-        源文件ID: file.fileId,
-        回退原因: error instanceof Error ? error.name : "原始地址解析失败",
-      });
-    }
-    const mediaProbe = probeByFileId.get(file.fileId) ?? null;
-    const mediaSourceId = toProtocolMediaSourceId(protocolItemId, files[0]?.fileId ?? "", file.fileId);
-    mediaSources.push({
-      ...buildStandardMediaSourceDefaults(),
-      Protocol: "File",
-      Id: mediaSourceId,
-      Path: file.name || "video.mp4",
-      Type: "Default",
-      Container: mediaProbe?.container || undefined,
-      Size: mediaProbe?.size || file.size || undefined,
-      Name: file.name || "video.mp4",
-      Bitrate: mediaProbe?.bitRate || undefined,
-      IsRemote: false,
-      DirectStreamUrl: buildJellyfinStreamUrl(protocolItemId, mediaSourceId, preference),
-      AddApiKeyToDirectStreamUrl: true,
-      RequiredHttpHeaders: {},
-      RunTimeTicks: mediaProbe?.runTimeTicks || undefined,
-      MediaStreams: mediaProbe?.mediaStreams ?? [],
-    });
-    if (requestedFile) break;
-  }
-  if (missingProviderFileCount === candidateFiles.length) {
-    throw new ApiError(404, "jellyfin_provider_file_not_found", "当前播放版本对应的网盘文件已删除");
-  }
-  if (mediaSources.length === 0 && preference === "origin") {
-    throw new ApiError(409, "jellyfin_origin_direct_unavailable", "当前媒体文件无法生成网盘原始播放地址");
-  }
-  if (mediaSources.length === 0) throw new ApiError(409, "jellyfin_direct_play_unavailable", "当前媒体文件没有可用的直放地址");
-  const playSessionId = String(readQuery(request).playSessionId ?? readQuery(request).PlaySessionId ?? "") || randomUUID();
-  const selectedSourceId = compatibility.toContextInternalMediaSourceId(context, itemId, String(mediaSources[0]?.Id ?? ""));
-  const now = new Date().toISOString();
-  await runtime.database.query("aggregate_playback_sessions").insert({
-    id: playSessionId,
-    aggregate_service_id: context.serviceId,
-    account_id: context.accountId,
-    aggregate_item_id: aggregateItem.aggregateItemId,
-    media_source_id: selectedSourceId || null,
-    status: "created",
-    position_ticks: 0,
-    paused: 0,
-    started_at: now,
-    updated_at: now,
-    stopped_at: null,
-  }).onConflict("id").ignore();
-  runtime.logBusinessEvent("info", {
-    日志关键字: "codex-aggregate-jellyfin",
-    事件: "生成聚合Jellyfin播放信息",
-    聚合服务ID: context.serviceId,
-    聚合条目ID: aggregateItem.aggregateItemId,
-    媒体源数量: mediaSources.length,
-    播放路由: selectedRoute === "server" ? "服务中转" : "原始直连",
-    影片规格是否全部完成: mediaSpecsReady,
-  });
-  return { MediaSources: mediaSources, PlaySessionId: playSessionId, ErrorCode: null };
-}
-
 /** 生成不包含转码能力的 PlaybackInfo。 */
 async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCompatibilityService, context: JellyfinContext, request: FastifyRequest, itemId: string) {
-  if (context.aggregateService) return buildAggregatePlaybackInfo(runtime, compatibility, context, request, itemId);
-  const service = await compatibility.requireEnabledService(context.serviceId);
+  const service = await compatibility.requireEnabledService(context.libraryId);
   const internalItemId = compatibility.toInternalItemId(itemId);
   const protocolItemId = compatibility.toProtocolItemId(internalItemId);
   const item = await runtime.repository.getCatalogItem(internalItemId, context.ownerUserId);
-  if (item.serviceId !== context.serviceId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
+  if (item.libraryId !== context.libraryId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
   const files = await runtime.repository.listItemFiles(internalItemId, context.ownerUserId);
   const requestedSource = readMediaSourceId(request);
   const internalRequestedSource = compatibility.toInternalMediaSourceId(internalItemId, requestedSource);
@@ -410,8 +323,8 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
   );
   const now = new Date().toISOString();
   // PlaybackInfo 先登记 created 会话；Playing、Progress、Stopped 将在相同会话上继续更新。
-  await runtime.database.query("service_playback_sessions").insert({
-    id: playSessionId, service_id: context.serviceId, account_id: context.accountId, item_id: internalItemId,
+  await runtime.database.query("library_playback_sessions").insert({
+    id: playSessionId, library_id: context.libraryId, account_id: context.accountId, item_id: internalItemId,
     media_source_id: selectedSourceId || null, status: "created", position_ticks: 0, paused: 0,
     started_at: now, updated_at: now, stopped_at: null,
   }).onConflict("id").ignore();
@@ -469,139 +382,6 @@ async function sendItemImage(compatibility: JellyfinCompatibilityService, contex
   } finally { clearTimeout(timer); }
 }
 
-/** 通过聚合索引定位来源文件并转发媒体流；媒体流本身仍由真实来源服务的 Provider 凭据解析。 */
-async function sendAggregateMediaStream(
-  runtime: ApiRuntime,
-  compatibility: JellyfinCompatibilityService,
-  context: JellyfinContext,
-  request: FastifyRequest,
-  reply: FastifyReply,
-  itemId: string,
-  responseMode: "playback" | "download",
-) {
-  const aggregateService = await compatibility.requireEnabledService(context.serviceId);
-  if (responseMode === "download" && !context.downloadEnabled) {
-    throw new ApiError(403, "jellyfin_download_disabled", "当前聚合 Jellyfin 未允许下载影片");
-  }
-  const { aggregateItem, files } = await compatibility.getAggregatePlaybackItem(context, itemId);
-  const requestedSource = readMediaSourceId(request);
-  const sourceId = compatibility.toContextInternalMediaSourceId(context, itemId, requestedSource);
-  const requestedFile = findPlaybackFile(files, aggregateItem.aggregateItemId, sourceId);
-  if (!requestedFile) throw new ApiError(404, "jellyfin_media_source_not_found", "媒体源不存在");
-  const candidateFiles = [
-    requestedFile,
-    ...files.filter((file) => file !== requestedFile && file.path === requestedFile.path),
-  ];
-  const requestedRoute = readPlaybackRoute(request);
-  const aggregateRelayEnabled = Number(aggregateService.jellyfin_relay_playback_enabled) === 1
-    || aggregateService.jellyfin_relay_playback_enabled === true;
-  const effectiveRoute = responseMode === "download"
-    ? "server"
-    : requestedRoute === "auto"
-      ? aggregateRelayEnabled ? "server" : "origin"
-      : requestedRoute;
-  const abortController = new AbortController();
-  const abort = () => abortController.abort();
-  request.raw.once("aborted", abort);
-  reply.raw.once("close", abort);
-  let upstreamBody: IncomingMessage | null = null;
-  try {
-    let selectedFile: typeof requestedFile | undefined;
-    let access: ProviderFileAccess | null = null;
-    let selectedPlaybackRoute: "origin" | "server" | "server_fallback" = effectiveRoute;
-    for (const file of candidateFiles) {
-      const sourceService = await compatibility.getAggregateSourceService(context, file.sourceServiceId);
-      try {
-        if (effectiveRoute === "origin") {
-          let originAccess: ProviderFileAccess | null = null;
-          try {
-            originAccess = await resolveFileAccess(runtime, sourceService, context.ownerUserId, file.playbackLocator, abortController.signal, request);
-          } catch (error) {
-            if (isMissingProviderFileError(error) || requestedRoute === "origin") throw error;
-            // auto 模式允许 Provider 原始地址解析失败后改由服务端读取，显式 origin 仍严格失败。
-            access = await resolveRelayAccess(runtime, toRelayLibrary(sourceService), context.ownerUserId, file.playbackLocator, abortController.signal);
-            selectedPlaybackRoute = "server_fallback";
-            runtime.logBusinessEvent("info", {
-              日志关键字: "codex-aggregate-jellyfin",
-              事件: "聚合Jellyfin自动回退中转播放",
-              聚合服务ID: context.serviceId,
-              来源服务ID: file.sourceServiceId,
-              源文件ID: file.fileId,
-              回退原因: error instanceof Error ? error.name : "原始地址解析失败",
-            });
-          }
-          if (originAccess && /^https?:\/\//iu.test(originAccess.url) && !hasRequiredPlaybackHeaders(originAccess, request, String(sourceService.provider_type))) {
-            reply.header("Cache-Control", "private, no-store");
-            return reply.redirect(originAccess.url, 307);
-          }
-          if (!access && requestedRoute === "origin") {
-            const errorCode = originAccess && hasRequiredPlaybackHeaders(originAccess, request, String(sourceService.provider_type))
-              ? "jellyfin_origin_headers_required"
-              : "jellyfin_origin_direct_unavailable";
-            const errorMessage = originAccess && hasRequiredPlaybackHeaders(originAccess, request, String(sourceService.provider_type))
-              ? "当前网盘原始地址依赖专用请求头，无法强制直连"
-              : "当前文件无法生成原始播放地址";
-            throw new ApiError(409, errorCode, errorMessage);
-          }
-          if (!access) {
-            // WebDAV 的 Basic/Bearer 鉴权头不能交给普通 Jellyfin 客户端保存，auto 模式透明改由云助手中转。
-            access = await resolveRelayAccess(runtime, toRelayLibrary(sourceService), context.ownerUserId, file.playbackLocator, abortController.signal);
-            selectedPlaybackRoute = "server_fallback";
-            runtime.logBusinessEvent("info", {
-              日志关键字: "codex-aggregate-jellyfin",
-              事件: "聚合Jellyfin自动回退中转播放",
-              聚合服务ID: context.serviceId,
-              来源服务ID: file.sourceServiceId,
-              源文件ID: file.fileId,
-              回退原因: originAccess && hasRequiredPlaybackHeaders(originAccess, request, String(sourceService.provider_type)) ? "原始地址需要认证请求头" : "未生成可用原始地址",
-            });
-          }
-        } else {
-          access = await resolveRelayAccess(runtime, toRelayLibrary(sourceService), context.ownerUserId, file.playbackLocator, abortController.signal);
-          selectedPlaybackRoute = "server";
-        }
-        selectedFile = file;
-        break;
-      } catch (error) {
-        if (!isMissingProviderFileError(error)) throw error;
-      }
-    }
-    if (!selectedFile || !access) {
-      throw new ApiError(404, "jellyfin_provider_file_not_found", "当前播放版本对应的网盘文件已删除");
-    }
-    const upstreamHeaders = buildUpstreamHeaders(request, access.headers);
-    if (responseMode === "download") upstreamHeaders.Accept = "*/*";
-    const upstream = await providerStream(access.url, { method: request.method, headers: upstreamHeaders }, {
-      allowInsecureHttp: runtime.config.allowInsecureProviderHttp,
-      logConnectionFailure: (fields) => runtime.logBusinessEvent("warn", fields),
-    }, abortController.signal);
-    upstreamBody = upstream.body;
-    copyMediaResponseHeaders(reply, upstream.headers);
-    if (responseMode === "download") {
-      const filename = selectedFile.name.trim() || aggregateItem.primaryItem.title;
-      reply.header("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
-    }
-    reply.status(upstream.statusCode);
-    runtime.logBusinessEvent("info", {
-      日志关键字: "codex-aggregate-jellyfin",
-      事件: responseMode === "download" ? "建立聚合Jellyfin影片下载连接" : "建立聚合Jellyfin媒体连接",
-      聚合服务ID: context.serviceId,
-      聚合条目ID: aggregateItem.aggregateItemId,
-      来源服务ID: selectedFile.sourceServiceId,
-      源文件ID: selectedFile.fileId,
-      播放路由: selectedPlaybackRoute === "origin" ? "原始直连" : selectedPlaybackRoute === "server" ? "服务中转" : "自动回退中转",
-      是否Range请求: Boolean(request.headers.range),
-      上游状态码: upstream.statusCode,
-    });
-    return reply.send(upstream.body);
-  } finally {
-    if (!upstreamBody) {
-      request.raw.removeListener("aborted", abort);
-      reply.raw.removeListener("close", abort);
-    }
-  }
-}
-
 /** 将 Provider 原始媒体流转发给 Jellyfin 客户端，用途决定播放路线或强制原文件下载。 */
 async function sendMediaStream(
   runtime: ApiRuntime,
@@ -612,10 +392,7 @@ async function sendMediaStream(
   itemId: string,
   responseMode: "playback" | "download" = "playback",
 ) {
-  if (context.aggregateService) {
-    return sendAggregateMediaStream(runtime, compatibility, context, request, reply, itemId, responseMode);
-  }
-  const service = await compatibility.requireEnabledService(context.serviceId);
+  const service = await compatibility.requireEnabledService(context.libraryId);
   if (responseMode === "download" && !context.downloadEnabled) {
     runtime.logBusinessEvent("warn", {
       日志关键字: "codex-jellyfin-download",
@@ -639,7 +416,7 @@ async function sendMediaStream(
       : requestedRoute;
   const internalItemId = compatibility.toInternalItemId(itemId);
   const item = await runtime.repository.getCatalogItem(internalItemId, context.ownerUserId);
-  if (item.serviceId !== context.serviceId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
+  if (item.libraryId !== context.libraryId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
   const files = await runtime.repository.listItemFiles(internalItemId, context.ownerUserId);
   const requestedSource = readMediaSourceId(request);
   const fileId = compatibility.toInternalMediaSourceId(internalItemId, requestedSource);
@@ -760,26 +537,33 @@ async function buildJellyfinLocalAddress(runtime: ApiRuntime, request: FastifyRe
 function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, compatibility: JellyfinCompatibilityService, prefix: string): void {
   /** 读取路由中的单层自定义后缀。 */
   const readPathSuffix = (request: FastifyRequest): string => String((request.params as { jellyfinPathSuffix: string }).jellyfinPathSuffix);
-  /** 使用自定义后缀找到真实服务 ID。 */
-  const resolveServiceId = async (request: FastifyRequest): Promise<string> => compatibility.resolveServiceIdByPathSuffix(readPathSuffix(request));
-  const authenticated = async (request: FastifyRequest) => compatibility.authenticate(await resolveServiceId(request), request);
+  /** 使用自定义后缀找到真实媒体库 ID。 */
+  const resolveLibraryId = async (request: FastifyRequest): Promise<string> => compatibility.resolveLibraryIdByPathSuffix(readPathSuffix(request));
+  const authenticated = async (request: FastifyRequest) => compatibility.authenticate(await resolveLibraryId(request), request);
   /** 图片读取按 Jellyfin 标准不要求客户端图片组件附带访问令牌。 */
-  const publicImageContext = async (request: FastifyRequest) => compatibility.resolvePublicImageContext(await resolveServiceId(request));
+  const publicImageContext = async (request: FastifyRequest) => compatibility.resolvePublicImageContext(await resolveLibraryId(request));
   server.get(`${prefix}/System/Info/Public`, async (request) => {
-    const serviceId = await resolveServiceId(request);
-    const service = await compatibility.requireEnabledService(serviceId);
-    return { LocalAddress: await buildJellyfinLocalAddress(runtime, request, readPathSuffix(request)), ServerName: service.display_name, Version: "10.10.0", ProductName: "FlyCloudHelper", OperatingSystem: process.platform, Id: serviceId, StartupWizardCompleted: true };
+    const libraryId = await resolveLibraryId(request);
+    const library = await compatibility.requireEnabledService(libraryId);
+    return { LocalAddress: await buildJellyfinLocalAddress(runtime, request, readPathSuffix(request)), ServerName: library.display_name, Version: "10.10.0", ProductName: "FlyCloudHelper", OperatingSystem: process.platform, Id: libraryId, StartupWizardCompleted: true };
   });
   server.get(`${prefix}/System/Info`, async (request) => {
-    const context = await authenticated(request); const service = await compatibility.requireEnabledService(context.serviceId);
-    return { LocalAddress: await buildJellyfinLocalAddress(runtime, request, readPathSuffix(request)), ServerName: service.display_name, Version: "10.10.0", ProductName: "FlyCloudHelper", OperatingSystem: process.platform, Id: context.serviceId, StartupWizardCompleted: true };
+    const context = await authenticated(request); const service = await compatibility.requireEnabledService(context.libraryId);
+    return { LocalAddress: await buildJellyfinLocalAddress(runtime, request, readPathSuffix(request)), ServerName: service.display_name, Version: "10.10.0", ProductName: "FlyCloudHelper", OperatingSystem: process.platform, Id: context.libraryId, StartupWizardCompleted: true };
   });
-  server.post(`${prefix}/Users/AuthenticateByName`, async (request) => compatibility.login(await resolveServiceId(request), request, (request.body ?? {}) as Record<string, unknown>));
-  server.post(`${prefix}/Sessions/Logout`, async (request, reply) => { await compatibility.logout(await resolveServiceId(request), request); return reply.status(204).send(); });
-  server.get(`${prefix}/Users/:userId`, async (request) => { const context = await authenticated(request); requireProtocolUser(context, String((request.params as { userId: string }).userId)); return compatibility.mapUser(context.accountId, context.accountUsername, context.serviceId, context.accountHasPassword, context.downloadEnabled); });
+  server.route({ method: ["GET", "POST"], url: `${prefix}/System/Ping`, handler: async (_request, reply) => reply.type("text/plain; charset=utf-8").send("FlyCloudHelper") });
+  server.post(`${prefix}/Users/AuthenticateByName`, async (request) => compatibility.login(await resolveLibraryId(request), request, (request.body ?? {}) as Record<string, unknown>));
+  server.post(`${prefix}/Sessions/Logout`, async (request, reply) => { await compatibility.logout(await resolveLibraryId(request), request); return reply.status(204).send(); });
+  server.get(`${prefix}/Users/:userId`, async (request) => { const context = await authenticated(request); requireProtocolUser(context, String((request.params as { userId: string }).userId)); return compatibility.mapUser(context.accountId, context.accountUsername, context.libraryId, context.accountHasPassword, context.downloadEnabled); });
+  server.get(`${prefix}/Users/Me`, async (request) => { const context = await authenticated(request); return compatibility.mapUser(context.accountId, context.accountUsername, context.libraryId, context.accountHasPassword, context.downloadEnabled); });
+  server.get(`${prefix}/Users/Public`, async (request) => { await resolveLibraryId(request); return []; });
+  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Users/:userId/Images/Primary`, handler: async (request, reply) => { const context = await authenticated(request); requireProtocolUser(context, String((request.params as { userId: string }).userId)); return sendUserImage(context, request, reply); } });
+  server.route({ method: ["GET", "HEAD"], url: `${prefix}/UserImage`, handler: async (request, reply) => { const context = await authenticated(request); const requestedUserId = String(readQuery(request).userId ?? readQuery(request).UserId ?? context.accountId); requireProtocolUser(context, requestedUserId); return sendUserImage(context, request, reply); } });
   server.get(`${prefix}/Users/:userId/Views`, async (request) => { const context = await authenticated(request); requireProtocolUser(context, String((request.params as { userId: string }).userId)); return compatibility.listLibraries(context); });
   server.get(`${prefix}/UserViews`, async (request) => compatibility.listLibraries(await authenticated(request)));
   server.get(`${prefix}/Users/:userId/Items/Resume`, async (request) => { const context = await authenticated(request); requireProtocolUser(context, String((request.params as { userId: string }).userId)); return compatibility.listResume(context, readQuery(request)); });
+  server.get(`${prefix}/Users/:userId/Items/Root`, async (request) => { const context = await authenticated(request); requireProtocolUser(context, String((request.params as { userId: string }).userId)); return buildRootItem(context); });
+  server.get(`${prefix}/Items/Root`, async (request) => { const context = await authenticated(request); const requestedUserId = String(readQuery(request).userId ?? readQuery(request).UserId ?? context.accountId); requireProtocolUser(context, requestedUserId); return buildRootItem(context); });
   server.get(`${prefix}/Users/:userId/Items/Latest`, async (request) => { const context = await authenticated(request); requireProtocolUser(context, String((request.params as { userId: string }).userId)); const result = await compatibility.listItems(context, { ...readQuery(request), SortBy: "DateCreated", SortOrder: "Descending" }); return result.Items; });
   server.get(`${prefix}/Users/:userId/Items/:itemId`, async (request) => {
     const context = await authenticated(request);
@@ -828,6 +612,10 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
     return compatibility.listItemAncestors(context, protocolItemId);
   });
   server.get(`${prefix}/Genres`, async (request) => compatibility.listGenres(await authenticated(request), readQuery(request)));
+  server.get(`${prefix}/Library/VirtualFolders`, async (request) => { const context = await authenticated(request); const libraries = await compatibility.listLibraries(context); return listProtocolVirtualFolders(runtime, context, libraries.Items); });
+  server.post(`${prefix}/Library/Media/Updated`, async (request, reply) => { const context = await authenticated(request); await enqueueProtocolScan(runtime, context, "jellyfin", "Library/Media/Updated"); return reply.status(204).send(); });
+  server.post(`${prefix}/Library/Refresh`, async (request, reply) => { const context = await authenticated(request); await enqueueProtocolScan(runtime, context, "jellyfin", "Library/Refresh"); return reply.status(204).send(); });
+  server.post(`${prefix}/Items/:itemId/Refresh`, async (request, reply) => { const context = await authenticated(request); const itemId = String((request.params as { itemId: string }).itemId); const libraries = await compatibility.listLibraries(context); const isLibrary = libraries.Items.some((item) => String(item.Id) === itemId); if (!isLibrary) await compatibility.getItemDetail(context, itemId); await enqueueProtocolScan(runtime, context, "jellyfin", "Items/{ItemId}/Refresh", itemId); return reply.status(204).send(); });
   server.get(`${prefix}/Search/Hints`, async (request) => { const context = await authenticated(request); const result = await compatibility.listItems(context, { ...readQuery(request), SearchTerm: readQuery(request).SearchTerm, Limit: readQuery(request).Limit ?? 50 }); return { SearchHints: result.Items.map((item: Record<string, unknown>) => ({ ItemId: item.Id, Id: item.Id, Name: item.Name, Type: item.Type, ProductionYear: item.ProductionYear, PrimaryImageTag: (item.ImageTags as Record<string, unknown>)?.Primary })), TotalRecordCount: result.TotalRecordCount }; });
   server.get(`${prefix}/Shows/:seriesId/Seasons`, async (request) => compatibility.listSeasons(await authenticated(request), String((request.params as { seriesId: string }).seriesId)));
   server.get(`${prefix}/Shows/:seriesId/Episodes`, async (request) => compatibility.listEpisodes(await authenticated(request), String((request.params as { seriesId: string }).seriesId), readQuery(request)));
@@ -859,6 +647,8 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
   server.post(`${prefix}/UserItems/:itemId/UserData`, async (request) => compatibility.updateUserData(await authenticated(request), String((request.params as { itemId: string }).itemId), (request.body ?? {}) as Record<string, unknown>));
   server.post(`${prefix}/Users/:userId/Items/:itemId/HideFromResume`, async (request, reply) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireProtocolUser(context, params.userId); await compatibility.setHiddenFromResume(context, params.itemId, true); return reply.status(204).send(); });
   server.delete(`${prefix}/Users/:userId/Items/:itemId/HideFromResume`, async (request, reply) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireProtocolUser(context, params.userId); await compatibility.setHiddenFromResume(context, params.itemId, false); return reply.status(204).send(); });
+  server.post(`${prefix}/Sessions/Capabilities`, async (request, reply) => { await authenticated(request); return reply.status(204).send(); });
+  server.post(`${prefix}/Sessions/Capabilities/Full`, async (request, reply) => { await authenticated(request); return reply.status(204).send(); });
 }
 
 /** 注册 Jellyfin 协议兼容接口。 */

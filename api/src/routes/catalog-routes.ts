@@ -1,10 +1,8 @@
-import fs from "node:fs";
 import { randomUUID } from "node:crypto";
-import path from "node:path";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { CatalogSort, MatchState, MediaType } from "../domain.js";
 import { ApiError } from "../errors.js";
-import { readPagination, requireConfirmation, requireRequestUser } from "../http.js";
+import { readPagination, requireRequestUser } from "../http.js";
 import {
   applyManualVideoMatch,
   clearManualVideoMatch,
@@ -27,10 +25,10 @@ const HOME_MUSIC_CATEGORIES = [
 /** 查询媒体库并强制当前用户归属。 */
 async function requireLibrary(runtime: ApiRuntime, libraryId: string, userId: string) {
   const row = await runtime.database.query("media_libraries as l")
-    .join("cloud_services as s", "s.id", "l.service_id")
+    .join("library_sources as ls", "ls.library_id", "l.id").join("cloud_services as s", "s.id", "ls.service_id")
     .select(
-      "l.id", "l.service_id", "l.provider_type", "l.catalog_version", "l.status",
-      "l.created_at", "l.updated_at", "s.display_name", "s.data_type", "s.last_scan_at",
+      "l.id", "ls.service_id", "s.provider_type", "l.catalog_version", "l.status",
+      "l.created_at", "l.updated_at", "s.display_name", "l.data_type", "l.last_scan_at",
     )
     .where("l.id", libraryId)
     .where("l.user_id", userId)
@@ -76,34 +74,8 @@ async function auditCatalogAction(
   });
 }
 
-/** 注册普通用户和 APP 共用的媒体目录、变更与导出接口。 */
+/** 注册普通用户和 APP 共用的媒体目录与变更接口。 */
 export async function registerCatalogRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
-  server.get<{ Params: { libraryId: string } }>("/api/v1/libraries/:libraryId", async (request) => {
-    const user = await requireRequestUser(request, runtime.database);
-    const library = await requireLibrary(runtime, request.params.libraryId, user.id);
-    const recentJobs = await runtime.repository.listJobs({
-      userId: user.id,
-      serviceId: String(library.service_id),
-      limit: 10,
-      offset: 0,
-    });
-    return {
-      library: {
-        libraryId: library.id,
-        serviceId: library.service_id,
-        displayName: library.display_name,
-        providerType: library.provider_type,
-        dataType: library.data_type,
-        catalogVersion: Number(library.catalog_version),
-        status: library.status,
-        lastScanAt: library.last_scan_at,
-        createdAt: library.created_at,
-        updatedAt: library.updated_at,
-        recentJobs: recentJobs.items,
-      },
-    };
-  });
-
   server.get<{
     Params: { libraryId: string };
     Querystring: Record<string, unknown>;
@@ -464,88 +436,5 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
     const limit = Math.min(1000, Math.max(1, Number.parseInt(String(request.query.limit ?? "500"), 10) || 500));
     const result = await runtime.repository.listCatalogChanges(user.id, request.params.libraryId, afterVersion, limit);
     return { ...result, catalogVersion: Number(library.catalog_version) };
-  });
-
-  server.post<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/libraries/:libraryId/exports", async (request, reply) => {
-    const user = await requireRequestUser(request, runtime.database);
-    await requireLibrary(runtime, request.params.libraryId, user.id);
-    const exportType = request.body.exportType ?? "snapshot";
-    if (exportType !== "snapshot") {
-      throw new ApiError(422, "export_type_not_supported", "当前只支持完整目录 snapshot 导出");
-    }
-    const record = await runtime.exports.createSnapshotTask(user.id, request.params.libraryId);
-    runtime.logBusinessEvent("info", {
-      日志关键字: "codex-flycloud-snapshot-task",
-      事件: "用户从网页或APP创建云端快照",
-      用户ID: user.id,
-      媒体库ID: request.params.libraryId,
-      导出ID: record.id,
-    });
-    return reply.status(202).send({ export: { ...record, filePath: undefined } });
-  });
-
-  server.get<{
-    Params: { libraryId: string };
-    Querystring: Record<string, unknown>;
-  }>("/api/v1/libraries/:libraryId/exports", async (request) => {
-    const user = await requireRequestUser(request, runtime.database);
-    await requireLibrary(runtime, request.params.libraryId, user.id);
-    const limit = Math.min(100, Math.max(1, Number.parseInt(String(request.query.limit ?? "20"), 10) || 20));
-    const records = await runtime.exports.listExports(user.id, request.params.libraryId, limit);
-    return { exports: records.map((record) => ({ ...record, filePath: undefined })) };
-  });
-
-  server.get<{ Params: { exportId: string } }>("/api/v1/exports/:exportId", async (request) => {
-    const user = await requireRequestUser(request, runtime.database);
-    const record = await runtime.exports.getExport(request.params.exportId, user.id);
-    return { export: { ...record, filePath: undefined } };
-  });
-
-  server.delete<{ Params: { exportId: string }; Body: Record<string, unknown> }>(
-    "/api/v1/exports/:exportId",
-    async (request, reply) => {
-      const user = await requireRequestUser(request, runtime.database);
-      requireConfirmation(request.body, request.params.exportId);
-      try {
-        const record = await runtime.exports.deleteExport(request.params.exportId, user.id);
-        await runtime.database.addAudit({
-          id: randomUUID(),
-          operatorUserId: user.id,
-          operatorUsername: user.username,
-          operationType: "delete_library_snapshot",
-          targetType: "library_export",
-          targetId: record.id,
-          result: "success",
-          detail: { 媒体库ID: record.libraryId, 快照状态: record.status },
-        });
-      } catch (error) {
-        runtime.logBusinessEvent("warn", {
-          日志关键字: "codex-flycloud-snapshot-delete",
-          事件: "用户删除云端快照失败",
-          用户ID: user.id,
-          导出ID: request.params.exportId,
-          错误码: error && typeof error === "object" && "code" in error
-            ? String((error as { code?: string }).code)
-            : "snapshot_delete_failed",
-        });
-        throw error;
-      }
-      return reply.status(204).send();
-    },
-  );
-
-  server.get<{ Params: { exportId: string } }>("/api/v1/exports/:exportId/download", async (request, reply) => {
-    const user = await requireRequestUser(request, runtime.database);
-    const filePath = await runtime.exports.getDownloadPath(request.params.exportId, user.id);
-    reply.header(
-      "Content-Type",
-      filePath.endsWith(".zip")
-        ? "application/zip"
-        : filePath.endsWith(".jsonl")
-          ? "application/x-ndjson"
-          : "application/vnd.flymby.scanner-backup+json",
-    );
-    reply.header("Content-Disposition", `attachment; filename="${path.basename(filePath)}"`);
-    return reply.send(fs.createReadStream(filePath));
   });
 }

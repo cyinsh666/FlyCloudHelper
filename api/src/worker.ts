@@ -3,7 +3,6 @@ import { WEBDAV_UNKNOWN_SEASON } from "./media/flymby-consecutive-episode-helper
 import path from "node:path";
 import { musicFileNameHints } from "./music/name-hints.js";
 import { runMusicScan } from "./music/scan-coordinator.js";
-import type { AggregateIndexService } from "./aggregate-index-service.js";
 import type { ApiConfig } from "./config.js";
 import type { FlyCloudHelperDatabase } from "./database.js";
 import type { MediaItemRecord, MediaType, ScanJobRecord, SourceFileRecord } from "./domain.js";
@@ -487,7 +486,6 @@ export class ScanWorker {
   private readonly plugins: MetadataPluginManager;
   private readonly aiVideoNameCleaner: AiVideoNameCleaner;
   private readonly failureReports: ScanFailureReportService;
-  private readonly aggregateIndex: AggregateIndexService;
   private readonly logger: WorkerLogger;
   private readonly config: ApiConfig;
   private readonly abortControllers = new Map<string, AbortController>();
@@ -505,7 +503,6 @@ export class ScanWorker {
     plugins: MetadataPluginManager;
     aiModels: AiModelManager;
     failureReports: ScanFailureReportService;
-    aggregateIndex: AggregateIndexService;
     logger: WorkerLogger;
     config: ApiConfig;
   }) {
@@ -519,7 +516,6 @@ export class ScanWorker {
     this.plugins = input.plugins;
     this.aiVideoNameCleaner = new AiVideoNameCleaner(input.database, input.aiModels, input.logger);
     this.failureReports = input.failureReports;
-    this.aggregateIndex = input.aggregateIndex;
     this.logger = input.logger;
     this.config = input.config;
   }
@@ -541,7 +537,7 @@ export class ScanWorker {
 
   /** 尽力统计本次扫描新增入库内容；统计失败时使用零值完成原任务。 */
   private async readScanCreatedMediaCounts(
-    job: Pick<ScanJobRecord, "serviceId" | "startedAt">,
+    job: Pick<ScanJobRecord, "serviceId" | "libraryId" | "startedAt">,
   ): Promise<ScanCreatedMediaCounts> {
     try {
       return await this.repository.getScanCreatedMediaCounts(job);
@@ -553,78 +549,6 @@ export class ScanWorker {
         错误信息: error instanceof Error ? error.message : "未知数据库错误",
       });
       return { videoContentCount: 0, videoContents: [], songCount: 0, albumCount: 0, artistCount: 0 };
-    }
-  }
-
-  /** 尽力读取影视媒体库目录版本，版本读取失败不能反向导致扫描任务失败。 */
-  private async readVideoCatalogVersion(job: ScanJobRecord): Promise<number | null> {
-    if (job.dataType !== "video") return null;
-    try {
-      const library = await this.database.query("media_libraries")
-        .select("catalog_version")
-        .where({ id: job.libraryId, user_id: job.userId })
-        .first();
-      return library ? Number(library.catalog_version ?? 0) : null;
-    } catch (error) {
-      this.logger.warn({
-        日志关键字: "codex-aggregate-index",
-        事件: "读取扫描前影视目录版本失败",
-        扫描任务ID: job.id,
-        来源服务ID: job.serviceId,
-        来源媒体库ID: job.libraryId,
-        错误信息: error instanceof Error ? error.message : "未知数据库错误",
-      });
-      return null;
-    }
-  }
-
-  /** 扫描成功后仅在目录版本实际推进时触发关联聚合服务，失败不影响已完成的来源扫描。 */
-  private async enqueueChangedAggregateIndexes(job: ScanJobRecord, previousCatalogVersion: number | null): Promise<void> {
-    if (job.dataType !== "video" || previousCatalogVersion === null) return;
-    try {
-      const completedJob = await this.repository.getJob(job.id);
-      if (completedJob.status !== "completed") return;
-      const catalogVersion = await this.readVideoCatalogVersion(job);
-      if (catalogVersion === null) return;
-      if (catalogVersion <= previousCatalogVersion) {
-        this.logger.info({
-          日志关键字: "codex-aggregate-index",
-          事件: "扫描目录无变化跳过聚合索引",
-          扫描任务ID: job.id,
-          来源服务ID: job.serviceId,
-          来源媒体库ID: job.libraryId,
-          扫描前目录版本: previousCatalogVersion,
-          扫描后目录版本: catalogVersion,
-        });
-        return;
-      }
-      const aggregateServiceCount = await this.aggregateIndex.enqueueForSourceCatalogChange({
-        userId: job.userId,
-        serviceId: job.serviceId,
-        libraryId: job.libraryId,
-        scanJobId: job.id,
-        previousCatalogVersion,
-        catalogVersion,
-      });
-      this.logger.info({
-        日志关键字: "codex-aggregate-index",
-        事件: "扫描目录变化聚合触发检查完成",
-        扫描任务ID: job.id,
-        来源服务ID: job.serviceId,
-        来源媒体库ID: job.libraryId,
-        扫描前目录版本: previousCatalogVersion,
-        扫描后目录版本: catalogVersion,
-        触发聚合服务数量: aggregateServiceCount,
-      });
-    } catch (error) {
-      this.logger.warn({
-        日志关键字: "codex-aggregate-index",
-        事件: "扫描完成后自动触发聚合索引失败",
-        扫描任务ID: job.id,
-        来源服务ID: job.serviceId,
-        来源媒体库ID: job.libraryId,
-        错误信息: error instanceof Error ? error.message : "未知数据库错误",
-      });
     }
   }
 
@@ -730,8 +654,6 @@ export class ScanWorker {
   private async executeJob(job: ScanJobRecord): Promise<void> {
     const controller = new AbortController();
     this.abortControllers.set(job.id, controller);
-    // 关键变量：只有任务成功结束且目录版本大于此值时，才允许触发聚合索引。
-    const previousCatalogVersion = await this.readVideoCatalogVersion(job);
     this.logger.info({
       日志标记: "flycloud-helper-worker",
       事件: isStoredAiSupplementJob(job) ? "AI补充未匹配任务开始" : "扫描任务开始",
@@ -744,7 +666,6 @@ export class ScanWorker {
       } else {
         await this.scan(job, controller.signal);
       }
-      await this.enqueueChangedAggregateIndexes(job, previousCatalogVersion);
     } catch (error) {
       if (controller.signal.aborted) {
         await this.applyAbortedJobState(job, "任务执行异常出口");
@@ -2702,6 +2623,7 @@ export class ScanWorker {
           userId: job.userId,
           serviceId: job.serviceId,
           libraryId: job.libraryId,
+          librarySourceId: String(job.snapshot.librarySourceId),
           providerResourceId: entry.resourceId.length <= 500
             ? entry.resourceId
             : createStableId("resource", entry.resourceId),

@@ -7,8 +7,9 @@ import type { ApiRuntime } from "./runtime.js";
 export interface JellyfinSortContext {
   serviceId: string;
   ownerUserId: string;
+  /** Jellyfin 当前服务对应的媒体库，用于隔离排序、播放和收藏状态。 */
+  libraryId: string;
   accountId: string;
-  aggregateService: boolean;
   accessToken: string;
 }
 
@@ -22,6 +23,13 @@ export interface JellyfinSortEntry {
 export interface JellyfinSortPlan {
   fields: Array<{ name: string; descending: boolean }>;
   randomSeed: string;
+}
+
+/** 节目子集日期聚合的数据库行；Knex 的 max 返回类型不会保留分组字段。 */
+interface JellyfinSeriesChildDateRow {
+  parent_id?: unknown;
+  created_at?: unknown;
+  premiere_date?: unknown;
 }
 
 /** 所有筛选先于排序和分页，避免混合类型、收藏和演员作品被截断到 500 条。 */
@@ -95,7 +103,7 @@ export class JellyfinCatalogSort {
     if (fields.length === 0) fields.push({ name: names.length === 0 ? "datecreated" : "sortname", descending: names.length === 0 });
     let randomSeed = "";
     if (fields.some((field) => field.name === "random")) {
-      const scope = [context.serviceId, context.accountId, context.accessToken,
+      const scope = [context.libraryId, context.accountId, context.accessToken,
         ...["ParentId", "IncludeItemTypes", "SearchTerm", "Filters", "IsFavorite", "IsPlayed", "PersonIds", "GenreIds", "SortBy", "SortOrder"]
           .map((key) => String(readJellyfinSortQuery(query, key) ?? ""))];
       // 关键变量：缓存键只保留摘要，绝不记录令牌或原始认证数据。
@@ -119,31 +127,11 @@ export class JellyfinCatalogSort {
     return this.runtime.database.query.raw("json_extract(??, ?) as ??", ["m.metadata_json", `$.${key}`, alias]);
   }
 
-  /** 有效主来源优先，否则按成员优先级选可用来源；与聚合详情的来源回退保持一致。 */
-  private effectiveAggregateSource(context: JellyfinSortContext, aggregateAlias: string): Knex.Raw {
-    const primary = this.runtime.database.query("media_items as primary_source")
-      .join("cloud_services as primary_service", "primary_service.id", "primary_source.service_id")
-      .whereRaw("?? = ??", ["primary_source.id", `${aggregateAlias}.primary_member_item_id`]).where("primary_source.user_id", context.ownerUserId)
-      .whereNull("primary_source.deleted_at").whereNull("primary_service.deleted_at").select("primary_source.id").limit(1);
-    const fallback = this.runtime.database.query("aggregate_media_item_members as candidate")
-      .join("media_items as source", "source.id", "candidate.media_item_id")
-      .join("cloud_services as source_service", "source_service.id", "source.service_id")
-      .whereRaw("?? = ??", ["candidate.aggregate_item_id", `${aggregateAlias}.id`]).where("source.user_id", context.ownerUserId)
-      .whereNull("source.deleted_at").whereNull("source_service.deleted_at")
-      .select("source.id").orderBy("candidate.metadata_rank", "asc").orderBy("candidate.id", "asc").limit(1);
-    // SQLite 不允许相关子查询在 ORDER BY 引用外层列，主来源与备用来源分开查询。
-    return this.runtime.database.query.raw("COALESCE((?), (?))", [primary, fallback]);
-  }
-
   /** 单集地区继承所属节目，不能使用单集默认的 other 地区值过滤收藏/已观看列表。 */
   private applyRegion(query: Knex.QueryBuilder, context: JellyfinSortContext, region: VideoRegionGroup): void {
-    const parent = context.aggregateService
-      ? this.runtime.database.query("aggregate_media_items as parent")
-        .join("media_items as parent_source", "parent_source.id", this.effectiveAggregateSource(context, "parent"))
-        .whereRaw("?? = ??", ["parent.id", "a.parent_aggregate_item_id"]).where("parent.status", "active").whereNull("parent.deleted_at")
-      : this.runtime.database.query("media_relations as relation")
-        .join("media_items as parent_source", "parent_source.id", "relation.parent_item_id")
-        .whereRaw("?? = ??", ["relation.child_item_id", "m.id"]).where("parent_source.service_id", context.serviceId);
+    const parent = this.runtime.database.query("media_relations as relation")
+      .join("media_items as parent_source", "parent_source.id", "relation.parent_item_id")
+      .whereRaw("?? = ??", ["relation.child_item_id", "m.id"]).where("parent_source.library_id", context.libraryId);
     parent.select("parent_source.id").where("parent_source.user_id", context.ownerUserId)
       .whereNull("parent_source.deleted_at").where("parent_source.region_group", region);
     query.where((builder) => builder
@@ -154,28 +142,21 @@ export class JellyfinCatalogSort {
   /** 一次查询候选排序键；字段、类型和用户范围不经过共享的 CatalogSort。 */
   public async load(context: JellyfinSortContext, filters: JellyfinSortFilters, plan: JellyfinSortPlan): Promise<JellyfinSortEntry[]> {
     if (filters.itemIds?.length === 0) return [];
-    const aggregate = context.aggregateService;
-    const idColumn = aggregate ? "a.id" : "m.id";
-    const typeColumn = aggregate ? "a.item_type" : "m.item_type";
-    // 主来源暂时被删除时继续使用有效备用成员，不能让仍有可播放版本的聚合影片消失。
-    const query = aggregate
-      ? this.runtime.database.query("aggregate_media_items as a").join("media_items as m", "m.id", this.effectiveAggregateSource(context, "a"))
-        .where({ "a.aggregate_service_id": context.serviceId, "a.status": "active" }).whereNull("a.deleted_at")
-      : this.runtime.database.query("media_items as m").where("m.service_id", context.serviceId);
+    const idColumn = "m.id";
+    const typeColumn = "m.item_type";
+    const query = this.runtime.database.query("media_items as m").where("m.library_id", context.libraryId);
     query.join("cloud_services as s", "s.id", "m.service_id")
       .where("m.user_id", context.ownerUserId).whereNull("m.deleted_at").whereNull("s.deleted_at")
-      .select({ id: idColumn, item_type: typeColumn, sort_title: aggregate ? "a.sort_title" : "m.sort_title",
-        title: "m.title", year: aggregate ? "a.year" : "m.year", premiere_date: aggregate ? "a.premiere_date" : "m.premiere_date",
+      .select({ id: idColumn, item_type: typeColumn, sort_title: "m.sort_title",
+        title: "m.title", year: "m.year", premiere_date: "m.premiere_date",
         created_at: "m.created_at", updated_at: "m.updated_at" });
     if (filters.itemTypes?.length) query.whereIn(typeColumn, filters.itemTypes);
     else if (filters.topLevel) query.whereIn(typeColumn, ["video.movie", "video.series"]);
-    if (aggregate && filters.topLevel) query.whereNull("a.parent_aggregate_item_id");
     if (filters.regionGroup) this.applyRegion(query, context, filters.regionGroup);
     if (filters.search?.trim()) query.where((builder) => builder.whereLike("m.title", `%${filters.search!.trim()}%`).orWhereLike("m.subtitle", `%${filters.search!.trim()}%`));
     if (filters.genres?.length) query.where((builder) => filters.genres!.forEach((genre) => builder.orWhereLike("m.metadata_json", `%${genre}%`)));
     if (filters.parentId) {
-      if (aggregate) query.where("a.parent_aggregate_item_id", filters.parentId);
-      else query.whereExists(this.runtime.database.query("media_relations as relation").select("relation.id")
+      query.whereExists(this.runtime.database.query("media_relations as relation").select("relation.id")
         .whereRaw("?? = ??", ["relation.child_item_id", "m.id"]).where("relation.parent_item_id", filters.parentId).where("relation.user_id", context.ownerUserId));
     }
     const names = new Set(plan.fields.map((field) => field.name));
@@ -187,11 +168,10 @@ export class JellyfinCatalogSort {
     if (names.has("indexnumber")) metadataFields.push(["episodeNumber", "episode_number"]);
     metadataFields.forEach(([key, alias]) => query.select(this.metadataColumn(key, alias)));
     if (filters.favorite || filters.played) {
-      const stateTable = filters.favorite ? (aggregate ? "aggregate_item_preferences" : "service_item_preferences")
-        : (aggregate ? "aggregate_playback_progress" : "service_playback_progress");
+      const stateTable = filters.favorite ? "library_item_preferences" : "library_playback_progress";
       const state = this.runtime.database.query(`${stateTable} as state`).select("state.id")
-        .whereRaw("?? = ??", [aggregate ? "state.aggregate_item_id" : "state.item_id", idColumn])
-        .where(aggregate ? "state.aggregate_service_id" : "state.service_id", context.serviceId).where("state.account_id", context.accountId);
+        .whereRaw("?? = ??", ["state.item_id", idColumn])
+        .where("state.library_id", context.libraryId).where("state.account_id", context.accountId);
       if (filters.favorite) state.whereNotNull("state.starred_at");
       else state.where("state.played", 1);
       query.whereExists(state);
@@ -217,21 +197,9 @@ export class JellyfinCatalogSort {
       },
     }));
     if (entries.length === 0) return entries;
-    if (aggregate && (names.has("datecreated") || names.has("datelastcontentadded"))) await this.loadAggregateCreatedDates(context, entries);
     if (names.has("datelastcontentadded") || names.has("lastcontentpremieredate")) await this.loadChildDates(context, entries);
     if (names.has("dateplayed") || names.has("seriesdateplayed") || names.has("playcount")) await this.loadPlaybackDates(context, entries);
     return this.sort(entries, plan);
-  }
-
-  /** 聚合创建时间取有效成员最早入库时间，重建或修改来源优先级不会重置它。 */
-  private async loadAggregateCreatedDates(context: JellyfinSortContext, entries: JellyfinSortEntry[]): Promise<void> {
-    const rows = await this.runtime.database.query("aggregate_media_item_members as member")
-      .join("media_items as source", "source.id", "member.media_item_id").join("cloud_services as source_service", "source_service.id", "source.service_id")
-      .where("member.aggregate_service_id", context.serviceId).where("source.user_id", context.ownerUserId)
-      .whereNull("source.deleted_at").whereNull("source_service.deleted_at")
-      .select("member.aggregate_item_id").min({ created_at: "source.created_at" }).groupBy("member.aggregate_item_id") as Array<{ aggregate_item_id: unknown; created_at: unknown }>;
-    const dates = new Map(rows.map((row) => [String(row.aggregate_item_id), readDate(row.created_at)]));
-    entries.forEach((entry) => { entry.values.datecreated = dates.get(entry.id) ?? entry.values.datecreated ?? null; });
   }
 
   /** 只汇总当前有效单集；电影或没有单集的节目回退自身入库/首映时间，不使用更新时间。 */
@@ -241,26 +209,13 @@ export class JellyfinCatalogSort {
       entry.values.lastcontentpremieredate = entry.values.premieredate ?? null;
     });
     if (!entries.some((entry) => entry.itemType === "video.series")) return;
-    let rows: Array<Record<string, unknown>>;
-    if (context.aggregateService) {
-      // 先把同一集的多个来源合成一个入库日期，再按整剧取最新，避免新增重复版本冒充新增集。
-      const episodes = this.runtime.database.query("aggregate_media_items as episode")
-        .join("aggregate_media_item_members as member", "member.aggregate_item_id", "episode.id")
-        .join("media_items as source", "source.id", "member.media_item_id")
-        .join("cloud_services as source_service", "source_service.id", "source.service_id")
-        .where({ "episode.aggregate_service_id": context.serviceId, "episode.status": "active", "episode.item_type": "video.episode" })
-        .where("source.user_id", context.ownerUserId).whereNull("episode.deleted_at").whereNull("source.deleted_at").whereNull("source_service.deleted_at")
-        .select("episode.parent_aggregate_item_id as parent_id", "episode.premiere_date")
-        .min({ created_at: "source.created_at" }).groupBy("episode.id", "episode.parent_aggregate_item_id", "episode.premiere_date");
-      rows = await this.runtime.database.query.from(episodes.as("dates")).select("parent_id")
-        .max({ created_at: "created_at", premiere_date: "premiere_date" }).groupBy("parent_id");
-    } else {
-      rows = await this.runtime.database.query("media_relations as relation")
-        .join("media_items as episode", "episode.id", "relation.child_item_id")
-        .where({ "episode.service_id": context.serviceId, "episode.user_id": context.ownerUserId, "episode.item_type": "video.episode" })
-        .whereNull("episode.deleted_at").select("relation.parent_item_id as parent_id")
-        .max({ created_at: "episode.created_at", premiere_date: "episode.premiere_date" }).groupBy("relation.parent_item_id");
-    }
+    // 关键变量：聚合结果需保留节目 ID，供节目条目映射到其最新子集日期。
+    const rows = (await this.runtime.database.query("media_relations as relation")
+      .join("media_items as episode", "episode.id", "relation.child_item_id")
+      .where({ "episode.library_id": context.libraryId, "episode.user_id": context.ownerUserId, "episode.item_type": "video.episode" })
+      .whereNull("episode.deleted_at").select("relation.parent_item_id as parent_id")
+      .max({ created_at: "episode.created_at", premiere_date: "episode.premiere_date" })
+      .groupBy("relation.parent_item_id")) as JellyfinSeriesChildDateRow[];
     const dates = new Map(rows.map((row) => [String(row.parent_id), row]));
     entries.forEach((entry) => {
       const children = entry.itemType === "video.series" ? dates.get(entry.id) : undefined;
@@ -271,12 +226,9 @@ export class JellyfinCatalogSort {
 
   /** 播放排序使用当前 Jellyfin 账号的实际播放时间，绝不读取更新进度记录的时间。 */
   private async loadPlaybackDates(context: JellyfinSortContext, entries: JellyfinSortEntry[]): Promise<void> {
-    const aggregate = context.aggregateService;
-    const query = this.runtime.database.query(aggregate ? "aggregate_playback_progress as progress" : "service_playback_progress as progress")
-      .where(aggregate ? "progress.aggregate_service_id" : "progress.service_id", context.serviceId).where("progress.account_id", context.accountId);
-    if (aggregate) query.join("aggregate_media_items as item", "item.id", "progress.aggregate_item_id")
-      .where("item.status", "active").whereNull("item.deleted_at").select("item.parent_aggregate_item_id as parent_id");
-    else query.join("media_items as item", "item.id", "progress.item_id").whereNull("item.deleted_at")
+    const query = this.runtime.database.query("library_playback_progress as progress")
+      .where("progress.library_id", context.libraryId).where("progress.account_id", context.accountId);
+    query.join("media_items as item", "item.id", "progress.item_id").whereNull("item.deleted_at")
       .leftJoin("media_relations as relation", "relation.child_item_id", "item.id").select("relation.parent_item_id as parent_id");
     const rows = await query.select("item.id", "progress.last_played_at", "progress.play_count", "progress.played");
     const dates = new Map<string, number>();
@@ -319,7 +271,7 @@ export class JellyfinCatalogSort {
   public log(context: JellyfinSortContext, plan: JellyfinSortPlan, entries: JellyfinSortEntry[], offset: number, count: number): void {
     this.runtime.logBusinessEvent("info", {
       日志关键字: "codex-jellyfin-sort", 事件: "Jellyfin排序完成", 服务ID: context.serviceId,
-      聚合服务: context.aggregateService, 排序字段: plan.fields.map((field) => `${field.name}:${field.descending ? "降序" : "升序"}`).join(","),
+      排序字段: plan.fields.map((field) => `${field.name}:${field.descending ? "降序" : "升序"}`).join(","),
       候选数量: entries.length, 分页起点: offset, 返回数量: count,
       排序样本: JSON.stringify(entries.slice(offset, offset + 3).map((entry) => ({ 条目ID: entry.id,
         排序值: plan.fields.map((field) => ({ 字段: field.name, 值: entry.values[field.name] ?? null })) }))),

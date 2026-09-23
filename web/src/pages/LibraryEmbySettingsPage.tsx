@@ -6,7 +6,7 @@ import { Panel, StatusPill } from "@/components/ui-kit";
 import {
   createServiceEmbyAccount,
   deleteServiceEmbyAccount,
-  getService,
+  getLibrary,
   getServiceAccessSettings,
   revokeServiceEmbyAccountSessions,
   updateLibraryPlaybackSettings,
@@ -34,7 +34,7 @@ async function copyEmbyAddress(value: string): Promise<void> {
 /** 管理单个媒体库的独立 Emby 播放、地区分组、地址和多账号。 */
 export function LibraryEmbySettingsPage({ serviceId, admin = false }: { serviceId: string; admin?: boolean }) {
   const resource = useApiResource(async () => {
-    const [service, settings] = await Promise.all([getService(serviceId, admin), getServiceAccessSettings(serviceId, admin)]);
+    const [service, settings] = await Promise.all([getLibrary(serviceId, admin).then((result) => ({ ...result.library, libraryId: result.library.id })), getServiceAccessSettings(serviceId, admin)]);
     return { service, settings };
   }, [serviceId, admin]);
   const [message, setMessage] = useState<string | null>(null);

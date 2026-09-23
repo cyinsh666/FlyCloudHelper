@@ -67,7 +67,7 @@ async function hydrateRealtimeEpisodeDetails(
   const tmdbStatus = runtime.tmdb.getStatus();
   if (tmdbStatus.healthyCount <= 0) return item;
   try {
-    const service = await runtime.repository.getServiceDetail(item.serviceId, item.userId);
+    const service = await runtime.repository.getServiceMediaContext(item.serviceId, item.userId);
     const locale = readTmdbLocale(service.metadataProfile);
     const episodes = await readEpisodeSeasonMetadata(runtime, tvId, seasonNumber, locale.language, signal);
     const localizedEpisode = episodes.find((candidate) => candidate.episodeNumber === episodeNumber);
@@ -135,7 +135,7 @@ export async function hydrateRealtimeVideoDetails(
       return item;
     }
     try {
-      const service = await runtime.repository.getServiceDetail(item.serviceId, item.userId);
+      const service = await runtime.repository.getServiceMediaContext(item.serviceId, item.userId);
       const locale = readTmdbLocale(service.metadataProfile);
       const mediaType = item.itemType === "video.series" ? "tv" : "movie";
       const metadata = await runtime.tmdb.readVideoMetadata(

@@ -67,8 +67,13 @@ COPY --from=build --chown=node:node /app/api/dist ./api/dist
 COPY --from=build --chown=node:node /app/web/dist ./web/dist
 COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
+# 当前网络环境无法稳定访问 deb.debian.org，切换到阿里云 HTTP Debian 镜像保证构建阶段可获取 ffmpeg。
 # Debian 的 ffmpeg 软件包提供原生 ffprobe；gosu 用于修复 NAS 挂载权限后降权启动服务。
-RUN apt-get update \
+RUN sed -i \
+        -e 's|http://deb.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g' \
+        -e 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg gosu \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /data/database /data/secrets /data/plugins /data/exports /data/migrations /data/music-artwork \

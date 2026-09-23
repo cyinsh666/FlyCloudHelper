@@ -116,7 +116,7 @@ async function runStages(input: MusicScanInput): Promise<void> {
           continue;
         }
         if (!describeMediaFile(entry, ["music"], root.displayPath || "/")) continue;
-        const source: SourceFileRecord = { id: createStableId("src", job.userId, job.libraryId, entry.resourceId), userId: job.userId, serviceId: job.serviceId, libraryId: job.libraryId,
+        const source: SourceFileRecord = { id: createStableId("src", job.userId, job.libraryId, entry.resourceId), userId: job.userId, serviceId: job.serviceId, libraryId: job.libraryId, librarySourceId: String(job.snapshot.librarySourceId),
           providerResourceId: entry.resourceId.length > 500 ? createStableId("resource", entry.resourceId) : entry.resourceId,
           parentResourceId: entry.parentResourceId && entry.parentResourceId.length > 500 ? createStableId("resource", entry.parentResourceId) : entry.parentResourceId,
           path: entry.path, name: entry.name, extension: getFileExtension(entry.name), size: entry.size, modifiedAt: entry.modifiedAt, etag: entry.etag,

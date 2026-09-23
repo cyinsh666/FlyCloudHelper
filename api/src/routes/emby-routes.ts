@@ -6,6 +6,7 @@ import { EmbyCompatibilityService, type EmbyContext, type EmbyLibraryContext } f
 import { providerFetch, providerStream } from "../providers/network.js";
 import type { ProviderConnectionContext, ProviderFileAccess } from "../providers/types.js";
 import type { ApiRuntime } from "../runtime.js";
+import { enqueueProtocolScan, listProtocolVirtualFolders } from "../protocol-scan-service.js";
 import { buildUpstreamHeaders, copyMediaResponseHeaders, resolveRelayAccess, type RelayLibraryRow } from "./media-stream-routes.js";
 
 /** 读取 Emby 查询参数，保留官方 PascalCase 与部分客户端 camelCase。 */
@@ -31,10 +32,34 @@ function requireEmbyUser(context: EmbyContext, userId: string): void {
   if (context.accountId !== userId) throw new ApiError(403, "emby_user_scope_mismatch", "不能访问其他 Emby 账号的数据");
 }
 
+/** 转义用户名称，避免生成的 SVG 头像包含无效 XML。 */
+function escapeUserImageText(value: string): string {
+  return value.replace(/&/gu, "&amp;").replace(/</gu, "&lt;").replace(/>/gu, "&gt;").replace(/"/gu, "&quot;").replace(/'/gu, "&apos;");
+}
+
+/** 返回云助手生成的 Emby 用户头像，供 Flymby 服务卡片直接展示。 */
+function sendUserImage(context: EmbyContext, request: FastifyRequest, reply: FastifyReply) {
+  const avatarText = escapeUserImageText(Array.from(context.accountUsername.trim())[0] ?? "F");
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256"><rect width="256" height="256" rx="56" fill="#30343b"/><text x="128" y="142" text-anchor="middle" dominant-baseline="middle" font-family="sans-serif" font-size="128" font-weight="600" fill="#f3f4f6">${avatarText}</text></svg>`;
+  reply.header("Content-Type", "image/svg+xml; charset=utf-8").header("Cache-Control", "private, max-age=86400");
+  return request.method === "HEAD" ? reply.send() : reply.send(Buffer.from(svg));
+}
+
+/** 构造 Emby 官方 RootItem 的 BaseItemDto。 */
+function buildRootItem(context: EmbyContext): Record<string, unknown> {
+  return {
+    Name: "媒体库",
+    ServerId: context.libraryId,
+    Id: context.libraryId,
+    Type: "Folder",
+    IsFolder: true,
+  };
+}
+
 /** 读取协议前缀对应的真实云服务和中转能力配置。 */
 async function getStreamService(runtime: ApiRuntime, serviceId: string): Promise<Record<string, unknown>> {
   const service = await runtime.database.query("cloud_services as s")
-    .join("media_libraries as l", "l.id", "s.library_id")
+    .join("library_sources as ls", "ls.service_id", "s.id").join("media_libraries as l", "l.id", "ls.library_id")
     .select("s.*", "l.emby_relay_playback_enabled")
     .where("s.id", serviceId)
     .whereNull("s.deleted_at")
@@ -154,37 +179,45 @@ export async function registerEmbyRoutes(server: FastifyInstance, runtime: ApiRu
   const compatibility = new EmbyCompatibilityService(runtime);
   const registerPrefix = (prefix: string) => {
     const suffix = (request: FastifyRequest) => String((request.params as { embyPathSuffix: string }).embyPathSuffix);
-    const serviceId = (request: FastifyRequest) => compatibility.resolveServiceIdByPathSuffix(suffix(request));
-    const authenticated = async (request: FastifyRequest) => compatibility.authenticate(await serviceId(request), request);
-    const publicImageContext = async (request: FastifyRequest) => compatibility.resolvePublicImageContext(await serviceId(request));
-    server.get(`${prefix}/System/Info/Public`, async (request) => { const id = await serviceId(request); const service = await compatibility.requireEnabledService(id); return { LocalAddress: await buildLocalAddress(runtime, request, suffix(request)), ServerName: service.display_name, Version: "4.8.11.0", ProductName: "Emby Server", OperatingSystem: process.platform, Id: id, StartupWizardCompleted: true }; });
-    server.get(`${prefix}/System/Info`, async (request) => { const context = await authenticated(request); const service = await compatibility.requireEnabledService(context.serviceId); return { LocalAddress: await buildLocalAddress(runtime, request, suffix(request)), ServerName: service.display_name, Version: "4.8.11.0", ProductName: "Emby Server", OperatingSystem: process.platform, Id: context.serviceId, StartupWizardCompleted: true }; });
-    server.get(`${prefix}/System/Ping`, async (_request, reply) => reply.status(204).send());
-    server.post(`${prefix}/Users/AuthenticateByName`, async (request) => compatibility.login(await serviceId(request), request, (request.body ?? {}) as Record<string, unknown>));
-    server.post(`${prefix}/Sessions/Logout`, async (request, reply) => { await compatibility.logout(await serviceId(request), request); return reply.status(204).send(); });
-    server.get(`${prefix}/Users/:userId`, async (request) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); return compatibility.mapUser(context.accountId, context.accountUsername, context.serviceId, context.accountHasPassword, context.downloadEnabled); });
-    server.get(`${prefix}/Users/Me`, async (request) => { const context = await authenticated(request); return compatibility.mapUser(context.accountId, context.accountUsername, context.serviceId, context.accountHasPassword, context.downloadEnabled); });
-    server.get(`${prefix}/Users/Public`, async (request) => { await authenticated(request); return []; });
+    const libraryId = (request: FastifyRequest) => compatibility.resolveLibraryIdByPathSuffix(suffix(request));
+    const authenticated = async (request: FastifyRequest) => compatibility.authenticate(await libraryId(request), request);
+    const publicImageContext = async (request: FastifyRequest) => compatibility.resolvePublicImageContext(await libraryId(request));
+    server.get(`${prefix}/System/Info/Public`, async (request) => { const id = await libraryId(request); const service = await compatibility.requireEnabledService(id); return { LocalAddress: await buildLocalAddress(runtime, request, suffix(request)), ServerName: service.display_name, Version: "4.8.11.0", ProductName: "Emby Server", OperatingSystem: process.platform, Id: id, StartupWizardCompleted: true }; });
+    server.get(`${prefix}/System/Info`, async (request) => { const context = await authenticated(request); const service = await compatibility.requireEnabledService(context.libraryId); return { LocalAddress: await buildLocalAddress(runtime, request, suffix(request)), ServerName: service.display_name, Version: "4.8.11.0", ProductName: "Emby Server", OperatingSystem: process.platform, Id: context.libraryId, StartupWizardCompleted: true }; });
+    // UHDNow 扩展不是 Emby 官方接口；Flymby 会把空线路视为当前服务没有额外域名。
+    server.get(`${prefix}/System/Ext/ServerDomains`, async (request) => { await authenticated(request); return { ok: true, data: [] }; });
+    server.route({ method: ["GET", "POST"], url: `${prefix}/System/Ping`, handler: async (_request, reply) => reply.type("text/plain; charset=utf-8").send("FlyCloudHelper") });
+    server.post(`${prefix}/Users/AuthenticateByName`, async (request) => compatibility.login(await libraryId(request), request, (request.body ?? {}) as Record<string, unknown>));
+    server.post(`${prefix}/Sessions/Logout`, async (request, reply) => { await compatibility.logout(await libraryId(request), request); return reply.status(204).send(); });
+    server.get(`${prefix}/Users/:userId`, async (request) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); return compatibility.mapUser(context.accountId, context.accountUsername, context.libraryId, context.accountHasPassword, context.downloadEnabled); });
+    server.get(`${prefix}/Users/Me`, async (request) => { const context = await authenticated(request); return compatibility.mapUser(context.accountId, context.accountUsername, context.libraryId, context.accountHasPassword, context.downloadEnabled); });
+    server.get(`${prefix}/Users/Public`, async (request) => { await libraryId(request); return []; });
+    server.route({ method: ["GET", "HEAD"], url: `${prefix}/Users/:userId/Images/Primary`, handler: async (request, reply) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); return sendUserImage(context, request, reply); } });
     server.get(`${prefix}/Users/:userId/Views`, async (request) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); return compatibility.listLibraries(context); });
     server.get(`${prefix}/UserViews`, async (request) => compatibility.listLibraries(await authenticated(request)));
     server.get(`${prefix}/Users/:userId/Items/Resume`, async (request) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); return compatibility.listResume(context, readQuery(request)); });
-    server.get(`${prefix}/Users/:userId/Items/Root`, async (request) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); return compatibility.listLibraries(context); });
+    server.get(`${prefix}/Users/:userId/Items/Root`, async (request) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); return buildRootItem(context); });
     server.get(`${prefix}/Users/:userId/Items/Latest`, async (request) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); return (await compatibility.listItems(context, { ...readQuery(request), SortBy: "DateCreated", SortOrder: "Descending" })).Items; });
-    server.get(`${prefix}/Users/:userId/Items/:itemId`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireEmbyUser(context, params.userId); return compatibility.getItem(context, params.itemId); });
-    server.get(`${prefix}/Users/:userId/Items/:itemId/UserData`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireEmbyUser(context, params.userId); const item = await compatibility.getItem(context, params.itemId) as { UserData?: unknown }; return item.UserData ?? {}; });
+    server.get(`${prefix}/Users/:userId/Items/:itemId`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireEmbyUser(context, params.userId); return compatibility.getItemDetail(context, params.itemId); });
+    server.get(`${prefix}/Users/:userId/Items/:itemId/UserData`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireEmbyUser(context, params.userId); return compatibility.getUserData(context, params.itemId); });
+    server.post(`${prefix}/Users/:userId/Items/:itemId/UserData`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireEmbyUser(context, params.userId); return compatibility.updateUserData(context, params.itemId, (request.body ?? {}) as Record<string, unknown>); });
     server.get(`${prefix}/Users/:userId/Items`, async (request) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); const query = readQuery(request); const favorite = String(query.IsFavorite ?? query.Filters ?? "").includes("true") || String(query.Filters ?? "").includes("IsFavorite"); const played = String(query.IsPlayed ?? query.Filters ?? "").includes("true") || String(query.Filters ?? "").includes("IsPlayed"); return favorite ? compatibility.listFavoriteItems(context, query) : played ? compatibility.listPlayedItems(context, query) : String(query.SortBy ?? "").includes("DatePlayed") ? compatibility.listHistory(context, query) : compatibility.listItems(context, query); });
     server.get(`${prefix}/Items`, async (request) => compatibility.listItems(await authenticated(request), readQuery(request)));
-    server.get(`${prefix}/Items/:itemId`, async (request) => compatibility.getItem(await authenticated(request), String((request.params as { itemId: string }).itemId)));
-    server.get(`${prefix}/Items/:itemId/Ancestors`, async (_request) => []);
-    server.get(`${prefix}/Items/:itemId/Similar`, async (_request) => ({ Items: [], TotalRecordCount: 0, StartIndex: 0 }));
+    server.get(`${prefix}/Items/:itemId`, async (request) => compatibility.getItemDetail(await authenticated(request), String((request.params as { itemId: string }).itemId)));
+    server.get(`${prefix}/Items/:itemId/Ancestors`, async (request) => compatibility.listItemAncestors(await authenticated(request), String((request.params as { itemId: string }).itemId)));
+    server.get(`${prefix}/Items/:itemId/Similar`, async (request) => compatibility.listSimilar(await authenticated(request), String((request.params as { itemId: string }).itemId), readQuery(request)));
     server.get(`${prefix}/Search/Hints`, async (request) => { const result = await compatibility.listItems(await authenticated(request), { ...readQuery(request), Limit: readQuery(request).Limit ?? 50 }); return { SearchHints: result.Items.map((item) => ({ ItemId: item.Id, Id: item.Id, Name: item.Name, Type: item.Type, ProductionYear: item.ProductionYear, PrimaryImageTag: (item.ImageTags as Record<string, unknown> | undefined)?.Primary })), TotalRecordCount: result.TotalRecordCount }; });
     server.get(`${prefix}/Items/Counts`, async (request) => compatibility.getItemCounts(await authenticated(request)));
     server.get(`${prefix}/Persons`, async (request) => compatibility.listPersons(await authenticated(request), readQuery(request)));
-    server.get(`${prefix}/Persons/:name`, async (request) => { const context = await authenticated(request); const result = await compatibility.listPersons(context, { SearchTerm: String((request.params as { name: string }).name), Limit: 1 }); const person = result.Items[0]; if (!person) throw new ApiError(404, "emby_person_not_found", "演员不存在"); return person; });
+    server.get(`${prefix}/Persons/:name`, async (request) => { const context = await authenticated(request); const person = await compatibility.getPersonByName(context, String((request.params as { name: string }).name)); if (!person) throw new ApiError(404, "emby_person_not_found", "演员不存在"); return person; });
     server.get(`${prefix}/Genres`, async (request) => compatibility.listGenres(await authenticated(request), readQuery(request)));
+    server.get(`${prefix}/Library/VirtualFolders`, async (request) => { const context = await authenticated(request); const libraries = await compatibility.listLibraries(context); return listProtocolVirtualFolders(runtime, context, libraries.Items); });
+    server.post(`${prefix}/Library/Media/Updated`, async (request, reply) => { const context = await authenticated(request); await enqueueProtocolScan(runtime, context, "emby", "Library/Media/Updated"); return reply.status(200).send(); });
+    server.post(`${prefix}/Library/Refresh`, async (request, reply) => { const context = await authenticated(request); await enqueueProtocolScan(runtime, context, "emby", "Library/Refresh"); return reply.status(200).send(); });
+    server.post(`${prefix}/Items/:itemId/Refresh`, async (request, reply) => { const context = await authenticated(request); const itemId = String((request.params as { itemId: string }).itemId); const libraries = await compatibility.listLibraries(context); const isLibrary = libraries.Items.some((item) => String(item.Id) === itemId); if (!isLibrary) await compatibility.getItemDetail(context, itemId); await enqueueProtocolScan(runtime, context, "emby", "Items/{ItemId}/Refresh", itemId); return reply.status(200).send(); });
     server.get(`${prefix}/Shows/:seriesId/Seasons`, async (request) => compatibility.listSeasons(await authenticated(request), String((request.params as { seriesId: string }).seriesId)));
     server.get(`${prefix}/Shows/:seriesId/Episodes`, async (request) => compatibility.listEpisodes(await authenticated(request), String((request.params as { seriesId: string }).seriesId), readQuery(request)));
-    server.get(`${prefix}/Shows/NextUp`, async (request) => ({ Items: [], TotalRecordCount: 0, StartIndex: 0 }));
+    server.get(`${prefix}/Shows/NextUp`, async (request) => compatibility.listNextUp(await authenticated(request), readQuery(request)));
     server.route({ method: ["GET", "POST"], url: `${prefix}/Items/:itemId/PlaybackInfo`, handler: async (request) => { const context = await authenticated(request); return compatibility.buildPlaybackInfo(context, String((request.params as { itemId: string }).itemId), { mediaSourceId: readMediaSourceId(request) || undefined, playSessionId: String(readQuery(request).PlaySessionId ?? readQuery(request).playSessionId ?? "") || undefined, route: readPlaybackRoute(request) }); } });
     server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Download`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId), true) });
     server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/File`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId), true) });
@@ -203,8 +236,8 @@ export async function registerEmbyRoutes(server: FastifyInstance, runtime: ApiRu
     server.delete(`${prefix}/Users/:userId/FavoriteItems/:itemId`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireEmbyUser(context, params.userId); return compatibility.setFavorite(context, params.itemId, false); });
     server.post(`${prefix}/Users/:userId/Items/:itemId/HideFromResume`, async (request, reply) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireEmbyUser(context, params.userId); await compatibility.setHiddenFromResume(context, params.itemId, true); return reply.status(204).send(); });
     server.delete(`${prefix}/Users/:userId/Items/:itemId/HideFromResume`, async (request, reply) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireEmbyUser(context, params.userId); await compatibility.setHiddenFromResume(context, params.itemId, false); return reply.status(204).send(); });
-    server.post(`${prefix}/Sessions/Capabilities`, async (_request, reply) => reply.status(204).send());
-    server.post(`${prefix}/Sessions/Capabilities/Full`, async (_request, reply) => reply.status(204).send());
+    server.post(`${prefix}/Sessions/Capabilities`, async (request, reply) => { await authenticated(request); return reply.status(200).send(); });
+    server.post(`${prefix}/Sessions/Capabilities/Full`, async (request, reply) => { await authenticated(request); return reply.status(200).send(); });
   };
   registerPrefix("/e/:embyPathSuffix");
   // 关键变量：Flymby 的 Emby 客户端会自动追加 /emby；这里只是同一独立 Emby 协议的路径别名。
