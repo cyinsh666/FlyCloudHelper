@@ -69,7 +69,8 @@ FlyCloudHelper 是一个可自部署的网盘媒体扫描、元数据刮削、�
 - 三类任务均可配置间隔、每日、每周或每月定时执行；视频规格分析使用独立队列，不占用扫描 Worker 槽位。
 - 任务记录开始时间、结束时间、实际运行时长、当前路径和阶段统计。
 - 支持运行状态筛选、排队等待原因、暂停与继续、终止、删除、失败重试和仅清理已完成任务。
-- 默认最多同时执行 5 个扫描刮削任务，具体 Provider 仍使用各自的服务级推荐并发。
+- 同一轮云聚合扫描在任务列表中按父任务合并展示，并在组内列出每个网盘来源的执行状态；父任务支持暂停全部、继续全部、取消全部和删除整组，来源详情仍可单独控制。
+- 不同网盘来源的扫描任务可以同时执行；同一个物理网盘源最多运行一个扫描任务，具体 Provider 仍使用各自的服务级推荐并发。
 
 ### 协议访问
 
@@ -337,9 +338,8 @@ cp .env.example .env
 | `FLYCLOUDHELPER_DATABASE_AUTO_CREATE` | `true` | 数据库不存在时尝试自动创建 |
 | `FLYCLOUDHELPER_DATABASE_URL` | 空 | 兼容原有完整连接地址，配置后优先于拆分字段 |
 | `FLYCLOUDHELPER_COOKIE_SECURE` | `false` | HTTPS 部署时设为 `true` |
-| `FLYCLOUDHELPER_WORKER_CONCURRENCY` | `5` | 同时执行的扫描刮削任务数 |
 | `FLYCLOUDHELPER_FFPROBE_PATH` | Docker 中为 `/usr/bin/ffprobe` | ffprobe 可执行文件路径 |
-| `FLYCLOUDHELPER_MEDIA_PROBE_CONCURRENCY` | `1` | 独立媒体规格队列并发数；不会占用扫描 Worker 槽位 |
+| `FLYCLOUDHELPER_MEDIA_PROBE_CONCURRENCY` | `2` | 独立媒体规格队列并发数，最大为 2；不会占用扫描 Worker |
 | `FLYCLOUDHELPER_ALLOW_INSECURE_HTTP` | `true` | 是否允许 Provider 使用 HTTP |
 | `FLYCLOUDHELPER_CLOUD115_CLIENT_ID` | `100195125` | 115 OpenAPI 公开应用 ID，不是应用 Secret |
 | `FLYCLOUDHELPER_HUAWEI_BINDING_PROOF_SECRET` | 空 | 可选的外部账号身份绑定验签密钥；配置后绑定注册必须提供短期受信任签名，支持同名 `_FILE` Secret |

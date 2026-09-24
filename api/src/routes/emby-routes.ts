@@ -7,7 +7,7 @@ import { providerFetch, providerStream } from "../providers/network.js";
 import type { ProviderConnectionContext, ProviderFileAccess } from "../providers/types.js";
 import type { ApiRuntime } from "../runtime.js";
 import { enqueueProtocolScan, listProtocolVirtualFolders } from "../protocol-scan-service.js";
-import { buildUpstreamHeaders, copyMediaResponseHeaders, resolveRelayAccess, type RelayLibraryRow } from "./media-stream-routes.js";
+import { buildUpstreamHeaders, copyMediaResponseHeaders, handleProviderAuthenticationFailure, resolveRelayAccess, type RelayLibraryRow } from "./media-stream-routes.js";
 
 /** 读取 Emby 查询参数，保留官方 PascalCase 与部分客户端 camelCase。 */
 function readQuery(request: FastifyRequest): Record<string, unknown> {
@@ -58,27 +58,38 @@ function buildRootItem(context: EmbyContext): Record<string, unknown> {
 
 /** 读取协议前缀对应的真实云服务和中转能力配置。 */
 async function getStreamService(runtime: ApiRuntime, serviceId: string): Promise<Record<string, unknown>> {
-  const service = await runtime.database.query("cloud_services as s")
-    .join("library_sources as ls", "ls.service_id", "s.id").join("media_libraries as l", "l.id", "ls.library_id")
-    .select("s.*", "l.emby_relay_playback_enabled")
-    .where("s.id", serviceId)
-    .whereNull("s.deleted_at")
+  const service = await runtime.database.query("media_libraries as l")
+    .select("l.id", "l.id as library_id", "l.user_id", "l.status", "l.library_kind", "l.emby_relay_playback_enabled")
+    .where("l.id", serviceId)
     .first();
   if (!service) throw new ApiError(404, "emby_service_not_found", "Emby 服务不存在");
   return service;
 }
 
 /** 解析网盘临时访问地址，并在 Provider 刷新授权时持久化新的连接配置。 */
-async function resolveFileAccess(runtime: ApiRuntime, service: Record<string, unknown>, ownerUserId: string, locator: Record<string, unknown>, signal: AbortSignal): Promise<ProviderFileAccess | null> {
-  const adapter = runtime.providers.get(String(service.provider_type));
+async function resolveFileAccess(runtime: ApiRuntime, file: Record<string, unknown>, ownerUserId: string, locator: Record<string, unknown>, signal: AbortSignal): Promise<ProviderFileAccess | null> {
+  const sourceRuntime = await runtime.repository.getLibrarySourceRuntimeConfiguration(String(file.librarySourceId), ownerUserId);
+  const adapter = runtime.providers.get(sourceRuntime.providerType);
   if (!adapter.resolveFileAccess) return null;
-  const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(String(service.id), ownerUserId));
+  const connection = runtime.vault.decrypt(sourceRuntime.encryptedConnection);
   const providerContext: ProviderConnectionContext = {
-    persistConnection: async (nextConnection) => runtime.repository.refreshActiveEncryptedConnection({
-      serviceId: String(service.id), userId: ownerUserId, credentialRevision: Number(service.credential_revision), encryptedConnection: runtime.vault.encrypt(nextConnection),
+    persistConnection: async (nextConnection) => runtime.repository.refreshLibrarySourceEncryptedConnection({
+      librarySourceId: sourceRuntime.source.id, userId: ownerUserId,
+      credentialRevision: sourceRuntime.credentialRevision, encryptedConnection: runtime.vault.encrypt(nextConnection),
     }),
   };
-  return adapter.resolveFileAccess(connection, locator, signal, providerContext);
+  try {
+    return await adapter.resolveFileAccess(connection, locator, signal, providerContext);
+  } catch (error) {
+    await handleProviderAuthenticationFailure(runtime, {
+      librarySourceId: sourceRuntime.source.id,
+      serviceId: sourceRuntime.source.serviceId ?? sourceRuntime.source.id,
+      userId: ownerUserId,
+      credentialRevision: sourceRuntime.credentialRevision,
+      providerType: sourceRuntime.providerType,
+    }, error);
+    throw error;
+  }
 }
 
 /** 判断 Provider 是否明确反馈该网盘文件已经被删除。 */
@@ -87,8 +98,13 @@ function isMissingProviderFileError(error: unknown): boolean {
 }
 
 /** 将服务数据库行转换为通用媒体中转模块需要的最小媒体库记录。 */
-function toRelayLibrary(service: Record<string, unknown>): RelayLibraryRow {
-  return { id: String(service.library_id), service_id: String(service.id), provider_type: String(service.provider_type), service_status: String(service.status), relay_playback_enabled: service.emby_relay_playback_enabled as number, credential_revision: Number(service.credential_revision) };
+function toRelayLibrary(service: Record<string, unknown>, file: Record<string, unknown>): RelayLibraryRow {
+  return {
+    id: String(service.library_id), service_id: String(service.id),
+    library_source_id: String(file.librarySourceId ?? "") || undefined,
+    provider_type: String(file.providerType ?? ""), service_status: String(service.status),
+    relay_playback_enabled: service.emby_relay_playback_enabled as number, credential_revision: 0,
+  };
 }
 
 /** 代理 Emby 项目图片，图片接口可不带令牌以兼容海报组件。 */
@@ -125,12 +141,14 @@ async function sendMediaStream(runtime: ApiRuntime, compatibility: EmbyCompatibi
   const effectiveRoute = download ? "server" : route === "auto" ? relayEnabled ? "server" : "origin" : route;
   const internalItemId = compatibility.toInternalItemId(itemId);
   const item = await runtime.repository.getCatalogItem(internalItemId, context.ownerUserId);
-  if (item.serviceId !== context.serviceId) throw new ApiError(404, "emby_item_not_found", "媒体条目不存在");
+  if (item.libraryId !== context.libraryId) throw new ApiError(404, "emby_item_not_found", "媒体条目不存在");
   const files = (await runtime.repository.listItemFiles(item.id, context.ownerUserId)).filter((file) => String(file.itemId) === item.id);
   const sourceId = compatibility.toInternalMediaSourceId(item.id, readMediaSourceId(request));
   const selected = !sourceId || sourceId === item.id ? files[0] : files.find((file) => String(file.fileId) === sourceId);
   if (!selected) throw new ApiError(404, "emby_media_source_not_found", "媒体源不存在");
-  const candidates = [selected, ...files.filter((file) => file !== selected && String(file.path) === String(selected.path))];
+  // 关键变量：Emby 与 Jellyfin 一致，每次播放最多自动回退一个其他来源版本。
+  const fallback = files.find((file) => file !== selected);
+  const candidates = fallback ? [selected, fallback] : [selected];
   const controller = new AbortController(); const abort = () => controller.abort();
   request.raw.once("aborted", abort); reply.raw.once("close", abort);
   let upstreamBody: IncomingMessage | null = null;
@@ -139,16 +157,19 @@ async function sendMediaStream(runtime: ApiRuntime, compatibility: EmbyCompatibi
     for (const candidate of candidates) {
       const locator = candidate.playbackLocator && typeof candidate.playbackLocator === "object" ? candidate.playbackLocator as Record<string, unknown> : {};
       try {
-        const originAccess = effectiveRoute === "origin" ? await resolveFileAccess(runtime, service, context.ownerUserId, locator, controller.signal) : null;
+        const originAccess = effectiveRoute === "origin" ? await resolveFileAccess(runtime, candidate, context.ownerUserId, locator, controller.signal) : null;
         if (effectiveRoute === "origin" && originAccess && Object.keys(originAccess.headers).length === 0) {
           reply.header("Cache-Control", "private, no-store");
           return reply.redirect(originAccess.url, 307);
         }
         if (effectiveRoute === "origin" && originAccess && !relayEnabled) throw new ApiError(409, "emby_origin_headers_required", "当前原始播放地址需要专用请求头，请启用 Emby 中转播放");
-        access = originAccess ?? await resolveRelayAccess(runtime, toRelayLibrary(service), context.ownerUserId, locator, controller.signal);
+        access = originAccess ?? await resolveRelayAccess(runtime, toRelayLibrary(service, candidate), context.ownerUserId, locator, controller.signal);
         file = candidate;
         break;
-      } catch (error) { if (!isMissingProviderFileError(error)) throw error; }
+      } catch (error) {
+        if (!isMissingProviderFileError(error)) throw error;
+        await runtime.repository.markSourceFileMissingFromPlayback(String(candidate.fileId), context.ownerUserId);
+      }
     }
     if (!access || !file) throw new ApiError(404, "emby_provider_file_not_found", "当前播放版本对应的网盘文件已删除");
     const headers = buildUpstreamHeaders(request, access.headers);

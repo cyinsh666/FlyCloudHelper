@@ -1117,6 +1117,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       status: status && status !== "active" ? status as JobStatus : undefined,
       statuses: status === "active" ? ["queued", "running", "retry_waiting", "paused"] : undefined,
       jobType: jobType ? jobType as "scan" | "media_probe" : undefined,
+      groupParentJobs: request.query.groupParentJobs === "true",
       ...readPagination(request.query),
     });
   });
@@ -1245,6 +1246,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       jobId: randomUUID(),
       userId: user.id,
       libraryId: sourceJob.libraryId,
+      librarySourceId: sourceJob.librarySourceId,
       requestedByUserId: user.id,
       requestId: requireString(request.body, "requestId", "请求 ID", 200),
       clientDeviceId: requireString(request.body, "clientDeviceId", "客户端设备 ID", 200),

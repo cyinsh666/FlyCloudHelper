@@ -33,7 +33,7 @@ import {
   validateTmdbKeyList,
 } from "../system-settings.js";
 import { streamJobEvents } from "./event-stream.js";
-import { attachLibrarySourceId } from "./library-routes.js";
+import { attachLibrarySourceId, notifyFinishedLibraryScanJob } from "./library-routes.js";
 import {
   consumeProviderAuthorization,
   attachConnectionAuthMode,
@@ -721,6 +721,9 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.put<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/admin/libraries/:libraryId/scan-profile", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const library = await runtime.repository.getLibrary(request.params.libraryId);
+    if (library.libraryKind === "cloud_aggregate_video") {
+      throw new ApiError(409, "aggregate_scan_profile_is_source_scoped", "云聚合扫描路径需要由媒体库所属用户在各来源中分别配置");
+    }
     const service = await runtime.repository.getServiceDetail(library.sourceServiceId, library.userId);
     const updateScope = request.body.updateScope === "paths" ? "paths" : "profile";
     const scanProfile = validateScanProfile(
@@ -819,10 +822,15 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       媒体库ID: library.id,
       服务ID: library.sourceServiceId,
     });
-    const result = await runtime.repository.enqueueExistingServiceMediaProbes(library.sourceServiceId, library.userId, operator.id);
-    const job = result.jobId
-      ? await runtime.repository.getJob(result.jobId)
+    const aggregateResult = library.libraryKind === "cloud_aggregate_video"
+      ? await runtime.repository.enqueueExistingLibraryMediaProbes(library.id, library.userId, operator.id)
       : null;
+    const legacyResult = aggregateResult
+      ? null
+      : await runtime.repository.enqueueExistingServiceMediaProbes(library.sourceServiceId, library.userId, operator.id);
+    const jobIds = aggregateResult?.jobIds ?? (legacyResult?.jobId ? [legacyResult.jobId] : []);
+    const jobs = await Promise.all(jobIds.map((jobId) => runtime.repository.getJob(jobId)));
+    const queuedCount = aggregateResult?.queuedCount ?? legacyResult?.queuedCount ?? 0;
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-media-ffprobe-backfill",
       事件: "管理员触发已有视频规格分析",
@@ -830,15 +838,16 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       目标用户ID: library.userId,
       媒体库ID: library.id,
       服务ID: library.sourceServiceId,
-      后台任务ID: result.jobId,
-      入队文件数量: result.queuedCount,
+      后台任务ID: jobIds[0] ?? null,
+      来源任务数量: jobIds.length,
+      入队文件数量: queuedCount,
     });
-    await audit(runtime, operator, "backfill_media_probes", "background_job", result.jobId ?? library.id, {
+    await audit(runtime, operator, "backfill_media_probes", "background_job", jobIds[0] ?? library.id, {
       媒体库ID: library.id,
       服务ID: library.sourceServiceId,
-      入队文件数量: result.queuedCount,
+      入队文件数量: queuedCount,
     });
-    return reply.status(result.jobId ? 202 : 200).send({ job, queuedCount: result.queuedCount });
+    return reply.status(jobIds.length > 0 ? 202 : 200).send({ job: jobs[0] ?? null, jobs, queuedCount });
   });
 
   /** 管理员保存任意媒体库的任务完成通知开关。 */
@@ -877,6 +886,46 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     if (await runtime.repository.findUnfinishedLibraryScanJob(library.id, library.userId)) {
       throw new ApiError(409, "scan_job_conflict", "当前媒体库已有未结束任务，不能重复启动");
     }
+    const requestId = requireString(request.body, "requestId", "请求 ID", 200);
+    const clientDeviceId = typeof request.body.clientDeviceId === "string" ? request.body.clientDeviceId : `admin:${operator.id}`;
+    if (library.libraryKind === "cloud_aggregate_video") {
+      const readySources = library.sources.filter((source) => source.status === "active"
+        && source.connectionStatus === "valid"
+        && source.credentialConfigured
+        && (source.serviceStatus === null || source.serviceStatus === "active"));
+      if (readySources.length === 0) throw new ApiError(409, "library_sources_not_ready", "请先添加并授权至少一个可用来源");
+      // 关键变量：管理员触发与用户触发使用同一路径参与规则。
+      const scanSources = readySources.filter((source) => {
+        const scan = source.configuration.scan;
+        return Boolean(scan && typeof scan === "object" && !Array.isArray(scan)
+          && getScanRootsForMode(scan as Record<string, unknown>, scanMode).length > 0);
+      });
+      if (scanSources.length === 0) {
+        throw new ApiError(409, "scan_paths_not_configured", `请先为至少一个可用来源配置${scanMode === "full" ? "全量" : "增量"}扫描路径`);
+      }
+      const parent = await runtime.repository.createLibraryScanJob({
+        id: randomUUID(), userId: library.userId, libraryId: library.id,
+        requestedByUserId: operator.id, requestId, clientDeviceId, scanMode,
+        sourceCount: scanSources.length,
+      });
+      for (const source of scanSources) {
+        await runtime.repository.createScanJob({
+          jobId: randomUUID(), userId: library.userId, libraryId: library.id,
+          librarySourceId: source.id, parentJobId: parent.id,
+          requestedByUserId: operator.id, requestId: `${requestId.slice(0, 130)}:${source.id}`,
+          clientDeviceId, scanMode, runtimeRevision: "scanner-worker-v1",
+          tmdbKeyPoolRevision: runtime.tmdb.revision,
+          aiModel: await runtime.aiModels.buildTaskSnapshot(profiles.metadataProfile),
+          pluginVersions: await runtime.plugins.buildTaskSnapshots(profiles.metadataProfile),
+        });
+      }
+      const aggregateJob = await runtime.repository.refreshLibraryScanJob(parent.id);
+      await audit(runtime, operator, "create_aggregate_scan_job", "library_scan_job", parent.id, {
+        媒体库ID: library.id,
+        来源数量: scanSources.length,
+      });
+      return reply.status(202).send({ job: aggregateJob });
+    }
     if (getScanRootsForMode(profiles.scanProfile, scanMode).length === 0) {
       throw new ApiError(409, "scan_paths_not_configured", `请先配置${scanMode === "full" ? "全量" : "增量"}扫描路径`);
     }
@@ -884,9 +933,10 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       jobId: randomUUID(),
       userId: library.userId,
       libraryId: library.id,
+      librarySourceId: library.sourceId,
       requestedByUserId: operator.id,
-      requestId: requireString(request.body, "requestId", "请求 ID", 200),
-      clientDeviceId: typeof request.body.clientDeviceId === "string" ? request.body.clientDeviceId : `admin:${operator.id}`,
+      requestId,
+      clientDeviceId,
       scanMode,
       runtimeRevision: "scanner-worker-v1",
       tmdbKeyPoolRevision: runtime.tmdb.revision,
@@ -896,6 +946,75 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     await audit(runtime, operator, "create_scan_job", "scan_job", job.id, { 媒体库ID: library.id, 服务ID: library.sourceServiceId });
     return reply.status(202).send({ job });
   });
+
+  server.get<{ Params: { libraryId: string; jobId: string } }>(
+    "/api/v1/admin/libraries/:libraryId/library-scan-jobs/:jobId",
+    async (request) => {
+      await requireSuperAdmin(request, runtime.database);
+      const existingJob = await runtime.repository.getLibraryScanJob(request.params.jobId);
+      if (existingJob.libraryId !== request.params.libraryId) throw new ApiError(404, "library_scan_job_not_found", "媒体库扫描任务不存在");
+      return { job: await runtime.repository.refreshLibraryScanJob(existingJob.id) };
+    },
+  );
+
+  server.post<{ Params: { libraryId: string; jobId: string }; Body: Record<string, unknown> }>(
+    "/api/v1/admin/libraries/:libraryId/library-scan-jobs/:jobId/control",
+    async (request) => {
+      const operator = await requireSuperAdmin(request, runtime.database);
+      const action = request.body.action;
+      if (action !== "pause" && action !== "resume" && action !== "cancel") {
+        throw validationError("action", "控制动作只支持 pause、resume 或 cancel");
+      }
+      const job = await runtime.repository.getLibraryScanJob(request.params.jobId);
+      if (job.libraryId !== request.params.libraryId) throw new ApiError(404, "library_scan_job_not_found", "媒体库扫描任务不存在");
+      const updatedJob = await runtime.repository.requestLibraryScanJobControl(job.id, job.userId, action);
+      if (action !== "resume") {
+        for (const child of job.sourceJobs.filter((sourceJob) => sourceJob.status === "running")) {
+          runtime.worker.interruptJobControl(child.id, action);
+        }
+      }
+      await notifyFinishedLibraryScanJob(runtime, updatedJob.id, job.userId);
+      await audit(runtime, operator, "control_library_scan_job", "library_scan_job", job.id, {
+        媒体库ID: job.libraryId,
+        控制动作: action,
+        来源子任务数量: job.sourceJobs.length,
+      });
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-library-scan-parent",
+        事件: "管理员控制云聚合扫描父任务",
+        管理员ID: operator.id,
+        媒体库ID: job.libraryId,
+        父任务ID: job.id,
+        控制动作: action,
+      });
+      return { job: updatedJob };
+    },
+  );
+
+  server.delete<{ Params: { libraryId: string; jobId: string }; Body: Record<string, unknown> }>(
+    "/api/v1/admin/libraries/:libraryId/library-scan-jobs/:jobId",
+    async (request, reply) => {
+      const operator = await requireSuperAdmin(request, runtime.database);
+      requireConfirmation(request.body, request.params.jobId);
+      const job = await runtime.repository.getLibraryScanJob(request.params.jobId);
+      if (job.libraryId !== request.params.libraryId) throw new ApiError(404, "library_scan_job_not_found", "媒体库扫描任务不存在");
+      await runtime.repository.deleteLibraryScanJob(job.id);
+      for (const child of job.sourceJobs) await runtime.failureReports.remove(child);
+      await audit(runtime, operator, "delete_library_scan_job", "library_scan_job", job.id, {
+        媒体库ID: job.libraryId,
+        来源子任务数量: job.sourceJobs.length,
+      });
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-library-scan-parent",
+        事件: "管理员删除云聚合扫描父任务",
+        管理员ID: operator.id,
+        媒体库ID: job.libraryId,
+        父任务ID: job.id,
+        来源子任务数量: job.sourceJobs.length,
+      });
+      return reply.status(204).send();
+    },
+  );
 
   server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/status", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
@@ -974,6 +1093,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       status: status && status !== "active" ? status as JobStatus : undefined,
       statuses: status === "active" ? ["queued", "running", "retry_waiting", "paused"] : undefined,
       jobType: jobType ? jobType as "scan" | "media_probe" : undefined,
+      groupParentJobs: request.query.groupParentJobs === "true",
       ...readPagination(request.query),
     });
   });
@@ -1107,11 +1227,11 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     if (sourceJob.status !== "failed" && sourceJob.status !== "cancelled") {
       throw new ApiError(409, "job_not_retryable", "只有失败或已取消任务可以重试");
     }
-    const service = await runtime.repository.getServiceMediaContext(sourceJob.serviceId, sourceJob.userId);
+    const profiles = await runtime.repository.getLibraryProfiles(sourceJob.libraryId, sourceJob.userId);
     const retriesAiSupplement = sourceJob.snapshot.taskPurpose === "ai_supplement_unmatched";
     const aiModelSnapshot = retriesAiSupplement
-      ? await runtime.aiModels.buildUnmatchedSupplementTaskSnapshot(service.metadataProfile)
-      : await runtime.aiModels.buildTaskSnapshot(service.metadataProfile);
+      ? await runtime.aiModels.buildUnmatchedSupplementTaskSnapshot(profiles.metadataProfile)
+      : await runtime.aiModels.buildTaskSnapshot(profiles.metadataProfile);
     if (retriesAiSupplement && !aiModelSnapshot) {
       throw new ApiError(409, "ai_cleaning_not_enabled", "请先在服务元数据配置中启用 AI 目录文件清洗");
     }
@@ -1119,6 +1239,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       jobId: randomUUID(),
       userId: sourceJob.userId,
       libraryId: sourceJob.libraryId,
+      librarySourceId: sourceJob.librarySourceId,
       requestedByUserId: operator.id,
       requestId: requireString(request.body, "requestId", "请求 ID", 200),
       clientDeviceId: typeof request.body.clientDeviceId === "string" ? request.body.clientDeviceId : `admin:${operator.id}`,
@@ -1128,7 +1249,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       aiModel: aiModelSnapshot,
       taskPurpose: retriesAiSupplement ? "ai_supplement_unmatched" : "standard",
       retryOfJobId: sourceJob.id,
-      pluginVersions: await runtime.plugins.buildTaskSnapshots(service.metadataProfile),
+      pluginVersions: await runtime.plugins.buildTaskSnapshots(profiles.metadataProfile),
     });
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-retry",

@@ -19,6 +19,7 @@ export interface JellyfinLibraryContext {
   serviceId: string;
   ownerUserId: string;
   libraryId: string;
+  libraryKind: string;
   /** 是否按节目地区拆分 Jellyfin 虚拟媒体库。 */
   regionLibrariesEnabled: boolean;
 }
@@ -36,6 +37,8 @@ export interface JellyfinContext extends JellyfinLibraryContext {
 interface JellyfinFileSummary {
   fileId: string;
   name: string;
+  sourceName: string;
+  providerType: string;
   size: number;
   /** 当前源文件已经完成的 ffprobe 结果；尚未完成或失败时为空。 */
   mediaProbe: MediaProbeResult | null;
@@ -209,7 +212,7 @@ function mapCatalogMediaSource(
     Type: "Default",
     Container: mediaProbe?.container || undefined,
     Size: mediaProbe?.size || undefined,
-    Name: fileName,
+    Name: `${file.sourceName || "网盘来源"}（${file.providerType || "未知网盘"}） · ${fileName}`,
     IsRemote: false,
     ETag: null,
     RunTimeTicks: fileRunTimeTicks || undefined,
@@ -298,10 +301,8 @@ export class JellyfinCompatibilityService {
   /** 根据媒体库自定义地址后缀解析媒体库 ID。 */
   public async resolveLibraryIdByPathSuffix(pathSuffix: string): Promise<string> {
     const row = await this.runtime.database.query("media_libraries as l")
-      .join("library_sources as ls", "ls.library_id", "l.id").join("cloud_services as s", "s.id", "ls.service_id")
       .select("l.id")
       .where("l.jellyfin_path_suffix_lookup", pathSuffix.toLowerCase())
-      .whereNull("s.deleted_at")
       .first();
     if (!row) throw new ApiError(404, "jellyfin_service_not_found", "Jellyfin 服务地址不存在");
     return String(row.id);
@@ -309,10 +310,13 @@ export class JellyfinCompatibilityService {
 
   /** 校验媒体库与来源服务启用状态，不要求客户端已登录。 */
   public async requireEnabledService(libraryId: string) {
-    const row = await this.runtime.database.query("cloud_services as s")
-      .join("library_sources as ls", "ls.service_id", "s.id").join("media_libraries as l", "l.id", "ls.library_id")
-      .select("s.id", "s.user_id", "ls.library_id as library_id", "s.display_name", "s.status", "l.jellyfin_enabled", "l.jellyfin_relay_playback_enabled", "l.jellyfin_download_enabled", "l.jellyfin_region_libraries_enabled", "s.provider_type", "s.credential_revision")
-      .where("l.id", libraryId).whereNull("s.deleted_at").first();
+    const row = await this.runtime.database.query("media_libraries as l")
+      .select(
+        "l.id", "l.user_id", "l.id as library_id", "l.display_name", "l.status",
+        "l.jellyfin_enabled", "l.jellyfin_relay_playback_enabled", "l.jellyfin_download_enabled",
+        "l.jellyfin_region_libraries_enabled", "l.library_kind",
+      )
+      .where("l.id", libraryId).first();
     if (!row) throw new ApiError(404, "jellyfin_service_not_found", "Jellyfin 服务不存在");
     if (Number(row.jellyfin_enabled) !== 1 || row.status === "disabled") throw new ApiError(404, "jellyfin_service_disabled", "Jellyfin 服务未启用");
     return row;
@@ -325,6 +329,7 @@ export class JellyfinCompatibilityService {
       serviceId: String(service.id),
       ownerUserId: String(service.user_id),
       libraryId,
+      libraryKind: String(service.library_kind ?? "single_source"),
       regionLibrariesEnabled: Number(service.jellyfin_region_libraries_enabled) === 1,
     };
   }
@@ -388,13 +393,12 @@ export class JellyfinCompatibilityService {
     const row = await this.runtime.database.query("library_protocol_sessions as ps")
       .join("library_access_accounts as a", "a.id", "ps.account_id")
       .join("media_libraries as l", "l.id", "ps.library_id")
-      .join("library_sources as ls", "ls.library_id", "l.id").join("cloud_services as s", "s.id", "ls.service_id")
       .select(
         "ps.*", "a.username", "a.password_required", "a.credential_revision as account_revision",
-        "a.status as account_status", "s.id as service_id", "s.user_id", "ls.library_id as library_id", "s.status as service_status",
-        "l.jellyfin_enabled", "l.jellyfin_region_libraries_enabled", "l.jellyfin_download_enabled",
+        "a.status as account_status", "l.id as service_id", "l.user_id", "l.id as library_id", "l.status as service_status",
+        "l.jellyfin_enabled", "l.jellyfin_region_libraries_enabled", "l.jellyfin_download_enabled", "l.library_kind",
       )
-      .where("ps.token_hash", hashSessionToken(token)).where("ps.library_id", libraryId).where("ps.protocol", "jellyfin").whereNull("ps.revoked_at").whereNull("s.deleted_at").first();
+      .where("ps.token_hash", hashSessionToken(token)).where("ps.library_id", libraryId).where("ps.protocol", "jellyfin").whereNull("ps.revoked_at").first();
     if (!row || String(row.expires_at) <= new Date().toISOString() || Number(row.credential_revision) !== Number(row.account_revision)
       || row.account_status !== "active" || row.service_status === "disabled" || Number(row.jellyfin_enabled) !== 1) {
       throw new ApiError(401, "jellyfin_session_invalid", "Jellyfin 登录已失效，请重新登录");
@@ -405,6 +409,7 @@ export class JellyfinCompatibilityService {
     }
     return {
       serviceId: String(row.service_id), ownerUserId: String(row.user_id), libraryId,
+      libraryKind: String(row.library_kind ?? "single_source"),
       regionLibrariesEnabled: Number(row.jellyfin_region_libraries_enabled) === 1,
       accountId: String(row.account_id), accountUsername: String(row.username),
       accountHasPassword: Number(row.password_required ?? 1) !== 0,
@@ -654,9 +659,17 @@ export class JellyfinCompatibilityService {
         .map((file) => ({
           fileId: String(file.fileId),
           name: String(file.name ?? ""),
+          sourceName: String(file.sourceName ?? "网盘来源"),
+          providerType: String(file.providerType ?? ""),
           size: Number(file.size ?? 0),
           mediaProbe: parseCompletedMediaProbeResult(file.mediaProbeStatus, file.mediaProbeResult),
         }));
+    }
+    const recentSourceId = String(progress?.media_source_id ?? "");
+    if (recentSourceId) {
+      // 关键变量：账号最近成功使用的版本优先，其余版本继续保持来源稳定顺序。
+      itemFiles = [...itemFiles].sort((left, right) =>
+        Number(right.fileId === recentSourceId) - Number(left.fileId === recentSourceId));
     }
     // 关键变量：规格分析开关只控制扫描后是否自动分析；Jellyfin 只判断现有数据是否完整。
     const mediaSpecsReady = itemFiles.length > 0
@@ -723,7 +736,7 @@ export class JellyfinCompatibilityService {
       MediaSources: itemFiles.map((file, index) => mapCatalogMediaSource(
         file,
         mediaSpecsReady,
-        index === 0 ? protocolItemId : file.fileId,
+        context.libraryKind === "cloud_aggregate_video" || index > 0 ? file.fileId : protocolItemId,
       )),
       SeriesId: type === "Episode" ? protocolParentItemId : undefined, SeriesName: type === "Episode" ? parent?.title ?? item.subtitle : undefined,
       ParentIndexNumber: type === "Episode" ? seasonNumber : undefined, IndexNumber: type === "Episode" ? episodeNumber : undefined,
@@ -1631,7 +1644,7 @@ export class JellyfinCompatibilityService {
       .where({
         "fl.user_id": item.userId,
         "fl.item_id": item.id,
-        "f.service_id": item.serviceId,
+        "f.library_id": item.libraryId,
         "f.status": "active",
       })
       .orderBy("f.path", "asc");
@@ -1662,11 +1675,25 @@ export class JellyfinCompatibilityService {
         .whereNotNull("starred_at"),
       this.runtime.database.query("file_links as fl")
         .join("source_files as f", "f.id", "fl.source_file_id")
+        .join("library_sources as ls", "ls.id", "f.library_source_id")
+        .leftJoin("cloud_services as source_service", "source_service.id", "ls.service_id")
         .leftJoin("media_file_probes as p", "p.source_file_id", "f.id")
-        .select("fl.item_id", "f.id as file_id", "f.name", "f.size", "p.status", "p.result_json")
+        .select("fl.item_id", "f.id as file_id", "f.name", "f.size", "ls.display_name as source_name", "ls.provider_type", "p.status", "p.result_json")
         .whereIn("fl.item_id", uniqueItemIds)
-        .where({ "f.service_id": context.serviceId, "f.status": "active" })
+        .where({ "f.library_id": context.libraryId, "f.status": "active" })
+        .where((builder) => builder
+          .where((owned) => owned.where({
+            "ls.source_mode": "owned_copy",
+            "ls.status": "active",
+            "ls.connection_status": "valid",
+          }))
+          .orWhere((linkedSource) => linkedSource.where({
+            "ls.source_mode": "linked_service",
+            "ls.status": "active",
+            "source_service.connection_status": "valid",
+          }).whereIn("source_service.status", ["active", "scanning"])))
         // 关键变量：列表和详情保持同一文件顺序，保证主媒体源选择稳定。
+        .orderBy("ls.sort_order", "asc")
         .orderBy("f.path", "asc"),
     ]);
     const progressByItemId = new Map(progressRows.map((row) => [String(row.item_id), row as Record<string, unknown>]));
@@ -1678,6 +1705,8 @@ export class JellyfinCompatibilityService {
       files.push({
         fileId: String(row.file_id),
         name: String(row.name ?? ""),
+        sourceName: String(row.source_name ?? "网盘来源"),
+        providerType: String(row.provider_type ?? ""),
         size: Number(row.size ?? 0),
         mediaProbe: parseCompletedMediaProbeResult(row.status, row.result_json),
       });

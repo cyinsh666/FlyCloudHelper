@@ -54,8 +54,8 @@ function ServiceCard({ service, admin, onChanged }: { service: CloudService; adm
 
   /** 二次确认后从服务卡片删除服务，并同步刷新服务列表。 */
   async function deleteCardService(): Promise<void> {
-    if (!service.canCreateLibrary) {
-      setMessage("请先在媒体库管理中删除关联媒体库，再删除网盘服务");
+    if (!service.canDeleteService) {
+      setMessage("请先从所有媒体库中移除该来源，再删除网盘服务");
       return;
     }
     if (deletingRef.current) {
@@ -66,7 +66,7 @@ function ServiceCard({ service, admin, onChanged }: { service: CloudService; adm
       return;
     }
     const confirmed = window.confirm(
-      `确定删除“${service.displayName}”吗？删除后登录凭据无法恢复。已关联媒体库时需要先删除媒体库。`,
+      `确定删除“${service.displayName}”吗？删除后登录凭据无法恢复。已被媒体库引用时需要先移除全部来源关系。`,
     );
     if (!confirmed) return;
 
@@ -130,11 +130,11 @@ function ServiceCard({ service, admin, onChanged }: { service: CloudService; adm
       <footer className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/70 pt-3">
         <Link to={detailPath} params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Settings2 className="size-3.5" /> 配置</Link>
         {service.canCreateLibrary && !admin && <Link to="/app/libraries/new/$serviceId" params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-3 py-2 text-xs text-primary-soft"><Plus className="size-3.5" /> 创建媒体库</Link>}
-        <button type="button" aria-label={deleting ? `正在删除${service.displayName}` : `删除${service.displayName}`} title={!service.canCreateLibrary ? "请先删除关联媒体库" : deleting ? "正在删除…" : "删除服务"} onClick={() => void deleteCardService()} disabled={deleting || !service.canCreateLibrary} className="ml-auto grid size-8 cursor-pointer place-items-center rounded-lg border border-destructive/50 bg-destructive/10 text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-50">
+        <button type="button" aria-label={deleting ? `正在删除${service.displayName}` : `删除${service.displayName}`} title={!service.canDeleteService ? "请先从所有媒体库中移除该来源" : deleting ? "正在删除…" : "删除服务"} onClick={() => void deleteCardService()} disabled={deleting || !service.canDeleteService} className="ml-auto grid size-8 cursor-pointer place-items-center rounded-lg border border-destructive/50 bg-destructive/10 text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-50">
           <Trash2 className="size-3.5" />
         </button>
       </footer>
-      {!service.canCreateLibrary && <p className="mt-2 text-[11px] text-muted-foreground">请先删除关联媒体库，再删除网盘服务。</p>}
+      {!service.canDeleteService && <p className="mt-2 text-[11px] text-muted-foreground">该服务仍被媒体库引用，需先移除全部来源关系。</p>}
       {message && <p className="mt-3 text-xs text-muted-foreground">{message}</p>}
     </article>
   );

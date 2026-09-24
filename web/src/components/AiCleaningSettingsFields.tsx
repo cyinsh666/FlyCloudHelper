@@ -14,7 +14,7 @@ interface AiCleaningSettingsFieldsState {
   onChange: (value: AiCleaningSettingsValue) => void;
 }
 
-/** 编辑服务级 AI 查询词清洗配置；单一 state 入参保证父页面状态变化可以完整刷新。 */
+/** 编辑媒体库级 AI 辅助识别配置；单一 state 入参保证父页面状态变化可以完整刷新。 */
 export function AiCleaningSettingsFields({ state }: { state: AiCleaningSettingsFieldsState }) {
   const selectedModel = state.models.find((model) => model.id === state.value.modelId);
   const enabledModels = state.models.filter((model) => model.status === "enabled");
@@ -28,14 +28,14 @@ export function AiCleaningSettingsFields({ state }: { state: AiCleaningSettingsF
     <div className="border-t border-border pt-3">
       <div className="flex items-center justify-between gap-4">
         <div>
-          <p className="text-sm font-medium">AI 补充目录文件识别</p>
+          <p className="text-sm font-medium">AI 辅助识别</p>
           <p className="mt-0.5 text-xs text-muted-foreground">只补充刮削查询词，不修改网盘文件和季集信息。</p>
         </div>
         <button
           type="button"
           role="switch"
           aria-checked={state.value.enabled}
-          aria-label="启用 AI 目录文件清洗"
+          aria-label="启用 AI 辅助识别"
           onClick={() => updateValue({ enabled: !state.value.enabled })}
           className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${state.value.enabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}
         >

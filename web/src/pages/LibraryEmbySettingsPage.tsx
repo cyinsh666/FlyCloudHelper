@@ -43,6 +43,8 @@ export function LibraryEmbySettingsPage({ serviceId, admin = false }: { serviceI
   const [newUsername, setNewUsername] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [creating, setCreating] = useState(false);
+  // 关键变量：默认收起新增账号表单，避免账号配置区长期占用大块纵向空间。
+  const [showCreateAccount, setShowCreateAccount] = useState(false);
   const [editingAccountId, setEditingAccountId] = useState<string | null>(null);
   const [editingUsername, setEditingUsername] = useState("");
   const [editingPassword, setEditingPassword] = useState("");
@@ -97,7 +99,7 @@ export function LibraryEmbySettingsPage({ serviceId, admin = false }: { serviceI
     setCreating(true);
     try {
       await createServiceEmbyAccount(serviceId, { username: newUsername, password: newPassword }, admin);
-      setNewUsername(""); setNewPassword(""); setMessage("Emby 访问账号已创建");
+      setNewUsername(""); setNewPassword(""); setShowCreateAccount(false); setMessage("Emby 访问账号已创建");
       await resource.refresh();
     } catch (error) { setMessage(error instanceof Error ? error.message : "创建 Emby 账号失败"); } finally { setCreating(false); }
   }
@@ -179,25 +181,31 @@ export function LibraryEmbySettingsPage({ serviceId, admin = false }: { serviceI
   return <>
     <PageHeader title={`${service.displayName} · Emby 配置`} actions={<Link to={settingsPath} params={{ serviceId }}><SecondaryButton>返回媒体库设置</SecondaryButton></Link>} />
     {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
-    <Panel title="客户端服务地址" description="标准地址为 /e/{自定义路径}；Flymby 自动追加的 /emby 入口也会兼容。">
-      <div className="rounded-xl border border-border bg-secondary/35 p-4">
-        <p className="break-all font-mono text-sm">{address}</p>
-        <div className="mt-3"><SecondaryButton type="button" onClick={() => void copyEmbyAddress(settings.embyUrl ?? settings.embyPath).then(() => setMessage("Emby 服务地址已复制"))}><Copy className="size-4" /> 复制地址</SecondaryButton></div>
+    <Panel title="Emby 设置" description="协议播放、下载、分类和服务地址集中管理。">
+      <div className="grid gap-2 md:grid-cols-3">
+        {[["中转播放", "关闭后优先使用网盘原始地址", settings.embyRelayPlaybackEnabled, toggleRelay], ["允许下载", "通过标准 Download 接口下载", settings.embyDownloadEnabled, () => saveEmbySwitch("embyDownloadEnabled", "Emby 影片下载")], ["节目地区分组", "拆分为国语、日韩、欧美和其他", settings.embyRegionLibrariesEnabled, () => saveEmbySwitch("embyRegionLibrariesEnabled", "Emby 节目地区分组")]].map(([title, description, checked, action]) => <div key={String(title)} className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/35 px-3 py-2.5"><div className="min-w-0"><p className="text-sm font-medium">{String(title)}</p><p className="mt-0.5 truncate text-[11px] text-muted-foreground">{String(description)}</p></div><button type="button" role="switch" aria-checked={Boolean(checked)} disabled={saving} onClick={() => void (action as () => Promise<void>)()} className={`relative h-7 w-12 shrink-0 rounded-full border ${checked ? "border-primary bg-primary" : "border-border bg-secondary"}`}><span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white transition-transform ${checked ? "translate-x-5" : "translate-x-0"}`} /></button></div>)}
       </div>
-      <form className="mt-4 flex flex-wrap items-end gap-3" onSubmit={(event) => void savePath(event)}>
-        <label className="min-w-56 flex-1 text-sm">地址后缀<input value={pathSuffix} onChange={(event) => setPathSuffix(event.target.value)} className="mt-1 w-full rounded-lg border border-border bg-background px-3 py-2 font-mono text-sm" /></label>
-        <PrimaryButton type="submit" disabled={saving}><Settings2 className="size-4" /> 保存地址</PrimaryButton>
-      </form>
+      <div className="mt-3 grid gap-3 border-t border-border pt-3 xl:grid-cols-[minmax(0,3fr)_minmax(260px,2fr)]">
+        <form className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center" onSubmit={(event) => void savePath(event)}>
+          <div className="flex min-w-0 flex-1 overflow-hidden rounded-lg border border-input bg-background/50"><span className="flex shrink-0 items-center border-r border-border bg-secondary/60 px-3 font-mono text-sm text-muted-foreground">/e/</span><input value={pathSuffix} maxLength={64} onChange={(event) => setPathSuffix(event.target.value)} aria-label="Emby 地址后缀" className="min-w-0 flex-1 bg-transparent px-3 py-2 font-mono text-sm outline-none" /></div>
+          <PrimaryButton type="submit" disabled={saving}><Settings2 className="size-4" /> {saving ? "保存中…" : "保存地址"}</PrimaryButton>
+        </form>
+        <div className="flex min-w-0 items-center justify-between gap-2 rounded-lg border border-border bg-secondary/25 px-3 py-2"><p className="min-w-0 truncate font-mono text-xs" title={address}>{address}</p><SecondaryButton type="button" onClick={() => void copyEmbyAddress(settings.embyUrl ?? settings.embyPath).then(() => setMessage("Emby 服务地址已复制"))}><Copy className="size-4" /> 复制</SecondaryButton></div>
+      </div>
+      <p className="mt-2 text-[11px] text-muted-foreground">标准地址使用 /e/ 前缀；Flymby 自动追加的 /emby 入口保持兼容。</p>
     </Panel>
-    <Panel title="播放与媒体库" className="mt-4">
-      {[["Emby 中转播放", "开启后自动模式由云助手中转，关闭后优先使用网盘原始地址。", settings.embyRelayPlaybackEnabled, toggleRelay], ["允许客户端下载", "允许后客户端可通过标准 Download 接口下载原始文件。", settings.embyDownloadEnabled, () => saveEmbySwitch("embyDownloadEnabled", "Emby 影片下载")], ["节目地区媒体库", "开启后按国语、日韩、欧美、其他返回虚拟电影和剧集媒体库。", settings.embyRegionLibrariesEnabled, () => saveEmbySwitch("embyRegionLibrariesEnabled", "Emby 节目地区分组")]].map(([title, description, checked, action]) => <div key={String(title)} className="flex items-center justify-between gap-4 border-b border-border py-4 last:border-b-0"><div><p className="text-sm font-medium">{String(title)}</p><p className="mt-1 text-xs text-muted-foreground">{String(description)}</p></div><button type="button" role="switch" aria-checked={Boolean(checked)} disabled={saving} onClick={() => void (action as () => Promise<void>)()} className={`relative h-7 w-12 shrink-0 rounded-full border ${checked ? "border-primary bg-primary" : "border-border bg-secondary"}`}><span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white transition-transform ${checked ? "translate-x-5" : "translate-x-0"}`} /></button></div>)}
-    </Panel>
-    <Panel title="Emby 访问账号" description="每个账号有独立的 Emby 收藏、已看、续播和播放历史，不与 Jellyfin 共用。" className="mt-4">
-      <div className="space-y-3">{settings.embyAccounts.map((account, index) => {
+    <Panel
+      title="Emby 访问账号"
+      description={`共 ${settings.embyAccounts.length} 个账号；收藏、已看、续播和播放历史均与 Jellyfin 独立。`}
+      className="mt-4"
+      action={<SecondaryButton type="button" disabled={creating || accountAction !== null} onClick={() => setShowCreateAccount((value) => !value)}><Plus className="size-4" /> 添加账号</SecondaryButton>}
+    >
+      {showCreateAccount && <form className="mb-3 grid gap-2 rounded-lg border border-border bg-secondary/35 p-3 md:grid-cols-2" onSubmit={(event) => void createAccount(event)}><label><span className="text-xs text-muted-foreground">新账号用户名</span><input required minLength={4} maxLength={255} value={newUsername} onChange={(event) => setNewUsername(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label><label><span className="text-xs text-muted-foreground">登录密码（可选）</span><input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} placeholder="留空则无需密码" className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label><div className="flex flex-wrap gap-2 md:col-span-2"><PrimaryButton type="submit" disabled={creating || accountAction !== null}><Plus className="size-4" /> {creating ? "正在创建…" : "创建账号"}</PrimaryButton><SecondaryButton type="button" disabled={creating || accountAction !== null} onClick={() => setShowCreateAccount(false)}>取消</SecondaryButton></div></form>}
+      <div className="space-y-2">{settings.embyAccounts.map((account, index) => {
         const editing = editingAccountId === account.id;
         const pending = accountAction?.endsWith(account.id) ?? false;
-        return <article key={account.id} className="rounded-xl border border-border bg-secondary/35 p-4">
-          <div className="flex flex-wrap items-start justify-between gap-3">
+        return <article key={account.id} className="rounded-lg border border-border bg-secondary/35 p-3">
+          <div className="flex flex-wrap items-start justify-between gap-2">
             <div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><p className="truncate text-sm font-medium">{account.username}</p><StatusPill tone={account.status === "active" ? "success" : "neutral"}>{account.status === "active" ? "已启用" : "已停用"}</StatusPill></div><p className="mt-1 text-[11px] text-muted-foreground">{index === 0 ? "第一个账号 · " : ""}{account.hasPassword ? "需要密码" : "免密码"} · 凭据 r{account.credentialRevision}</p></div>
             <div className="flex flex-wrap gap-2">
               <SecondaryButton type="button" disabled={accountAction !== null} onClick={() => beginEditAccount(account)}><Pencil className="size-4" /> 编辑</SecondaryButton>
@@ -206,10 +214,9 @@ export function LibraryEmbySettingsPage({ serviceId, admin = false }: { serviceI
               <button type="button" disabled={accountAction !== null || settings.embyAccounts.length <= 1} onClick={() => void deleteAccount(account.id, account.username)} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/8 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /> {pending && accountAction?.startsWith("delete:") ? "正在删除…" : "删除"}</button>
             </div>
           </div>
-          {editing && <form onSubmit={(event) => void saveAccount(event, account)} className="mt-4 grid gap-3 border-t border-border pt-4 md:grid-cols-2"><label><span className="text-xs text-muted-foreground">访问用户名</span><input value={editingUsername} required minLength={4} maxLength={255} onChange={(event) => setEditingUsername(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label><label><span className="text-xs text-muted-foreground">新密码</span><input value={editingPassword} type="password" autoComplete="new-password" placeholder="留空表示不修改" onChange={(event) => setEditingPassword(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label><div className="flex flex-wrap gap-2 md:col-span-2"><PrimaryButton type="submit" disabled={accountAction !== null}><Settings2 className="size-4" /> {pending && accountAction?.startsWith("save:") ? "正在保存…" : "保存账号"}</PrimaryButton>{account.hasPassword && <SecondaryButton type="button" disabled={accountAction !== null} onClick={() => void clearAccountPassword(account)}>改为免密码</SecondaryButton>}<SecondaryButton type="button" disabled={accountAction !== null} onClick={() => setEditingAccountId(null)}>取消</SecondaryButton></div></form>}
+          {editing && <form onSubmit={(event) => void saveAccount(event, account)} className="mt-3 grid gap-2 border-t border-border pt-3 md:grid-cols-2"><label><span className="text-xs text-muted-foreground">访问用户名</span><input value={editingUsername} required minLength={4} maxLength={255} onChange={(event) => setEditingUsername(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label><label><span className="text-xs text-muted-foreground">新密码</span><input value={editingPassword} type="password" autoComplete="new-password" placeholder="留空表示不修改" onChange={(event) => setEditingPassword(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label><div className="flex flex-wrap gap-2 md:col-span-2"><PrimaryButton type="submit" disabled={accountAction !== null}><Settings2 className="size-4" /> {pending && accountAction?.startsWith("save:") ? "正在保存…" : "保存账号"}</PrimaryButton>{account.hasPassword && <SecondaryButton type="button" disabled={accountAction !== null} onClick={() => void clearAccountPassword(account)}>改为免密码</SecondaryButton>}<SecondaryButton type="button" disabled={accountAction !== null} onClick={() => setEditingAccountId(null)}>取消</SecondaryButton></div></form>}
         </article>;
       })}</div>
-      <form className="mt-4 grid gap-3 rounded-xl border border-border bg-secondary/35 p-4 md:grid-cols-2" onSubmit={(event) => void createAccount(event)}><label><span className="text-xs text-muted-foreground">新账号用户名</span><input required minLength={4} maxLength={255} value={newUsername} onChange={(event) => setNewUsername(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label><label><span className="text-xs text-muted-foreground">登录密码（可选）</span><input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} placeholder="留空则无需密码" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label><div className="md:col-span-2"><PrimaryButton type="submit" disabled={creating || accountAction !== null}><Plus className="size-4" /> {creating ? "正在创建…" : "创建账号"}</PrimaryButton></div></form>
     </Panel>
   </>;
 }

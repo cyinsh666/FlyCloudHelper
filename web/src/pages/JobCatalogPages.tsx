@@ -1,7 +1,7 @@
 import { MusicScanStages } from "../components/MusicScanStages";
 import { Link } from "@tanstack/react-router";
-import { Download, Images, Pause, Play, Plus, Radio, RefreshCw, RotateCcw, Settings2, Sparkles, Square, Trash2 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { Download, Images, Layers3, Pause, Play, Plus, Radio, RefreshCw, RotateCcw, Settings2, Sparkles, Square, Trash2 } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { AdminServiceFilters } from "@/components/AdminServiceFilters";
 import { AiSupplementDialog } from "@/components/AiSupplementDialog";
@@ -10,7 +10,9 @@ import { FilterChip, Panel, ProgressMeter, StatusPill, type StatusTone } from "@
 import {
   cancelScanJob,
   clearCompletedAndFailedScanJobs,
+  controlLibraryScanJob,
   createManualAiSupplementJob,
+  deleteLibraryScanJob,
   deleteScanJob,
   downloadScanFailureReport,
   getJobAiSupplements,
@@ -119,6 +121,12 @@ interface JobPluginSnapshot {
 }
 
 type JobOperation = "pause" | "resume" | "cancel" | "retry" | "delete";
+
+interface JobListGroup {
+  key: string;
+  parentJobId: string | null;
+  jobs: ScanJob[];
+}
 
 const jobOperationLabels: Record<JobOperation, string> = {
   pause: "暂停",
@@ -297,6 +305,32 @@ function canDeleteJob(job: ScanJob): boolean {
   return ["completed", "failed", "cancelled"].includes(job.status);
 }
 
+/** 按云聚合父任务合并任务列表；普通扫描和视频规格任务仍各自独立展示。 */
+function groupJobList(jobs: ScanJob[]): JobListGroup[] {
+  const groups: JobListGroup[] = [];
+  const aggregateGroupIndexes = new Map<string, number>();
+  for (const job of jobs) {
+    if (!job.parentJobId || job.jobType !== "scan") {
+      groups.push({ key: job.id, parentJobId: null, jobs: [job] });
+      continue;
+    }
+    const groupIndex = aggregateGroupIndexes.get(job.parentJobId);
+    if (groupIndex === undefined) {
+      aggregateGroupIndexes.set(job.parentJobId, groups.length);
+      groups.push({ key: `aggregate:${job.parentJobId}`, parentJobId: job.parentJobId, jobs: [job] });
+      continue;
+    }
+    groups[groupIndex]?.jobs.push(job);
+  }
+  return groups;
+}
+
+/** 汇总云聚合来源子任务状态，优先展示仍在执行或需要处理的状态。 */
+function getAggregateGroupStatus(jobs: ScanJob[]): JobStatus {
+  const statusPriority: JobStatus[] = ["running", "retry_waiting", "queued", "paused", "failed", "cancelled", "completed"];
+  return statusPriority.find((status) => jobs.some((job) => job.status === status)) ?? "completed";
+}
+
 /** 渲染任务列表及选中任务详情。 */
 function JobsView({ admin }: { admin: boolean }) {
   const [statusFilter, setStatusFilter] = useState<JobStatusFilter>("all");
@@ -306,6 +340,7 @@ function JobsView({ admin }: { admin: boolean }) {
     () => listJobs(admin, {
       status: statusFilter === "all" ? undefined : statusFilter,
       jobType: jobTypeFilter === "all" ? undefined : jobTypeFilter,
+      groupParentJobs: true,
       limit: JOB_LIST_PAGE_SIZE,
       offset: jobPageOffset,
     }),
@@ -340,15 +375,25 @@ function JobsView({ admin }: { admin: boolean }) {
   // 关键变量：同步占用手动补充请求，阻止按钮状态刷新前的连续点击。
   const aiSupplementTriggeringRef = useRef(false);
   const jobs = resource.data?.items ?? [];
+  const jobGroups = useMemo(() => groupJobList(jobs), [jobs]);
   const activeJob = jobs.find((job) => job.id === selectedJobId) ?? jobs[0];
+  const activeJobGroup = activeJob ? jobGroups.find((group) => group.jobs.some((job) => job.id === activeJob.id)) : undefined;
+  const activeParentJobId = activeJobGroup?.parentJobId ?? null;
   const pendingActiveJobOperation = activeJob ? pendingJobOperations[activeJob.id] : undefined;
+  const pendingActiveGroupOperation = activeParentJobId ? pendingJobOperations[activeParentJobId] : undefined;
   const activeJobIsAiSupplement = activeJob?.snapshot.taskPurpose === "ai_supplement_unmatched";
   const activeJobOperationBlocked = Boolean(activeJob && (pendingActiveJobOperation || activeJob.controlAction !== "none"));
+  const activeGroupOperationBlocked = Boolean(activeJobGroup && (pendingActiveGroupOperation
+    || activeJobGroup.jobs.some((job) => job.controlAction !== "none")));
   const canRetryActiveJob = Boolean(activeJob && canRetryJob(activeJob));
   const canPauseActiveJob = Boolean(activeJob && canPauseJob(activeJob));
   const canResumeActiveJob = Boolean(activeJob && canResumeJob(activeJob));
   const canCancelActiveJob = Boolean(activeJob && canCancelJob(activeJob));
   const canDeleteActiveJob = Boolean(activeJob && canDeleteJob(activeJob));
+  const canPauseActiveGroup = Boolean(activeParentJobId && activeJobGroup?.jobs.some(canPauseJob));
+  const canResumeActiveGroup = Boolean(activeParentJobId && activeJobGroup?.jobs.some(canResumeJob));
+  const canCancelActiveGroup = Boolean(activeParentJobId && activeJobGroup?.jobs.some(canCancelJob));
+  const canDeleteActiveGroup = Boolean(activeParentJobId && activeJobGroup && activeJobGroup.jobs.every(canDeleteJob));
   const canDownloadFailureReport = Boolean(activeJob && activeJob.jobType === "scan" && activeJob.status !== "queued");
   const snapshotFields = activeJob ? getJobSnapshotFields(activeJob.snapshot) : [];
   const pluginSnapshots = activeJob ? getJobPluginSnapshots(activeJob.snapshot) : [];
@@ -376,6 +421,17 @@ function JobsView({ admin }: { admin: boolean }) {
     if (!resource.error) return;
     console.warn("codex-job-progress-refresh", { "刷新错误": resource.error, "管理模式": admin });
   }, [admin, resource.error]);
+
+  useEffect(() => {
+    const aggregateGroups = jobGroups.filter((group) => group.parentJobId !== null);
+    if (aggregateGroups.length === 0) return;
+    console.info("codex-library-scan-group", {
+      事件: "后台任务列表合并云聚合来源子任务",
+      父任务数量: aggregateGroups.length,
+      来源子任务数量: aggregateGroups.reduce((count, group) => count + group.jobs.length, 0),
+      父任务ID: aggregateGroups.map((group) => group.parentJobId),
+    });
+  }, [jobGroups]);
 
   useEffect(() => {
     console.info("codex-job-list-filter", {
@@ -524,6 +580,56 @@ function JobsView({ admin }: { admin: boolean }) {
     }
   }
 
+  /** 对云聚合父任务统一执行暂停、继续或取消，并保留各来源已经完成的结果。 */
+  async function controlAggregateGroup(targetGroup: JobListGroup, action: "pause" | "resume" | "cancel"): Promise<void> {
+    const parentJobId = targetGroup.parentJobId;
+    const firstSourceJob = targetGroup.jobs[0];
+    if (!parentJobId || !firstSourceJob) return;
+    if (action === "pause" && !targetGroup.jobs.some(canPauseJob)) return;
+    if (action === "resume" && !targetGroup.jobs.some(canResumeJob)) return;
+    if (action === "cancel" && !targetGroup.jobs.some(canCancelJob)) return;
+    if (action === "cancel" && !window.confirm(`确定取消整组云聚合扫描 ${parentJobId} 吗？已经完成的来源结果不会自动回滚。`)) return;
+    const operation: JobOperation = action === "pause" ? "pause" : action === "resume" ? "resume" : "cancel";
+    if (!beginJobOperation(parentJobId, operation)) return;
+    setMessage(action === "pause" ? "正在暂停全部来源…" : action === "resume" ? "正在继续全部已暂停来源…" : "正在取消全部来源…");
+    try {
+      await controlLibraryScanJob(firstSourceJob.libraryId, parentJobId, action, admin);
+      setMessage(action === "pause" ? "已提交暂停全部来源" : action === "resume" ? "已继续全部已暂停来源" : "已提交取消全部来源");
+      console.info("codex-library-scan-parent", {
+        事件: "后台任务页控制云聚合父任务",
+        父任务ID: parentJobId,
+        媒体库ID: firstSourceJob.libraryId,
+        控制动作: action,
+        来源子任务数量: targetGroup.jobs.length,
+      });
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "聚合任务控制失败");
+    } finally {
+      finishJobOperation(parentJobId);
+    }
+  }
+
+  /** 删除已经结束的云聚合父任务及其全部来源子任务。 */
+  async function deleteAggregateGroup(targetGroup: JobListGroup): Promise<void> {
+    const parentJobId = targetGroup.parentJobId;
+    const firstSourceJob = targetGroup.jobs[0];
+    if (!parentJobId || !firstSourceJob || !targetGroup.jobs.every(canDeleteJob)) return;
+    if (!window.confirm(`确定删除整组云聚合扫描 ${parentJobId} 吗？全部来源任务、进度和错误记录都将删除。`)) return;
+    if (!beginJobOperation(parentJobId, "delete")) return;
+    setMessage("正在删除整组云聚合扫描…");
+    try {
+      await deleteLibraryScanJob(firstSourceJob.libraryId, parentJobId, admin);
+      setSelectedJobId(null);
+      setMessage(`云聚合扫描 ${parentJobId} 已整组删除`);
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "删除聚合任务失败");
+    } finally {
+      finishJobOperation(parentJobId);
+    }
+  }
+
   /** 二次确认后清除权限范围内全部已完成和失败任务，保留其他状态任务。 */
   async function clearCompletedJobs(): Promise<void> {
     if (clearingCompletedJobsRef.current) return;
@@ -639,11 +745,13 @@ function JobsView({ admin }: { admin: boolean }) {
         title={admin ? "全部后台任务" : "后台任务"}
         actions={<>
           <SecondaryButton onClick={() => void resource.refresh()}><Radio className="size-4" /> 每 5 秒刷新</SecondaryButton>
-          <SecondaryButton onClick={() => { if (activeJob) void pauseJob(activeJob); }} disabled={!canPauseActiveJob || activeJobOperationBlocked}><Pause className="size-4" /> {pendingActiveJobOperation === "pause" || activeJob?.controlAction === "pause" ? "暂停处理中…" : "暂停"}</SecondaryButton>
-          <SecondaryButton onClick={() => { if (activeJob) void resumeJob(activeJob); }} disabled={!canResumeActiveJob || activeJobOperationBlocked}><Play className="size-4" /> {pendingActiveJobOperation === "resume" ? "正在继续…" : "继续"}</SecondaryButton>
-          <SecondaryButton onClick={() => { if (activeJob) void cancelJob(activeJob); }} disabled={!canCancelActiveJob || activeJobOperationBlocked}><Square className="size-4" /> {pendingActiveJobOperation === "cancel" || activeJob?.controlAction === "cancel" ? "终止处理中…" : "终止任务"}</SecondaryButton>
-          <PrimaryButton onClick={() => { if (activeJob) void retryJob(activeJob); }} disabled={!canRetryActiveJob || activeJobOperationBlocked}><RotateCcw className="size-4" /> {pendingActiveJobOperation === "retry" ? "正在重试…" : activeJobIsAiSupplement ? "重试AI补充" : "重试失败内容"}</PrimaryButton>
-          <button type="button" onClick={() => { if (activeJob) void deleteJob(activeJob); }} disabled={!canDeleteActiveJob || activeJobOperationBlocked} className="inline-flex items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {pendingActiveJobOperation === "delete" ? "正在删除…" : "删除任务"}</button>
+          {activeParentJobId && activeJobGroup && <>
+            <span className="self-center text-xs text-muted-foreground">聚合任务</span>
+            <SecondaryButton onClick={() => void controlAggregateGroup(activeJobGroup, "pause")} disabled={!canPauseActiveGroup || activeGroupOperationBlocked}><Pause className="size-4" /> {pendingActiveGroupOperation === "pause" ? "暂停处理中…" : "暂停全部"}</SecondaryButton>
+            <SecondaryButton onClick={() => void controlAggregateGroup(activeJobGroup, "resume")} disabled={!canResumeActiveGroup || activeGroupOperationBlocked}><Play className="size-4" /> {pendingActiveGroupOperation === "resume" ? "正在继续…" : "继续全部"}</SecondaryButton>
+            <SecondaryButton onClick={() => void controlAggregateGroup(activeJobGroup, "cancel")} disabled={!canCancelActiveGroup || activeGroupOperationBlocked}><Square className="size-4" /> {pendingActiveGroupOperation === "cancel" ? "取消处理中…" : "取消全部"}</SecondaryButton>
+            <button type="button" onClick={() => void deleteAggregateGroup(activeJobGroup)} disabled={!canDeleteActiveGroup || activeGroupOperationBlocked} className="inline-flex items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {pendingActiveGroupOperation === "delete" ? "正在删除…" : "删除整组"}</button>
+          </>}
         </>}
       />
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
@@ -707,6 +815,18 @@ function JobsView({ admin }: { admin: boolean }) {
                   <span title="完整电影或节目处理失败的数量">错误 {activeJob.errorCount.toLocaleString()}</span>
                 </div>
               )}
+              <div className="mt-3 border-t border-border/70 pt-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-[11px] text-muted-foreground">{activeParentJobId ? `当前来源任务 · ${activeJob.serviceName}` : "当前任务操作"}</p>
+                  <div className="flex flex-wrap justify-end gap-2">
+                    <SecondaryButton onClick={() => void pauseJob(activeJob)} disabled={!canPauseActiveJob || activeJobOperationBlocked}><Pause className="size-4" /> {pendingActiveJobOperation === "pause" || activeJob.controlAction === "pause" ? "暂停处理中…" : "暂停当前"}</SecondaryButton>
+                    <SecondaryButton onClick={() => void resumeJob(activeJob)} disabled={!canResumeActiveJob || activeJobOperationBlocked}><Play className="size-4" /> {pendingActiveJobOperation === "resume" ? "正在继续…" : "继续当前"}</SecondaryButton>
+                    <SecondaryButton onClick={() => void cancelJob(activeJob)} disabled={!canCancelActiveJob || activeJobOperationBlocked}><Square className="size-4" /> {pendingActiveJobOperation === "cancel" || activeJob.controlAction === "cancel" ? "取消处理中…" : "取消当前"}</SecondaryButton>
+                    <PrimaryButton onClick={() => void retryJob(activeJob)} disabled={!canRetryActiveJob || activeJobOperationBlocked}><RotateCcw className="size-4" /> {pendingActiveJobOperation === "retry" ? "正在重试…" : activeJobIsAiSupplement ? "重试AI补充" : "重试当前"}</PrimaryButton>
+                    <button type="button" onClick={() => void deleteJob(activeJob)} disabled={!canDeleteActiveJob || activeJobOperationBlocked} className="inline-flex items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {pendingActiveJobOperation === "delete" ? "正在删除…" : "删除当前"}</button>
+                  </div>
+                </div>
+              </div>
               {activeJob.jobType === "scan" && <div className="mt-3 flex flex-wrap justify-end gap-2 border-t border-border/70 pt-3">
                 <SecondaryButton onClick={() => void openAiSupplementDialog()}>
                   <Sparkles className="size-4" /> AI补充详情
@@ -751,16 +871,64 @@ function JobsView({ admin }: { admin: boolean }) {
           <Panel
             className="overflow-hidden p-4 sm:p-4 xl:flex xl:h-[calc(100vh-14rem)] xl:min-h-[560px] xl:max-h-[720px] xl:flex-col"
             title="任务列表"
-            description={`共 ${jobTotal} 个任务 · 第 ${currentJobPage}/${jobPageCount} 页`}
+            description={`当前页 ${jobGroups.length} 组 · ${jobs.length} 个底层任务 · 共 ${jobTotal} 组 · 第 ${currentJobPage}/${jobPageCount} 页`}
             action={<button type="button" title="清除已完成和失败的任务" onClick={() => void clearCompletedJobs()} disabled={clearingCompletedJobs} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/8 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /> {clearingCompletedJobs ? "正在清除…" : "清除已完成和失败"}</button>}
           >
             <ul className="grid max-h-[560px] grid-cols-1 content-start gap-1.5 overflow-y-auto pr-1 sm:grid-cols-2 xl:min-h-0 xl:flex-1 xl:max-h-none">
-              {jobs.map((job) => {
+              {jobGroups.map((group) => {
+                if (group.parentJobId) {
+                  const firstSourceJob = group.jobs[0];
+                  if (!firstSourceJob) return null;
+                  const pendingGroupOperation = pendingJobOperations[group.parentJobId];
+                  const groupOperationBlocked = Boolean(pendingGroupOperation || group.jobs.some((job) => job.controlAction !== "none"));
+                  const groupStatus = getAggregateGroupStatus(group.jobs);
+                  const groupSelected = group.jobs.some((job) => job.id === activeJob?.id);
+                  const selectedSourceJob = group.jobs.find((job) => job.id === activeJob?.id) ?? firstSourceJob;
+                  const groupProcessedCount = group.jobs.reduce((count, job) => count + job.processedCount, 0);
+                  const groupErrorCount = group.jobs.reduce((count, job) => count + job.errorCount, 0);
+                  return <li key={group.key} className="sm:col-span-2">
+                    <article className={`overflow-hidden rounded-xl border bg-secondary/40 transition-colors ${groupSelected ? "border-foreground/45" : "border-border hover:border-foreground/25"}`}>
+                      <button type="button" aria-pressed={groupSelected} onClick={() => setSelectedJobId(selectedSourceJob.id)} className="w-full px-3 py-2.5 text-left">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <Layers3 className="size-4 shrink-0 text-muted-foreground" />
+                          <p className="truncate text-sm font-semibold">云聚合{firstSourceJob.scanMode === "full" ? "全量" : "增量"}扫描</p>
+                          <span role="status" aria-label={jobStatusLabels[groupStatus]} title={jobStatusLabels[groupStatus]} className={`size-2 shrink-0 rounded-full ${getJobStatusDotClass(groupStatus)}`} />
+                          <span className="ml-auto shrink-0 text-[11px] text-muted-foreground">{group.jobs.length} 个来源</span>
+                        </div>
+                        <p className="mt-1 text-[11px] text-muted-foreground">已处理 {groupProcessedCount.toLocaleString()} · 错误 {groupErrorCount.toLocaleString()} · 父任务 {group.parentJobId.slice(0, 8)}</p>
+                      </button>
+                      <div className="grid gap-1.5 border-t border-border/70 p-2 sm:grid-cols-2">
+                        {group.jobs.map((job) => {
+                          const sourceSelected = activeJob?.id === job.id;
+                          return <button key={job.id} type="button" aria-pressed={sourceSelected} onClick={() => setSelectedJobId(job.id)} className={`rounded-lg border px-2.5 py-2 text-left transition-colors ${sourceSelected ? "border-foreground/40 bg-background/70" : "border-border/70 bg-background/35 hover:border-foreground/25"}`}>
+                            <div className="flex min-w-0 items-center gap-2">
+                              <span className={`size-2 shrink-0 rounded-full ${getJobStatusDotClass(job.status)}`} />
+                              <span className="min-w-0 flex-1 truncate text-xs font-medium" title={job.serviceName}>{job.serviceName}</span>
+                              <span className="shrink-0 text-[10px] text-muted-foreground">{getJobStatusLabel(job)}</span>
+                            </div>
+                            <p className="mt-1 truncate text-[10px] text-muted-foreground">{getJobStageLabel(job.stage)} · 已处理 {job.processedCount.toLocaleString()}{job.errorCount > 0 ? ` · 错误 ${job.errorCount.toLocaleString()}` : ""}</p>
+                          </button>;
+                        })}
+                      </div>
+                      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/70 px-3 py-2">
+                        <span className="text-[10px] text-muted-foreground">整组操作</span>
+                        <div className="flex flex-wrap justify-end gap-1.5">
+                          <button type="button" onClick={() => void controlAggregateGroup(group, "pause")} disabled={!group.jobs.some(canPauseJob) || groupOperationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/35 px-2.5 py-1.5 text-[11px] transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"><Pause className="size-3.5" />{pendingGroupOperation === "pause" ? "暂停处理中…" : "暂停全部"}</button>
+                          <button type="button" onClick={() => void controlAggregateGroup(group, "resume")} disabled={!group.jobs.some(canResumeJob) || groupOperationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/35 px-2.5 py-1.5 text-[11px] transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"><Play className="size-3.5" />{pendingGroupOperation === "resume" ? "正在继续…" : "继续全部"}</button>
+                          <button type="button" onClick={() => void controlAggregateGroup(group, "cancel")} disabled={!group.jobs.some(canCancelJob) || groupOperationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-destructive/35 bg-destructive/8 px-2.5 py-1.5 text-[11px] text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Square className="size-3.5" />{pendingGroupOperation === "cancel" ? "取消处理中…" : "取消全部"}</button>
+                          <button type="button" onClick={() => void deleteAggregateGroup(group)} disabled={!group.jobs.every(canDeleteJob) || groupOperationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-destructive/35 bg-destructive/8 px-2.5 py-1.5 text-[11px] text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" />{pendingGroupOperation === "delete" ? "正在删除…" : "删除整组"}</button>
+                        </div>
+                      </div>
+                    </article>
+                  </li>;
+                }
+                const job = group.jobs[0];
+                if (!job) return null;
                 const selected = activeJob?.id === job.id;
                 const pendingOperation = pendingJobOperations[job.id];
                 const operationBlocked = Boolean(pendingOperation || job.controlAction !== "none");
                 const hasFooterOperation = canPauseJob(job) || canResumeJob(job) || canCancelJob(job) || canRetryJob(job);
-                return <li key={job.id}>
+                return <li key={group.key}>
                   <article className={`relative overflow-hidden rounded-xl border bg-secondary/40 transition-colors ${selected ? "border-foreground/45" : "border-border hover:border-foreground/25"}`}>
                     <button type="button" aria-pressed={selected} onClick={() => setSelectedJobId(job.id)} className={`w-full px-3 py-2.5 text-left ${canDeleteJob(job) ? "pr-11" : ""}`}>
                       <div className="min-w-0">
@@ -846,11 +1014,11 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
             <header className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
               <div className="flex min-w-0 items-center gap-3">
                 <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-border text-xs font-semibold" style={{ backgroundImage: "var(--gradient-surface)" }}>
-                  <ProviderSelectionIcon providerType={library.providerType} />
+                  <ProviderSelectionIcon providerType={library.libraryKind === "cloud_aggregate_video" ? "aggregate" : library.providerType} />
                 </span>
                 <div className="min-w-0">
                   <h2 className="truncate text-sm font-semibold">{library.displayName}</h2>
-                  <p className="truncate text-[11px] text-muted-foreground">{library.sourceServiceName} · {library.providerType}{admin ? ` · ${library.ownerUsername}` : ""}</p>
+                  <p className="truncate text-[11px] text-muted-foreground">{library.libraryKind === "cloud_aggregate_video" ? `云聚合视频库 · ${library.sourceCount} 个来源` : `${library.sourceServiceName} · ${library.providerType}`}{admin ? ` · ${library.ownerUsername}` : ""}</p>
                 </div>
               </div>
               <span className={`mt-1 size-2.5 rounded-full ${library.status === "active" && library.sourceConnectionStatus === "valid" ? "bg-success" : "bg-warning"}`} title={library.status === "active" ? "媒体库已启用" : "媒体库已停用"} />

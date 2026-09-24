@@ -143,6 +143,7 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export type MediaType = "video" | "music" | "audiobook";
+export type MediaLibraryKind = "legacy_single_source" | "cloud_aggregate_video";
 export type CatalogSort = "created_desc" | "year_desc" | "premiere_date_desc" | "title_asc";
 export type MatchState = "matched" | "needs_review" | "unmatched" | "processing";
 export type ServiceStatus = "active" | "scanning" | "disabled" | "reauthorization_required";
@@ -161,8 +162,7 @@ export interface WorkerStatus {
   enabled: boolean;
   running: boolean;
   activeWorkers: number;
-  concurrency: number;
-  availableSlots: number;
+  schedulingMode: "per_source_exclusive";
 }
 
 export interface AdminRuntimeStatus extends OverviewResult {
@@ -285,6 +285,7 @@ export interface CloudService {
   connectionAuthMode?: "official_api" | "web_qr" | "web_sms" | null;
   credentialRevision: number;
   canCreateLibrary: boolean;
+  canDeleteService: boolean;
   /** 旧页面编译期兼容字段；服务接口不再返回这些媒体库数据。 */
   libraryId: string;
   dataType: MediaType;
@@ -295,12 +296,34 @@ export interface CloudService {
   metadataProfileRevision: number;
   catalogVersion: number;
   itemCount: number;
+  recentJobs?: ScanJob[];
   lastScanAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
 
-/** 媒体库及本次唯一来源服务的摘要。 */
+/** 云聚合媒体库中一份完全独立的网盘来源配置。 */
+export interface LibrarySource {
+  id: string;
+  libraryId: string;
+  sourceMode: "linked_service" | "owned_copy";
+  serviceId: string | null;
+  displayName: string;
+  providerType: string;
+  serviceStatus: "active" | "scanning" | "disabled" | "reauthorization_required" | null;
+  status: "active" | "disabled" | "reauthorization_required";
+  connectionStatus: string;
+  sortOrder: number;
+  credentialRevision: number;
+  /** 来源是否已有可用登录凭据；接口只返回状态，不返回凭据内容。 */
+  credentialConfigured: boolean;
+  configuration: Record<string, unknown>;
+  lastScanAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 媒体库及其来源摘要；旧单源库继续保留兼容字段。 */
 export interface MediaLibrary {
   id: string;
   userId: string;
@@ -308,6 +331,9 @@ export interface MediaLibrary {
   displayName: string;
   dataType: MediaType;
   status: "active" | "disabled";
+  libraryKind: MediaLibraryKind;
+  sourceCount: number;
+  sources: LibrarySource[];
   sourceId: string;
   sourceServiceId: string;
   sourceServiceName: string;
@@ -321,6 +347,8 @@ export interface MediaLibrary {
   metadataProfileRevision: number;
   catalogVersion: number;
   itemCount: number;
+  /** 普通媒体库详情会返回最近任务；管理端详情不包含该字段。 */
+  recentJobs?: ScanJob[];
   lastScanAt: string | null;
   createdAt: string;
   updatedAt: string;
@@ -349,13 +377,23 @@ export interface CreateCloudServiceInput {
   userId?: string;
 }
 
-export interface CreateMediaLibraryInput {
+export interface CreateLegacyMediaLibraryInput {
   displayName: string;
   dataType: MediaType;
   sourceServiceId: string;
   scan: Record<string, unknown>;
   metadata: Record<string, unknown>;
 }
+
+export interface CreateCloudAggregateVideoLibraryInput {
+  libraryKind: "cloud_aggregate_video";
+  displayName: string;
+  dataType: "video";
+  sourceServiceIds: string[];
+  metadata: Record<string, unknown>;
+}
+
+export type CreateMediaLibraryInput = CreateLegacyMediaLibraryInput | CreateCloudAggregateVideoLibraryInput;
 
 
 export interface ServiceAccessAccount {
@@ -420,6 +458,8 @@ export interface ScanJob {
   userId: string;
   serviceId: string;
   libraryId: string;
+  librarySourceId: string;
+  parentJobId: string | null;
   ownerUsername: string;
   serviceName: string;
   dataType: MediaType;
@@ -457,6 +497,30 @@ export interface ScanJob {
   }>;
   hiddenWaitingJobCount: number;
   queueAheadCount: number;
+  updatedAt: string;
+}
+
+/** 云聚合扫描父任务；每个来源对应一个可并行执行的子任务。 */
+export interface LibraryScanJob {
+  id: string;
+  userId: string;
+  libraryId: string;
+  scanMode: "incremental" | "full";
+  status: "pending" | "running" | "paused" | "completed" | "completed_with_errors" | "partial_failed" | "failed" | "cancelled";
+  controlAction: "none" | "pause" | "cancel";
+  sourceCount: number;
+  completedSourceCount: number;
+  failedSourceCount: number;
+  cancelledSourceCount: number;
+  processedCount: number;
+  discoveredCount: number;
+  errorCount: number;
+  errorCode: string | null;
+  errorMessage: string | null;
+  sourceJobs: ScanJob[];
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
   updatedAt: string;
 }
 
@@ -871,6 +935,77 @@ export function browseServiceDirectories(
   }));
 }
 
+/** 将已有网盘服务关联为云聚合库来源；连接状态和凭据继续由服务统一管理。 */
+export async function addLibrarySource(libraryId: string, sourceServiceId: string): Promise<LibrarySource> {
+  const result = await requestJson<{ source: LibrarySource }>(`/api/v1/libraries/${libraryId}/sources`, {
+    method: "POST",
+    body: JSON.stringify({ sourceServiceId }),
+  });
+  return result.source;
+}
+
+/** 保存云聚合来源的显示名称、启用状态或稳定展示顺序。 */
+export async function updateLibrarySource(
+  libraryId: string,
+  sourceId: string,
+  patch: { displayName?: string; status?: "active" | "disabled"; sortOrder?: number },
+): Promise<LibrarySource> {
+  const result = await requestJson<{ source: LibrarySource }>(`/api/v1/libraries/${libraryId}/sources/${sourceId}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+  return result.source;
+}
+
+/** 保存单个云聚合来源自己的扫描路径和并发配置。 */
+export async function updateLibrarySourceScanProfile(
+  libraryId: string,
+  sourceId: string,
+  scan: Record<string, unknown>,
+): Promise<LibrarySource> {
+  const result = await requestJson<{ source: LibrarySource }>(`/api/v1/libraries/${libraryId}/sources/${sourceId}/scan-profile`, {
+    method: "PUT",
+    body: JSON.stringify({ scan }),
+  });
+  return result.source;
+}
+
+/** 兼容遗留独立来源的连接更新；新来源连接统一在网盘服务中管理。 */
+export async function updateLibrarySourceConnection(
+  libraryId: string,
+  sourceId: string,
+  connection: Record<string, string>,
+  expectedRevision: number,
+): Promise<LibrarySource> {
+  const result = await requestJson<{ source: LibrarySource }>(`/api/v1/libraries/${libraryId}/sources/${sourceId}/connection`, {
+    method: "PUT",
+    body: JSON.stringify({ connection, ...(expectedRevision > 0 ? { expectedRevision } : {}) }),
+  });
+  return result.source;
+}
+
+/** 浏览云聚合来源自己的网盘目录。 */
+export function browseLibrarySourceDirectories(
+  libraryId: string,
+  sourceId: string,
+  parent?: Pick<ProviderDirectory, "resourceId" | "displayPath" | "driveId">,
+): Promise<ProviderDirectoryListing> {
+  return requestJson(withQuery(`/api/v1/libraries/${libraryId}/sources/${sourceId}/directories`, {
+    resourceId: parent?.resourceId,
+    displayPath: parent?.displayPath,
+    driveId: parent?.driveId,
+    cacheKey: Date.now(),
+  }));
+}
+
+/** 删除云聚合库中的来源成员，不影响被引用的网盘服务和其他媒体库。 */
+export function deleteLibrarySource(libraryId: string, sourceId: string): Promise<void> {
+  return requestJson(`/api/v1/libraries/${libraryId}/sources/${sourceId}`, {
+    method: "DELETE",
+    body: JSON.stringify({ confirmation: sourceId }),
+  });
+}
+
 /** 读取可配置的 Provider 描述。 */
 export async function listProviders(): Promise<ProviderDescriptor[]> {
   return (await requestJson<{ items: ProviderDescriptor[] }>("/api/v1/providers")).items;
@@ -999,8 +1134,8 @@ export async function createService(
 }
 
 /** 创建扫描任务；Web 控制台使用稳定设备标识和随机请求 ID。 */
-export async function createScanJob(serviceId: string, scanMode: "incremental" | "full", admin = false): Promise<ScanJob> {
-  const result = await requestJson<{ job: ScanJob }>(
+export async function createScanJob(serviceId: string, scanMode: "incremental" | "full", admin = false): Promise<ScanJob | LibraryScanJob> {
+  const result = await requestJson<{ job: ScanJob | LibraryScanJob }>(
     admin ? `/api/v1/admin/libraries/${serviceId}/scan-jobs` : `/api/v1/libraries/${serviceId}/scan-jobs`,
     {
       method: "POST",
@@ -1012,6 +1147,42 @@ export async function createScanJob(serviceId: string, scanMode: "incremental" |
     },
   );
   return result.job;
+}
+
+/** 对云聚合父任务统一下发暂停、继续或取消动作。 */
+export async function controlLibraryScanJob(
+  libraryId: string,
+  jobId: string,
+  action: "pause" | "resume" | "cancel",
+  admin = false,
+): Promise<LibraryScanJob> {
+  const result = await requestJson<{ job: LibraryScanJob }>(
+    admin
+      ? `/api/v1/admin/libraries/${libraryId}/library-scan-jobs/${jobId}/control`
+      : `/api/v1/libraries/${libraryId}/library-scan-jobs/${jobId}/control`,
+    { method: "POST", body: JSON.stringify({ action }) },
+  );
+  return result.job;
+}
+
+/** 读取云聚合父任务及各来源子任务的最新汇总状态。 */
+export async function getLibraryScanJob(libraryId: string, jobId: string, admin = false): Promise<LibraryScanJob> {
+  const result = await requestJson<{ job: LibraryScanJob }>(
+    admin
+      ? `/api/v1/admin/libraries/${libraryId}/library-scan-jobs/${jobId}`
+      : `/api/v1/libraries/${libraryId}/library-scan-jobs/${jobId}`,
+  );
+  return result.job;
+}
+
+/** 删除已经结束的云聚合父任务及其全部来源子任务。 */
+export function deleteLibraryScanJob(libraryId: string, jobId: string, admin = false): Promise<void> {
+  return requestJson(
+    admin
+      ? `/api/v1/admin/libraries/${libraryId}/library-scan-jobs/${jobId}`
+      : `/api/v1/libraries/${libraryId}/library-scan-jobs/${jobId}`,
+    { method: "DELETE", body: JSON.stringify({ confirmation: jobId }) },
+  );
 }
 
 /** 读取媒体库的扫描和视频规格分析计划。 */
@@ -1449,6 +1620,8 @@ export interface JobListFilters {
   /** active 同时表示排队、运行、等待恢复和暂停。 */
   status?: JobStatus | "active";
   jobType?: "scan" | "media_probe";
+  /** 以云聚合父任务作为分页单位，并返回该组全部来源子任务。 */
+  groupParentJobs?: boolean;
   limit?: number;
   offset?: number;
 }
@@ -1461,6 +1634,7 @@ export function listJobs(admin = false, filters: JobListFilters = {}): Promise<{
   });
   if (filters.status) query.set("status", filters.status);
   if (filters.jobType) query.set("jobType", filters.jobType);
+  if (filters.groupParentJobs) query.set("groupParentJobs", "true");
   return requestJson(`${admin ? "/api/v1/admin/jobs" : "/api/v1/scan-jobs"}?${query.toString()}`);
 }
 

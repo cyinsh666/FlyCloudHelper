@@ -448,32 +448,81 @@ export class ScanScheduleWorker {
     }
     try {
       const library = await this.options.repository.getLibrary(schedule.libraryId, schedule.userId);
-      const service = await this.options.repository.getServiceMediaContext(library.sourceServiceId, schedule.userId);
+      const profiles = await this.options.repository.getLibraryProfiles(library.id, schedule.userId);
       if (schedule.scanMode === "media_probe") {
-        if (service.dataType !== "video") {
+        if (library.dataType !== "video") {
           throw new ApiError(409, "media_probe_video_only", "只有影视服务可以定时分析视频规格");
         }
-        if (service.status !== "active") {
+        if (library.status !== "active") {
           throw new ApiError(409, "service_not_active", "请先启用服务，再执行定时视频规格分析");
         }
-        const result = await this.options.repository.enqueueExistingServiceMediaProbes(
-          service.id,
-          schedule.userId,
-          schedule.userId,
-          "scheduled",
+        const aggregateResult = library.libraryKind === "cloud_aggregate_video"
+          ? await this.options.repository.enqueueExistingLibraryMediaProbes(library.id, schedule.userId, schedule.userId)
+          : null;
+        const legacyResult = aggregateResult ? null : await this.options.repository.enqueueExistingServiceMediaProbes(
+          library.sourceServiceId, schedule.userId, schedule.userId, "scheduled",
         );
-        await this.options.store.markTriggeredJob(schedule.id, result.jobId);
+        const jobIds = aggregateResult?.jobIds ?? (legacyResult?.jobId ? [legacyResult.jobId] : []);
+        const queuedCount = aggregateResult?.queuedCount ?? legacyResult?.queuedCount ?? 0;
+        await this.options.store.markTriggeredJob(schedule.id, jobIds[0] ?? null);
         this.options.logger("info", {
           日志关键字: "codex-flycloud-scan-schedule",
-          事件: result.jobId ? "定时视频规格任务创建成功" : "定时视频规格任务没有待分析文件",
+          事件: jobIds.length > 0 ? "定时视频规格任务创建成功" : "定时视频规格任务没有待分析文件",
           用户ID: schedule.userId,
           媒体库ID: schedule.libraryId,
           计划ID: schedule.id,
-          任务ID: result.jobId,
-          入队文件数量: result.queuedCount,
+          任务ID: jobIds[0] ?? null,
+          来源任务数量: jobIds.length,
+          入队文件数量: queuedCount,
         });
         return;
       }
+      // 视频规格任务已单独处理，余下的计划只会按全量或增量扫描读取目录。
+      const scanMode: "incremental" | "full" = schedule.scanMode;
+      if (library.libraryKind === "cloud_aggregate_video") {
+        const readySources = library.sources.filter((source) => source.status === "active"
+          && source.connectionStatus === "valid"
+          && source.credentialConfigured
+          && (source.serviceStatus === null || source.serviceStatus === "active"));
+        if (readySources.length === 0) throw new ApiError(409, "library_sources_not_ready", "没有可用于定时扫描的来源");
+        // 关键变量：定时扫描与手动扫描使用同一参与规则，未配置路径的来源直接跳过。
+        const scanSources = readySources.filter((source) => {
+          const scan = source.configuration.scan;
+          return Boolean(scan && typeof scan === "object" && !Array.isArray(scan)
+            && readConfiguredRoots(scan as Record<string, unknown>, scanMode).length > 0);
+        });
+        if (scanSources.length === 0) {
+          throw new ApiError(409, "scan_paths_not_configured", `请先为至少一个可用来源配置${scanMode === "full" ? "全量" : "增量"}扫描路径`);
+        }
+        const requestId = `schedule:${schedule.id}:${schedule.nextRunAt ?? now.toISOString()}`;
+        const parent = await this.options.repository.createLibraryScanJob({
+          id: randomUUID(), userId: schedule.userId, libraryId: library.id,
+          requestedByUserId: schedule.userId, requestId,
+          clientDeviceId: "flycloud-helper-scheduler", scanMode: schedule.scanMode,
+          sourceCount: scanSources.length,
+        });
+        for (const source of scanSources) {
+          await this.options.repository.createScanJob({
+            jobId: randomUUID(), userId: schedule.userId, libraryId: library.id,
+            librarySourceId: source.id, parentJobId: parent.id,
+            requestedByUserId: schedule.userId, requestId: `${requestId}:${source.id}`,
+            clientDeviceId: "flycloud-helper-scheduler", scanMode: schedule.scanMode,
+            runtimeRevision: "scanner-worker-v1", tmdbKeyPoolRevision: this.options.tmdb.revision,
+            aiModel: await this.options.aiModels.buildTaskSnapshot(profiles.metadataProfile),
+            pluginVersions: await this.options.plugins.buildTaskSnapshots(profiles.metadataProfile),
+          });
+        }
+        await this.options.repository.refreshLibraryScanJob(parent.id);
+        await this.options.store.markTriggeredJob(schedule.id, parent.id);
+        this.options.logger("info", {
+          日志关键字: "codex-library-scan-parent",
+          事件: "定时任务创建云聚合扫描父任务",
+          用户ID: schedule.userId, 媒体库ID: schedule.libraryId,
+          计划ID: schedule.id, 父任务ID: parent.id, 来源子任务数量: scanSources.length,
+        });
+        return;
+      }
+      const service = await this.options.repository.getServiceMediaContext(library.sourceServiceId, schedule.userId);
       const configuredRoots = readConfiguredRoots(service.scanProfile, schedule.scanMode);
       if (configuredRoots.length === 0) {
         throw new ApiError(409, "scan_paths_not_configured", `未配置${schedule.scanMode === "full" ? "全量" : "增量"}扫描路径`);
@@ -482,6 +531,7 @@ export class ScanScheduleWorker {
         jobId: randomUUID(),
         userId: schedule.userId,
         libraryId: service.libraryId,
+        librarySourceId: library.sourceId,
         requestedByUserId: schedule.userId,
         requestId: `schedule:${schedule.id}:${schedule.nextRunAt ?? now.toISOString()}`,
         clientDeviceId: "flycloud-helper-scheduler",

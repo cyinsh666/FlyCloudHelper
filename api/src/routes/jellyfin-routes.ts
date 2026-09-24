@@ -12,6 +12,7 @@ import { enqueueProtocolScan, listProtocolVirtualFolders } from "../protocol-sca
 import {
   buildUpstreamHeaders,
   copyMediaResponseHeaders,
+  handleProviderAuthenticationFailure,
   resolveRelayAccess,
   type RelayLibraryRow,
 } from "./media-stream-routes.js";
@@ -30,9 +31,9 @@ function readMediaSourceId(request: FastifyRequest): string {
   return String(query.mediaSourceId ?? query.MediaSourceId ?? body.MediaSourceId ?? body.mediaSourceId ?? "");
 }
 
-/** 返回条目主媒体源的 Jellyfin 协议 ID，其他文件版本继续使用文件 ID。 */
-function toProtocolMediaSourceId(itemId: string, primaryFileId: string, fileId: string): string {
-  return fileId === primaryFileId ? itemId : fileId;
+/** 云聚合始终返回稳定文件版本 ID；旧单源库继续兼容“主版本等于条目 ID”的历史行为。 */
+function toProtocolMediaSourceId(itemId: string, primaryFileId: string, fileId: string, stableVersionId: boolean): string {
+  return stableVersionId || fileId !== primaryFileId ? fileId : itemId;
 }
 
 /** 按 Jellyfin 媒体源 ID 找到真实文件，条目 ID 表示主媒体源。 */
@@ -82,9 +83,11 @@ function buildRootItem(context: JellyfinContext): Record<string, unknown> {
 }
 
 /** 把服务数据库行转换为媒体中转公共上下文。 */
-function toRelayLibrary(service: Record<string, unknown>): RelayLibraryRow {
+function toRelayLibrary(service: Record<string, unknown>, file: Record<string, unknown>): RelayLibraryRow {
   return {
-    id: String(service.library_id), service_id: String(service.id), provider_type: String(service.provider_type),
+    id: String(service.library_id), service_id: String(service.id),
+    library_source_id: String(file.librarySourceId ?? "") || undefined,
+    provider_type: String(file.providerType ?? service.provider_type ?? ""),
     service_status: String(service.status), relay_playback_enabled: service.jellyfin_relay_playback_enabled as number,
     credential_revision: Number(service.credential_revision),
   };
@@ -165,27 +168,40 @@ function buildStandardMediaSourceDefaults(): Record<string, unknown> {
 }
 
 /** 解析文件访问地址，并在 Provider 刷新令牌时安全持久化。 */
-async function resolveFileAccess(runtime: ApiRuntime, service: Record<string, unknown>, ownerUserId: string, locator: Record<string, unknown>, signal: AbortSignal, playbackRequest?: FastifyRequest) {
+async function resolveFileAccess(runtime: ApiRuntime, file: Record<string, unknown>, ownerUserId: string, locator: Record<string, unknown>, signal: AbortSignal, playbackRequest?: FastifyRequest) {
   // 关键变量：只有明确适配播放器 UA 的网盘才覆盖本次取址标识，不修改其他网盘的固定访问头。
-  const providerType = String(service.provider_type);
+  const sourceRuntime = await runtime.repository.getLibrarySourceRuntimeConfiguration(String(file.librarySourceId), ownerUserId);
+  const providerType = sourceRuntime.providerType;
   const adapter = runtime.providers.get(providerType);
-  const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(String(service.id), ownerUserId));
+  const connection = runtime.vault.decrypt(sourceRuntime.encryptedConnection);
   const providerContext: ProviderConnectionContext = {
     // 只在实际访问 Videos/stream 时传入播放器 UA，不能把 PlaybackInfo 的 API 客户端 UA 当成播放 UA。
     playbackUserAgent: supportsPlaybackUserAgent(providerType) && playbackRequest
       ? playbackRequest.headers["user-agent"] || undefined
       : undefined,
-    persistConnection: async (nextConnection) => runtime.repository.refreshActiveEncryptedConnection({
-      serviceId: String(service.id), userId: ownerUserId, credentialRevision: Number(service.credential_revision),
+    persistConnection: async (nextConnection) => runtime.repository.refreshLibrarySourceEncryptedConnection({
+      librarySourceId: sourceRuntime.source.id, userId: ownerUserId, credentialRevision: sourceRuntime.credentialRevision,
       encryptedConnection: runtime.vault.encrypt(nextConnection),
     }),
   };
-  const access = adapter.resolveFileAccess ? await adapter.resolveFileAccess(connection, locator, signal, providerContext) : null;
+  let access: ProviderFileAccess | null;
+  try {
+    access = adapter.resolveFileAccess ? await adapter.resolveFileAccess(connection, locator, signal, providerContext) : null;
+  } catch (error) {
+    await handleProviderAuthenticationFailure(runtime, {
+      librarySourceId: sourceRuntime.source.id,
+      serviceId: sourceRuntime.source.serviceId ?? sourceRuntime.source.id,
+      userId: ownerUserId,
+      credentialRevision: sourceRuntime.credentialRevision,
+      providerType,
+    }, error);
+    throw error;
+  }
   if (playbackRequest) {
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-jellyfin-cloud-direct",
       事件: "网盘直连请求头检查",
-      服务ID: String(service.id),
+      媒体库源ID: sourceRuntime.source.id,
       网盘类型: providerType,
       请求方法: playbackRequest.method,
       请求播放路由: readPlaybackRoute(playbackRequest),
@@ -195,9 +211,9 @@ async function resolveFileAccess(runtime: ApiRuntime, service: Record<string, un
       是否仍需额外请求头: access ? hasRequiredPlaybackHeaders(access, playbackRequest, providerType) : null,
     });
   }
-  if (String(service.provider_type) === "cloud115" && playbackRequest) {
+  if (providerType === "cloud115" && playbackRequest) {
     runtime.logBusinessEvent("info", {
-      日志关键字: "codex-jellyfin-115-direct", 事件: "115直连取址完成", 服务ID: String(service.id),
+      日志关键字: "codex-jellyfin-115-direct", 事件: "115直连取址完成", 媒体库源ID: sourceRuntime.source.id,
       使用播放器UA: Boolean(providerContext.playbackUserAgent), 请求方法: playbackRequest.method,
       是否取得原始地址: Boolean(access && /^https?:\/\//iu.test(access.url)),
       是否仍需额外请求头: access ? hasRequiredPlaybackHeaders(access, playbackRequest, "cloud115") : null,
@@ -218,7 +234,15 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
   const internalRequestedSource = compatibility.toInternalMediaSourceId(internalItemId, requestedSource);
   // 关键变量：节目查询可能连带返回所有单集文件，PlaybackInfo 只能暴露当前电影或单集自身的多版本文件。
   const itemFiles = files.filter((candidate) => String(candidate.itemId) === internalItemId);
-  const playableFiles = itemFiles;
+  const progress = await runtime.database.query("library_playback_progress")
+    .select("media_source_id")
+    .where({ library_id: context.libraryId, account_id: context.accountId, item_id: internalItemId })
+    .first();
+  const recentSourceId = String(progress?.media_source_id ?? "");
+  // 关键变量：未明确指定版本时优先返回该账号最近成功使用的版本，其后保持来源稳定顺序。
+  const playableFiles = recentSourceId
+    ? [...itemFiles].sort((left, right) => Number(String(right.fileId) === recentSourceId) - Number(String(left.fileId) === recentSourceId))
+    : itemFiles;
   const requestedFile = requestedSource
     ? findPlaybackFile(playableFiles, internalItemId, internalRequestedSource)
     : undefined;
@@ -228,7 +252,7 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
   if (requestedSource && !requestedFile) {
     throw new ApiError(404, "jellyfin_media_source_not_found", "指定媒体源不存在");
   }
-  // 指定版本失效时只允许尝试同路径的替换文件，不能切换到同一集的其他版本。
+  // PlaybackInfo 明确指定版本时只返回该版本；真正取流失败后再最多回退一个其他版本。
   const candidateFiles = requestedFile
     ? [
       requestedFile,
@@ -240,6 +264,7 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
   // 关键变量：Jellyfin 中转开关只约束服务器媒体入口，不影响临时原始地址直连。
   const jellyfinRelayPlaybackEnabled = Number(service.jellyfin_relay_playback_enabled) === 1
     || service.jellyfin_relay_playback_enabled === true;
+  const usesStableVersionIds = String(service.library_kind) === "cloud_aggregate_video";
   const itemMediaProbes = itemFiles.map((file) =>
     parseCompletedMediaProbeResult(file.mediaProbeStatus, file.mediaProbeResult));
   // 关键变量：规格开关只控制自动入队；已有规格完整时，PlaybackInfo 必须始终返回。
@@ -258,6 +283,7 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
       protocolItemId,
       String(playableFiles[0]?.fileId ?? ""),
       String(file.fileId),
+      usesStableVersionIds,
     );
     const fileName = String(file.name ?? "video.mp4");
     const mediaProbe = mediaProbeByFileId.get(String(file.fileId)) ?? null;
@@ -273,13 +299,14 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
       try {
         originAccess = await resolveFileAccess(
           runtime,
-          service,
+          file,
           context.ownerUserId,
           locator,
           new AbortController().signal,
         );
       } catch (error) {
         if (isMissingProviderFileError(error)) {
+          await runtime.repository.markSourceFileMissingFromPlayback(String(file.fileId), context.ownerUserId);
           missingProviderFileCount += 1;
           continue;
         }
@@ -294,7 +321,9 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
       ...buildStandardMediaSourceDefaults(),
       // 关键变量：所有 Jellyfin 客户端统一接收标准 File 媒体源和服务内相对播放地址。
       Protocol: "File", Id: protocolMediaSourceId, Path: fileName,
-      Type: "Default", Container: mediaProbe?.container || undefined, Size: mediaProbe?.size || undefined, Name: fileName,
+      Type: "Default", Container: mediaProbe?.container || undefined, Size: mediaProbe?.size || undefined,
+      // 多版本名称明确展示来源，APP 只需要使用标准 Jellyfin MediaSources。
+      Name: `${String(file.sourceName ?? "网盘来源")}（${String(file.providerType ?? "未知网盘")}） · ${fileName}`,
       Bitrate: mediaProbe?.bitRate || undefined,
       IsRemote: false,
       DirectStreamUrl: directStreamUrl, AddApiKeyToDirectStreamUrl: true,
@@ -423,11 +452,9 @@ async function sendMediaStream(
   const itemFiles = files.filter((candidate) => String(candidate.itemId) === internalItemId);
   const requestedFile = findPlaybackFile(itemFiles, internalItemId, fileId);
   if (!requestedFile) throw new ApiError(404, "jellyfin_media_source_not_found", "媒体源不存在");
-  // 指定版本失效时只允许尝试同路径的替换文件，不能切换到同一集的其他版本。
-  const candidateFiles = [
-    requestedFile,
-    ...itemFiles.filter((file) => file !== requestedFile && String(file.path) === String(requestedFile.path)),
-  ];
+  // 关键变量：指定版本失效时最多回退一个其他来源版本，避免客户端连续等待多个异常来源。
+  const fallbackFile = itemFiles.find((file) => file !== requestedFile);
+  const candidateFiles = fallbackFile ? [requestedFile, fallbackFile] : [requestedFile];
   const abortController = new AbortController();
   const abort = () => abortController.abort();
   request.raw.once("aborted", abort); reply.raw.once("close", abort);
@@ -443,7 +470,7 @@ async function sendMediaStream(
         if (effectiveRoute === "origin") {
           const originAccess = await resolveFileAccess(
             runtime,
-            service,
+            candidateFile,
             context.ownerUserId,
             locator,
             abortController.signal,
@@ -452,7 +479,7 @@ async function sendMediaStream(
           if (!originAccess || !/^https?:\/\//iu.test(originAccess.url)) {
             throw new ApiError(409, "jellyfin_origin_direct_unavailable", "当前文件无法生成原始播放地址，请启用 Jellyfin 中转播放");
           }
-          if (!hasRequiredPlaybackHeaders(originAccess, request, String(service.provider_type))) {
+          if (!hasRequiredPlaybackHeaders(originAccess, request, String(candidateFile.providerType ?? ""))) {
             reply.header("Cache-Control", "private, no-store");
             return reply.redirect(originAccess.url, 307);
           }
@@ -464,7 +491,7 @@ async function sendMediaStream(
         } else {
           access = await resolveRelayAccess(
             runtime,
-            toRelayLibrary(service),
+            toRelayLibrary(service, candidateFile),
             context.ownerUserId,
             locator,
             abortController.signal,
@@ -474,6 +501,7 @@ async function sendMediaStream(
         break;
       } catch (error) {
         if (!isMissingProviderFileError(error)) throw error;
+        await runtime.repository.markSourceFileMissingFromPlayback(String(candidateFile.fileId), context.ownerUserId);
       }
     }
     if (!file || !access) {

@@ -5,18 +5,25 @@ import { MediaCatalogView, type MediaCatalogQuery } from "@/components/MediaCata
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, StatusPill } from "@/components/ui-kit";
 import { ServicePathPicker, toProviderDirectory } from "@/components/ServicePathPicker";
+import { CloudAggregateSourcesPanel } from "@/components/CloudAggregateSourcesPanel";
+import { CloudAggregateScanPathsPanel } from "@/components/CloudAggregateScanPathsPanel";
+import { AiCleaningSettingsFields, type AiCleaningSettingsValue } from "@/components/AiCleaningSettingsFields";
 import {
   clearServiceCatalog,
+  controlLibraryScanJob,
   createScanJob,
   createServiceAccessAccount,
   deleteLibrary,
   deleteServiceAccessAccount,
   getLibrary,
+  getLibraryScanJob,
   getServiceAccessSettings,
   listAdminServiceItems,
+  listAvailableAiModels,
   listLibraryItems,
   revokeServiceAccessAccountSessions,
   type ServiceAccessAccount,
+  type LibraryScanJob,
   updateServiceAccessAccount,
   updateServiceJellyfinSettings,
   updateServiceEmbySettings,
@@ -25,12 +32,34 @@ import {
   updateLibraryMetadataProfile,
   updateLibraryNotificationSettings,
   updateLibraryScanProfile,
+  type LibrarySource,
   type ProviderDirectory,
 } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
 
 // 关键变量：单个媒体库海报墙每页读取 60 个顶层条目，避免一次加载完整目录。
 const LIBRARY_CATALOG_PAGE_SIZE = 60;
+
+const aggregateScanStatusLabels: Record<LibraryScanJob["status"], string> = {
+  pending: "等待子任务",
+  running: "扫描中",
+  paused: "已暂停",
+  completed: "已完成",
+  completed_with_errors: "完成但有错误",
+  partial_failed: "部分来源失败",
+  failed: "失败",
+  cancelled: "已取消",
+};
+
+const sourceScanStatusLabels: Record<LibraryScanJob["sourceJobs"][number]["status"], string> = {
+  queued: "排队中",
+  running: "扫描中",
+  retry_waiting: "等待重试",
+  paused: "已暂停",
+  completed: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+};
 
 /** 把媒体库扫描配置中的根目录转换为目录选择器数据。 */
 function readLibraryScanRoots(profile: Record<string, unknown>, mode: "full" | "incremental"): ProviderDirectory[] {
@@ -58,6 +87,24 @@ function buildLibraryScanRoots(directories: ProviderDirectory[], dataType: "vide
     ...(directory.driveId ? { driveId: directory.driveId } : {}),
     mediaTypes: [dataType],
   }));
+}
+
+/** 判断云聚合来源是否具备本轮目录浏览和扫描条件。 */
+function isReadyAggregateSource(source: LibrarySource): boolean {
+  return source.status === "active"
+    && source.connectionStatus === "valid"
+    && source.credentialConfigured
+    && (source.serviceStatus === null || source.serviceStatus === "active");
+}
+
+/** 判断来源是否已经配置指定扫描模式的至少一个根目录。 */
+function hasAggregateSourceRoots(source: LibrarySource, mode: "full" | "incremental"): boolean {
+  const scan = source.configuration.scan;
+  if (!scan || typeof scan !== "object" || Array.isArray(scan)) return false;
+  const profile = scan as Record<string, unknown>;
+  const selectedRoots = mode === "full" ? profile.fullRoots : profile.incrementalRoots;
+  const roots = Array.isArray(selectedRoots) ? selectedRoots : profile.roots;
+  return Array.isArray(roots) && roots.length > 0;
 }
 
 /** 复制媒体库协议地址，并兼容未开放 Clipboard API 的浏览器。 */
@@ -91,12 +138,20 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
       settings,
     };
   }, [serviceId, admin]);
+  // 关键变量：AI 模型单独读取；模型接口异常时仍允许用户管理媒体库的其他配置。
+  const aiModelsResource = useApiResource(
+    () => listAvailableAiModels(serviceId),
+    [serviceId],
+  );
   const [message, setMessage] = useState<string | null>(null);
   const [updatingJellyfin, setUpdatingJellyfin] = useState(false);
   const [updatingEmby, setUpdatingEmby] = useState(false);
   const [updatingNavidrome, setUpdatingNavidrome] = useState(false);
   const [clearingCatalog, setClearingCatalog] = useState(false);
   const [creatingScanMode, setCreatingScanMode] = useState<"full" | "incremental" | null>(null);
+  const [scanActionFeedback, setScanActionFeedback] = useState<{ message: string; failed: boolean } | null>(null);
+  const [aggregateScanJob, setAggregateScanJob] = useState<LibraryScanJob | null>(null);
+  const [controllingAggregateScan, setControllingAggregateScan] = useState(false);
   const [updatingNotification, setUpdatingNotification] = useState(false);
   const [savingMetadata, setSavingMetadata] = useState(false);
   const [unlinkingService, setUnlinkingService] = useState(false);
@@ -106,6 +161,12 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   const [useNfo, setUseNfo] = useState(true);
   const [syncDetails, setSyncDetails] = useState(false);
   const [analyzeMediaSpecs, setAnalyzeMediaSpecs] = useState(false);
+  const [aiCleaning, setAiCleaning] = useState<AiCleaningSettingsValue>({
+    enabled: false,
+    modelId: "",
+    triggerMode: "weak_or_unmatched",
+    minConfidence: 0.75,
+  });
   const [musicAggregateMode, setMusicAggregateMode] = useState<"fast" | "complete">("fast");
   const [syncLyrics, setSyncLyrics] = useState(false);
   // 关键变量：同步占用清空操作，避免按钮状态刷新前重复提交。
@@ -114,6 +175,11 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   const settings = resource.data?.settings;
   const scanProfile = resource.data?.scanProfile ?? {};
   const metadataProfile = resource.data?.metadataProfile ?? {};
+  const isCloudAggregate = service?.libraryKind === "cloud_aggregate_video";
+  // 关键变量：聚合扫描只计入状态正常且已配置当前模式路径的来源。
+  const readyAggregateSources = service?.sources.filter(isReadyAggregateSource) ?? [];
+  const fullAggregateScanSources = readyAggregateSources.filter((source) => hasAggregateSourceRoots(source, "full"));
+  const incrementalAggregateScanSources = readyAggregateSources.filter((source) => hasAggregateSourceRoots(source, "incremental"));
   const catalogPath = admin ? "/admin/libraries/$serviceId/catalog" : "/app/libraries/$serviceId/catalog";
   const jellyfinPath = admin ? "/admin/libraries/$serviceId/jellyfin" : "/app/libraries/$serviceId/jellyfin";
   const embyPath = admin ? "/admin/libraries/$serviceId/emby" : "/app/libraries/$serviceId/emby";
@@ -134,12 +200,50 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
     setUseNfo(selected.useNfo !== false);
     setSyncDetails(selected.syncDetails === true);
     setAnalyzeMediaSpecs(selected.analyzeMediaSpecs === true);
+    const selectedAiCleaning = selected.aiCleaning && typeof selected.aiCleaning === "object" && !Array.isArray(selected.aiCleaning)
+      ? selected.aiCleaning as Record<string, unknown>
+      : {};
+    setAiCleaning({
+      enabled: selectedAiCleaning.enabled === true,
+      modelId: typeof selectedAiCleaning.modelId === "string" ? selectedAiCleaning.modelId : "",
+      triggerMode: selectedAiCleaning.triggerMode === "weak_only" ? "weak_only" : "weak_or_unmatched",
+      minConfidence: typeof selectedAiCleaning.minConfidence === "number" ? selectedAiCleaning.minConfidence : 0.75,
+    });
     setMusicAggregateMode(selected.aggregateMode === "complete" ? "complete" : "fast");
     const requiredFields = selected.requiredFields && typeof selected.requiredFields === "object" && !Array.isArray(selected.requiredFields)
       ? selected.requiredFields as Record<string, unknown>
       : {};
     setSyncLyrics(requiredFields.lyrics === true);
   }, [metadataProfile, service?.dataType]);
+
+  useEffect(() => {
+    if (!aggregateScanJob || ["completed", "completed_with_errors", "partial_failed", "failed", "cancelled"].includes(aggregateScanJob.status)) return;
+    const timer = window.setInterval(() => {
+      void getLibraryScanJob(serviceId, aggregateScanJob.id, admin)
+        .then(setAggregateScanJob)
+        .catch((error) => console.warn("codex-library-scan-parent", {
+          事件: "网页刷新云聚合父任务失败",
+          媒体库ID: serviceId,
+          父任务ID: aggregateScanJob.id,
+          错误信息: error instanceof Error ? error.message : "未知错误",
+        }));
+    }, 2_000);
+    return () => window.clearInterval(timer);
+  }, [admin, aggregateScanJob, serviceId]);
+
+  useEffect(() => {
+    if (!isCloudAggregate || aggregateScanJob) return;
+    const parentJobId = service?.recentJobs?.find((job) => Boolean(job.parentJobId))?.parentJobId;
+    if (!parentJobId) return;
+    void getLibraryScanJob(serviceId, parentJobId, admin)
+      .then(setAggregateScanJob)
+      .catch((error) => console.warn("codex-library-scan-parent", {
+        事件: "网页恢复最近云聚合父任务失败",
+        媒体库ID: serviceId,
+        父任务ID: parentJobId,
+        错误信息: error instanceof Error ? error.message : "未知错误",
+      }));
+  }, [admin, aggregateScanJob, isCloudAggregate, service?.recentJobs, serviceId]);
 
   /** 保存全量或增量扫描路径，同时保留并发等其他扫描配置。 */
   async function saveScanRoots(mode: "full" | "incremental", directories: ProviderDirectory[]): Promise<void> {
@@ -157,13 +261,53 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   async function triggerScan(mode: "full" | "incremental"): Promise<void> {
     if (creatingScanMode !== null) return;
     setCreatingScanMode(mode);
+    setScanActionFeedback({ message: `正在创建${mode === "full" ? "全量" : "增量"}扫描任务…`, failed: false });
     try {
+      if (isCloudAggregate && service) {
+        const readySources = service.sources.filter(isReadyAggregateSource);
+        const scanSources = readySources.filter((source) => hasAggregateSourceRoots(source, mode));
+        if (readySources.length === 0) throw new Error("当前没有状态正常的网盘来源，无法开始扫描");
+        if (scanSources.length === 0) throw new Error(`请先为至少一个状态正常的来源配置${mode === "full" ? "全量" : "增量"}扫描路径`);
+      }
       const job = await createScanJob(serviceId, mode, admin);
-      setMessage(`${mode === "full" ? "全量" : "增量"}扫描任务已创建：${job.id}`);
+      if ("sourceJobs" in job) setAggregateScanJob(job);
+      const successMessage = `${mode === "full" ? "全量" : "增量"}扫描任务已创建：${job.id}`;
+      console.info("codex-library-scan-trigger", {
+        事件: "扫描任务创建完成",
+        媒体库ID: serviceId,
+        扫描模式: mode,
+        扫描任务ID: job.id,
+        来源子任务数量: "sourceJobs" in job ? job.sourceJobs.length : 1,
+      });
+      setScanActionFeedback({ message: successMessage, failed: false });
+      setMessage(successMessage);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "扫描任务创建失败");
+      const errorMessage = error instanceof Error ? error.message : "扫描任务创建失败";
+      console.warn("codex-library-scan-trigger", {
+        事件: "扫描任务创建失败",
+        媒体库ID: serviceId,
+        扫描模式: mode,
+        错误信息: errorMessage,
+      });
+      setScanActionFeedback({ message: errorMessage, failed: true });
+      setMessage(errorMessage);
     } finally {
       setCreatingScanMode(null);
+    }
+  }
+
+  /** 统一控制当前云聚合父任务，并由服务端传播到各来源子任务。 */
+  async function controlAggregateScan(action: "pause" | "resume" | "cancel"): Promise<void> {
+    if (!aggregateScanJob || controllingAggregateScan) return;
+    setControllingAggregateScan(true);
+    try {
+      const job = await controlLibraryScanJob(serviceId, aggregateScanJob.id, action, admin);
+      setAggregateScanJob(job);
+      setMessage(action === "pause" ? "已请求暂停全部来源" : action === "resume" ? "已继续全部已暂停来源" : "已请求取消全部来源");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "父任务控制失败");
+    } finally {
+      setControllingAggregateScan(false);
     }
   }
 
@@ -197,6 +341,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
           useNfo,
           syncDetails,
           analyzeMediaSpecs,
+          aiCleaning,
         };
       await updateLibraryMetadataProfile(serviceId, {
         ...metadataProfile,
@@ -357,7 +502,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
         )}
       />
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
-      <Panel title="关联服务" description="当前媒体库使用这个网盘服务的登录凭据读取和扫描文件。" className="mb-4">
+      {isCloudAggregate ? <><CloudAggregateSourcesPanel library={service} admin={admin} onChanged={resource.refresh} onMessage={setMessage} /><CloudAggregateScanPathsPanel library={service} admin={admin} onChanged={resource.refresh} onMessage={setMessage} /></> : <Panel title="关联服务" description="当前媒体库使用这个网盘服务的登录凭据读取和扫描文件。" className="mb-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0">
             <p className="truncate text-sm font-medium">{service.sourceServiceName}</p>
@@ -369,7 +514,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
           </div>
         </div>
         <p className="mt-2 text-xs text-muted-foreground">当前只有这一个关联服务；取消关联会同时删除媒体库，网盘服务仍然保留。</p>
-      </Panel>
+      </Panel>}
       <div className={`grid gap-3 sm:grid-cols-3 ${settings.navidromeSupported ? "" : "xl:grid-cols-4"}`}>
         <div className="flex items-center justify-between gap-3 rounded-xl border border-border bg-secondary/20 px-4 py-3">
           <span className="text-xs text-muted-foreground">媒体条目</span>
@@ -389,7 +534,27 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
         </div>}
       </div>
       <div className="mt-4 grid gap-4 xl:grid-cols-2">
-        <Panel title="扫描路径" description="全量与增量路径分别保存到媒体库，网盘服务只提供登录凭据。">
+        {isCloudAggregate ? <Panel title="聚合扫描" description="每个参与来源作为独立子任务并行扫描，扫描结果通过公共队列依次合并到同一媒体库。">
+          <p className="text-xs text-muted-foreground">只扫描当前模式下已配置目录的正常来源；未配置路径、失效或停用的来源不会进入本轮任务。</p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <SecondaryButton disabled={creatingScanMode !== null || fullAggregateScanSources.length === 0} onClick={() => void triggerScan("full")}><ScanLine className="size-4" /> {creatingScanMode === "full" ? "创建中…" : "全量扫描已配置来源"}</SecondaryButton>
+            <PrimaryButton disabled={creatingScanMode !== null || incrementalAggregateScanSources.length === 0} onClick={() => void triggerScan("incremental")}><ScanLine className="size-4" /> {creatingScanMode === "incremental" ? "创建中…" : "增量扫描已配置来源"}</PrimaryButton>
+          </div>
+          {scanActionFeedback && <p className={`mt-3 rounded-lg border px-3 py-2 text-xs ${scanActionFeedback.failed ? "border-destructive/30 bg-destructive/10 text-destructive" : "border-border bg-secondary/20 text-muted-foreground"}`}>{scanActionFeedback.message}</p>}
+          {aggregateScanJob && <div className="mt-4 rounded-xl border border-border bg-secondary/20 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div><p className="text-sm font-medium">本轮父任务 · {aggregateScanStatusLabels[aggregateScanJob.status]}</p><p className="mt-1 text-xs text-muted-foreground">完成 {aggregateScanJob.completedSourceCount}/{aggregateScanJob.sourceCount}，失败 {aggregateScanJob.failedSourceCount}，取消 {aggregateScanJob.cancelledSourceCount}，错误 {aggregateScanJob.errorCount}</p></div>
+              <div className="flex flex-wrap gap-2">
+                <SecondaryButton disabled={controllingAggregateScan || !["pending", "running"].includes(aggregateScanJob.status)} onClick={() => void controlAggregateScan("pause")}>暂停全部</SecondaryButton>
+                <SecondaryButton disabled={controllingAggregateScan || !aggregateScanJob.sourceJobs.some((job) => job.status === "paused")} onClick={() => void controlAggregateScan("resume")}>继续全部</SecondaryButton>
+                <button type="button" disabled={controllingAggregateScan || ["completed", "completed_with_errors", "partial_failed", "failed", "cancelled"].includes(aggregateScanJob.status)} onClick={() => void controlAggregateScan("cancel")} className="rounded-lg border border-destructive/50 px-3 py-2 text-xs text-destructive disabled:opacity-40">取消全部</button>
+              </div>
+            </div>
+            <div className="mt-3 grid gap-2">
+              {aggregateScanJob.sourceJobs.map((job) => <div key={job.id} className="flex items-center justify-between gap-3 rounded-lg border border-border/70 bg-background/35 px-3 py-2 text-xs"><span className="min-w-0 truncate">{job.serviceName}</span><span className="shrink-0 text-muted-foreground">{sourceScanStatusLabels[job.status]} · 已处理 {job.processedCount}{job.errorCount > 0 ? ` · 错误 ${job.errorCount}` : ""}</span></div>)}
+            </div>
+          </div>}
+        </Panel> : <Panel title="扫描路径" description="全量与增量路径分别保存到媒体库，网盘服务只提供登录凭据。">
           <div className="grid gap-3">
             <ServicePathPicker serviceId={service.sourceServiceId} admin={admin} label="全量扫描目录" value={readLibraryScanRoots(scanProfile, "full")} onConfirm={(directories) => saveScanRoots("full", directories)} />
             <ServicePathPicker serviceId={service.sourceServiceId} admin={admin} label="增量扫描目录" value={readLibraryScanRoots(scanProfile, "incremental")} onConfirm={(directories) => saveScanRoots("incremental", directories)} />
@@ -398,8 +563,8 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
             <SecondaryButton disabled={creatingScanMode !== null || readLibraryScanRoots(scanProfile, "full").length === 0} onClick={() => void triggerScan("full")}><ScanLine className="size-4" /> {creatingScanMode === "full" ? "创建中…" : "全量扫描"}</SecondaryButton>
             <PrimaryButton disabled={creatingScanMode !== null || readLibraryScanRoots(scanProfile, "incremental").length === 0} onClick={() => void triggerScan("incremental")}><ScanLine className="size-4" /> {creatingScanMode === "incremental" ? "创建中…" : "增量扫描"}</PrimaryButton>
           </div>
-        </Panel>
-        <Panel title="元数据" description={service.dataType === "music" ? "配置音乐平台聚合与歌词补全。" : "配置影视刮削来源、语言和扫描增强。"}>
+        </Panel>}
+        <Panel title="元数据" description={service.dataType === "music" ? "配置音乐平台聚合与歌词补全。" : isCloudAggregate ? "全部网盘来源共用这一套影视元数据配置，并汇总为每部影片唯一的元数据。" : "配置影视刮削来源、语言和扫描增强。"}>
           <div className="grid gap-3 sm:grid-cols-2">
             <label><span className="text-xs text-muted-foreground">元数据来源</span><select value={metadataProvider} onChange={(event) => setMetadataProvider(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm">{service.dataType === "music" ? <><option value="auto">多平台自动补全</option><option value="musicbrainz">MusicBrainz</option><option value="netease">网易云音乐</option><option value="qmusic">QQ音乐</option><option value="kugou">酷狗音乐</option><option value="migu">咪咕音乐</option><option value="kuwo">酷我音乐</option></> : <><option value="builtin.tmdb">TMDB 在线刮削</option><option value="local">仅本地 NFO 和文件名</option></>}</select></label>
             {service.dataType === "music" ? <label><span className="text-xs text-muted-foreground">聚合方式</span><select value={musicAggregateMode} onChange={(event) => setMusicAggregateMode(event.target.value as "fast" | "complete")} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm"><option value="fast">最快命中</option><option value="complete">完整聚合</option></select></label> : <><label><span className="text-xs text-muted-foreground">语言</span><select value={metadataLanguage} onChange={(event) => setMetadataLanguage(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm"><option value="zh-CN">简体中文</option><option value="zh-TW">繁体中文</option><option value="en-US">英语</option><option value="ja-JP">日语</option><option value="ko-KR">韩语</option></select></label><label><span className="text-xs text-muted-foreground">地区</span><select value={metadataRegion} onChange={(event) => setMetadataRegion(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm"><option value="CN">中国大陆</option><option value="HK">中国香港</option><option value="TW">中国台湾</option><option value="US">美国</option><option value="JP">日本</option><option value="KR">韩国</option></select></label></>}
@@ -407,6 +572,14 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
           <div className="mt-3 flex flex-wrap gap-4 text-xs text-muted-foreground">
             {service.dataType === "music" ? <label className="inline-flex items-center gap-2"><input type="checkbox" checked={syncLyrics} onChange={(event) => setSyncLyrics(event.target.checked)} /> 补全歌词</label> : <><label className="inline-flex items-center gap-2"><input type="checkbox" checked={useNfo} onChange={(event) => setUseNfo(event.target.checked)} /> 优先本地 NFO</label><label className="inline-flex items-center gap-2"><input type="checkbox" checked={syncDetails} onChange={(event) => setSyncDetails(event.target.checked)} /> 同步详情</label><label className="inline-flex items-center gap-2"><input type="checkbox" checked={analyzeMediaSpecs} onChange={(event) => setAnalyzeMediaSpecs(event.target.checked)} /> 分析视频规格</label></>}
           </div>
+          {service.dataType === "video" && <div className="mt-4">
+            <AiCleaningSettingsFields state={{
+              value: aiCleaning,
+              models: aiModelsResource.data?.items ?? [],
+              loading: aiModelsResource.loading,
+              onChange: setAiCleaning,
+            }} />
+          </div>}
           <div className="mt-4"><PrimaryButton disabled={savingMetadata} onClick={() => void saveMetadataSettings()}>{savingMetadata ? "正在保存…" : "保存元数据配置"}</PrimaryButton></div>
         </Panel>
       </div>
@@ -777,66 +950,31 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
     <>
       <PageHeader title={`${service.displayName} · ${settings.navidromeSupported ? "协议访问账号" : "Jellyfin 配置"}`} actions={<Link to={settingsPath} params={{ serviceId }}><SecondaryButton>返回媒体库设置</SecondaryButton></Link>} />
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
-      {!settings.navidromeSupported && <><Panel title="播放设置" description="仅影响通过 Jellyfin 协议播放，和 APP 专用播放设置互不影响。">
-        <div className="rounded-xl border border-border bg-secondary/35 p-4">
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <p className="text-sm font-medium">Jellyfin 中转播放</p>
-              <p className="mt-1 text-xs text-muted-foreground">开启后使用 FlyCloudHelper 标准视频入口中转，兼容不能携带网盘请求头的第三方播放器；关闭后优先跳转网盘原始地址。</p>
-            </div>
-            <button type="button" role="switch" aria-checked={settings.jellyfinRelayPlaybackEnabled} aria-label="启用 Jellyfin 中转播放" disabled={(!settings.relayPlaybackSupported && !settings.jellyfinRelayPlaybackEnabled) || updatingPlayback} onClick={() => void toggleJellyfinRelayPlayback()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.jellyfinRelayPlaybackEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
-              <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.jellyfinRelayPlaybackEnabled ? "translate-x-5" : "translate-x-0"}`} />
-            </button>
+      {!settings.navidromeSupported && <Panel title="Jellyfin 设置" description="协议播放、下载、分类和服务地址集中管理。">
+        <div className="grid gap-2 md:grid-cols-3">
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/35 px-3 py-2.5">
+            <div className="min-w-0"><p className="text-sm font-medium">中转播放</p><p className="mt-0.5 truncate text-[11px] text-muted-foreground">关闭后优先使用网盘原始地址</p></div>
+            <button type="button" role="switch" aria-checked={settings.jellyfinRelayPlaybackEnabled} aria-label="启用 Jellyfin 中转播放" disabled={(!settings.relayPlaybackSupported && !settings.jellyfinRelayPlaybackEnabled) || updatingPlayback} onClick={() => void toggleJellyfinRelayPlayback()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.jellyfinRelayPlaybackEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}><span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.jellyfinRelayPlaybackEnabled ? "translate-x-5" : "translate-x-0"}`} /></button>
+          </div>
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/35 px-3 py-2.5">
+            <div className="min-w-0"><p className="text-sm font-medium">允许下载</p><p className="mt-0.5 truncate text-[11px] text-muted-foreground">传输原始文件，不转码</p></div>
+            <button type="button" role="switch" aria-checked={settings.jellyfinDownloadEnabled} aria-label="允许 Jellyfin 下载影片" disabled={updatingDownload} onClick={() => void toggleJellyfinDownload()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.jellyfinDownloadEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}><span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.jellyfinDownloadEnabled ? "translate-x-5" : "translate-x-0"}`} /></button>
+          </div>
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/35 px-3 py-2.5">
+            <div className="min-w-0"><p className="text-sm font-medium">节目地区分组</p><p className="mt-0.5 truncate text-[11px] text-muted-foreground">拆分为华语、日韩、欧美和其他</p></div>
+            <button type="button" role="switch" aria-checked={settings.jellyfinRegionLibrariesEnabled} aria-label="启用 Jellyfin 节目地区分组" disabled={updatingRegionLibraries} onClick={() => void toggleRegionLibraries()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.jellyfinRegionLibrariesEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}><span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.jellyfinRegionLibrariesEnabled ? "translate-x-5" : "translate-x-0"}`} /></button>
           </div>
         </div>
-        {!settings.relayPlaybackSupported && <p className="mt-3 text-xs text-muted-foreground">当前网盘类型暂不支持中转播放。</p>}
-      </Panel>
-      <Panel title="下载设置" description="控制 Jellyfin 客户端是否可以下载媒体库中的原始影片文件。" className="mt-4">
-        <div className="rounded-xl border border-border bg-secondary/35 p-4">
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <p className="text-sm font-medium">允许下载影片</p>
-              <p className="mt-1 text-xs text-muted-foreground">默认开启；下载由云助手传输原始文件，不转码，也不受 Jellyfin 播放中转开关影响。</p>
-            </div>
-            <button type="button" role="switch" aria-checked={settings.jellyfinDownloadEnabled} aria-label="允许 Jellyfin 下载影片" disabled={updatingDownload} onClick={() => void toggleJellyfinDownload()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.jellyfinDownloadEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
-              <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.jellyfinDownloadEnabled ? "translate-x-5" : "translate-x-0"}`} />
-            </button>
-          </div>
-        </div>
-      </Panel>
-      <Panel title="媒体库分类" className="mt-4">
-        <div className="rounded-xl border border-border bg-secondary/35 p-4">
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <p className="text-sm font-medium">节目按地区分组</p>
-              <p className="mt-1 text-xs text-muted-foreground">关闭时返回“电影、节目”；开启后节目拆分为“华语、日韩、欧美、其他”，电影不拆分。</p>
-            </div>
-            <button type="button" role="switch" aria-checked={settings.jellyfinRegionLibrariesEnabled} aria-label="启用 Jellyfin 节目地区分组" disabled={updatingRegionLibraries} onClick={() => void toggleRegionLibraries()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.jellyfinRegionLibrariesEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
-              <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.jellyfinRegionLibrariesEnabled ? "translate-x-5" : "translate-x-0"}`} />
-            </button>
-          </div>
-        </div>
-        <p className="mt-3 text-xs text-muted-foreground">已有节目没有地区数据时归入“其他节目”；后续正常扫描会按刮削结果更新，不增加单独的地区补全任务。</p>
-      </Panel>
-      <Panel title="服务地址" className="mt-4">
-        <div className="rounded-xl border border-border bg-secondary/35 p-4">
-          <form onSubmit={(event) => void saveJellyfinPath(event)}>
-            <p className="text-xs text-muted-foreground">Jellyfin 服务地址</p>
-            <div className="mt-2 flex flex-col gap-2 md:flex-row">
-              <div className="flex min-w-0 flex-1 overflow-hidden rounded-lg border border-input bg-background/50">
-                <span className="flex shrink-0 items-center border-r border-border bg-secondary/60 px-3 font-mono text-sm text-muted-foreground">/j/</span>
-                <input value={jellyfinPathSuffix} maxLength={64} onChange={(event) => setJellyfinPathSuffix(event.target.value)} aria-label="Jellyfin 地址后缀" className="min-w-0 flex-1 bg-transparent px-3 py-2.5 font-mono text-sm outline-none" />
-              </div>
-              <PrimaryButton type="submit" disabled={savingJellyfinPath}><Settings2 className="size-4" /> {savingJellyfinPath ? "正在保存…" : "保存地址"}</PrimaryButton>
-            </div>
-            <p className="mt-2 text-[11px] text-muted-foreground">固定前缀不可修改；后缀在全部媒体库中不能重复，只支持文字、数字、短横线或下划线，不能包含多级路径。</p>
+        {!settings.relayPlaybackSupported && <p className="mt-2 text-[11px] text-muted-foreground">当前网盘类型暂不支持中转播放。</p>}
+        <div className="mt-3 grid gap-3 border-t border-border pt-3 xl:grid-cols-[minmax(0,3fr)_minmax(260px,2fr)]">
+          <form onSubmit={(event) => void saveJellyfinPath(event)} className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
+            <div className="flex min-w-0 flex-1 overflow-hidden rounded-lg border border-input bg-background/50"><span className="flex shrink-0 items-center border-r border-border bg-secondary/60 px-3 font-mono text-sm text-muted-foreground">/j/</span><input value={jellyfinPathSuffix} maxLength={64} onChange={(event) => setJellyfinPathSuffix(event.target.value)} aria-label="Jellyfin 地址后缀" className="min-w-0 flex-1 bg-transparent px-3 py-2 font-mono text-sm outline-none" /></div>
+            <PrimaryButton type="submit" disabled={savingJellyfinPath}><Settings2 className="size-4" /> {savingJellyfinPath ? "保存中…" : "保存地址"}</PrimaryButton>
           </form>
-          <div className="mt-3 flex items-start justify-between gap-3 border-t border-border pt-3">
-            <p className="min-w-0 break-all font-mono text-xs">{jellyfinAddress}</p>
-            <SecondaryButton type="button" onClick={() => void copyLibraryText(settings.jellyfinUrl ?? settings.jellyfinPath).then(() => setMessage(settings.jellyfinUrl ? "Jellyfin 服务地址已复制" : "Jellyfin 服务路径已复制"))}><Copy className="size-4" /> 复制</SecondaryButton>
-          </div>
+          <div className="flex min-w-0 items-center justify-between gap-2 rounded-lg border border-border bg-secondary/25 px-3 py-2"><p className="min-w-0 truncate font-mono text-xs" title={jellyfinAddress}>{jellyfinAddress}</p><SecondaryButton type="button" onClick={() => void copyLibraryText(settings.jellyfinUrl ?? settings.jellyfinPath).then(() => setMessage(settings.jellyfinUrl ? "Jellyfin 服务地址已复制" : "Jellyfin 服务路径已复制"))}><Copy className="size-4" /> 复制</SecondaryButton></div>
         </div>
-      </Panel></>}
+        <p className="mt-2 text-[11px] text-muted-foreground">地址后缀在全部媒体库中不能重复，只支持文字、数字、短横线或下划线。</p>
+      </Panel>}
       {settings.navidromeSupported && (
         <Panel title="播放设置" description="控制 Navidrome 音乐播放和下载的传输方式，不转码。" className="mb-4">
           <div className="flex items-center justify-between gap-4 rounded-xl border border-border bg-secondary/35 p-4">
@@ -878,22 +1016,22 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
         action={<SecondaryButton type="button" disabled={pendingAccountAction !== null} onClick={() => setShowCreateAccount((value) => !value)}><Plus className="size-4" /> 添加账号</SecondaryButton>}
       >
         {showCreateAccount && (
-          <form onSubmit={(event) => void createAccessAccount(event)} className="mb-4 grid gap-3 rounded-xl border border-border bg-secondary/35 p-4 md:grid-cols-2">
-            <label><span className="text-xs text-muted-foreground">新账号用户名</span><input value={newAccountUsername} required minLength={4} maxLength={255} onChange={(event) => setNewAccountUsername(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
-            <label><span className="text-xs text-muted-foreground">登录密码（可选）</span><input value={newAccountPassword} type="password" autoComplete="new-password" placeholder="留空则无需密码" onChange={(event) => setNewAccountPassword(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
+          <form onSubmit={(event) => void createAccessAccount(event)} className="mb-3 grid gap-2 rounded-lg border border-border bg-secondary/35 p-3 md:grid-cols-2">
+            <label><span className="text-xs text-muted-foreground">新账号用户名</span><input value={newAccountUsername} required minLength={4} maxLength={255} onChange={(event) => setNewAccountUsername(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label>
+            <label><span className="text-xs text-muted-foreground">登录密码（可选）</span><input value={newAccountPassword} type="password" autoComplete="new-password" placeholder="留空则无需密码" onChange={(event) => setNewAccountPassword(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label>
             <div className="flex flex-wrap gap-2 md:col-span-2">
               <PrimaryButton type="submit" disabled={pendingAccountAction !== null}><Plus className="size-4" /> {pendingAccountAction === "create" ? "正在创建…" : "创建账号"}</PrimaryButton>
               <SecondaryButton type="button" disabled={pendingAccountAction !== null} onClick={() => setShowCreateAccount(false)}>取消</SecondaryButton>
             </div>
           </form>
         )}
-        <div className="space-y-3">
+        <div className="space-y-2">
           {accessAccounts.map((account, index) => {
             const editing = editingAccountId === account.id;
             const accountPending = pendingAccountAction?.endsWith(account.id) ?? false;
             return (
-              <article key={account.id} className="rounded-xl border border-border bg-secondary/35 p-4">
-                <div className="flex flex-wrap items-start justify-between gap-3">
+              <article key={account.id} className="rounded-lg border border-border bg-secondary/35 p-3">
+                <div className="flex flex-wrap items-start justify-between gap-2">
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
                       <p className="truncate text-sm font-medium">{account.username}</p>
@@ -912,9 +1050,9 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
                   </div>
                 </div>
                 {editing && (
-                  <form onSubmit={(event) => void saveAccessAccount(event, account)} className="mt-4 grid gap-3 border-t border-border pt-4 md:grid-cols-2">
-                    <label><span className="text-xs text-muted-foreground">访问用户名</span><input value={editingAccountUsername} required minLength={4} maxLength={255} onChange={(event) => setEditingAccountUsername(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
-                    <label><span className="text-xs text-muted-foreground">新密码</span><input value={editingAccountPassword} type="password" autoComplete="new-password" placeholder="留空表示不修改" onChange={(event) => setEditingAccountPassword(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
+                  <form onSubmit={(event) => void saveAccessAccount(event, account)} className="mt-3 grid gap-2 border-t border-border pt-3 md:grid-cols-2">
+                    <label><span className="text-xs text-muted-foreground">访问用户名</span><input value={editingAccountUsername} required minLength={4} maxLength={255} onChange={(event) => setEditingAccountUsername(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label>
+                    <label><span className="text-xs text-muted-foreground">新密码</span><input value={editingAccountPassword} type="password" autoComplete="new-password" placeholder="留空表示不修改" onChange={(event) => setEditingAccountPassword(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label>
                     <div className="flex flex-wrap gap-2 md:col-span-2">
                       <PrimaryButton type="submit" disabled={pendingAccountAction !== null}><Settings2 className="size-4" /> {accountPending && pendingAccountAction?.startsWith("save:") ? "正在保存…" : "保存账号"}</PrimaryButton>
                       {account.hasPassword && <SecondaryButton type="button" disabled={pendingAccountAction !== null} onClick={() => void clearAccessAccountPassword(account)}>改为免密码</SecondaryButton>}

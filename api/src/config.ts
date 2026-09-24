@@ -30,13 +30,12 @@ export interface ApiConfig {
   acoustidApiKey: string | null;
   fpcalcPath: string | null;
   workerEnabled: boolean;
-  workerConcurrency: number;
   workerPollIntervalMs: number;
   /** ffprobe 可执行文件；Docker 镜像固定为 /usr/bin/ffprobe。 */
   ffprobePath: string;
   /** ffmpeg 可执行文件，用于从远端音频提取内嵌封面。 */
   ffmpegPath: string;
-  /** 媒体规格独立 Worker 的低并发数量。 */
+  /** 媒体规格独立 Worker 的低并发数量，最多为 2。 */
   mediaProbeConcurrency: number;
   mediaProbePollIntervalMs: number;
   ffprobeTimeoutMs: number;
@@ -346,11 +345,10 @@ export function loadApiConfig(): ApiConfig {
     acoustidApiKey: acoustidSecret.value,
     fpcalcPath: readEnvironmentValue("FLYCLOUDHELPER_FPCALC_PATH") || null,
     workerEnabled: readBoolean("FLYCLOUDHELPER_WORKER_ENABLED", true),
-    workerConcurrency: readPositiveInteger("FLYCLOUDHELPER_WORKER_CONCURRENCY", 5),
     workerPollIntervalMs: readPositiveInteger("FLYCLOUDHELPER_WORKER_POLL_INTERVAL_MS", 1000),
     ffprobePath: readEnvironmentValue("FLYCLOUDHELPER_FFPROBE_PATH") || "ffprobe",
     ffmpegPath: readEnvironmentValue("FLYCLOUDHELPER_FFMPEG_PATH") || "ffmpeg",
-    mediaProbeConcurrency: readPositiveInteger("FLYCLOUDHELPER_MEDIA_PROBE_CONCURRENCY", 1),
+    mediaProbeConcurrency: Math.min(2, readPositiveInteger("FLYCLOUDHELPER_MEDIA_PROBE_CONCURRENCY", 2)),
     mediaProbePollIntervalMs: readPositiveInteger("FLYCLOUDHELPER_MEDIA_PROBE_POLL_INTERVAL_MS", 2000),
     ffprobeTimeoutMs: readPositiveInteger("FLYCLOUDHELPER_FFPROBE_TIMEOUT_MS", 60_000),
     ffprobeAnalyzeDurationUs: readPositiveInteger("FLYCLOUDHELPER_FFPROBE_ANALYZE_DURATION_US", 10_000_000),

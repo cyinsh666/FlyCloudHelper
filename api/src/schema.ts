@@ -6,7 +6,7 @@ import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
 import { createMusicScanTables } from "./music/scan-state.js";
 
-export const currentSchemaVersion = 55;
+export const currentSchemaVersion = 59;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -55,10 +55,30 @@ async function addUniqueIfMissing(
   } catch (error) {
     const databaseError = error as Error & { code?: string };
     const duplicateIndex = databaseError.code === "42P07"
-      || databaseError.code === "23505"
       || databaseError.code === "ER_DUP_KEYNAME"
       || /(?:index|constraint) .* already exists/iu.test(databaseError.message);
     if (!duplicateIndex) throw error;
+  }
+}
+
+/** 删除历史唯一约束，并容忍约束已经不存在或迁移中断后已被删除。 */
+async function dropUniqueIfExists(
+  database: Knex,
+  tableName: string,
+  columns: string[],
+  indexName: string,
+): Promise<void> {
+  try {
+    await database.schema.alterTable(tableName, (table) => {
+      table.dropUnique(columns, indexName);
+    });
+  } catch (error) {
+    const databaseError = error as Error & { code?: string };
+    const constraintMissing = databaseError.code === "42704"
+      || databaseError.code === "ER_CANT_DROP_FIELD_OR_KEY"
+      || /(?:constraint|index).*?(?:does not exist|not found|no such)|no such (?:index|constraint)/iu
+        .test(databaseError.message);
+    if (!constraintMissing) throw error;
   }
 }
 
@@ -225,6 +245,8 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
       table.string("display_name", 255).notNullable();
       table.string("data_type", 32).notNullable();
+      table.string("library_kind", 64).notNullable().defaultTo("legacy_single_source");
+      table.string("singleton_key", 64).nullable();
       table.bigInteger("catalog_version").notNullable().defaultTo(0);
       table.integer("notification_enabled").notNullable().defaultTo(0);
       table.integer("scan_profile_revision").notNullable().defaultTo(1);
@@ -250,6 +272,7 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("created_at", 40).notNullable();
       table.string("updated_at", 40).notNullable();
       table.index(["user_id"], "idx_media_libraries_user");
+      table.unique(["user_id", "singleton_key"], { indexName: "uq_media_libraries_singleton" });
       table.unique(["jellyfin_path_suffix_lookup"], { indexName: "uq_media_libraries_jellyfin_path_suffix" });
       table.unique(["emby_path_suffix_lookup"], { indexName: "uq_media_libraries_emby_path_suffix" });
       table.unique(["navidrome_path_suffix_lookup"], { indexName: "uq_media_libraries_navidrome_path_suffix" });
@@ -260,6 +283,12 @@ async function createServiceTables(database: Knex): Promise<void> {
     });
     await addColumnIfMissing(database, "media_libraries", "data_type", (table) => {
       table.string("data_type", 32).notNullable().defaultTo("video");
+    });
+    await addColumnIfMissing(database, "media_libraries", "library_kind", (table) => {
+      table.string("library_kind", 64).notNullable().defaultTo("legacy_single_source");
+    });
+    await addColumnIfMissing(database, "media_libraries", "singleton_key", (table) => {
+      table.string("singleton_key", 64).nullable();
     });
     await addColumnIfMissing(database, "media_libraries", "notification_enabled", (table) => {
       table.integer("notification_enabled").notNullable().defaultTo(0);
@@ -329,13 +358,42 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("id", 64).primary();
       table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
       table.string("library_id", 64).notNullable().references("id").inTable("media_libraries").onDelete("CASCADE");
-      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("RESTRICT");
+      table.string("service_id", 64).nullable().references("id").inTable("cloud_services").onDelete("RESTRICT");
+      table.string("source_mode", 32).notNullable().defaultTo("linked_service");
+      table.string("display_name", 255).notNullable();
+      table.string("provider_type", 64).notNullable();
+      table.string("connection_status", 64).notNullable().defaultTo("valid");
+      table.integer("credential_revision").notNullable().defaultTo(0);
+      table.text("configuration_json").notNullable().defaultTo("{}");
       table.string("status", 32).notNullable().defaultTo("active");
       table.integer("sort_order").notNullable().defaultTo(0);
+      table.string("last_scan_at", 40).nullable();
       table.string("created_at", 40).notNullable();
       table.string("updated_at", 40).notNullable();
-      table.unique(["user_id", "service_id"], { indexName: "uq_library_sources_service" });
+      table.unique(["library_id", "service_id"], { indexName: "uq_library_sources_library_service" });
       table.index(["library_id", "status", "sort_order"], "idx_library_sources_library_order");
+    });
+  } else {
+    await addColumnIfMissing(database, "library_sources", "source_mode", (table) => {
+      table.string("source_mode", 32).notNullable().defaultTo("linked_service");
+    });
+    await addColumnIfMissing(database, "library_sources", "display_name", (table) => {
+      table.string("display_name", 255).notNullable().defaultTo("");
+    });
+    await addColumnIfMissing(database, "library_sources", "provider_type", (table) => {
+      table.string("provider_type", 64).notNullable().defaultTo("");
+    });
+    await addColumnIfMissing(database, "library_sources", "connection_status", (table) => {
+      table.string("connection_status", 64).notNullable().defaultTo("valid");
+    });
+    await addColumnIfMissing(database, "library_sources", "credential_revision", (table) => {
+      table.integer("credential_revision").notNullable().defaultTo(0);
+    });
+    await addColumnIfMissing(database, "library_sources", "configuration_json", (table) => {
+      table.text("configuration_json").notNullable().defaultTo("{}");
+    });
+    await addColumnIfMissing(database, "library_sources", "last_scan_at", (table) => {
+      table.string("last_scan_at", 40).nullable();
     });
   }
 
@@ -351,6 +409,22 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("status", 32).notNullable();
       table.string("created_at", 40).notNullable();
       table.unique(["user_id", "service_id", "revision"], { indexName: "uq_service_credentials_revision" });
+    });
+  }
+
+  if (!(await database.schema.hasTable("library_source_credentials"))) {
+    await database.schema.createTable("library_source_credentials", (table) => {
+      table.string("id", 64).primary();
+      table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
+      table.string("library_source_id", 64).notNullable().references("id").inTable("library_sources").onDelete("CASCADE");
+      table.integer("revision").notNullable();
+      table.text("encrypted_payload").notNullable();
+      table.integer("key_version").notNullable();
+      table.integer("schema_version").notNullable();
+      table.string("status", 32).notNullable();
+      table.string("created_at", 40).notNullable();
+      table.unique(["user_id", "library_source_id", "revision"], { indexName: "uq_library_source_credentials_revision" });
+      table.index(["library_source_id", "status"], "idx_library_source_credentials_active");
     });
   }
 
@@ -672,13 +746,48 @@ async function createEmbyProtocolTables(database: Knex): Promise<void> {
 
 /** 创建扫描任务、源文件和媒体目录表。 */
 async function createCatalogTables(database: Knex): Promise<void> {
+  if (!(await database.schema.hasTable("library_scan_jobs"))) {
+    await database.schema.createTable("library_scan_jobs", (table) => {
+      table.string("id", 64).primary();
+      table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
+      table.string("library_id", 64).notNullable().references("id").inTable("media_libraries").onDelete("CASCADE");
+      table.string("requested_by_user_id", 64).notNullable();
+      table.string("request_id", 200).notNullable();
+      table.string("client_device_id", 200).notNullable();
+      table.string("scan_mode", 32).notNullable();
+      table.string("status", 32).notNullable();
+      table.string("control_action", 32).notNullable().defaultTo("none");
+      table.integer("source_count").notNullable().defaultTo(0);
+      table.integer("completed_source_count").notNullable().defaultTo(0);
+      table.integer("failed_source_count").notNullable().defaultTo(0);
+      table.integer("cancelled_source_count").notNullable().defaultTo(0);
+      table.bigInteger("processed_count").notNullable().defaultTo(0);
+      table.bigInteger("discovered_count").notNullable().defaultTo(0);
+      table.bigInteger("error_count").notNullable().defaultTo(0);
+      table.string("error_code", 100).nullable();
+      table.text("error_message").nullable();
+      table.string("created_at", 40).notNullable();
+      table.string("started_at", 40).nullable();
+      table.string("finished_at", 40).nullable();
+      // 关键变量：多个来源子任务并发收尾时，只允许一个 Worker 领取父任务汇总通知。
+      table.string("notification_sent_at", 40).nullable();
+      table.string("updated_at", 40).notNullable();
+      table.unique(["user_id", "client_device_id", "request_id"], { indexName: "uq_library_scan_jobs_request" });
+      table.index(["library_id", "status", "created_at"], "idx_library_scan_jobs_library_status");
+    });
+  }
+  await addColumnIfMissing(database, "library_scan_jobs", "notification_sent_at", (table) => {
+    table.string("notification_sent_at", 40).nullable();
+  });
+
   if (!(await database.schema.hasTable("scan_jobs"))) {
     await database.schema.createTable("scan_jobs", (table) => {
       table.string("id", 64).primary();
       table.string("user_id", 64).notNullable();
-      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("service_id", 64).nullable().references("id").inTable("cloud_services").onDelete("CASCADE");
       table.string("library_id", 64).notNullable().references("id").inTable("media_libraries").onDelete("CASCADE");
       table.string("library_source_id", 64).notNullable().references("id").inTable("library_sources").onDelete("RESTRICT");
+      table.string("parent_job_id", 64).nullable().references("id").inTable("library_scan_jobs").onDelete("CASCADE");
       table.string("requested_by_user_id", 64).notNullable();
       table.string("request_id", 200).notNullable();
       table.string("client_device_id", 200).notNullable();
@@ -708,6 +817,8 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.unique(["user_id", "client_device_id", "request_id"], { indexName: "uq_scan_jobs_request" });
       table.index(["user_id", "status"], "idx_scan_jobs_user_status");
       table.index(["service_id", "status"], "idx_scan_jobs_service_status");
+      table.index(["parent_job_id", "status"], "idx_scan_jobs_parent_status");
+      table.index(["library_source_id", "status"], "idx_scan_jobs_source_status");
       table.index(["status", "next_retry_at"], "idx_scan_jobs_retry_due");
     });
   }
@@ -736,6 +847,10 @@ async function createCatalogTables(database: Knex): Promise<void> {
   });
   await addColumnIfMissing(database, "scan_jobs", "library_source_id", (table) => {
     table.string("library_source_id", 64).nullable();
+  });
+  await addColumnIfMissing(database, "scan_jobs", "parent_job_id", (table) => {
+    table.string("parent_job_id", 64).nullable().references("id").inTable("library_scan_jobs").onDelete("CASCADE");
+    table.index(["parent_job_id", "status"], "idx_scan_jobs_parent_status");
   });
   // 兼容升级时已经处于运行中的旧任务：从本次升级时刻开始计时，不追算之前可能包含暂停或停机的时间。
   await database("scan_jobs")
@@ -807,6 +922,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.string("user_id", 64).notNullable();
       table.string("service_id", 64).notNullable();
       table.string("library_id", 64).notNullable();
+      table.string("library_source_id", 64).notNullable().references("id").inTable("library_sources").onDelete("RESTRICT");
       table.integer("checkpoint_version").notNullable();
       table.string("scan_session_id", 64).notNullable();
       table.string("generation_id", 64).notNullable();
@@ -821,14 +937,18 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.index(["service_id", "updated_at"], "idx_scan_job_checkpoints_service_updated");
     });
   }
+  await addColumnIfMissing(database, "scan_job_checkpoints", "library_source_id", (table) => {
+    table.string("library_source_id", 64).nullable();
+  });
 
   if (!(await database.schema.hasTable("scan_root_runs"))) {
     await database.schema.createTable("scan_root_runs", (table) => {
       table.string("id", 64).primary();
       table.string("job_id", 64).notNullable().references("id").inTable("scan_jobs").onDelete("CASCADE");
       table.string("user_id", 64).notNullable();
-      table.string("service_id", 64).notNullable();
+      table.string("service_id", 64).nullable();
       table.string("library_id", 64).notNullable();
+      table.string("library_source_id", 64).notNullable().references("id").inTable("library_sources").onDelete("RESTRICT");
       table.string("root_key", 64).notNullable();
       table.text("root_resource_id").notNullable();
       table.text("display_path").notNullable();
@@ -842,6 +962,9 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.index(["library_id", "status"], "idx_scan_root_runs_library_status");
     });
   }
+  await addColumnIfMissing(database, "scan_root_runs", "library_source_id", (table) => {
+    table.string("library_source_id", 64).nullable();
+  });
 
   if (!(await database.schema.hasTable("tmdb_metadata_cache"))) {
     await database.schema.createTable("tmdb_metadata_cache", (table) => {
@@ -869,6 +992,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.string("user_id", 64).notNullable();
       table.string("service_id", 64).notNullable();
       table.string("library_id", 64).notNullable();
+      table.string("library_source_id", 64).notNullable().references("id").inTable("library_sources").onDelete("RESTRICT");
       table.string("provider_resource_id", 512).notNullable();
       table.string("parent_resource_id", 512).nullable();
       table.text("path").notNullable();
@@ -885,7 +1009,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.string("status", 32).notNullable();
       table.string("created_at", 40).notNullable();
       table.string("updated_at", 40).notNullable();
-      table.unique(["user_id", "library_id", "provider_resource_id"], { indexName: "uq_source_files_resource" });
+      table.unique(["user_id", "library_id", "library_source_id", "provider_resource_id"], { indexName: "uq_source_files_source_resource" });
       table.index(["library_id", "generation_id"], "idx_source_files_generation");
       table.index(["library_id", "scan_root_key", "generation_id"], "idx_source_files_root_generation");
     });
@@ -902,6 +1026,59 @@ async function createCatalogTables(database: Knex): Promise<void> {
   await addColumnIfMissing(database, "source_files", "library_source_id", (table) => {
     table.string("library_source_id", 64).nullable();
   });
+
+  if (!(await database.schema.hasTable("media_item_source_candidates"))) {
+    await database.schema.createTable("media_item_source_candidates", (table) => {
+      table.string("id", 64).primary();
+      table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
+      table.string("library_id", 64).notNullable().references("id").inTable("media_libraries").onDelete("CASCADE");
+      table.string("library_source_id", 64).notNullable().references("id").inTable("library_sources").onDelete("CASCADE");
+      table.string("source_file_id", 64).notNullable().references("id").inTable("source_files").onDelete("CASCADE");
+      table.string("candidate_key", 160).notNullable();
+      table.string("identity_key", 128).notNullable();
+      table.string("candidate_role", 32).notNullable();
+      // 兼容本轮已创建的数据库结构保留该列；统一元数据不再按网盘来源优先级排序。
+      table.integer("source_priority").notNullable().defaultTo(0);
+      table.integer("completeness_score").notNullable().defaultTo(0);
+      table.text("payload_json").notNullable();
+      table.string("status", 32).notNullable().defaultTo("active");
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.unique(["user_id", "library_id", "source_file_id", "candidate_key"], { indexName: "uq_media_item_source_candidate" });
+      table.index(["library_id", "identity_key", "status"], "idx_media_item_candidates_identity");
+      table.index(["library_source_id", "status"], "idx_media_item_candidates_source");
+    });
+  }
+
+  if (!(await database.schema.hasTable("catalog_projection_jobs"))) {
+    await database.schema.createTable("catalog_projection_jobs", (table) => {
+      table.string("id", 64).primary();
+      table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
+      table.string("library_id", 64).notNullable().references("id").inTable("media_libraries").onDelete("CASCADE");
+      table.string("library_source_id", 64).notNullable().references("id").inTable("library_sources").onDelete("CASCADE");
+      table.string("source_scan_job_id", 64).notNullable().references("id").inTable("scan_jobs").onDelete("CASCADE");
+      table.string("source_file_id", 64).notNullable().references("id").inTable("source_files").onDelete("CASCADE");
+      table.string("event_key", 200).notNullable();
+      table.string("identity_key", 128).notNullable();
+      table.string("action", 32).notNullable();
+      table.text("payload_json").notNullable();
+      table.string("status", 32).notNullable().defaultTo("queued");
+      table.integer("attempt_count").notNullable().defaultTo(0);
+      table.integer("max_attempts").notNullable().defaultTo(5);
+      table.string("lease_owner", 100).nullable();
+      table.string("lease_expires_at", 40).nullable();
+      table.string("next_retry_at", 40).nullable();
+      table.string("error_code", 100).nullable();
+      table.text("error_message").nullable();
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.string("finished_at", 40).nullable();
+      table.unique(["source_scan_job_id", "event_key"], { indexName: "uq_catalog_projection_job_event" });
+      table.index(["status", "next_retry_at", "created_at"], "idx_catalog_projection_jobs_claim");
+      table.index(["source_scan_job_id", "status"], "idx_catalog_projection_jobs_scan_status");
+      table.index(["library_id", "identity_key", "status"], "idx_catalog_projection_jobs_identity");
+    });
+  }
 
   if (!(await database.schema.hasTable("audio_file_tags"))) {
     await database.schema.createTable("audio_file_tags", (table) => {
@@ -932,8 +1109,9 @@ async function createCatalogTables(database: Knex): Promise<void> {
       // 关键变量：缓存使用Provider稳定资源ID和文件指纹，未变化的NFO无需再次从网盘下载。
       table.string("id", 64).primary();
       table.string("user_id", 64).notNullable();
-      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("service_id", 64).nullable().references("id").inTable("cloud_services").onDelete("CASCADE");
       table.string("library_id", 64).notNullable().references("id").inTable("media_libraries").onDelete("CASCADE");
+      table.string("library_source_id", 64).notNullable().references("id").inTable("library_sources").onDelete("CASCADE");
       table.string("provider_resource_id", 512).notNullable();
       table.text("path").notNullable();
       table.bigInteger("size").notNullable();
@@ -943,17 +1121,21 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.text("metadata_json").notNullable();
       table.string("created_at", 40).notNullable();
       table.string("updated_at", 40).notNullable();
-      table.unique(["user_id", "library_id", "provider_resource_id"], { indexName: "uq_nfo_sidecar_cache_resource" });
+      table.unique(["user_id", "library_id", "library_source_id", "provider_resource_id"], { indexName: "uq_nfo_sidecar_cache_source_resource" });
       table.index(["service_id", "library_id"], "idx_nfo_sidecar_cache_service_library");
     });
   }
+  await addColumnIfMissing(database, "nfo_sidecar_cache", "library_source_id", (table) => {
+    table.string("library_source_id", 64).nullable();
+  });
 
   if (!(await database.schema.hasTable("media_probe_jobs"))) {
     await database.schema.createTable("media_probe_jobs", (table) => {
       table.string("id", 64).primary();
       table.string("user_id", 64).notNullable();
-      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("service_id", 64).nullable().references("id").inTable("cloud_services").onDelete("CASCADE");
       table.string("library_id", 64).notNullable().references("id").inTable("media_libraries").onDelete("CASCADE");
+      table.string("library_source_id", 64).nullable().references("id").inTable("library_sources").onDelete("CASCADE");
       table.string("requested_by_user_id", 64).notNullable();
       table.string("trigger_type", 32).notNullable();
       table.string("status", 32).notNullable();
@@ -983,6 +1165,9 @@ async function createCatalogTables(database: Knex): Promise<void> {
   await addColumnIfMissing(database, "media_probe_jobs", "error_message", (table) => {
     table.text("error_message").nullable();
   });
+  await addColumnIfMissing(database, "media_probe_jobs", "library_source_id", (table) => {
+    table.string("library_source_id", 64).nullable();
+  });
 
   if (!(await database.schema.hasTable("media_file_probes"))) {
     await database.schema.createTable("media_file_probes", (table) => {
@@ -991,6 +1176,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.string("user_id", 64).notNullable();
       table.string("service_id", 64).notNullable();
       table.string("library_id", 64).notNullable();
+      table.string("library_source_id", 64).nullable();
       table.string("probe_job_id", 64).nullable();
       table.string("fingerprint", 64).notNullable();
       table.string("status", 32).notNullable();
@@ -1013,12 +1199,15 @@ async function createCatalogTables(database: Knex): Promise<void> {
     table.string("probe_job_id", 64).nullable();
     table.index(["probe_job_id", "status"], "idx_media_file_probes_job_status");
   });
+  await addColumnIfMissing(database, "media_file_probes", "library_source_id", (table) => {
+    table.string("library_source_id", 64).nullable();
+  });
 
   if (!(await database.schema.hasTable("media_items"))) {
     await database.schema.createTable("media_items", (table) => {
       table.string("id", 64).primary();
       table.string("user_id", 64).notNullable();
-      table.string("service_id", 64).notNullable();
+      table.string("service_id", 64).nullable();
       table.string("library_id", 64).notNullable();
       table.string("identity_key", 128).notNullable();
       table.string("media_type", 32).notNullable();
@@ -1760,7 +1949,269 @@ async function backfillLibrarySourceOwnership(database: Knex): Promise<void> {
       .where({ library_id: source.library_id, service_id: source.service_id })
       .whereNull("library_source_id")
       .update({ library_source_id: source.id });
+    if (await database.schema.hasColumn("scan_job_checkpoints", "library_source_id")) {
+      await database("scan_job_checkpoints")
+        .where({ library_id: source.library_id, service_id: source.service_id })
+        .whereNull("library_source_id")
+        .update({ library_source_id: source.id });
+    }
+    if (await database.schema.hasColumn("scan_root_runs", "library_source_id")) {
+      await database("scan_root_runs")
+        .where({ library_id: source.library_id, service_id: source.service_id })
+        .whereNull("library_source_id")
+        .update({ library_source_id: source.id });
+    }
+    for (const tableName of ["nfo_sidecar_cache", "media_probe_jobs", "media_file_probes"]) {
+      if (!(await database.schema.hasColumn(tableName, "library_source_id"))) continue;
+      await database(tableName)
+        .where({ library_id: source.library_id, service_id: source.service_id })
+        .whereNull("library_source_id")
+        .update({ library_source_id: source.id });
+    }
   }
+}
+
+/** 把 Schema 55 的服务引用来源升级为同时支持媒体库自有复制来源。 */
+async function migrateCloudAggregateV56(database: Knex): Promise<void> {
+  const now = new Date().toISOString();
+  await database("media_libraries")
+    .whereNull("library_kind")
+    .update({ library_kind: "legacy_single_source", singleton_key: null, updated_at: now });
+
+  const linkedSources = await database("library_sources as ls")
+    .join("cloud_services as s", "s.id", "ls.service_id")
+    .select(
+      "ls.id",
+      "s.display_name",
+      "s.provider_type",
+      "s.connection_status",
+      "s.credential_revision",
+    );
+  for (const source of linkedSources) {
+    await database("library_sources").where({ id: source.id }).update({
+      source_mode: "linked_service",
+      display_name: String(source.display_name),
+      provider_type: String(source.provider_type),
+      connection_status: String(source.connection_status),
+      credential_revision: Number(source.credential_revision),
+      configuration_json: "{}",
+      updated_at: now,
+    });
+  }
+
+  await addUniqueIfMissing(
+    database,
+    "media_libraries",
+    ["user_id", "singleton_key"],
+    "uq_media_libraries_singleton",
+  );
+  await dropUniqueIfExists(
+    database,
+    "source_files",
+    ["user_id", "library_id", "provider_resource_id"],
+    "uq_source_files_resource",
+  );
+  await addUniqueIfMissing(
+    database,
+    "source_files",
+    ["user_id", "library_id", "library_source_id", "provider_resource_id"],
+    "uq_source_files_source_resource",
+  );
+  await dropUniqueIfExists(
+    database,
+    "nfo_sidecar_cache",
+    ["user_id", "library_id", "provider_resource_id"],
+    "uq_nfo_sidecar_cache_resource",
+  );
+  await addUniqueIfMissing(
+    database,
+    "nfo_sidecar_cache",
+    ["user_id", "library_id", "library_source_id", "provider_resource_id"],
+    "uq_nfo_sidecar_cache_source_resource",
+  );
+  await addIndexIfMissing(database, "scan_jobs", ["parent_job_id", "status"], "idx_scan_jobs_parent_status");
+  await addIndexIfMissing(database, "scan_jobs", ["library_source_id", "status"], "idx_scan_jobs_source_status");
+
+  // 关键字段：owned_copy 来源不再指向原 cloud_services，任务同样只依赖 library_source_id。
+  await database.schema.alterTable("library_sources", (table) => {
+    table.string("service_id", 64).nullable().references("id").inTable("cloud_services").onDelete("RESTRICT").alter();
+  });
+  await database.schema.alterTable("scan_jobs", (table) => {
+    table.string("service_id", 64).nullable().references("id").inTable("cloud_services").onDelete("CASCADE").alter();
+  });
+  await database.schema.alterTable("nfo_sidecar_cache", (table) => {
+    table.string("service_id", 64).nullable().references("id").inTable("cloud_services").onDelete("CASCADE").alter();
+  });
+  await database.schema.alterTable("media_probe_jobs", (table) => {
+    table.string("service_id", 64).nullable().references("id").inTable("cloud_services").onDelete("CASCADE").alter();
+  });
+
+  console.info(JSON.stringify({
+    日志关键字: "codex-library-source-config",
+    事件: "Schema56云聚合来源结构升级完成",
+    旧来源回填数量: linkedSources.length,
+  }));
+}
+
+/** 修复已升级到 Schema 56 的 PostgreSQL 仍保留 service_id 非空约束，允许聚合库来源独立于网盘服务。 */
+async function migrateCloudAggregateSourceNullableV57(database: Knex): Promise<void> {
+  if (database.client.config.client === "pg") {
+    await database.raw("ALTER TABLE library_sources ALTER COLUMN service_id DROP NOT NULL");
+  } else {
+    await database.schema.alterTable("library_sources", (table) => {
+      table.string("service_id", 64).nullable().references("id").inTable("cloud_services").onDelete("RESTRICT").alter();
+    });
+  }
+  console.info(JSON.stringify({
+    日志关键字: "codex-library-source-config",
+    事件: "Schema57放宽聚合来源服务ID非空约束",
+  }));
+}
+
+/** 让云聚合来源与单媒体库共同引用独立网盘服务的统一连接状态和凭据。 */
+async function migrateCloudAggregateServiceLinksV58(database: Knex): Promise<void> {
+  await dropUniqueIfExists(
+    database,
+    "library_sources",
+    ["user_id", "service_id"],
+    "uq_library_sources_service",
+  );
+  await addUniqueIfMissing(
+    database,
+    "library_sources",
+    ["library_id", "service_id"],
+    "uq_library_sources_library_service",
+  );
+  const copiedSources = await database("library_sources")
+    .select("id", "user_id", "library_id", "provider_type", "status", "configuration_json")
+    .where({ source_mode: "owned_copy" });
+  let linkedSourceCount = 0;
+  let duplicateSourceCount = 0;
+  const now = new Date().toISOString();
+  await database.transaction(async (transaction) => {
+    for (const source of copiedSources) {
+      let configuration: Record<string, unknown> = {};
+      try {
+        const parsed = JSON.parse(String(source.configuration_json ?? "{}"));
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) configuration = parsed as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      const templateServiceId = typeof configuration.templateServiceId === "string"
+        ? configuration.templateServiceId.trim()
+        : "";
+      if (!templateServiceId) continue;
+      const service = await transaction("cloud_services")
+        .where({
+          id: templateServiceId,
+          user_id: source.user_id,
+          provider_type: source.provider_type,
+        })
+        .whereNull("deleted_at")
+        .first();
+      if (!service) continue;
+      // 关键变量：Schema 56/57 允许同一模板服务被重复复制；不能为迁移强行合并或删除已有媒体数据。
+      const existingLinkedSource = await transaction("library_sources")
+        .where({ library_id: source.library_id, service_id: templateServiceId })
+        .whereNot("id", source.id)
+        .whereNot("status", "deleted")
+        .first();
+      if (existingLinkedSource) {
+        duplicateSourceCount += 1;
+        continue;
+      }
+      await transaction("library_sources").where({ id: source.id, user_id: source.user_id }).update({
+        service_id: templateServiceId,
+        source_mode: "linked_service",
+        connection_status: String(service.connection_status),
+        credential_revision: Number(service.credential_revision),
+        status: String(source.status) === "disabled" ? "disabled" : "active",
+        updated_at: now,
+      });
+      // 关键变量：旧聚合任务和文件原先没有 service_id，补齐后鉴权异常与恢复才能跟随同一网盘服务。
+      for (const tableName of [
+        "scan_jobs", "source_files", "scan_job_checkpoints", "scan_root_runs",
+        "nfo_sidecar_cache", "media_probe_jobs", "media_file_probes",
+      ]) {
+        if (!(await transaction.schema.hasColumn(tableName, "service_id"))
+          || !(await transaction.schema.hasColumn(tableName, "library_source_id"))) continue;
+        await transaction(tableName)
+          .where({ library_source_id: source.id })
+          .whereNull("service_id")
+          .update({ service_id: templateServiceId });
+      }
+      await transaction("library_source_credentials").where({ library_source_id: source.id }).delete();
+      linkedSourceCount += 1;
+    }
+  });
+  console.info(JSON.stringify({
+    日志关键字: "codex-library-source-service-link",
+    事件: "Schema58统一聚合来源服务连接",
+    待处理来源数量: copiedSources.length,
+    已关联服务来源数量: linkedSourceCount,
+    重复来源保留兼容数量: duplicateSourceCount,
+  }));
+}
+
+/**
+ * 补建多来源文件写入依赖的唯一约束。
+ * Schema 56 若把 PostgreSQL 的 23505 数据冲突误判为索引已存在，会在 Schema 58 留下缺失约束。
+ */
+async function migrateCloudAggregateSourceUniqueConstraintsV59(database: Knex): Promise<void> {
+  let removedSourceFileCount = 0;
+  let removedNfoCacheCount = 0;
+  await database.transaction(async (transaction) => {
+    /** 删除同一来源资源的历史重复副本，保留最近更新的一条供后续扫描继续覆盖。 */
+    const removeDuplicateRows = async (tableName: "source_files" | "nfo_sidecar_cache"): Promise<number> => {
+      const keyColumns = ["user_id", "library_id", "library_source_id", "provider_resource_id"];
+      const duplicateGroups = await transaction(tableName)
+        .select(keyColumns)
+        .whereNotNull("library_source_id")
+        .groupBy(keyColumns)
+        .havingRaw("count(*) > 1");
+      let removedCount = 0;
+      for (const group of duplicateGroups) {
+        const rows = await transaction(tableName)
+          .select("id")
+          .where({
+            user_id: group.user_id,
+            library_id: group.library_id,
+            library_source_id: group.library_source_id,
+            provider_resource_id: group.provider_resource_id,
+          })
+          .orderBy("updated_at", "desc")
+          .orderBy("created_at", "desc");
+        const duplicateIds = rows.slice(1).map((row) => String(row.id)); // 关键变量：第一条是保留的最新资源记录。
+        if (duplicateIds.length === 0) continue;
+        await transaction(tableName).whereIn("id", duplicateIds).delete();
+        removedCount += duplicateIds.length;
+      }
+      return removedCount;
+    };
+
+    removedSourceFileCount = await removeDuplicateRows("source_files");
+    removedNfoCacheCount = await removeDuplicateRows("nfo_sidecar_cache");
+  });
+  await addUniqueIfMissing(
+    database,
+    "source_files",
+    ["user_id", "library_id", "library_source_id", "provider_resource_id"],
+    "uq_source_files_source_resource",
+  );
+  await addUniqueIfMissing(
+    database,
+    "nfo_sidecar_cache",
+    ["user_id", "library_id", "library_source_id", "provider_resource_id"],
+    "uq_nfo_sidecar_cache_source_resource",
+  );
+  console.info(JSON.stringify({
+    日志关键字: "codex-library-source-unique-index",
+    事件: "Schema59补建云聚合来源文件唯一约束",
+    清理重复源文件数量: removedSourceFileCount,
+    清理重复NFO缓存数量: removedNfoCacheCount,
+    源文件约束: "user_id+library_id+library_source_id+provider_resource_id",
+    NFO缓存约束: "user_id+library_id+library_source_id+provider_resource_id",
+  }));
 }
 
 /** 将旧服务级协议账号、会话和播放状态迁移到媒体库作用域。 */
@@ -1892,6 +2343,18 @@ export async function migrateDatabase(database: Knex, exportDirectory: string): 
     }
     if (Number(existingState.schema_version ?? 0) < 54) {
       await dropRemovedAggregateServiceTables(database);
+    }
+    if (Number(existingState.schema_version ?? 0) < 56) {
+      await migrateCloudAggregateV56(database);
+    }
+    if (Number(existingState.schema_version ?? 0) < 57) {
+      await migrateCloudAggregateSourceNullableV57(database);
+    }
+    if (Number(existingState.schema_version ?? 0) < 58) {
+      await migrateCloudAggregateServiceLinksV58(database);
+    }
+    if (Number(existingState.schema_version ?? 0) < 59) {
+      await migrateCloudAggregateSourceUniqueConstraintsV59(database);
     }
     await dropRemovedAppSyncTables(database);
     await dropLegacyServiceLibraryColumns(database);

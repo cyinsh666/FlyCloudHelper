@@ -331,9 +331,14 @@ function resolveCatalogIdentityKey(
   descriptor: MediaDescriptor,
   metadata: EnrichedMetadata,
   parent: boolean,
+  unmatchedSourceNamespace?: string,
 ): string {
   const metadataIdentity = readMetadataIdentity(metadata);
   const businessTaskKey = readBusinessTaskKey(descriptor);
+  // 关键变量：云聚合未取得可靠外部 ID 时必须保留来源边界，标题和文件名不能触发跨源自动合并。
+  const sourceScopedBusinessTaskKey = unmatchedSourceNamespace
+    ? `${unmatchedSourceNamespace}:${businessTaskKey}`
+    : businessTaskKey;
   if (descriptor.mediaType === "music") {
     if (parent || descriptor.itemType === "music.album") {
       const releaseId = metadata.externalIds.musicbrainzRelease
@@ -353,14 +358,14 @@ function resolveCatalogIdentityKey(
     const itemKind = parent ? "series" : "movie";
     return metadataIdentity
       ? `video:${itemKind}:metadata:${metadataIdentity}`
-      : `video:${itemKind}:task:${businessTaskKey}`;
+      : `video:${itemKind}:task:${sourceScopedBusinessTaskKey}`;
   }
   if (descriptor.itemType === "video.episode") {
     const seasonNumber = (Number(descriptor.metadata.seasonNumber) === WEBDAV_UNKNOWN_SEASON
       ? WEBDAV_UNKNOWN_SEASON : Math.max(0, Number(descriptor.metadata.seasonNumber ?? 1)));
     const episodeNumber = Math.max(1, Number(descriptor.metadata.episodeNumber ?? 1));
     const parentIdentity = metadata.parent ? readMetadataIdentity(metadata.parent) : "";
-    const seriesIdentity = parentIdentity || businessTaskKey;
+    const seriesIdentity = parentIdentity || sourceScopedBusinessTaskKey;
     return `video:episode:${seriesIdentity}:s${seasonNumber}:e${episodeNumber}`;
   }
   return descriptor.identityKey;
@@ -520,19 +525,63 @@ export class ScanWorker {
     this.config = input.config;
   }
 
-  /** 尽力读取服务通知开关；通知配置查询失败时不影响后台任务本身和站内通知。 */
-  private async readServiceNotificationEnabled(serviceId: string): Promise<boolean> {
+  /** 尽力读取媒体库通知开关；通知配置查询失败时不影响后台任务本身和站内通知。 */
+  private async readServiceNotificationEnabled(serviceId: string, libraryId?: string): Promise<boolean> {
     try {
-      return await this.repository.isServiceNotificationEnabled(serviceId);
+      return libraryId
+        ? await this.repository.isLibraryNotificationEnabled(libraryId)
+        : await this.repository.isServiceNotificationEnabled(serviceId);
     } catch (error) {
       this.logger.warn({
         日志关键字: "codex-flycloud-helper-service-notification",
         事件: "读取服务任务通知开关失败",
         服务ID: serviceId,
+        媒体库ID: libraryId ?? null,
         错误信息: error instanceof Error ? error.message : "未知数据库错误",
       });
       return false;
     }
+  }
+
+  /** 在最后一个来源子任务结束时发送一次父任务汇总通知；返回值表示当前任务属于父任务。 */
+  private async notifyAggregateParentIfFinished(job: ScanJobRecord): Promise<boolean> {
+    if (!job.parentJobId) return false;
+    try {
+      const parentJob = await this.repository.claimLibraryScanJobCompletionNotification(job.parentJobId, job.userId);
+      if (!parentJob) return true;
+      const notificationEnabled = await this.readServiceNotificationEnabled(job.serviceId, job.libraryId);
+      const hasFailure = parentJob.failedSourceCount > 0;
+      const hasErrors = parentJob.errorCount > 0;
+      const wasCancelled = parentJob.status === "cancelled" || parentJob.cancelledSourceCount > 0;
+      await this.database.createNotificationSafely({
+        userId: job.userId,
+        category: "task",
+        tone: hasFailure || hasErrors || wasCancelled ? "warning" : "success",
+        title: hasFailure || hasErrors || wasCancelled ? "云聚合扫描异常结束" : "云聚合扫描已完成",
+        message: `媒体库扫描已结束：${parentJob.completedSourceCount} 个来源完成，${parentJob.failedSourceCount} 个来源失败，${parentJob.cancelledSourceCount} 个来源已取消；共处理 ${parentJob.processedCount} 项，错误 ${parentJob.errorCount} 项。`,
+        actionPath: "/app/jobs",
+        deliverExternally: notificationEnabled,
+      });
+      this.logger.info({
+        日志关键字: "codex-library-scan-parent",
+        事件: "发送云聚合父任务汇总通知",
+        父任务ID: parentJob.id,
+        媒体库ID: parentJob.libraryId,
+        最终状态: parentJob.status,
+        完成来源数量: parentJob.completedSourceCount,
+        失败来源数量: parentJob.failedSourceCount,
+        取消来源数量: parentJob.cancelledSourceCount,
+      });
+    } catch (error) {
+      this.logger.warn({
+        日志关键字: "codex-library-scan-parent",
+        事件: "父任务汇总通知处理失败",
+        父任务ID: job.parentJobId,
+        媒体库ID: job.libraryId,
+        错误信息: error instanceof Error ? error.message : "未知数据库错误",
+      });
+    }
+    return true;
   }
 
   /** 尽力统计本次扫描新增入库内容；统计失败时使用零值完成原任务。 */
@@ -579,8 +628,7 @@ export class ScanWorker {
       enabled: this.config.workerEnabled,
       running: !this.stopping && this.config.workerEnabled,
       activeWorkers: this.activeWorkers,
-      concurrency: this.config.workerConcurrency,
-      availableSlots: Math.max(0, this.config.workerConcurrency - this.activeWorkers),
+      schedulingMode: "per_source_exclusive" as const,
     };
   }
 
@@ -617,7 +665,7 @@ export class ScanWorker {
     }, delay);
   }
 
-  /** 按 Worker 并发槽位领取排队任务。 */
+  /** 领取所有来源互不冲突的排队任务；仓储层保证同一物理网盘源最多运行一个。 */
   private async poll(): Promise<void> {
     if (this.stopping) {
       return;
@@ -631,19 +679,28 @@ export class ScanWorker {
           恢复任务数量: recoveredCount,
         });
       }
-      while (this.activeWorkers < this.config.workerConcurrency) {
+      while (true) {
         const job = await this.repository.claimNextQueuedJob();
         if (!job) break;
         this.activeWorkers += 1;
+        this.logger.info({
+          日志关键字: "codex-scan-source-scheduler",
+          事件: "领取网盘来源扫描任务",
+          任务ID: job.id,
+          网盘服务ID: job.serviceId,
+          媒体库ID: job.libraryId,
+          来源ID: job.librarySourceId,
+          当前活动来源数量: this.activeWorkers,
+        });
         void this.executeJob(job).finally(() => {
           this.activeWorkers -= 1;
         });
       }
     } catch (error) {
       this.logger.error({
-        日志标记: "flycloud-helper-worker",
+        日志关键字: "codex-scan-source-scheduler",
         事件: "领取扫描任务失败",
-        错误: error,
+        错误信息: error instanceof Error ? error.message : "未知错误",
       });
     } finally {
       this.schedulePoll(this.config.workerPollIntervalMs);
@@ -712,18 +769,21 @@ export class ScanWorker {
         errorCode: code,
         errorMessage: toSafeErrorMessage(error, isStoredAiSupplementJob(job) ? "AI 补充任务失败" : "扫描任务失败"),
       });
-      const notificationEnabled = await this.readServiceNotificationEnabled(job.serviceId);
-      await this.database.createNotificationSafely({
-        userId: job.userId,
-        category: "task",
-        tone: "danger",
-        title: isStoredAiSupplementJob(job) ? "AI 补充任务失败" : "扫描任务失败",
-        message: isStoredAiSupplementJob(job)
-          ? `服务“${job.serviceName}”的未匹配内容 AI 补充失败：${toSafeErrorMessage(error, "AI 补充任务失败")}`
-          : `服务“${job.serviceName}”的${job.scanMode === "full" ? "全量" : "增量"}扫描失败：${toSafeErrorMessage(error, "扫描任务失败")}`,
-        actionPath: "/app/jobs",
-        deliverExternally: notificationEnabled,
-      });
+      const belongsToAggregateParent = await this.notifyAggregateParentIfFinished(job);
+      if (!belongsToAggregateParent) {
+        const notificationEnabled = await this.readServiceNotificationEnabled(job.serviceId, job.libraryId);
+        await this.database.createNotificationSafely({
+          userId: job.userId,
+          category: "task",
+          tone: "danger",
+          title: isStoredAiSupplementJob(job) ? "AI 补充任务失败" : "扫描任务失败",
+          message: isStoredAiSupplementJob(job)
+            ? `服务“${job.serviceName}”的未匹配内容 AI 补充失败：${toSafeErrorMessage(error, "AI 补充任务失败")}`
+            : `服务“${job.serviceName}”的${job.scanMode === "full" ? "全量" : "增量"}扫描失败：${toSafeErrorMessage(error, "扫描任务失败")}`,
+          actionPath: "/app/jobs",
+          deliverExternally: notificationEnabled,
+        });
+      }
       this.logger.warn({
         日志标记: "flycloud-helper-worker",
         事件: isStoredAiSupplementJob(job) ? "AI补充未匹配任务失败" : "扫描任务失败",
@@ -753,7 +813,7 @@ export class ScanWorker {
     while (true) {
       const page = await this.repository.listCatalogItems({
         userId: job.userId,
-        serviceId: job.serviceId,
+        libraryId: job.libraryId,
         mediaType: "video",
         categoryKey: "unrecognized",
         sort: "updated_asc",
@@ -778,7 +838,7 @@ export class ScanWorker {
     });
     if (unmatchedItems.length === 0) {
       await this.repository.finishJob(job.id, { status: "completed" });
-      const notificationEnabled = await this.readServiceNotificationEnabled(job.serviceId);
+      const notificationEnabled = await this.readServiceNotificationEnabled(job.serviceId, job.libraryId);
       await this.database.createNotificationSafely({
         userId: job.userId,
         category: "task",
@@ -1317,16 +1377,19 @@ export class ScanWorker {
 
     await this.repository.updateJobProgress(job.id, { stage: "persisting", currentPath: null });
     await this.repository.finishJob(job.id, { status: "completed" });
-    const notificationEnabled = await this.readServiceNotificationEnabled(job.serviceId);
-    await this.database.createNotificationSafely({
-      userId: job.userId,
-      category: "task",
-      tone: errorCount > 0 ? "warning" : "success",
-      title: "AI 补充未识别内容完成",
-      message: `服务“${job.serviceName}”的 AI 补充已完成：${matchedCount} 部影片完成了 AI 补充。共处理 ${processedCount} 部，仍未匹配 ${unmatchedCount} 部，错误 ${errorCount} 部。`,
-      actionPath: "/app/jobs",
-      deliverExternally: notificationEnabled,
-    });
+    const belongsToAggregateParent = await this.notifyAggregateParentIfFinished(job);
+    if (!belongsToAggregateParent) {
+      const notificationEnabled = await this.readServiceNotificationEnabled(job.serviceId, job.libraryId);
+      await this.database.createNotificationSafely({
+        userId: job.userId,
+        category: "task",
+        tone: errorCount > 0 ? "warning" : "success",
+        title: "AI 补充未识别内容完成",
+        message: `服务“${job.serviceName}”的 AI 补充已完成：${matchedCount} 部影片完成了 AI 补充。共处理 ${processedCount} 部，仍未匹配 ${unmatchedCount} 部，错误 ${errorCount} 部。`,
+        actionPath: "/app/jobs",
+        deliverExternally: notificationEnabled,
+      });
+    }
     this.logger.info({
       日志关键字: "codex-flycloud-helper-ai-clean",
       事件: "AI补充未匹配任务完成",
@@ -1354,7 +1417,7 @@ export class ScanWorker {
     const cache: ScanMetadataCache = { video: new Map(), seasons: new Map(), music: new Map(), parentItems: new Map(), aiResults: new Map(), aiContexts: new Map(), aiUsageOwner: { userId: job.userId, serviceId: job.serviceId } };
     await runMusicScan({ job, database: this.database, repository: this.repository, config: this.config, adapter, connection, roots, scanProfile: runtime.scanProfile, settings, signal,
       context: { persistConnection: async (next) => {
-        await this.repository.refreshActiveEncryptedConnection({ serviceId: job.serviceId, userId: job.userId, credentialRevision: Number(job.snapshot.credentialRevision), encryptedConnection: this.vault.encrypt(next) });
+        await this.repository.refreshLibrarySourceEncryptedConnection({ librarySourceId: job.librarySourceId, userId: job.userId, credentialRevision: Number(job.snapshot.credentialRevision), encryptedConnection: this.vault.encrypt(next) });
       } },
       control: async () => {
         if (await this.repository.getJobControl(job.id) !== "none") this.abortControllers.get(job.id)?.abort();
@@ -1400,7 +1463,7 @@ export class ScanWorker {
       },
     });
     const [notificationEnabled, createdMediaCounts, completedJob] = await Promise.all([
-      this.readServiceNotificationEnabled(job.serviceId), this.readScanCreatedMediaCounts(job), this.repository.getJob(job.id, job.userId),
+      this.readServiceNotificationEnabled(job.serviceId, job.libraryId), this.readScanCreatedMediaCounts(job), this.repository.getJob(job.id, job.userId),
     ]);
     await this.database.createNotificationSafely({ userId: job.userId, category: "task",
       tone: completedJob.errorCount > 0 || completedJob.status !== "completed" ? "warning" : "success", title: completedJob.status === "completed" ? "音乐扫描任务已完成" : "音乐阶段已结束，其他阶段待继续",
@@ -1419,7 +1482,7 @@ export class ScanWorker {
     const recordScanFailure = (input: ScanFailureRecordInput): Promise<void> => (
       this.failureReports.record(job, input)
     );
-    const roots = readScanRoots(runtime.scanProfile, job.scanMode);
+    const roots: ScanRoot[] = readScanRoots(runtime.scanProfile, job.scanMode);
     if (roots.length === 0) {
       throw new ApiError(409, "scan_paths_not_configured", `未配置${job.scanMode === "full" ? "全量" : "增量"}扫描路径`);
     }
@@ -1974,8 +2037,8 @@ export class ScanWorker {
                 {
                   persistConnection: async (nextConnection) => {
                     const credentialRevision = Number(job.snapshot.credentialRevision);
-                    await this.repository.refreshActiveEncryptedConnection({
-                      serviceId: job.serviceId,
+                    await this.repository.refreshLibrarySourceEncryptedConnection({
+                      librarySourceId: job.librarySourceId,
                       userId: job.userId,
                       credentialRevision,
                       encryptedConnection: this.vault.encrypt(nextConnection),
@@ -2410,8 +2473,8 @@ export class ScanWorker {
       checkpointDirectoryInterval: 50,
       persistConnection: async (nextConnection) => {
         const credentialRevision = Number(job.snapshot.credentialRevision);
-        await this.repository.refreshActiveEncryptedConnection({
-          serviceId: job.serviceId,
+        await this.repository.refreshLibrarySourceEncryptedConnection({
+          librarySourceId: job.librarySourceId,
           userId: job.userId,
           credentialRevision,
           encryptedConnection: this.vault.encrypt(nextConnection),
@@ -2523,6 +2586,7 @@ export class ScanWorker {
               userId: job.userId,
               serviceId: job.serviceId,
               libraryId: job.libraryId,
+              librarySourceId: job.librarySourceId,
               providerResourceId: nfoProviderResourceId,
               path: nfoPath,
               size: entry.size,
@@ -2619,11 +2683,13 @@ export class ScanWorker {
         rootPath,
         shouldProcess: true,
         sourceFileInput: {
-          id: createStableId("src", job.userId, job.libraryId, entry.resourceId),
+          id: job.snapshot.libraryKind === "cloud_aggregate_video"
+            ? createStableId("src", job.userId, job.libraryId, job.librarySourceId, entry.resourceId)
+            : createStableId("src", job.userId, job.libraryId, entry.resourceId),
           userId: job.userId,
           serviceId: job.serviceId,
           libraryId: job.libraryId,
-          librarySourceId: String(job.snapshot.librarySourceId),
+          librarySourceId: job.librarySourceId,
           providerResourceId: entry.resourceId.length <= 500
             ? entry.resourceId
             : createStableId("resource", entry.resourceId),
@@ -2786,6 +2852,7 @@ export class ScanWorker {
       userId: job.userId,
       serviceId: job.serviceId,
       libraryId: job.libraryId,
+      librarySourceId: job.librarySourceId,
       generationId,
       completedRootGenerations: completedRootRuns.map((rootRun) => ({
         rootKey: rootRun.rootKey,
@@ -2832,23 +2899,26 @@ export class ScanWorker {
       });
     }
     await this.repository.finishJob(job.id, { status: "completed" });
+    const belongsToAggregateParent = await this.notifyAggregateParentIfFinished(job);
     const [notificationEnabled, createdMediaCounts] = await Promise.all([
-      this.readServiceNotificationEnabled(job.serviceId),
+      this.readServiceNotificationEnabled(job.serviceId, job.libraryId),
       this.readScanCreatedMediaCounts(job),
     ]);
     // 关键变量：影视与音乐使用不同业务单位，只有本次任务确实有新内容入库时才投递 Telegram。
     const createdContentCount = createdMediaCounts.videoContentCount;
     const deliverScanNotificationExternally = notificationEnabled && createdContentCount > 0;
     const completionMessage = buildScanCompletionMessage(job, createdMediaCounts);
-    await this.database.createNotificationSafely({
-      userId: job.userId,
-      category: "task",
-      tone: businessProgress.failedKeys.size > 0 ? "warning" : "success",
-      title: "扫描任务已完成",
-      message: completionMessage,
-      actionPath: "/app/jobs",
-      deliverExternally: deliverScanNotificationExternally,
-    });
+    if (!belongsToAggregateParent) {
+      await this.database.createNotificationSafely({
+        userId: job.userId,
+        category: "task",
+        tone: businessProgress.failedKeys.size > 0 ? "warning" : "success",
+        title: "扫描任务已完成",
+        message: completionMessage,
+        actionPath: "/app/jobs",
+        deliverExternally: deliverScanNotificationExternally,
+      });
+    }
     this.logger.info({
       日志关键字: "codex-flycloud-helper-task-count",
       性能日志关键字: "codex-flycloud-scan-performance",
@@ -2900,8 +2970,58 @@ export class ScanWorker {
     });
   }
 
-  /** 完成单个已发现媒体的刮削、父子条目落库和文件定位关联。 */
+  /** 通过数据库公共队列串行投影各来源扫描结果，来源枚举和刮削仍可并行。 */
   private async persistScannedMedia(input: {
+    job: ScanJobRecord;
+    descriptor: MediaDescriptor;
+    sourceFile: SourceFileRecord;
+    entryLocator: Record<string, unknown>;
+    generationId: string;
+    metadataProfiles: Record<string, unknown>;
+    metadataCache: ScanMetadataCache;
+    nfoSidecars: Map<string, NfoSidecarEntry>;
+    forceCatalogChange: boolean;
+    resolvedMetadata?: EnrichedMetadata;
+    signal: AbortSignal;
+  }): Promise<{ changedItemIds: string[]; matched: boolean; providerUnavailable: boolean }> {
+    const projectionId = await this.repository.enqueueCatalogProjectionTurn({
+      userId: input.job.userId,
+      libraryId: input.job.libraryId,
+      librarySourceId: input.job.librarySourceId,
+      sourceScanJobId: input.job.id,
+      sourceFileId: input.sourceFile.id,
+      eventKey: `upsert:${input.sourceFile.id}`,
+    });
+    const leaseOwner = `${input.job.id}:${input.sourceFile.id}`;
+    while (true) {
+      input.signal.throwIfAborted();
+      const claim = await this.repository.claimCatalogProjectionTurn(projectionId, leaseOwner);
+      if (claim === "completed") {
+        return { changedItemIds: [], matched: true, providerUnavailable: false };
+      }
+      if (claim === "claimed") break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+    this.logger.info({
+      日志关键字: "codex-library-projection-queue",
+      事件: "公共目录投影队列开始处理来源结果",
+      任务ID: input.job.id,
+      媒体库ID: input.job.libraryId,
+      媒体库源ID: input.job.librarySourceId,
+      投影任务ID: projectionId,
+    });
+    try {
+      const result = await this.persistScannedMediaNow(input);
+      await this.repository.finishCatalogProjectionTurn(projectionId, leaseOwner);
+      return result;
+    } catch (error) {
+      await this.repository.failCatalogProjectionTurn(projectionId, leaseOwner, error);
+      throw error;
+    }
+  }
+
+  /** 完成一个已领取结果的刮削、父子条目落库和文件定位关联。 */
+  private async persistScannedMediaNow(input: {
     job: ScanJobRecord;
     descriptor: MediaDescriptor;
     sourceFile: SourceFileRecord;
@@ -2931,6 +3051,9 @@ export class ScanWorker {
       hasManualMatch: boolean;
       itemType: string;
     } | null = null;
+    const unmatchedSourceNamespace = input.job.snapshot.libraryKind === "cloud_aggregate_video"
+      ? input.job.librarySourceId
+      : undefined;
     if (input.descriptor.parent) {
       const parentDescriptor = input.descriptor.parent;
       const parentMetadata = metadata.parent ?? (input.descriptor.mediaType === "music" ? {
@@ -2944,7 +3067,7 @@ export class ScanWorker {
           artistIds: metadata.metadata.artistIds ?? input.descriptor.metadata.musicBrainzArtistIds,
         },
       } : metadata);
-      const parentIdentityKey = resolveCatalogIdentityKey(input.descriptor, parentMetadata, true);
+      const parentIdentityKey = resolveCatalogIdentityKey(input.descriptor, parentMetadata, true, unmatchedSourceNamespace);
       const parentCacheKey = createStableId(
         "parent-cache",
         input.job.userId,
@@ -2964,6 +3087,8 @@ export class ScanWorker {
           userId: input.job.userId,
           serviceId: input.job.serviceId,
           libraryId: input.job.libraryId,
+          librarySourceId: input.job.librarySourceId,
+          sourceFileId: input.sourceFile.id,
           identityKey: createStableId("identity", parentIdentityKey),
           mediaType: input.descriptor.mediaType,
           itemType: parentDescriptor.itemType,
@@ -2995,7 +3120,7 @@ export class ScanWorker {
       parentItemId = parentItemState.itemId;
       if (parentItemState.changed || input.forceCatalogChange) changedItemIds.push(parentItemState.itemId);
     }
-    const itemIdentityKey = resolveCatalogIdentityKey(input.descriptor, metadata, false);
+    const itemIdentityKey = resolveCatalogIdentityKey(input.descriptor, metadata, false, unmatchedSourceNamespace);
     // 音乐重刮继续使用当前文件关联的曲目 ID，保留歌单与播放记录。
     const existingMusic = input.descriptor.mediaType === "music" ? await this.database.query("file_links as f")
       .join("media_items as i", "i.id", "f.item_id").where({ "f.source_file_id": input.sourceFile.id, "i.library_id": input.job.libraryId, "i.item_type": "music.track" })
@@ -3005,6 +3130,8 @@ export class ScanWorker {
       userId: input.job.userId,
       serviceId: input.job.serviceId,
       libraryId: input.job.libraryId,
+      librarySourceId: input.job.librarySourceId,
+      sourceFileId: input.sourceFile.id,
       identityKey: existingMusic ? String(existingMusic.identity_key) : createStableId("identity", itemIdentityKey),
       mediaType: input.descriptor.mediaType,
       itemType: input.descriptor.itemType,
@@ -3087,6 +3214,8 @@ export class ScanWorker {
           userId: input.job.userId,
           serviceId: input.job.serviceId,
           libraryId: input.job.libraryId,
+          librarySourceId: input.job.librarySourceId,
+          sourceFileId: input.sourceFile.id,
           identityKey: createStableId("identity", artistIdentityKey),
           mediaType: "music",
           itemType: "music.artist",
@@ -3161,6 +3290,7 @@ export class ScanWorker {
     }
     if (action === "cancel") {
       await this.repository.finishJob(job.id, { status: "cancelled" });
+      await this.notifyAggregateParentIfFinished(job);
       return true;
     }
     return false;
@@ -3173,6 +3303,7 @@ export class ScanWorker {
       await this.repository.finishJob(job.id, { status: "paused" });
     } else if (action === "cancel") {
       await this.repository.finishJob(job.id, { status: "cancelled" });
+      await this.notifyAggregateParentIfFinished(job);
     }
     this.logger.info({
       日志关键字: "codex-scan-control-resume",

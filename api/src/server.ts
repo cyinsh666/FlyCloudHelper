@@ -157,7 +157,6 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   const serviceAccess = new ServiceAccessService(database, vault);
   const embyAccess = new EmbyAccessService(database);
   const repository = new ServiceRepository(database, serviceAccess, logger, {
-    scanWorkerConcurrency: config.workerConcurrency,
     mediaProbeConcurrency: config.mediaProbeConcurrency,
   });
   const publicAccess = new PublicAccessService(database, config);

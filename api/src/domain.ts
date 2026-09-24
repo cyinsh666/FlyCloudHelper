@@ -8,6 +8,9 @@ export type JobStatus = "queued" | "running" | "retry_waiting" | "paused" | "com
 export type BackgroundJobType = "scan" | "media_probe";
 export type JobStage = "queued" | "enumerating" | "classifying" | "scraping" | "persisting" | "probing" | "completed";
 export type MediaType = "video" | "music" | "audiobook";
+export type MediaLibraryKind = "legacy_single_source" | "cloud_aggregate_video";
+export type LibrarySourceMode = "linked_service" | "owned_copy";
+export type LibrarySourceStatus = "active" | "disabled" | "reauthorization_required" | "copy_failed" | "deleted";
 export type VideoRegionGroup = "chinese" | "japan_korea" | "europe_america" | "other";
 export type CatalogSort =
   | "created_desc"
@@ -65,14 +68,37 @@ export interface CloudServiceRecord {
   status: ServiceStatus;
   connectionStatus: string;
   credentialRevision: number;
-  /** 未建立媒体库来源关系时允许从服务详情打开快速创建媒体库页面。 */
+  /** 未建立旧单媒体库来源时允许从服务详情打开快速创建入口。 */
   canCreateLibrary: boolean;
+  /** 没有任何媒体库引用时才允许删除独立网盘服务。 */
+  canDeleteService: boolean;
   createdAt: string;
   updatedAt: string;
 }
 
 export interface ServiceDetailRecord extends CloudServiceRecord {
   credentialConfigured: boolean;
+}
+
+/** 媒体库来源成员摘要；新来源引用统一网盘服务，owned_copy 只用于兼容遗留数据。 */
+export interface LibrarySourceRecord {
+  id: string;
+  userId: string;
+  libraryId: string;
+  serviceId: string | null;
+  sourceMode: LibrarySourceMode;
+  displayName: string;
+  providerType: string;
+  serviceStatus: ServiceStatus | null;
+  connectionStatus: string;
+  credentialRevision: number;
+  credentialConfigured: boolean;
+  configuration: Record<string, unknown>;
+  status: LibrarySourceStatus;
+  sortOrder: number;
+  lastScanAt: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 /** 媒体库及本次唯一来源服务的公开摘要。 */
@@ -82,12 +108,15 @@ export interface MediaLibraryRecord {
   ownerUsername: string;
   displayName: string;
   dataType: MediaType;
+  libraryKind: MediaLibraryKind;
   status: "active" | "disabled";
   sourceId: string;
   sourceServiceId: string;
   sourceServiceName: string;
   providerType: string;
   sourceConnectionStatus: string;
+  sourceCount: number;
+  sources: LibrarySourceRecord[];
   notificationEnabled: boolean;
   jellyfinEnabled: boolean;
   embyEnabled: boolean;
@@ -117,6 +146,8 @@ export interface ScanJobRecord {
   userId: string;
   serviceId: string;
   libraryId: string;
+  librarySourceId: string;
+  parentJobId: string | null;
   ownerUsername: string;
   serviceName: string;
   dataType: MediaType;
@@ -159,6 +190,35 @@ export interface ScanJobRecord {
   /** 当前扫描任务之前尚未被领取的扫描任务数量。 */
   queueAheadCount: number;
   updatedAt: string;
+}
+
+export type LibraryScanJobStatus = "pending" | "running" | "paused" | "completed" | "completed_with_errors" | "partial_failed" | "failed" | "cancelled";
+
+/** 一个媒体库扫描请求的父任务，负责并行来源子任务的控制和汇总。 */
+export interface LibraryScanJobRecord {
+  id: string;
+  userId: string;
+  libraryId: string;
+  requestedByUserId: string;
+  requestId: string;
+  clientDeviceId: string;
+  scanMode: "incremental" | "full";
+  status: LibraryScanJobStatus;
+  controlAction: "none" | "pause" | "cancel";
+  sourceCount: number;
+  completedSourceCount: number;
+  failedSourceCount: number;
+  cancelledSourceCount: number;
+  processedCount: number;
+  discoveredCount: number;
+  errorCount: number;
+  errorCode: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  updatedAt: string;
+  sourceJobs: ScanJobRecord[];
 }
 
 /** 媒体库级扫描或视频规格分析定时计划。 */

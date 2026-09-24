@@ -1,12 +1,14 @@
 import type { IncomingHttpHeaders, IncomingMessage } from "node:http";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { ApiError } from "../errors.js";
+import { isProviderAuthenticationErrorCode } from "../providers/authentication-errors.js";
 import { providerStream } from "../providers/network.js";
 import type { ProviderConnectionContext, ProviderFileStreamAccess } from "../providers/types.js";
 import type { ApiRuntime } from "../runtime.js";
 export interface RelayLibraryRow {
   id: string;
   service_id: string;
+  library_source_id?: string;
   provider_type: string;
   service_status: string;
   relay_playback_enabled: number | string | boolean;
@@ -17,6 +19,43 @@ interface RelayStreamParams {
   libraryId: string;
   itemId: string;
   fileId: string;
+}
+
+/** 协议取址确认鉴权失效时，只隔离当前文件所属来源并停止其规格任务。 */
+export async function handleProviderAuthenticationFailure(
+  runtime: ApiRuntime,
+  input: {
+    librarySourceId?: string;
+    serviceId: string;
+    userId: string;
+    credentialRevision: number;
+    providerType: string;
+  },
+  error: unknown,
+): Promise<void> {
+  if (!(error instanceof ApiError) || !isProviderAuthenticationErrorCode(error.code)) return;
+  if (input.librarySourceId) {
+    await runtime.repository.failLibrarySourceMediaProbeJobsForAuthentication(
+      input.librarySourceId,
+      input.userId,
+      input.credentialRevision,
+    );
+  } else {
+    await runtime.repository.failMediaProbeJobsForAuthentication(
+      input.serviceId,
+      input.userId,
+      input.credentialRevision,
+    );
+  }
+  runtime.logBusinessEvent("warn", {
+    日志关键字: "codex-library-source-config",
+    事件: "协议播放确认来源鉴权失效",
+    用户ID: input.userId,
+    服务ID: input.serviceId,
+    媒体库源ID: input.librarySourceId ?? null,
+    网盘类型: input.providerType,
+    错误码: error.code,
+  });
 }
 
 /** 只有 APP Bearer Token 可以请求媒体流，浏览器 Cookie 不能直接播放。 */
@@ -106,33 +145,53 @@ export async function resolveRelayAccess(
   locator: Record<string, unknown>,
   signal: AbortSignal,
 ): Promise<ProviderFileStreamAccess> {
-  const adapter = runtime.providers.get(library.provider_type);
-  const connection = runtime.vault.decrypt(
-    await runtime.repository.getActiveEncryptedConnection(library.service_id, userId),
-  );
+  const sourceRuntime = library.library_source_id
+    ? await runtime.repository.getLibrarySourceRuntimeConfiguration(library.library_source_id, userId)
+    : null;
+  const providerType = sourceRuntime?.providerType ?? library.provider_type;
+  const credentialRevision = sourceRuntime?.credentialRevision ?? Number(library.credential_revision);
+  const adapter = runtime.providers.get(providerType);
+  const connection = runtime.vault.decrypt(sourceRuntime?.encryptedConnection
+    ?? await runtime.repository.getActiveEncryptedConnection(library.service_id, userId));
   const context: ProviderConnectionContext = {
     persistConnection: async (nextConnection) => {
-      await runtime.repository.refreshActiveEncryptedConnection({
-        serviceId: library.service_id,
-        userId,
-        credentialRevision: Number(library.credential_revision),
-        encryptedConnection: runtime.vault.encrypt(nextConnection),
-      });
+      if (library.library_source_id) {
+        await runtime.repository.refreshLibrarySourceEncryptedConnection({
+          librarySourceId: library.library_source_id, userId, credentialRevision,
+          encryptedConnection: runtime.vault.encrypt(nextConnection),
+        });
+      } else {
+        await runtime.repository.refreshActiveEncryptedConnection({
+          serviceId: library.service_id, userId, credentialRevision,
+          encryptedConnection: runtime.vault.encrypt(nextConnection),
+        });
+      }
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-flycloud-helper-provider-connection-refresh",
         事件: "媒体中转期间保存Provider刷新令牌",
         用户ID: userId,
         服务ID: library.service_id,
-        网盘类型: library.provider_type,
+        网盘类型: providerType,
       });
     },
   };
-  if (adapter.resolveFileStreamAccess) {
-    return adapter.resolveFileStreamAccess(connection, locator, signal, context);
-  }
-  // 安全的临时直链同样可以作为中转上游；不会把地址返回给本次 APP 请求。
-  if (adapter.resolveFileAccess) {
-    return adapter.resolveFileAccess(connection, locator, signal, context);
+  try {
+    if (adapter.resolveFileStreamAccess) {
+      return await adapter.resolveFileStreamAccess(connection, locator, signal, context);
+    }
+    // 安全的临时直链同样可以作为中转上游；不会把地址返回给本次 APP 请求。
+    if (adapter.resolveFileAccess) {
+      return await adapter.resolveFileAccess(connection, locator, signal, context);
+    }
+  } catch (error) {
+    await handleProviderAuthenticationFailure(runtime, {
+      librarySourceId: library.library_source_id,
+      serviceId: library.service_id,
+      userId,
+      credentialRevision,
+      providerType,
+    }, error);
+    throw error;
   }
   throw new ApiError(422, "provider_relay_playback_unsupported", "当前网盘类型暂不支持中转播放");
 }

@@ -22,7 +22,7 @@ export function ServiceBasicDetailPage({ serviceId, admin = false }: { serviceId
         <div className="flex items-center justify-between gap-4"><div className="flex items-center gap-3"><KeyRound className="size-5 text-muted-foreground" /><div><p className="text-sm font-medium">{service.connectionStatus === "valid" ? "登录有效" : "需要重新登录"}</p><p className="mt-1 text-xs text-muted-foreground">凭据修订 r{service.credentialRevision}</p></div></div><Link to={connectionPath} params={{ serviceId: service.id }}><SecondaryButton>重新登录</SecondaryButton></Link></div>
       </Panel>
     </div>
-    {service.canCreateLibrary && <Panel className="mt-4"><div className="flex items-center gap-3"><Database className="size-5 text-muted-foreground" /><p className="text-sm text-muted-foreground">当前服务尚未关联媒体库。</p></div></Panel>}
+    {service.canCreateLibrary && <Panel className="mt-4"><div className="flex items-center gap-3"><Database className="size-5 text-muted-foreground" /><p className="text-sm text-muted-foreground">当前服务尚未创建旧单媒体库，可继续创建；加入云聚合库不会占用这个入口。</p></div></Panel>}
   </>;
 }
 

@@ -22,6 +22,7 @@ interface MediaProbeJob {
   sourceFileId: string;
   userId: string;
   serviceId: string;
+  librarySourceId: string;
   providerType: string;
   credentialRevision: number;
   locator: Record<string, unknown>;
@@ -289,27 +290,30 @@ export class MediaProbeWorker {
       const candidates = await transaction("media_file_probes as p")
         .join("source_files as f", "f.id", "p.source_file_id")
         .join("media_probe_jobs as j", "j.id", "p.probe_job_id")
-        .join("cloud_services as s", "s.id", "p.service_id")
+        .join("library_sources as ls", "ls.id", "p.library_source_id")
+        .leftJoin("cloud_services as s", "s.id", "ls.service_id")
         .join("media_libraries as l", "l.id", "f.library_id")
         .join("library_metadata_profiles as mp", function joinCurrentProfile() {
           this.on("mp.library_id", "l.id").andOn("mp.revision", "l.metadata_profile_revision");
         })
         .select(
-          "p.source_file_id", "p.user_id", "p.service_id", "p.probe_job_id", "p.fingerprint", "p.attempt_count",
+          "p.source_file_id", "p.user_id", "p.service_id", "p.library_source_id", "p.probe_job_id", "p.fingerprint", "p.attempt_count",
           "j.trigger_type",
-          "f.locator_json", "f.size", "f.name", "s.provider_type", "s.credential_revision", "mp.configuration_json",
+          "f.locator_json", "f.size", "f.name", "mp.configuration_json",
+          transaction.raw("COALESCE(s.provider_type, ls.provider_type) as provider_type"),
+          transaction.raw("COALESCE(s.credential_revision, ls.credential_revision) as runtime_credential_revision"),
         )
         .whereIn("p.status", ["pending", "retry_waiting"])
         .whereIn("j.status", ["queued", "running", "retry_waiting"])
         .where("j.control_action", "none")
         .where("f.status", "active")
-        .whereNotIn("s.status", ["disabled", "scanning", "reauthorization_required"])
-        .whereNull("s.deleted_at")
-        // 关键变量：同服务已经排队的下一次扫描也优先，避免两个 Worker 在状态切换间隙争用网盘连接。
+        .where("ls.status", "active")
+        .where("ls.connection_status", "valid")
+        // 关键变量：同来源已经排队的下一次扫描也优先，避免两个 Worker 争用同一份独立凭据。
         .whereNotExists(
           transaction("scan_jobs as sj")
             .select(transaction.raw("1"))
-            .whereRaw("sj.service_id = p.service_id")
+            .whereRaw("sj.library_source_id = p.library_source_id")
             .whereIn("sj.status", ["queued", "running", "retry_waiting"]),
         )
         .andWhere((builder) => builder.whereNull("p.next_retry_at").orWhere("p.next_retry_at", "<=", now))
@@ -342,8 +346,9 @@ export class MediaProbeWorker {
           sourceFileId: String(row.source_file_id),
           userId: String(row.user_id),
           serviceId: String(row.service_id),
+          librarySourceId: String(row.library_source_id),
           providerType: String(row.provider_type),
-          credentialRevision: Number(row.credential_revision),
+          credentialRevision: Number(row.runtime_credential_revision),
           locator: parseJsonObject(row.locator_json),
           size: Number(row.size ?? 0),
           fileName: String(row.name ?? ""),
@@ -409,8 +414,8 @@ export class MediaProbeWorker {
       const retryDelay = retryDelays[attemptCount - 1];
       const failureCode = readProbeFailureCode(error);
       if (isProviderAuthenticationErrorCode(failureCode)) {
-        const authenticationFailure = await this.repository.failMediaProbeJobsForAuthentication(
-          job.serviceId, job.userId, job.credentialRevision);
+        const authenticationFailure = await this.repository.failLibrarySourceMediaProbeJobsForAuthentication(
+          job.librarySourceId, job.userId, job.credentialRevision);
         if (authenticationFailure.ignoredStaleCredential) {
           // 关键变量：让旧凭据任务的当前文件回到待领取状态，下一次直接使用重新扫码后的当前凭据。
           await this.database.query("media_file_probes").where({
@@ -498,13 +503,16 @@ export class MediaProbeWorker {
 
   /** 使用当前服务凭据解析短期上游地址；刷新后的连接仍写回同一凭据修订。 */
   private async resolveAccess(job: MediaProbeJob, signal: AbortSignal): Promise<ProviderFileStreamAccess> {
-    const adapter = this.providers.get(job.providerType);
-    const connection = this.vault.decrypt(
-      await this.repository.getActiveEncryptedConnection(job.serviceId, job.userId),
+    const sourceRuntime = await this.repository.getLibrarySourceRuntimeConfiguration(
+      job.librarySourceId,
+      job.userId,
+      job.credentialRevision,
     );
+    const adapter = this.providers.get(sourceRuntime.providerType);
+    const connection = this.vault.decrypt(sourceRuntime.encryptedConnection);
     const context: ProviderConnectionContext = {
-      persistConnection: async (nextConnection) => this.repository.refreshActiveEncryptedConnection({
-        serviceId: job.serviceId,
+      persistConnection: async (nextConnection) => this.repository.refreshLibrarySourceEncryptedConnection({
+        librarySourceId: job.librarySourceId,
         userId: job.userId,
         credentialRevision: job.credentialRevision,
         encryptedConnection: this.vault.encrypt(nextConnection),

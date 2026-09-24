@@ -14,6 +14,7 @@ export interface EmbyLibraryContext {
   serviceId: string;
   ownerUserId: string;
   libraryId: string;
+  libraryKind: string;
   /** 是否按媒体地区返回 Emby 虚拟媒体库。 */
   regionLibrariesEnabled: boolean;
 }
@@ -178,17 +179,21 @@ export class EmbyCompatibilityService {
 
   /** 根据 /e/{路径} 的自定义后缀找到所属媒体库。 */
   public async resolveLibraryIdByPathSuffix(pathSuffix: string): Promise<string> {
-    const row = await this.runtime.database.query("media_libraries as l").join("library_sources as ls", "ls.library_id", "l.id").join("cloud_services as s", "s.id", "ls.service_id")
-      .select("l.id").where("l.emby_path_suffix_lookup", pathSuffix.toLowerCase()).whereNull("s.deleted_at").first();
+    const row = await this.runtime.database.query("media_libraries as l")
+      .select("l.id").where("l.emby_path_suffix_lookup", pathSuffix.toLowerCase()).first();
     if (!row) throw new ApiError(404, "emby_service_not_found", "Emby 服务地址不存在");
     return String(row.id);
   }
 
   /** 检查 Emby 服务开关，并返回路由、下载和地区库配置。 */
   public async requireEnabledService(libraryId: string) {
-    const row = await this.runtime.database.query("cloud_services as s").join("library_sources as ls", "ls.service_id", "s.id").join("media_libraries as l", "l.id", "ls.library_id")
-      .select("s.id", "s.user_id", "ls.library_id as library_id", "s.display_name", "s.status", "l.emby_enabled", "l.emby_relay_playback_enabled", "l.emby_download_enabled", "l.emby_region_libraries_enabled")
-      .where("l.id", libraryId).whereNull("s.deleted_at").first();
+    const row = await this.runtime.database.query("media_libraries as l")
+      .select(
+        "l.id", "l.user_id", "l.id as library_id", "l.display_name", "l.status",
+        "l.emby_enabled", "l.emby_relay_playback_enabled", "l.emby_download_enabled",
+        "l.emby_region_libraries_enabled", "l.library_kind",
+      )
+      .where("l.id", libraryId).first();
     if (!row) throw new ApiError(404, "emby_service_not_found", "Emby 服务不存在");
     if (Number(row.emby_enabled) !== 1 || row.status === "disabled") throw new ApiError(404, "emby_service_disabled", "Emby 服务未启用");
     return row;
@@ -197,7 +202,7 @@ export class EmbyCompatibilityService {
   /** 图片入口无需认证时使用的媒体归属上下文。 */
   public async resolvePublicImageContext(libraryId: string): Promise<EmbyLibraryContext> {
     const service = await this.requireEnabledService(libraryId);
-    return { serviceId: String(service.id), ownerUserId: String(service.user_id), libraryId, regionLibrariesEnabled: Number(service.emby_region_libraries_enabled) === 1 };
+    return { serviceId: String(service.id), ownerUserId: String(service.user_id), libraryId, libraryKind: String(service.library_kind ?? "single_source"), regionLibrariesEnabled: Number(service.emby_region_libraries_enabled) === 1 };
   }
 
   /** 服务独立 Emby 账号登录并创建 library_emby_sessions 会话。 */
@@ -244,9 +249,9 @@ export class EmbyCompatibilityService {
       throw new ApiError(401, "emby_token_required", "需要 Emby 访问令牌");
     }
     const row = await this.runtime.database.query("library_emby_sessions as es").join("library_emby_accounts as a", "a.id", "es.account_id")
-      .join("media_libraries as l", "l.id", "es.library_id").join("library_sources as ls", "ls.library_id", "l.id").join("cloud_services as s", "s.id", "ls.service_id")
-      .select("es.*", "a.username", "a.password_required", "a.credential_revision as account_revision", "a.status as account_status", "s.id as service_id", "s.user_id", "ls.library_id as library_id", "s.status as service_status", "l.emby_enabled", "l.emby_region_libraries_enabled", "l.emby_download_enabled")
-      .where("es.token_hash", hashSessionToken(token)).where("es.library_id", libraryId).whereNull("es.revoked_at").whereNull("s.deleted_at").first();
+      .join("media_libraries as l", "l.id", "es.library_id")
+      .select("es.*", "a.username", "a.password_required", "a.credential_revision as account_revision", "a.status as account_status", "l.id as service_id", "l.user_id", "l.id as library_id", "l.status as service_status", "l.library_kind", "l.emby_enabled", "l.emby_region_libraries_enabled", "l.emby_download_enabled")
+      .where("es.token_hash", hashSessionToken(token)).where("es.library_id", libraryId).whereNull("es.revoked_at").first();
     const now = new Date().toISOString();
     // 关键变量：会话失效原因只记录布尔状态，绝不输出实际访问令牌。
     const sessionInvalid = !row || String(row.expires_at) <= now || Number(row.credential_revision) !== Number(row.account_revision)
@@ -267,7 +272,7 @@ export class EmbyCompatibilityService {
       throw new ApiError(401, "emby_session_invalid", "Emby 登录已失效，请重新登录");
     }
     if (String(row.last_seen_at) < new Date(Date.now() - 5 * 60 * 1000).toISOString()) await this.runtime.database.query("library_emby_sessions").where({ id: row.id }).update({ last_seen_at: new Date().toISOString() });
-    return { serviceId: String(row.service_id), ownerUserId: String(row.user_id), libraryId, regionLibrariesEnabled: Number(row.emby_region_libraries_enabled) === 1, accountId: String(row.account_id), accountUsername: String(row.username), accountHasPassword: Number(row.password_required ?? 1) !== 0, credentialRevision: Number(row.account_revision), accessToken: token, downloadEnabled: Number(row.emby_download_enabled) === 1 };
+    return { serviceId: String(row.service_id), ownerUserId: String(row.user_id), libraryId, libraryKind: String(row.library_kind ?? "single_source"), regionLibrariesEnabled: Number(row.emby_region_libraries_enabled) === 1, accountId: String(row.account_id), accountUsername: String(row.username), accountHasPassword: Number(row.password_required ?? 1) !== 0, credentialRevision: Number(row.account_revision), accessToken: token, downloadEnabled: Number(row.emby_download_enabled) === 1 };
   }
 
   /** 注销当前 Emby 令牌。 */
@@ -534,7 +539,11 @@ export class EmbyCompatibilityService {
   /** 建立 Emby PlaybackInfo，并登记独立播放会话。 */
   public async buildPlaybackInfo(context: EmbyContext, itemId: string, input: { mediaSourceId?: string; playSessionId?: string; route?: "auto" | "origin" | "server" }) {
     const service = await this.requireEnabledService(context.serviceId); const internalItemId = decodeItemId(itemId); const item = await this.requireItem(context, internalItemId);
-    const files = (await this.runtime.repository.listItemFiles(item.id, context.ownerUserId)).filter((file) => String(file.itemId) === item.id);
+    const itemFiles = (await this.runtime.repository.listItemFiles(item.id, context.ownerUserId)).filter((file) => String(file.itemId) === item.id);
+    const progress = await this.runtime.database.query("library_emby_playback_progress").select("media_source_id").where({ library_id: context.libraryId, account_id: context.accountId, item_id: item.id }).first();
+    const recentSourceId = String(progress?.media_source_id ?? "");
+    // 关键变量：Emby 未指定版本时优先返回该账号最近成功使用的版本，其后保持来源稳定顺序。
+    const files = recentSourceId ? [...itemFiles].sort((left, right) => Number(String(right.fileId) === recentSourceId) - Number(String(left.fileId) === recentSourceId)) : itemFiles;
     if (files.length === 0) throw new ApiError(404, "emby_media_source_not_found", "媒体条目没有可播放文件");
     const requested = this.toInternalMediaSourceId(item.id, input.mediaSourceId ?? "");
     const selectedFiles = requested ? files.filter((file, index) => String(file.fileId) === requested || (index === 0 && requested === item.id)) : files;
@@ -542,13 +551,16 @@ export class EmbyCompatibilityService {
     const playSessionId = input.playSessionId || randomUUID(); const protocolId = encodeItemId(item.id);
     const probes = selectedFiles.map((file) => parseCompletedMediaProbeResult(file.mediaProbeStatus, file.mediaProbeResult)); const ready = probes.every(Boolean); const duration = ready ? readJellyfinRunTimeTicks(probes) : 0;
     const sources = selectedFiles.map((file, index) => {
-      const sourceId = index === 0 ? protocolId : String(file.fileId);
+      // 关键变量：云聚合版本不能随来源排序改变 ID；旧单源库仍保留主版本等于条目 ID 的兼容行为。
+      const sourceId = String(service.library_kind) === "cloud_aggregate_video"
+        ? String(file.fileId)
+        : index === 0 ? protocolId : String(file.fileId);
       const probe = probes[index]; const route = input.route ?? "auto";
       // 关键变量：部分播放器不会处理 AddApiKeyToDirectStreamUrl，直放地址必须自行携带当前 Emby 会话令牌。
       const query = new URLSearchParams({ static: "true", MediaSourceId: sourceId, PlaySessionId: playSessionId, FlyCloudPlaybackRoute: route, api_key: context.accessToken });
       // 关键变量：Emby 客户端会将相对 /Videos 地址拼接到当前服务器根路径；不能重复写入 /e/{路径}，否则部分播放器会产生双重路径并返回 404。
       const container = probe?.container || "mp4";
-      return { Protocol: "File", Id: sourceId, Path: String(file.name ?? "video.mp4"), Name: String(file.name ?? "video.mp4"), Type: "Default", Container: probe?.container || undefined, Size: Number(file.size ?? 0) || undefined, Bitrate: probe?.bitRate || undefined, RunTimeTicks: probe?.runTimeTicks || duration || undefined, MediaStreams: probe?.mediaStreams ?? [], SupportsTranscoding: false, SupportsDirectStream: true, SupportsDirectPlay: true, IsRemote: false, DirectStreamUrl: `/Videos/${protocolId}/stream.${container}?${query.toString()}`, AddApiKeyToDirectStreamUrl: false, RequiredHttpHeaders: {} };
+      return { Protocol: "File", Id: sourceId, Path: String(file.name ?? "video.mp4"), Name: `${String(file.sourceName ?? "网盘来源")}（${String(file.providerType ?? "未知网盘")}） · ${String(file.name ?? "video.mp4")}`, Type: "Default", Container: probe?.container || undefined, Size: Number(file.size ?? 0) || undefined, Bitrate: probe?.bitRate || undefined, RunTimeTicks: probe?.runTimeTicks || duration || undefined, MediaStreams: probe?.mediaStreams ?? [], SupportsTranscoding: false, SupportsDirectStream: true, SupportsDirectPlay: true, IsRemote: false, DirectStreamUrl: `/Videos/${protocolId}/stream.${container}?${query.toString()}`, AddApiKeyToDirectStreamUrl: false, RequiredHttpHeaders: {} };
     });
     const now = new Date().toISOString(); const selectedId = this.toInternalMediaSourceId(item.id, String(sources[0]?.Id ?? ""));
     await this.runtime.database.query("library_emby_playback_sessions").insert({ id: playSessionId, library_id: context.libraryId, account_id: context.accountId, item_id: item.id, media_source_id: selectedId || null, status: "created", position_ticks: 0, paused: 0, started_at: now, updated_at: now, stopped_at: null }).onConflict("id").ignore();
@@ -664,12 +676,15 @@ export class EmbyCompatibilityService {
 
   private async mapItem(context: EmbyContext, item: MediaItemRecord, parent?: MediaItemRecord): Promise<Record<string, unknown>> {
     if (item.libraryId !== context.libraryId) throw new ApiError(404, "emby_item_not_found", "媒体条目不存在");
-    const files = (await this.runtime.repository.listItemFiles(item.id, context.ownerUserId)).filter((file) => String(file.itemId) === item.id);
+    let files = (await this.runtime.repository.listItemFiles(item.id, context.ownerUserId)).filter((file) => String(file.itemId) === item.id);
+    const progress = await this.readProgress(context, item.id);
+    const recentSourceId = String(progress?.media_source_id ?? "");
+    if (recentSourceId) files = [...files].sort((left, right) => Number(String(right.fileId) === recentSourceId) - Number(String(left.fileId) === recentSourceId));
     const probes = files.map((file) => parseCompletedMediaProbeResult(file.mediaProbeStatus, file.mediaProbeResult)); const specsReady = files.length > 0 && probes.every(Boolean); const ticks = specsReady ? readJellyfinRunTimeTicks(probes) : 0;
     const type = item.itemType === "video.series" ? "Series" : item.itemType === "video.episode" ? "Episode" : "Movie"; const primaryTag = item.posterUrl ? String(Date.parse(item.updatedAt) || 1) : type === "Episode" && parent?.posterUrl ? String(Date.parse(parent.updatedAt) || 1) : "";
     const ownLogo = String(item.metadata.logoUrl ?? ""); const people = Array.isArray(item.metadata.people) ? item.metadata.people as Array<Record<string, unknown>> : []; const protocolId = encodeItemId(item.id);
-    const season = Number(item.metadata.seasonNumber ?? 0); const favorite = await this.isFavorite(context, item.id); const progress = await this.readProgress(context, item.id);
-    return { Name: item.title, OriginalTitle: String(item.metadata.originalTitle ?? ""), ServerId: context.libraryId, Id: protocolId, Etag: String(Date.parse(item.updatedAt) || 1), DateCreated: item.createdAt, SortName: item.sortTitle, PremiereDate: item.premiereDate ?? undefined, ProductionYear: item.year ?? undefined, Overview: item.overview, CommunityRating: Number(item.metadata.rating ?? 0) || undefined, Type: type, MediaType: "Video", IsFolder: type === "Series", LocationType: "FileSystem", CanDownload: context.downloadEnabled && type !== "Series" && files.length > 0, ProviderIds: mapProviderIds(item.externalIds), Genres: Array.isArray(item.metadata.genres) ? item.metadata.genres.map(String) : [], ImageTags: { ...(primaryTag ? { Primary: primaryTag } : {}), ...(ownLogo ? { Logo: imageTag(ownLogo) } : {}) }, PrimaryImageTag: primaryTag || undefined, PrimaryImageItemId: item.posterUrl ? protocolId : parent?.posterUrl ? encodeItemId(parent.id) : undefined, BackdropImageTags: item.backdropUrl ? [String(Date.parse(item.updatedAt) || 1)] : [], RunTimeTicks: ticks || undefined, Container: probes[0]?.container || undefined, Bitrate: probes[0]?.bitRate || undefined, MediaStreams: probes[0]?.mediaStreams ?? [], MediaSources: files.map((file, index) => ({ Protocol: "File", Id: index === 0 ? protocolId : String(file.fileId), Path: String(file.name ?? "video.mp4"), Name: String(file.name ?? "video.mp4"), Type: "Default", Size: Number(file.size ?? 0) || undefined, Container: probes[index]?.container || undefined, SupportsTranscoding: false, SupportsDirectStream: true, SupportsDirectPlay: true })), SeriesId: type === "Episode" && parent ? encodeItemId(parent.id) : undefined, SeriesName: type === "Episode" ? parent?.title ?? item.subtitle : undefined, ParentIndexNumber: type === "Episode" ? season : undefined, IndexNumber: type === "Episode" ? Number(item.metadata.episodeNumber ?? 0) : undefined, SeasonId: type === "Episode" && parent ? encodeSeasonId(parent.id, season) : undefined, SeasonName: type === "Episode" ? videoSeasonTitle(season) : undefined, ParentId: type === "Episode" && parent ? encodeSeasonId(parent.id, season) : this.libraryForItem(context, item).id, People: people.map((person) => { const name = String(person.name ?? "").trim(); const profile = String(person.profileUrl ?? "").trim(); return { Name: name, Id: this.personId(person), Role: String(person.role ?? ""), Type: String(person.type ?? "").toLowerCase() === "cast" ? "Actor" : "Unknown", PrimaryImageTag: profile ? imageTag(profile) : undefined }; }), UserData: this.userData(progress, ticks, favorite, protocolId), DatePlayed: progress?.last_played_at ?? undefined };
+    const season = Number(item.metadata.seasonNumber ?? 0); const favorite = await this.isFavorite(context, item.id);
+    return { Name: item.title, OriginalTitle: String(item.metadata.originalTitle ?? ""), ServerId: context.libraryId, Id: protocolId, Etag: String(Date.parse(item.updatedAt) || 1), DateCreated: item.createdAt, SortName: item.sortTitle, PremiereDate: item.premiereDate ?? undefined, ProductionYear: item.year ?? undefined, Overview: item.overview, CommunityRating: Number(item.metadata.rating ?? 0) || undefined, Type: type, MediaType: "Video", IsFolder: type === "Series", LocationType: "FileSystem", CanDownload: context.downloadEnabled && type !== "Series" && files.length > 0, ProviderIds: mapProviderIds(item.externalIds), Genres: Array.isArray(item.metadata.genres) ? item.metadata.genres.map(String) : [], ImageTags: { ...(primaryTag ? { Primary: primaryTag } : {}), ...(ownLogo ? { Logo: imageTag(ownLogo) } : {}) }, PrimaryImageTag: primaryTag || undefined, PrimaryImageItemId: item.posterUrl ? protocolId : parent?.posterUrl ? encodeItemId(parent.id) : undefined, BackdropImageTags: item.backdropUrl ? [String(Date.parse(item.updatedAt) || 1)] : [], RunTimeTicks: ticks || undefined, Container: probes[0]?.container || undefined, Bitrate: probes[0]?.bitRate || undefined, MediaStreams: probes[0]?.mediaStreams ?? [], MediaSources: files.map((file, index) => ({ Protocol: "File", Id: context.libraryKind === "cloud_aggregate_video" || index > 0 ? String(file.fileId) : protocolId, Path: String(file.name ?? "video.mp4"), Name: `${String(file.sourceName ?? "网盘来源")}（${String(file.providerType ?? "未知网盘")}） · ${String(file.name ?? "video.mp4")}`, Type: "Default", Size: Number(file.size ?? 0) || undefined, Container: probes[index]?.container || undefined, SupportsTranscoding: false, SupportsDirectStream: true, SupportsDirectPlay: true })), SeriesId: type === "Episode" && parent ? encodeItemId(parent.id) : undefined, SeriesName: type === "Episode" ? parent?.title ?? item.subtitle : undefined, ParentIndexNumber: type === "Episode" ? season : undefined, IndexNumber: type === "Episode" ? Number(item.metadata.episodeNumber ?? 0) : undefined, SeasonId: type === "Episode" && parent ? encodeSeasonId(parent.id, season) : undefined, SeasonName: type === "Episode" ? videoSeasonTitle(season) : undefined, ParentId: type === "Episode" && parent ? encodeSeasonId(parent.id, season) : this.libraryForItem(context, item).id, People: people.map((person) => { const name = String(person.name ?? "").trim(); const profile = String(person.profileUrl ?? "").trim(); return { Name: name, Id: this.personId(person), Role: String(person.role ?? ""), Type: String(person.type ?? "").toLowerCase() === "cast" ? "Actor" : "Unknown", PrimaryImageTag: profile ? imageTag(profile) : undefined }; }), UserData: this.userData(progress, ticks, favorite, protocolId), DatePlayed: progress?.last_played_at ?? undefined };
   }
 
   private libraryForItem(context: EmbyLibraryContext, item: MediaItemRecord): EmbyLibraryDefinition { const roots = this.libraryDefinitions(context); return roots.find((entry) => entry.itemType === (item.itemType === "video.movie" ? "video.movie" : "video.series") && entry.regionGroup === (context.regionLibrariesEnabled ? item.regionGroup : undefined)) ?? roots[0]!; }

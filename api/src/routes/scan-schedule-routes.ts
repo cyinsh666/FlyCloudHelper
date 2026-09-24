@@ -110,7 +110,7 @@ async function saveSchedule(
     }
   } else {
     const roots = readConfiguredRoots(profiles.scanProfile, scheduledTaskMode);
-    if (configuration.enabled && roots.length === 0) {
+    if (configuration.enabled && library.libraryKind !== "cloud_aggregate_video" && roots.length === 0) {
       throw new ApiError(409, "scan_paths_not_configured", `请先配置${scheduledTaskMode === "full" ? "全量" : "增量"}扫描路径`);
     }
   }

@@ -6,20 +6,33 @@ import { buildEmbyPath, validateEmbyPathSuffix } from "../emby-path.js";
 import { buildNavidromePath, validateNavidromePathSuffix } from "../navidrome-path.js";
 import type { ApiRuntime } from "../runtime.js";
 
-/** 校验媒体库归属，并解析本次唯一来源服务。 */
+/** 校验媒体库归属；云聚合库使用库本身作为协议配置日志主体。 */
 async function requireManagedLibrary(runtime: ApiRuntime, request: FastifyRequest, libraryId: string, admin: boolean) {
   const operator = admin
     ? await requireSuperAdmin(request, runtime.database)
     : await requireRequestUser(request, runtime.database);
   const library = await runtime.repository.getLibrary(libraryId, admin ? undefined : operator.id);
-  const service = await runtime.repository.getServiceDetail(library.sourceServiceId, admin ? undefined : operator.id);
+  const service = library.libraryKind === "cloud_aggregate_video"
+    ? { id: library.id, providerType: library.sources[0]?.providerType ?? "" }
+    : await runtime.repository.getServiceDetail(library.sourceServiceId, admin ? undefined : operator.id);
   return { operator, service, library };
 }
 
 /** 判断 Provider 是否具备媒体中转能力，兼容现有两种能力标识。 */
 function supportsRelayPlayback(runtime: ApiRuntime, providerType: string): boolean {
+  if (!providerType) return false;
   const capabilities = runtime.providers.get(providerType).descriptor.capabilities;
   return capabilities.includes("relayPlayback") || capabilities.includes("relay");
+}
+
+/** 云聚合中转能力由全部已配置来源共同决定，避免启用后某个版本无法中转。 */
+function librarySupportsRelayPlayback(
+  runtime: ApiRuntime,
+  library: Awaited<ReturnType<ApiRuntime["repository"]["getLibrary"]>>,
+): boolean {
+  if (library.libraryKind !== "cloud_aggregate_video") return supportsRelayPlayback(runtime, library.providerType);
+  return library.sources.length > 0
+    && library.sources.every((source) => supportsRelayPlayback(runtime, source.providerType));
 }
 
 /** 只有声明支持音乐且按音乐数据创建的网盘服务才开放 Navidrome。 */
@@ -31,7 +44,6 @@ function supportsNavidrome(runtime: ApiRuntime, providerType: string, dataType: 
 /** 构造媒体库协议配置；账号、会话和观看状态全部按媒体库隔离。 */
 async function buildLibraryAccessSettings(runtime: ApiRuntime, libraryId: string) {
   const libraryRecord = await runtime.repository.getLibrary(libraryId);
-  const service = await runtime.repository.getServiceDetail(libraryRecord.sourceServiceId);
   const accounts = await runtime.serviceAccess.listByLibrary(libraryId);
   const account = accounts[0];
   if (!account) throw new ApiError(404, "service_access_account_not_found", "协议访问账号不存在");
@@ -57,10 +69,11 @@ async function buildLibraryAccessSettings(runtime: ApiRuntime, libraryId: string
   const jellyfinPathSuffix = String(library.jellyfin_path_suffix ?? "").trim() || libraryId;
   const navidromePathSuffix = String(library.navidrome_path_suffix ?? "").trim() || libraryId;
   const embyPathSuffix = String(library.emby_path_suffix ?? "").trim() || libraryId;
-  const navidromeSupported = supportsNavidrome(runtime, service.providerType, libraryRecord.dataType);
+  const navidromeSupported = libraryRecord.libraryKind !== "cloud_aggregate_video"
+    && supportsNavidrome(runtime, libraryRecord.providerType, libraryRecord.dataType);
   const embyAccounts = await runtime.embyAccess.listByLibrary(libraryId);
   return {
-    relayPlaybackSupported: supportsRelayPlayback(runtime, service.providerType),
+    relayPlaybackSupported: librarySupportsRelayPlayback(runtime, libraryRecord),
     jellyfinRelayPlaybackEnabled: Number(library.jellyfin_relay_playback_enabled) === 1,
     jellyfinDownloadEnabled: library.jellyfin_download_enabled === undefined || Number(library.jellyfin_download_enabled) === 1,
     jellyfinRegionLibrariesEnabled: Number(library.jellyfin_region_libraries_enabled) === 1,
@@ -465,7 +478,7 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       }
       const enablesRelay = request.body.jellyfinRelayPlaybackEnabled === true
         || request.body.embyRelayPlaybackEnabled === true;
-      if (enablesRelay && !supportsRelayPlayback(runtime, service.providerType)) {
+      if (enablesRelay && !librarySupportsRelayPlayback(runtime, library)) {
         throw new ApiError(422, "provider_relay_playback_unsupported", "当前网盘类型暂不支持中转播放");
       }
       const updateValues: Record<string, unknown> = { updated_at: new Date().toISOString() };

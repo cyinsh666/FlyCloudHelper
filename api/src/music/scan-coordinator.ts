@@ -116,7 +116,7 @@ async function runStages(input: MusicScanInput): Promise<void> {
           continue;
         }
         if (!describeMediaFile(entry, ["music"], root.displayPath || "/")) continue;
-        const source: SourceFileRecord = { id: createStableId("src", job.userId, job.libraryId, entry.resourceId), userId: job.userId, serviceId: job.serviceId, libraryId: job.libraryId, librarySourceId: String(job.snapshot.librarySourceId),
+        const source: SourceFileRecord = { id: createStableId("src", job.userId, job.libraryId, entry.resourceId), userId: job.userId, serviceId: job.serviceId, libraryId: job.libraryId, librarySourceId: job.librarySourceId,
           providerResourceId: entry.resourceId.length > 500 ? createStableId("resource", entry.resourceId) : entry.resourceId,
           parentResourceId: entry.parentResourceId && entry.parentResourceId.length > 500 ? createStableId("resource", entry.parentResourceId) : entry.parentResourceId,
           path: entry.path, name: entry.name, extension: getFileExtension(entry.name), size: entry.size, modifiedAt: entry.modifiedAt, etag: entry.etag,
@@ -243,14 +243,14 @@ async function runStages(input: MusicScanInput): Promise<void> {
     lastProgress = 0;
     await publish();
     const completed = job.scanMode === "full" && !job.snapshot.retryOfJobId ? await repository.listCompletedScanRootRuns(job.id) : [];
-    await repository.finalizeGeneration({ userId: job.userId, serviceId: job.serviceId, libraryId: job.libraryId, generationId: checkpoint.generationId,
+    await repository.finalizeGeneration({ userId: job.userId, serviceId: job.serviceId, libraryId: job.libraryId, librarySourceId: job.librarySourceId, generationId: checkpoint.generationId,
       completedRootGenerations: completed.map((root) => ({ rootKey: root.rootKey, generationId: root.generationId })), deleteMissing: completed.length > 0, allowDestructiveCleanup: false, changedItemIds: await state.changedItemIds() });
     const remaining = (await state.progress()).some((stage) => stage.pending + stage.running > 0);
     await repository.finishJob(job.id, remaining
       ? { status: "failed", errorCode: "music_other_stages_pending", errorMessage: "本次阶段已结束，其他阶段尚未完成，请重试全部失败内容" }
       : { status: "completed" });
     finished = true;
-    console.info("codex-flycloud-music", { 事件: remaining ? "所选阶段结束，其他阶段待继续" : "三阶段扫描完成", 任务ID: job.id, 网盘类型: adapter.descriptor.type });
+    console.info("codex-flycloud-music", { 事件: remaining ? "所选阶段结束，其他阶段待继续" : "三阶段扫描完成", 任务ID: job.id, 媒体库源ID: job.librarySourceId, 网盘类型: adapter.descriptor.type });
   } catch (error) {
     throw fatalError ?? error;
   } finally {

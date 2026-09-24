@@ -104,7 +104,7 @@ function SystemConfigurationSummary({ config, compact = false }: { config: Admin
       <SystemSummaryItem compact={compact} label="凭据主密钥" value={configurationSourceLabels[config.credentials.source]} status={config.credentials.configured ? "已配置" : "未配置"} tone={config.credentials.configured ? "success" : "danger"} />
       <SystemSummaryItem compact={compact} label="元数据插件" value={`已启用 ${config.plugins.enabledCount} / 已安装 ${config.plugins.installedCount}`} status={config.plugins.directoryReady ? "目录正常" : "目录异常"} tone={config.plugins.directoryReady ? "success" : "danger"} />
       <SystemSummaryItem compact={compact} label="AI 模型" value={`已启用 ${config.aiModels.enabledCount} / 已配置 ${config.aiModels.configuredCount}`} status={config.aiModels.availableCount > 0 ? `${config.aiModels.availableCount} 个可用` : "尚无可用模型"} tone={config.aiModels.availableCount > 0 ? "success" : config.aiModels.configuredCount > 0 ? "warning" : "neutral"} />
-      <SystemSummaryItem compact={compact} label="扫描 Worker" value={`活动 ${config.worker.activeWorkers} / 并发 ${config.worker.concurrency}`} status={config.worker.running ? "运行中" : "已停止"} tone={config.worker.running ? "success" : "warning"} />
+      <SystemSummaryItem compact={compact} label="扫描 Worker" value={`活动 ${config.worker.activeWorkers} 个来源`} status={config.worker.running ? "每个网盘源最多 1 个" : "已停止"} tone={config.worker.running ? "success" : "warning"} />
     </div>
   );
 }
@@ -126,7 +126,7 @@ function SystemRuntimeSummary({ status }: { status: AdminRuntimeStatus }) {
       <SystemSummaryItem label="用户与服务" value={`${status.userCount} 个用户 · ${status.serviceCount} 个服务`} status="正常" tone="info" />
       <SystemSummaryItem label="媒体目录" value={`${status.mediaCount.toLocaleString()} 个条目`} status={`待确认 ${status.needsReviewCount}`} tone={status.needsReviewCount > 0 ? "warning" : "success"} />
       <SystemSummaryItem label="后台任务" value={`${status.activeJobCount} 个活动任务`} status={`含失败 ${status.failedJobCount}`} tone={status.failedJobCount > 0 ? "danger" : "success"} />
-      <SystemSummaryItem label="Worker 槽位" value={`${status.worker.availableSlots} 个可用槽位`} status={status.worker.running ? "运行中" : "已停止"} tone={status.worker.running ? "success" : "warning"} />
+      <SystemSummaryItem label="扫描 Worker" value={`${status.worker.activeWorkers} 个来源正在运行`} status={status.worker.running ? "每个网盘源最多 1 个" : "已停止"} tone={status.worker.running ? "success" : "warning"} />
     </div>
   );
 }
