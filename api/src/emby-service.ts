@@ -3,7 +3,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { FastifyRequest } from "fastify";
 import type { Knex } from "knex";
 import { hashSessionToken } from "./auth.js";
-import type { CatalogSort, MediaItemRecord, VideoRegionGroup } from "./domain.js";
+import { parseJsonObject, type CatalogSort, type MediaItemRecord, type VideoRegionGroup } from "./domain.js";
 import { ApiError } from "./errors.js";
 import type { ApiRuntime } from "./runtime.js";
 import { hydrateRealtimeVideoDetails } from "./media/realtime-video-details.js";
@@ -74,6 +74,8 @@ const ITEM_UUID_PREFIX = "f10c0000";
 const SEASON_UUID_PREFIX = "f2";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const INTERNAL_ITEM_ID_PATTERN = /^itm_([0-9a-f]{24})$/iu;
+/** 单次写入 Emby 用户状态的最大条目数，避免长剧集超过数据库参数上限。 */
+const EMBY_USER_STATE_BATCH_SIZE = 50;
 
 /** 格式化为 Emby SDK 可解析的标准 UUID。 */
 function formatUuid(value: string): string {
@@ -574,13 +576,20 @@ export class EmbyCompatibilityService {
     const item = await this.requireItem(context, decodeItemId(rawItemId)); const playSessionId = String(body.PlaySessionId ?? body.playSessionId ?? randomUUID());
     const positionTicks = Math.max(0, Number(body.PositionTicks ?? body.positionTicks ?? 0)); const mediaSourceId = this.toInternalMediaSourceId(item.id, String(body.MediaSourceId ?? body.mediaSourceId ?? ""));
     const durationTicks = await this.readItemRunTimeTicks(item, mediaSourceId); const completed = durationTicks > 0 && positionTicks / durationTicks >= 0.9; const now = new Date().toISOString();
+    // 关键变量：只有从未观看变为已观看时，才需要重新汇总父节目并输出状态日志。
+    let automaticallyMarkedPlayed = false;
     await this.runtime.database.query.transaction(async (transaction: Knex.Transaction) => {
       const existingSession = await transaction("library_emby_playback_sessions").where({ id: playSessionId, library_id: context.libraryId, account_id: context.accountId }).first();
       const sessionPatch = { item_id: item.id, media_source_id: mediaSourceId || null, status: kind === "stopped" ? "stopped" : kind, position_ticks: positionTicks, paused: body.IsPaused === true || body.isPaused === true ? 1 : 0, updated_at: now, stopped_at: kind === "stopped" ? now : null };
       if (existingSession) await transaction("library_emby_playback_sessions").where({ id: playSessionId }).update(sessionPatch); else await transaction("library_emby_playback_sessions").insert({ id: playSessionId, library_id: context.libraryId, account_id: context.accountId, ...sessionPatch, started_at: now });
-      await this.upsertProgress(transaction, context, item.id, mediaSourceId || null, positionTicks, kind === "stopped", completed, now);
+      automaticallyMarkedPlayed = await this.upsertProgress(transaction, context, item.id,
+        mediaSourceId || null, positionTicks, kind === "stopped", completed, now);
       if (kind === "stopped") { const history = await transaction("library_emby_playback_history").where({ library_id: context.libraryId, account_id: context.accountId, play_session_id: playSessionId }).first(); if (!history) await transaction("library_emby_playback_history").insert({ id: randomUUID(), library_id: context.libraryId, account_id: context.accountId, item_id: item.id, play_session_id: playSessionId, position_ticks: positionTicks, completed: completed ? 1 : 0, started_at: existingSession?.started_at ?? now, stopped_at: now }); }
     });
+    // 自动播放进度也属于单集状态变化，最后一集完播后应立即更新整剧完成标记。
+    if (item.itemType === "video.episode" && automaticallyMarkedPlayed) {
+      await this.synchronizeParentSeriesProgress(context, item.id, now);
+    }
     this.runtime.logBusinessEvent("info", { 日志关键字: "codex-emby-playback", 事件: completed ? "Emby播放进度达到90%自动标记已观看" : "保存Emby播放进度", 服务ID: context.serviceId, 账号ID: context.accountId, 媒体条目ID: item.id, 上报类型: kind, 已观看Ticks: positionTicks, 总时长Ticks: durationTicks });
   }
 
@@ -618,6 +627,12 @@ export class EmbyCompatibilityService {
       });
     }
     if (typeof body.Played === "boolean") await this.setPlayed(context, itemId, body.Played);
+    // 仅写入播放位置也会撤销单集已观看状态，需要同步刷新父节目汇总。
+    if (item.itemType === "video.episode"
+      && Object.prototype.hasOwnProperty.call(body, "PlaybackPositionTicks")
+      && typeof body.Played !== "boolean") {
+      await this.synchronizeParentSeriesProgress(context, item.id, new Date().toISOString());
+    }
     if (typeof body.IsFavorite === "boolean") await this.setFavorite(context, itemId, body.IsFavorite);
     this.runtime.logBusinessEvent("info", {
       日志关键字: "codex-emby-app-api",
@@ -634,10 +649,62 @@ export class EmbyCompatibilityService {
 
   /** 手动切换已观看状态。 */
   public async setPlayed(context: EmbyContext, itemId: string, played: boolean) {
-    const item = await this.requireItem(context, decodeItemId(itemId)); const now = new Date().toISOString(); const existing = await this.readProgress(context, item.id);
-    const patch = { played: played ? 1 : 0, position_ticks: 0, hidden_from_resume: played ? 1 : 0, play_count: played ? Math.max(1, Number(existing?.play_count ?? 0)) : 0, last_played_at: played ? now : existing?.last_played_at ?? null, updated_at: now };
-    if (existing) await this.runtime.database.query("library_emby_playback_progress").where({ id: existing.id }).update(patch); else await this.runtime.database.query("library_emby_playback_progress").insert({ id: randomUUID(), library_id: context.libraryId, account_id: context.accountId, item_id: item.id, ...patch });
-    return this.userData({ ...existing, ...patch, item_id: item.id }, await this.readItemRunTimeTicks(item), await this.isFavorite(context, item.id), encodeItemId(item.id));
+    const item = await this.requireItem(context, decodeItemId(itemId));
+    const now = new Date().toISOString();
+    const episodeIds = item.itemType === "video.series"
+      ? (await this.runtime.repository.listCatalogChildren(item.id, context.ownerUserId))
+        .filter((child) => child.libraryId === context.libraryId && child.itemType === "video.episode")
+        .map((episode) => episode.id)
+      : [];
+    // 关键变量：整剧操作覆盖当前存在的全部单集，新增单集仍由扫描关系使整剧状态失效。
+    const targetItemIds = [...new Set([item.id, ...episodeIds])];
+    await this.runtime.database.query.transaction(async (transaction: Knex.Transaction) => {
+      const existingRows: Array<Record<string, unknown>> = [];
+      for (let offset = 0; offset < targetItemIds.length; offset += EMBY_USER_STATE_BATCH_SIZE) {
+        existingRows.push(...await transaction("library_emby_playback_progress")
+          .where({ library_id: context.libraryId, account_id: context.accountId })
+          .whereIn("item_id", targetItemIds.slice(offset, offset + EMBY_USER_STATE_BATCH_SIZE)));
+      }
+      const existingByItemId = new Map(existingRows.map((row) => [String(row.item_id), row]));
+      const rows = targetItemIds.map((targetItemId) => {
+        const existing = existingByItemId.get(targetItemId);
+        return {
+          id: String(existing?.id ?? randomUUID()),
+          library_id: context.libraryId,
+          account_id: context.accountId,
+          item_id: targetItemId,
+          media_source_id: existing?.media_source_id ?? null,
+          played: played ? 1 : 0,
+          position_ticks: 0,
+          hidden_from_resume: played ? 1 : 0,
+          play_count: played ? Math.max(1, Number(existing?.play_count ?? 0)) : 0,
+          last_played_at: played ? now : null,
+          updated_at: now,
+        };
+      });
+      for (let offset = 0; offset < rows.length; offset += EMBY_USER_STATE_BATCH_SIZE) {
+        await transaction("library_emby_playback_progress")
+          .insert(rows.slice(offset, offset + EMBY_USER_STATE_BATCH_SIZE))
+          .onConflict(["library_id", "account_id", "item_id"])
+          .merge(["played", "position_ticks", "hidden_from_resume", "play_count", "last_played_at", "updated_at"]);
+      }
+    });
+    if (item.itemType === "video.episode") {
+      await this.synchronizeParentSeriesProgress(context, item.id, now);
+    }
+    const progress = await this.readProgress(context, item.id);
+    this.runtime.logBusinessEvent("info", {
+      日志关键字: "codex-series-watched-state",
+      事件: "更新Emby观看状态",
+      服务ID: context.serviceId,
+      账号ID: context.accountId,
+      媒体条目ID: item.id,
+      媒体类型: item.itemType,
+      是否已观看: played,
+      级联单集数量: episodeIds.length,
+    });
+    return this.userData(progress, await this.readItemRunTimeTicks(item),
+      await this.isFavorite(context, item.id), encodeItemId(item.id));
   }
 
   /** 收藏媒体条目，或收藏 Emby Person 虚拟条目。 */
@@ -691,14 +758,156 @@ export class EmbyCompatibilityService {
   private personId(person: Record<string, unknown>): string { const source = String(person.id ?? "").trim(); const name = String(person.name ?? "").trim(); return protocolUuid("person", source ? `source:${source}` : `name:${name}`).toLowerCase(); }
   private async requireItem(context: EmbyLibraryContext, itemId: string): Promise<MediaItemRecord> { const item = await this.runtime.repository.getCatalogItem(itemId, context.ownerUserId); if (item.libraryId !== context.libraryId) throw new ApiError(404, "emby_item_not_found", "媒体条目不存在"); return item; }
   private async findParent(itemId: string, userId: string) { const relation = await this.runtime.database.query("media_relations").where({ child_item_id: itemId }).first(); return relation ? this.runtime.repository.getCatalogItem(String(relation.parent_item_id), userId) : undefined; }
-  private async readProgress(context: EmbyContext, itemId: string) { return this.runtime.database.query("library_emby_playback_progress").where({ library_id: context.libraryId, account_id: context.accountId, item_id: itemId }).first(); }
+  /** 根据当前有效单集计算节目整体观看状态，不能永久沿用历史父记录。 */
+  private buildSeriesProgress(
+    itemId: string,
+    currentProgress: Record<string, unknown> | undefined,
+    episodeIds: string[],
+    progressByItemId: Map<string, Record<string, unknown>>,
+  ): Record<string, unknown> | undefined {
+    if (episodeIds.length === 0) return currentProgress;
+    const playedEpisodeCount = episodeIds.filter((episodeId) =>
+      Number(progressByItemId.get(episodeId)?.played ?? 0) === 1).length;
+    const allEpisodesPlayed = playedEpisodeCount === episodeIds.length; // 关键变量：整剧完成必须覆盖当前目录中的全部有效单集。
+    const latestEpisodePlayedAt = episodeIds.map((episodeId) =>
+      String(progressByItemId.get(episodeId)?.last_played_at ?? ""))
+      .filter(Boolean)
+      .sort()
+      .pop() ?? null;
+    return {
+      ...(currentProgress ?? {}),
+      item_id: itemId,
+      played: allEpisodesPlayed ? 1 : 0,
+      position_ticks: 0,
+      hidden_from_resume: allEpisodesPlayed ? 1 : 0,
+      play_count: allEpisodesPlayed ? Math.max(1, Number(currentProgress?.play_count ?? 0)) : 0,
+      last_played_at: allEpisodesPlayed ? currentProgress?.last_played_at ?? latestEpisodePlayedAt : null,
+      unplayed_item_count: episodeIds.length - playedEpisodeCount,
+    };
+  }
+
+  /** 读取单条进度；节目状态按当前有效单集动态汇总。 */
+  private async readProgress(context: EmbyContext, itemId: string) {
+    const currentProgress = await this.runtime.database.query("library_emby_playback_progress")
+      .where({ library_id: context.libraryId, account_id: context.accountId, item_id: itemId }).first();
+    const episodeRows = await this.runtime.database.query("media_relations as relation")
+      .join("media_items as episode", "episode.id", "relation.child_item_id")
+      .select("relation.child_item_id")
+      .where({
+        "relation.library_id": context.libraryId,
+        "relation.parent_item_id": itemId,
+        "relation.relation_type": "series_episode",
+        "episode.library_id": context.libraryId,
+        "episode.item_type": "video.episode",
+      })
+      .whereNull("episode.deleted_at");
+    const episodeIds = episodeRows.map((row) => String(row.child_item_id));
+    if (episodeIds.length === 0) return currentProgress;
+    const episodeProgressRows = await this.runtime.database.query("library_emby_playback_progress")
+      .where({ library_id: context.libraryId, account_id: context.accountId })
+      .whereIn("item_id", episodeIds);
+    const progressByItemId = new Map(episodeProgressRows.map((row) =>
+      [String(row.item_id), row as Record<string, unknown>]));
+    return this.buildSeriesProgress(itemId, currentProgress as Record<string, unknown> | undefined,
+      episodeIds, progressByItemId);
+  }
+
+  /** 单集状态变化后持久化整剧汇总，保证 Emby 已观看筛选结果同步更新。 */
+  private async synchronizeParentSeriesProgress(context: EmbyContext, episodeItemId: string, now: string): Promise<void> {
+    const relation = await this.runtime.database.query("media_relations")
+      .select("parent_item_id")
+      .where({ library_id: context.libraryId, child_item_id: episodeItemId, relation_type: "series_episode" })
+      .first();
+    if (!relation) return;
+    const seriesItemId = String(relation.parent_item_id); // 关键变量：需要随当前单集重新汇总的节目条目。
+    const seriesProgress = await this.readProgress(context, seriesItemId);
+    if (!seriesProgress) return;
+    const existing = await this.runtime.database.query("library_emby_playback_progress")
+      .where({ library_id: context.libraryId, account_id: context.accountId, item_id: seriesItemId }).first();
+    const patch = {
+      played: Number(seriesProgress.played ?? 0), position_ticks: 0,
+      hidden_from_resume: Number(seriesProgress.hidden_from_resume ?? 0),
+      play_count: Number(seriesProgress.play_count ?? 0),
+      last_played_at: seriesProgress.last_played_at ?? null, updated_at: now,
+    };
+    if (existing) await this.runtime.database.query("library_emby_playback_progress").where({ id: existing.id }).update(patch);
+    else await this.runtime.database.query("library_emby_playback_progress").insert({
+      id: randomUUID(), library_id: context.libraryId, account_id: context.accountId,
+      item_id: seriesItemId, media_source_id: null, ...patch,
+    });
+    this.runtime.logBusinessEvent("info", {
+      日志关键字: "codex-series-watched-state",
+      事件: "单集状态变化后重算Emby整剧观看状态",
+      服务ID: context.serviceId,
+      账号ID: context.accountId,
+      节目条目ID: seriesItemId,
+      单集条目ID: episodeItemId,
+      是否整剧已观看: Number(seriesProgress.played ?? 0) === 1,
+      未观看单集数: Number(seriesProgress.unplayed_item_count ?? 0),
+    });
+  }
   private async isFavorite(context: EmbyContext, itemId: string) { return Boolean(await this.runtime.database.query("library_emby_item_preferences").select("id").where({ library_id: context.libraryId, account_id: context.accountId, item_id: itemId }).whereNotNull("starred_at").first()); }
   private async isVirtualFavorite(context: EmbyContext, itemId: string) { return Boolean(await this.runtime.database.query("library_emby_virtual_preferences").select("id").where({ library_id: context.libraryId, account_id: context.accountId, protocol_item_id: itemId.toLowerCase() }).first()); }
   private emptyUserData() { return this.userData(null, 0, false); }
-  private userData(progress: Record<string, unknown> | null | undefined, runTimeTicks: number, favorite: boolean, protocolItemId?: string) { const played = Number(progress?.played ?? 0) === 1; const position = played ? 0 : Number(progress?.position_ticks ?? 0); const source = String(progress?.media_source_id ?? ""); return { PlaybackPositionTicks: position, PlayCount: Number(progress?.play_count ?? 0), IsFavorite: favorite, Played: played, LastPlayedDate: progress?.last_played_at ?? undefined, PlayedPercentage: runTimeTicks > 0 && position > 0 ? position / runTimeTicks * 100 : undefined, Key: "", ItemId: protocolItemId, MediaSourceId: source ? (INTERNAL_ITEM_ID_PATTERN.test(source) ? encodeItemId(source) : source) : undefined }; }
+  private userData(progress: Record<string, unknown> | null | undefined, runTimeTicks: number, favorite: boolean, protocolItemId?: string) { const played = Number(progress?.played ?? 0) === 1; const position = played ? 0 : Number(progress?.position_ticks ?? 0); const source = String(progress?.media_source_id ?? ""); return { PlaybackPositionTicks: position, PlayCount: Number(progress?.play_count ?? 0), IsFavorite: favorite, Played: played, LastPlayedDate: progress?.last_played_at ?? undefined, UnplayedItemCount: progress?.unplayed_item_count === undefined ? undefined : Number(progress.unplayed_item_count), PlayedPercentage: runTimeTicks > 0 && position > 0 ? position / runTimeTicks * 100 : undefined, Key: "", ItemId: protocolItemId, MediaSourceId: source ? (INTERNAL_ITEM_ID_PATTERN.test(source) ? encodeItemId(source) : source) : undefined }; }
   private async readItemRunTimeTicks(item: MediaItemRecord, mediaSourceId?: string) { const files = (await this.runtime.repository.listItemFiles(item.id, item.userId)).filter((file) => String(file.itemId) === item.id); const probes = files.map((file) => parseCompletedMediaProbeResult(file.mediaProbeStatus, file.mediaProbeResult)); if (files.length === 0 || probes.some((probe) => !probe)) return 0; if (mediaSourceId) { const index = mediaSourceId === item.id ? 0 : files.findIndex((file) => String(file.fileId) === mediaSourceId); return index >= 0 ? probes[index]?.runTimeTicks ?? 0 : 0; } return readJellyfinRunTimeTicks(probes); }
-  private async upsertProgress(transaction: Knex | Knex.Transaction, context: EmbyContext, itemId: string, mediaSourceId: string | null, position: number, stopped: boolean, completed: boolean, now: string) { const existing = await transaction("library_emby_playback_progress").where({ library_id: context.libraryId, account_id: context.accountId, item_id: itemId }).first(); const alreadyPlayed = Number(existing?.played ?? 0) === 1; const newlyCompleted = completed && !alreadyPlayed; const playCount = newlyCompleted ? Math.max(1, Number(existing?.play_count ?? 0)) : Number(existing?.play_count ?? 0) + (stopped && !completed ? 1 : 0); const patch = { media_source_id: mediaSourceId ?? existing?.media_source_id ?? null, position_ticks: completed ? 0 : position, played: completed || alreadyPlayed ? 1 : 0, hidden_from_resume: completed || alreadyPlayed ? 1 : 0, last_played_at: now, updated_at: now, play_count: playCount }; if (existing) await transaction("library_emby_playback_progress").where({ id: existing.id }).update(patch); else await transaction("library_emby_playback_progress").insert({ id: randomUUID(), library_id: context.libraryId, account_id: context.accountId, item_id: itemId, ...patch }); }
-  private async loadPersonCache(context: EmbyLibraryContext): Promise<EmbyPersonCache> { const cacheKey = `${context.serviceId}:${context.libraryId}`; const version = Number((await this.runtime.database.query("media_libraries").select("catalog_version").where({ id: context.libraryId }).first())?.catalog_version ?? 0); const cached = this.personCaches.get(cacheKey); if (cached?.catalogVersion === version) return cached; const records = (await Promise.all(["video.movie", "video.series"].map(async (itemType) => (await this.runtime.repository.listCatalogItems({ userId: context.ownerUserId, libraryId: context.libraryId, mediaType: "video", itemType, sort: "updated_desc", limit: 5000, offset: 0, includeFileCounts: false })).items))).flat(); const peopleById = new Map<string, EmbyPersonSummary>(); for (const item of records) { const people = Array.isArray(item.metadata.people) ? item.metadata.people as Array<Record<string, unknown>> : []; for (const raw of people) { const name = String(raw.name ?? "").trim(); if (!name) continue; const id = this.personId(raw); const entry = peopleById.get(id) ?? { id, name, profileUrl: String(raw.profileUrl ?? "").trim(), imageTag: String(raw.profileUrl ?? "").trim() ? imageTag(String(raw.profileUrl)) : "", itemIds: new Set<string>() }; entry.itemIds.add(item.id); peopleById.set(id, entry); } } const next = { catalogVersion: version, peopleById }; this.personCaches.set(cacheKey, next); return next; }
+  /** 新增或更新播放进度，并返回本次是否首次达到完播阈值。 */
+  private async upsertProgress(transaction: Knex | Knex.Transaction, context: EmbyContext, itemId: string, mediaSourceId: string | null, position: number, stopped: boolean, completed: boolean, now: string): Promise<boolean> { const existing = await transaction("library_emby_playback_progress").where({ library_id: context.libraryId, account_id: context.accountId, item_id: itemId }).first(); const alreadyPlayed = Number(existing?.played ?? 0) === 1; const newlyCompleted = completed && !alreadyPlayed; const playCount = newlyCompleted ? Math.max(1, Number(existing?.play_count ?? 0)) : Number(existing?.play_count ?? 0) + (stopped && !completed ? 1 : 0); const patch = { media_source_id: mediaSourceId ?? existing?.media_source_id ?? null, position_ticks: completed ? 0 : position, played: completed || alreadyPlayed ? 1 : 0, hidden_from_resume: completed || alreadyPlayed ? 1 : 0, last_played_at: now, updated_at: now, play_count: playCount }; if (existing) await transaction("library_emby_playback_progress").where({ id: existing.id }).update(patch); else await transaction("library_emby_playback_progress").insert({ id: randomUUID(), library_id: context.libraryId, account_id: context.accountId, item_id: itemId, ...patch }); return newlyCompleted; }
+  /** 按媒体库目录版本建立完整演员索引，供标准人物详情、头像和关联作品接口共用。 */
+  private async loadPersonCache(context: EmbyLibraryContext): Promise<EmbyPersonCache> {
+    const cacheKey = `${context.serviceId}:${context.libraryId}`;
+    const catalogVersion = Number((await this.runtime.database.query("media_libraries")
+      .select("catalog_version").where({ id: context.libraryId }).first())?.catalog_version ?? 0);
+    const cached = this.personCaches.get(cacheKey);
+    if (cached?.catalogVersion === catalogVersion) return cached;
+
+    // 关键变量：演员索引必须覆盖全部电影和节目，不能只读取每类最近 5000 条。
+    const rows = await this.runtime.database.query("media_items")
+      .select("id", "metadata_json")
+      .where({ user_id: context.ownerUserId, library_id: context.libraryId, media_type: "video" })
+      .whereIn("item_type", ["video.movie", "video.series"])
+      .whereNull("deleted_at");
+    const peopleById = new Map<string, EmbyPersonSummary>();
+    for (const row of rows) {
+      const metadata = parseJsonObject(row.metadata_json);
+      const people = Array.isArray(metadata.people) ? metadata.people as Array<Record<string, unknown>> : [];
+      for (const person of people) {
+        const name = String(person.name ?? "").trim();
+        if (!name) continue;
+        const personId = this.personId(person);
+        const profileUrl = String(person.profileUrl ?? "").trim();
+        const validProfileUrl = /^https?:\/\//iu.test(profileUrl) ? profileUrl : "";
+        const existing = peopleById.get(personId);
+        if (existing) {
+          existing.itemIds.add(String(row.id));
+          if (!existing.profileUrl && validProfileUrl) {
+            existing.profileUrl = validProfileUrl;
+            existing.imageTag = imageTag(validProfileUrl);
+          }
+          continue;
+        }
+        peopleById.set(personId, {
+          id: personId,
+          name,
+          profileUrl: validProfileUrl,
+          imageTag: validProfileUrl ? imageTag(validProfileUrl) : "",
+          itemIds: new Set([String(row.id)]),
+        });
+      }
+    }
+
+    const next = { catalogVersion, peopleById };
+    this.personCaches.set(cacheKey, next);
+    this.runtime.logBusinessEvent("info", {
+      日志关键字: "codex-emby-person",
+      事件: "建立Emby演员索引",
+      媒体库ID: context.libraryId,
+      目录版本: catalogVersion,
+      影视条目数量: rows.length,
+      演员数量: peopleById.size,
+    });
+    return next;
+  }
   private queryString(query: Record<string, unknown>, key: string): string { const camel = `${key.charAt(0).toLowerCase()}${key.slice(1)}`; return String(query[key] ?? query[camel] ?? "").trim(); }
   private readSort(query: Record<string, unknown>): CatalogSort { const sort = this.queryString(query, "SortBy").toLowerCase(); const desc = this.queryString(query, "SortOrder").toLowerCase() === "descending"; if (sort.includes("productionyear")) return desc ? "year_desc" : "year_asc"; if (sort.includes("premieredate")) return desc ? "premiere_date_desc" : "premiere_date_asc"; if (sort.includes("sortname") || sort.includes("name")) return desc ? "title_desc" : "title_asc"; return desc || !sort ? "created_desc" : "created_asc"; }
   private paginate<T>(items: T[], query: Record<string, unknown>) { const start = Math.max(0, Number(this.queryString(query, "StartIndex") || 0)); const limit = Math.min(500, Math.max(1, Number(this.queryString(query, "Limit") || items.length || 100))); return { Items: items.slice(start, start + limit), TotalRecordCount: items.length, StartIndex: start }; }

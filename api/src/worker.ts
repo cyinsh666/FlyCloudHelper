@@ -5,7 +5,7 @@ import { musicFileNameHints } from "./music/name-hints.js";
 import { runMusicScan } from "./music/scan-coordinator.js";
 import type { ApiConfig } from "./config.js";
 import type { FlyCloudHelperDatabase } from "./database.js";
-import type { MediaItemRecord, MediaType, ScanJobRecord, SourceFileRecord } from "./domain.js";
+import type { LibraryScanJobRecord, MediaItemRecord, MediaType, ScanJobRecord, SourceFileRecord } from "./domain.js";
 import { ApiError, toSafeErrorMessage } from "./errors.js";
 import {
   createStableId,
@@ -67,6 +67,11 @@ import {
 } from "./scan-failure-report-service.js";
 import { CredentialVault } from "./secrets.js";
 import { loadMusicSourceSettings } from "./system-settings.js";
+import {
+  buildAggregateScanCompletionMessage,
+  buildScanCompletionMessage,
+  createEmptyScanCreatedMediaCounts,
+} from "./scan-notification.js";
 import {
   ServiceRepository,
   type ScanCreatedMediaCounts,
@@ -455,30 +460,6 @@ function findMatchingScanRoot(entryPath: string, roots: ScanRoot[]): ScanRoot | 
     })[0];
 }
 
-/** 生成扫描完成通知；影视列出最多五个新入库影片，音乐保持数量摘要。 */
-function buildScanCompletionMessage(
-  job: Pick<ScanJobRecord, "dataType" | "scanMode" | "serviceName">,
-  createdMediaCounts: ScanCreatedMediaCounts,
-): string {
-  const scanModeLabel = job.scanMode === "full" ? "全量" : "增量";
-  if (job.dataType === "music") {
-    return `服务“${job.serviceName}”的${scanModeLabel}扫描已完成：新增入库 ${createdMediaCounts.songCount} 首歌曲、${createdMediaCounts.albumCount} 张专辑、${createdMediaCounts.artistCount} 位艺术家。`;
-  }
-  const videoLines = createdMediaCounts.videoContents.map((content, index) => (
-    content.itemType === "video.series"
-      ? `${index + 1}. 《${content.title}》（本次新增 ${content.episodeCount ?? 0} 集）`
-      : `${index + 1}. 《${content.title}》（电影）`
-  ));
-  const remainingLine = createdMediaCounts.videoContentCount > 5
-    ? `……等 ${createdMediaCounts.videoContentCount} 个影片。`
-    : null;
-  return [
-    `服务“${job.serviceName}”的${scanModeLabel}扫描已完成：新增入库 ${createdMediaCounts.videoContentCount} 个影片。`,
-    ...videoLines,
-    ...(remainingLine ? [remainingLine] : []),
-  ].join("\n");
-}
-
 /** 轮询数据库任务队列并执行 Provider 扫描；当前只开放影视持久化。 */
 export class ScanWorker {
   private readonly database: FlyCloudHelperDatabase;
@@ -549,7 +530,10 @@ export class ScanWorker {
     try {
       const parentJob = await this.repository.claimLibraryScanJobCompletionNotification(job.parentJobId, job.userId);
       if (!parentJob) return true;
-      const notificationEnabled = await this.readServiceNotificationEnabled(job.serviceId, job.libraryId);
+      const [notificationEnabled, createdMediaCounts] = await Promise.all([
+        this.readServiceNotificationEnabled(job.serviceId, job.libraryId),
+        this.readLibraryScanCreatedMediaCounts(parentJob),
+      ]);
       const hasFailure = parentJob.failedSourceCount > 0;
       const hasErrors = parentJob.errorCount > 0;
       const wasCancelled = parentJob.status === "cancelled" || parentJob.cancelledSourceCount > 0;
@@ -558,7 +542,7 @@ export class ScanWorker {
         category: "task",
         tone: hasFailure || hasErrors || wasCancelled ? "warning" : "success",
         title: hasFailure || hasErrors || wasCancelled ? "云聚合扫描异常结束" : "云聚合扫描已完成",
-        message: `媒体库扫描已结束：${parentJob.completedSourceCount} 个来源完成，${parentJob.failedSourceCount} 个来源失败，${parentJob.cancelledSourceCount} 个来源已取消；共处理 ${parentJob.processedCount} 项，错误 ${parentJob.errorCount} 项。`,
+        message: buildAggregateScanCompletionMessage(parentJob, createdMediaCounts),
         actionPath: "/app/jobs",
         deliverExternally: notificationEnabled,
       });
@@ -571,6 +555,8 @@ export class ScanWorker {
         完成来源数量: parentJob.completedSourceCount,
         失败来源数量: parentJob.failedSourceCount,
         取消来源数量: parentJob.cancelledSourceCount,
+        新增影视内容数量: createdMediaCounts.videoContentCount,
+        通知展示影视数量: createdMediaCounts.videoContents.length,
       });
     } catch (error) {
       this.logger.warn({
@@ -582,6 +568,22 @@ export class ScanWorker {
       });
     }
     return true;
+  }
+
+  /** 尽力统计云聚合父任务新增内容；统计失败时仍发送不含明细的完成通知。 */
+  private async readLibraryScanCreatedMediaCounts(parentJob: LibraryScanJobRecord): Promise<ScanCreatedMediaCounts> {
+    try {
+      return await this.repository.getLibraryScanCreatedMediaCounts(parentJob);
+    } catch (error) {
+      this.logger.warn({
+        日志关键字: "codex-flycloud-helper-service-notification",
+        事件: "统计云聚合扫描新增入库内容失败",
+        父任务ID: parentJob.id,
+        媒体库ID: parentJob.libraryId,
+        错误信息: error instanceof Error ? error.message : "未知数据库错误",
+      });
+      return createEmptyScanCreatedMediaCounts();
+    }
   }
 
   /** 尽力统计本次扫描新增入库内容；统计失败时使用零值完成原任务。 */
@@ -597,7 +599,7 @@ export class ScanWorker {
         服务ID: job.serviceId,
         错误信息: error instanceof Error ? error.message : "未知数据库错误",
       });
-      return { videoContentCount: 0, videoContents: [], songCount: 0, albumCount: 0, artistCount: 0 };
+      return createEmptyScanCreatedMediaCounts();
     }
   }
 

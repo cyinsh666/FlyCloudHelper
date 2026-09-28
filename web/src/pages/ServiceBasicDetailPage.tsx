@@ -17,6 +17,7 @@ export function ServiceBasicDetailPage({ serviceId, admin = false }: { serviceId
     <div className="grid gap-4 lg:grid-cols-2">
       <Panel title="基础信息">
         <dl className="grid gap-3 text-sm"><div className="flex justify-between gap-4"><dt className="text-muted-foreground">网盘类型</dt><dd>{service.providerType}</dd></div><div className="flex justify-between gap-4"><dt className="text-muted-foreground">所属用户</dt><dd>{service.ownerUsername}</dd></div><div className="flex justify-between gap-4"><dt className="text-muted-foreground">服务状态</dt><dd>{service.status === "active" ? "已启用" : "已停用"}</dd></div></dl>
+        {service.providerType === "baidupan" && <p className="mt-4 text-xs text-muted-foreground">Jellyfin 关闭中转后，百度直链服务仅 Flymby 可用；其他播放器请开启中转播放。</p>}
       </Panel>
       <Panel title="登录凭据" description="服务只保存网盘登录信息；扫描、元数据和协议设置由媒体库管理。">
         <div className="flex items-center justify-between gap-4"><div className="flex items-center gap-3"><KeyRound className="size-5 text-muted-foreground" /><div><p className="text-sm font-medium">{service.connectionStatus === "valid" ? "登录有效" : "需要重新登录"}</p><p className="mt-1 text-xs text-muted-foreground">凭据修订 r{service.credentialRevision}</p></div></div><Link to={connectionPath} params={{ serviceId: service.id }}><SecondaryButton>重新登录</SecondaryButton></Link></div>

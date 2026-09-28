@@ -273,6 +273,7 @@ function MediaDetailDialog({
   const externalIds = Object.entries(item.externalIds).filter(([, value]) => Boolean(value));
   const mediaProbeSummary = item.mediaProbeSummary;
   const canMatchVideo = item.mediaType === "video" && (item.itemType === "video.movie" || item.itemType === "video.series");
+  const aggregateSourceNames = item.libraryKind === "cloud_aggregate_video" && Array.isArray(item.sourceNames) ? item.sourceNames : [];
   // 关键变量：只有节目详情使用季集位置展示子项，电影及其他媒体保持原展示。
   const isSeries = item.itemType === "video.series";
   const isMusicAlbum = item.itemType === "music.album";
@@ -299,6 +300,7 @@ function MediaDetailDialog({
                 <StatusPill tone={item.matchState === "matched" ? "success" : item.matchState === "unmatched" ? "danger" : "warning"}>{matchStateLabels[item.matchState]}</StatusPill>
                 <StatusPill>{item.year ?? "年份未知"}</StatusPill>
                 <StatusPill>{item.fileCount} 个文件</StatusPill>
+                {aggregateSourceNames.map((sourceName) => <StatusPill key={sourceName} tone="info">来源：{sourceName}</StatusPill>)}
               </div>
               {canMatchVideo && (
                 <div className="mt-4 flex flex-wrap gap-2">
@@ -359,7 +361,7 @@ function MediaDetailDialog({
                   {paths.map((pathItem) => (
                     <li key={pathItem.fileId} className="rounded-lg border border-border bg-secondary/30 p-3">
                       <p className="break-all font-mono text-xs leading-5">{pathItem.path}</p>
-                      <p className="mt-1 text-[11px] text-muted-foreground">{pathItem.linkedItemTitle || pathItem.name} · {formatFileSize(pathItem.size)}</p>
+                      <p className="mt-1 text-[11px] text-muted-foreground">来源：{pathItem.sourceName} · {pathItem.providerType} · {pathItem.linkedItemTitle || pathItem.name} · {formatFileSize(pathItem.size)}</p>
                       {pathItem.mediaProbe && (
                         <div className="mt-2 space-y-1.5 border-t border-border/70 pt-2">
                           <p className="text-[11px] text-muted-foreground">
@@ -429,7 +431,7 @@ function MediaDetailDialog({
               ) : <p className="mt-3 text-sm text-muted-foreground">{isSeries ? "当前节目没有剧集" : isMusicAlbum ? "当前专辑没有歌曲" : "当前条目没有子项"}</p>}
             </div>
             <div className="mt-5 rounded-xl border border-border bg-secondary/30 p-4 text-xs leading-6 text-muted-foreground">
-              所属用户：{item.ownerUsername}<br />所属服务：{item.serviceName}<br />该页面不提供播放、下载或网盘地址。
+              所属用户：{item.ownerUsername}<br />所属媒体库：{item.serviceName}<br />{aggregateSourceNames.length > 0 && <>网盘来源：{aggregateSourceNames.join("、")}<br /></>}该页面不提供播放、下载或网盘地址。
             </div>
           </div>
         </div>

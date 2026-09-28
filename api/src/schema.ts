@@ -6,7 +6,7 @@ import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
 import { createMusicScanTables } from "./music/scan-state.js";
 
-export const currentSchemaVersion = 59;
+export const currentSchemaVersion = 60;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -238,6 +238,27 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("deleted_at", 40).nullable();
       table.index(["user_id", "status"], "idx_cloud_services_user_status");
     });
+  } else {
+    // 关键变量：旧数据库可能已标记为最新版本，但历史建表分支没有补过这三个客户端来源字段。
+    const clientMetadataColumns = ["device_id", "device_name", "client_name"] as const;
+    const missingClientMetadataColumns: string[] = [];
+    for (const columnName of clientMetadataColumns) {
+      if (!(await database.schema.hasColumn("cloud_services", columnName))) {
+        missingClientMetadataColumns.push(columnName);
+      }
+    }
+    await addColumnIfMissing(database, "cloud_services", "device_id", (table) => {
+      table.string("device_id", 255).nullable();
+    });
+    await addColumnIfMissing(database, "cloud_services", "device_name", (table) => {
+      table.string("device_name", 255).nullable();
+    });
+    await addColumnIfMissing(database, "cloud_services", "client_name", (table) => {
+      table.string("client_name", 255).nullable();
+    });
+    if (missingClientMetadataColumns.length > 0) {
+      console.info(`[codex-cloud-service-schema] 事件=补齐网盘服务客户端来源字段 表名=cloud_services 缺失字段=${missingClientMetadataColumns.join(",")} 结果=成功`);
+    }
   }
   if (!(await database.schema.hasTable("media_libraries"))) {
     await database.schema.createTable("media_libraries", (table) => {
@@ -1784,6 +1805,9 @@ async function migrateServiceLibraryOwnershipV55(database: Knex): Promise<void> 
       "user_id",
       "library_id",
       "display_name",
+      "provider_type",
+      "connection_status",
+      "credential_revision",
       "data_type",
       "notification_enabled",
       "scan_profile_revision",
@@ -1840,8 +1864,16 @@ async function migrateServiceLibraryOwnershipV55(database: Knex): Promise<void> 
           user_id: service.user_id,
           library_id: libraryId,
           service_id: serviceId,
+          source_mode: "linked_service",
+          display_name: String(service.display_name),
+          provider_type: String(service.provider_type),
+          connection_status: String(service.connection_status),
+          credential_revision: Number(service.credential_revision),
+          // 关键变量：旧版来源仍然引用原网盘服务，不复制独立连接配置。
+          configuration_json: "{}",
           status: "active",
           sort_order: 0,
+          last_scan_at: service.last_scan_at ?? null,
           created_at: now,
           updated_at: now,
         });

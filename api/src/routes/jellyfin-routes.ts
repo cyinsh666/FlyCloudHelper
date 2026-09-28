@@ -121,10 +121,10 @@ function supportsPlaybackUserAgent(providerType: string): boolean {
   return providerType === "cloud115" || providerType === "cloud123";
 }
 
-/** 115、123取址 UA 与当前播放器一致时无需额外请求头；其他网盘及认证头仍保持原限制。 */
+/** 115、123取址 UA 或百度固定 UA 与当前播放器一致时无需额外请求头；认证头仍保持原限制。 */
 function hasRequiredPlaybackHeaders(access: ProviderFileAccess, request: FastifyRequest, providerType: string): boolean {
   return Object.entries(access.headers).some(([name, value]) => {
-    if (supportsPlaybackUserAgent(providerType) && name.toLowerCase() === "user-agent") {
+    if ((supportsPlaybackUserAgent(providerType) || providerType === "baidupan") && name.toLowerCase() === "user-agent") {
       const playerUserAgent = request.headers["user-agent"];
       return typeof playerUserAgent !== "string" || !playerUserAgent || value !== playerUserAgent;
     }
@@ -316,6 +316,10 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
     }
     if (selectedRoute === "origin" && !originAccess) continue;
     const directStreamUrl = buildJellyfinStreamUrl(protocolItemId, protocolMediaSourceId, preference);
+    // 关键变量：百度直链要求固定 UA；只在原始路线声明给播放器，中转路线不改变客户端请求头。
+    const requiredHttpHeaders = selectedRoute === "origin" && String(file.providerType ?? "") === "baidupan"
+      ? { "User-Agent": "pan.baidu.com" }
+      : {};
     routeNames.add(selectedRoute === "origin" ? "Jellyfin原始跳转" : "服务器中转");
     mediaSources.push({
       ...buildStandardMediaSourceDefaults(),
@@ -327,7 +331,7 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
       Bitrate: mediaProbe?.bitRate || undefined,
       IsRemote: false,
       DirectStreamUrl: directStreamUrl, AddApiKeyToDirectStreamUrl: true,
-      RequiredHttpHeaders: {},
+      RequiredHttpHeaders: requiredHttpHeaders,
       RunTimeTicks: mediaProbe?.runTimeTicks || runTimeTicks || undefined,
       MediaStreams: mediaProbe?.mediaStreams ?? [],
     });
@@ -479,7 +483,9 @@ async function sendMediaStream(
           if (!originAccess || !/^https?:\/\//iu.test(originAccess.url)) {
             throw new ApiError(409, "jellyfin_origin_direct_unavailable", "当前文件无法生成原始播放地址，请启用 Jellyfin 中转播放");
           }
-          if (!hasRequiredPlaybackHeaders(originAccess, request, String(candidateFile.providerType ?? ""))) {
+          // 关键变量：百度直链仅在播放器实际使用指定 UA 时跳转，避免无专用请求头的客户端接收不可播地址。
+          const requiresExtraHeaders = hasRequiredPlaybackHeaders(originAccess, request, String(candidateFile.providerType ?? ""));
+          if (!requiresExtraHeaders) {
             reply.header("Cache-Control", "private, no-store");
             return reply.redirect(originAccess.url, 307);
           }

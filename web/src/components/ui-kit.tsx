@@ -210,6 +210,7 @@ export function PosterCard({ item, onClick }: { item: MediaItem; onClick?: () =>
   };
   const hue = [...item.id].reduce((sum, character) => sum + character.charCodeAt(0), 0) % 360;
   const mediaProbeSummary = item.mediaProbeSummary;
+  const aggregateSourceNames = item.libraryKind === "cloud_aggregate_video" && Array.isArray(item.sourceNames) ? item.sourceNames : [];
   // 关键变量：海报只保留最有辨识度的三个规格，完整音视频流放在详情中展示。
   const mediaSpecLabels = mediaProbeSummary ? [
     formatPosterResolution(mediaProbeSummary.width, mediaProbeSummary.height),
@@ -250,7 +251,12 @@ export function PosterCard({ item, onClick }: { item: MediaItem; onClick?: () =>
             ))}
           </div>
         )}
-        <div className="absolute inset-x-3 bottom-3">
+        <div className="absolute inset-x-3 bottom-3 flex flex-wrap items-center gap-1.5">
+          {aggregateSourceNames.map((sourceName) => (
+            <span key={sourceName} title={`网盘来源：${sourceName}`} className="max-w-full truncate rounded-md border border-white/20 bg-black/65 px-1.5 py-0.5 text-[9px] font-semibold text-white shadow-sm backdrop-blur-sm">
+              来源：{sourceName}
+            </span>
+          ))}
           <StatusPill tone={statusTone[item.matchState]}>{statusLabels[item.matchState]}</StatusPill>
         </div>
       </div>

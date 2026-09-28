@@ -287,6 +287,7 @@ export interface MediaItemRecord {
   userId: string;
   serviceId: string;
   libraryId: string;
+  libraryKind: MediaLibraryKind;
   mediaType: MediaType;
   itemType: string;
   /** 节目的 Jellyfin 地区分组；电影和缺少地区数据的条目为 other。 */
@@ -307,6 +308,8 @@ export interface MediaItemRecord {
   mediaProbeSummary: MediaProbeSummaryRecord | null;
   ownerUsername: string;
   serviceName: string;
+  /** 当前条目及其直接子项实际关联的网盘来源名称，按媒体库来源顺序排列。 */
+  sourceNames: string[];
   createdAt: string;
   updatedAt: string;
 }

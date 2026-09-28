@@ -605,6 +605,7 @@ export interface MediaItem {
   userId: string;
   serviceId: string;
   libraryId: string;
+  libraryKind: "legacy_single_source" | "cloud_aggregate_video";
   mediaType: MediaType;
   itemType: string;
   title: string;
@@ -623,6 +624,8 @@ export interface MediaItem {
   mediaProbeSummary: MediaProbeSummary | null;
   ownerUsername: string;
   serviceName: string;
+  /** 云聚合条目及其直接子项实际所属的网盘来源。 */
+  sourceNames: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -660,6 +663,8 @@ export interface MediaPathItem {
   resourceId: string;
   linkedItemId: string;
   linkedItemTitle: string;
+  sourceName: string;
+  providerType: string;
   path: string;
   name: string;
   size: number;
@@ -1669,9 +1674,9 @@ export function listLibraryItems(
   }));
 }
 
-/** 读取管理端指定服务的海报墙条目。 */
-export function listAdminServiceItems(
-  serviceId: string,
+/** 读取管理端指定媒体库的海报墙条目，云聚合库不再被第一个来源限制。 */
+export function listAdminLibraryItems(
+  libraryId: string,
   options: {
     search?: string;
     mediaType?: MediaType;
@@ -1683,7 +1688,7 @@ export function listAdminServiceItems(
   } = {},
 ): Promise<{ items: MediaItem[]; total: number }> {
   return requestJson(withQuery("/api/v1/admin/catalog/items", {
-    serviceId,
+    libraryId,
     search: options.search,
     mediaType: options.mediaType,
     itemType: options.itemType,

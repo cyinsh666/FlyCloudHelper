@@ -1290,14 +1290,15 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     await requireSuperAdmin(request, runtime.database);
     const userId = typeof request.query.userId === "string" ? request.query.userId : undefined;
     const serviceId = typeof request.query.serviceId === "string" ? request.query.serviceId : undefined;
-    if (!userId && !serviceId) {
-      throw validationError("userId", "全局海报墙必须指定用户或服务范围");
+    const libraryId = typeof request.query.libraryId === "string" ? request.query.libraryId : undefined;
+    if (!userId && !serviceId && !libraryId) {
+      throw validationError("userId", "全局海报墙必须指定用户、服务或媒体库范围");
     }
     const sortValue = request.query.sort;
     return runtime.repository.listCatalogItems({
       userId,
       serviceId,
-      libraryId: typeof request.query.libraryId === "string" ? request.query.libraryId : undefined,
+      libraryId,
       mediaType: typeof request.query.mediaType === "string" ? request.query.mediaType as MediaType : undefined,
       itemType: typeof request.query.itemType === "string" ? request.query.itemType : undefined,
       matchState: typeof request.query.matchState === "string" ? request.query.matchState as MatchState : undefined,

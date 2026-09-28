@@ -144,6 +144,7 @@ interface JobRow {
   parent_job_id: string | null;
   owner_username: string;
   service_name: string;
+  service_name_fallback_used?: number | string | boolean;
   data_type: MediaType;
   request_id: string;
   client_device_id: string;
@@ -181,6 +182,7 @@ interface MediaProbeJobRow {
   library_source_id: string | null;
   owner_username: string;
   service_name: string;
+  service_name_fallback_used?: number | string | boolean;
   status: JobStatus;
   stage: "queued" | "probing" | "completed";
   processed_count: number | string;
@@ -590,6 +592,8 @@ export interface CatalogPathRow {
   resourceId: string;
   linkedItemId: string;
   linkedItemTitle: string;
+  sourceName: string;
+  providerType: string;
   path: string;
   name: string;
   size: number;
@@ -775,6 +779,10 @@ export class ServiceRepository {
   private readonly serviceAccess: ServiceAccessService;
   // 关键变量：阻止同一 API 实例同时执行同一服务的多次清空，跨实例仍由数据库服务行锁兜底。
   private readonly clearingCatalogServiceIds = new Set<string>();
+  // 关键变量：任务列表会轮询，同一任务的标题回退日志只记录一次。
+  private readonly loggedJobTitleFallbackIds = new Set<string>();
+  // 关键变量：海报列表和详情会重复读取条目，每个条目的来源标签日志只记录一次。
+  private readonly loggedAggregateSourceLabelItemIds = new Set<string>();
 
   /** 初始化服务仓储；普通扫描按来源互斥，只有视频规格队列保留固定并发上限。 */
   public constructor(
@@ -789,6 +797,22 @@ export class ServiceRepository {
     this.logger = logger;
     this.mediaProbeConcurrency = queueLimits.mediaProbeConcurrency;
     this.serviceAccess = serviceAccess;
+  }
+
+  /** 记录历史空来源名称的任务标题回退，便于验证列表标题修复。 */
+  private logJobTitleFallback(rows: Array<JobRow | MediaProbeJobRow>): void {
+    for (const row of rows) {
+      if (!Boolean(Number(row.service_name_fallback_used)) || this.loggedJobTitleFallbackIds.has(row.id)) continue;
+      this.loggedJobTitleFallbackIds.add(row.id);
+      this.logger?.("info", {
+        日志关键字: "codex-job-title-fallback",
+        事件: "后台任务标题使用名称回退",
+        任务ID: row.id,
+        媒体库ID: row.library_id,
+        媒体库源ID: row.library_source_id,
+        最终标题: row.service_name,
+      });
+    }
   }
 
   /**
@@ -806,6 +830,7 @@ export class ServiceRepository {
     const selectWaitRows = (tableName: "scan_jobs" | "media_probe_jobs") => transaction(`${tableName} as j`)
       .leftJoin("library_sources as ls", "ls.id", "j.library_source_id")
       .leftJoin("cloud_services as s", "s.id", "j.service_id")
+      .leftJoin("media_libraries as l", "l.id", "j.library_id")
       .join("user_accounts as u", "u.id", "j.user_id")
       .select(
         "j.id",
@@ -813,7 +838,7 @@ export class ServiceRepository {
         transaction.raw("coalesce(j.service_id, j.library_source_id) as service_id"),
         "j.status",
         "j.created_at",
-        transaction.raw("coalesce(ls.display_name, s.display_name, '已删除来源') as service_name"),
+        transaction.raw("coalesce(nullif(trim(ls.display_name), ''), nullif(trim(s.display_name), ''), nullif(trim(l.display_name), ''), '已删除来源') as service_name"),
         "u.username as owner_username",
       );
 
@@ -987,46 +1012,60 @@ export class ServiceRepository {
     initialStatus?: "active" | "disabled";
   }): Promise<ServiceDetailRecord> {
     const now = new Date().toISOString();
-    await this.database.query.transaction(async (transaction) => {
-      await transaction("cloud_services").insert({
-        id: input.serviceId,
-        user_id: input.userId,
-        display_name: input.displayName,
-        provider_type: input.providerType,
-        status: input.initialStatus ?? "active",
-        connection_status: "valid",
-        credential_revision: 1,
-        device_id: input.deviceId ?? null,
-        device_name: input.deviceName ?? null,
-        client_name: input.clientName ?? null,
-        created_at: now,
-        updated_at: now,
-        deleted_at: null,
-      });
-      await transaction("service_credentials").insert({
-        id: randomUUID(),
-        user_id: input.userId,
-        service_id: input.serviceId,
-        revision: 1,
-        encrypted_payload: input.encryptedConnection,
-        key_version: 1,
-        schema_version: input.providerSchemaVersion,
-        status: "active",
-        created_at: now,
-      });
-      if (input.importSource) {
-        await transaction("service_import_sources").insert({
-          id: input.importSource.id,
+    try {
+      await this.database.query.transaction(async (transaction) => {
+        await transaction("cloud_services").insert({
+          id: input.serviceId,
+          user_id: input.userId,
+          display_name: input.displayName,
+          provider_type: input.providerType,
+          status: input.initialStatus ?? "active",
+          connection_status: "valid",
+          credential_revision: 1,
+          device_id: input.deviceId ?? null,
+          device_name: input.deviceName ?? null,
+          client_name: input.clientName ?? null,
+          created_at: now,
+          updated_at: now,
+          deleted_at: null,
+        });
+        await transaction("service_credentials").insert({
+          id: randomUUID(),
           user_id: input.userId,
           service_id: input.serviceId,
-          source_device_id: input.importSource.sourceDeviceId,
-          source_local_service_id: input.importSource.sourceLocalServiceId,
-          request_id: input.importSource.requestId,
-          provider_type: input.providerType,
+          revision: 1,
+          encrypted_payload: input.encryptedConnection,
+          key_version: 1,
+          schema_version: input.providerSchemaVersion,
+          status: "active",
           created_at: now,
         });
-      }
-    });
+        if (input.importSource) {
+          await transaction("service_import_sources").insert({
+            id: input.importSource.id,
+            user_id: input.userId,
+            service_id: input.serviceId,
+            source_device_id: input.importSource.sourceDeviceId,
+            source_local_service_id: input.importSource.sourceLocalServiceId,
+            request_id: input.importSource.requestId,
+            provider_type: input.providerType,
+            created_at: now,
+          });
+        }
+      });
+    } catch (error) {
+      const databaseError = error as Error & { code?: string };
+      this.logger?.("warn", {
+        日志关键字: "codex-cloud-service-create",
+        事件: "创建网盘服务事务失败",
+        用户ID: input.userId,
+        服务ID: input.serviceId,
+        网盘类型: input.providerType,
+        数据库错误码: databaseError.code ?? "unknown",
+        错误信息: databaseError.message || "未知数据库错误",
+      });
+      throw error;
+    }
     return this.getServiceDetail(input.serviceId, input.userId);
   }
 
@@ -2537,7 +2576,8 @@ export class ServiceRepository {
       .leftJoin("scan_job_checkpoints as cp", "cp.job_id", "j.id")
       .select(
         "j.*",
-        this.database.query.raw("COALESCE(ls.display_name, s.display_name) as service_name"),
+        transaction.raw("COALESCE(NULLIF(TRIM(ls.display_name), ''), NULLIF(TRIM(s.display_name), ''), NULLIF(TRIM(l.display_name), ''), '已删除来源') as service_name"),
+        transaction.raw("CASE WHEN ls.display_name IS NULL OR TRIM(ls.display_name) = '' THEN 1 ELSE 0 END as service_name_fallback_used"),
         "l.data_type",
         "u.username as owner_username",
         "cp.updated_at as checkpoint_updated_at",
@@ -2549,10 +2589,12 @@ export class ServiceRepository {
     return transaction("media_probe_jobs as j")
       .leftJoin("library_sources as ls", "ls.id", "j.library_source_id")
       .leftJoin("cloud_services as s", "s.id", "j.service_id")
+      .leftJoin("media_libraries as l", "l.id", "j.library_id")
       .join("user_accounts as u", "u.id", "j.user_id")
       .select(
         "j.*",
-        this.database.query.raw("COALESCE(ls.display_name, s.display_name) as service_name"),
+        transaction.raw("COALESCE(NULLIF(TRIM(ls.display_name), ''), NULLIF(TRIM(s.display_name), ''), NULLIF(TRIM(l.display_name), ''), '已删除来源') as service_name"),
+        transaction.raw("CASE WHEN ls.display_name IS NULL OR TRIM(ls.display_name) = '' THEN 1 ELSE 0 END as service_name_fallback_used"),
         "u.username as owner_username",
       );
   }
@@ -2569,6 +2611,7 @@ export class ServiceRepository {
     }
     const row = await query.first() as JobRow | undefined;
     if (row) {
+      this.logJobTitleFallback([row]);
       const mappedJob = mapJob(row);
       return (await this.attachQueuedJobWaitDetails([mappedJob], userId, transaction))[0] ?? mappedJob;
     }
@@ -2576,6 +2619,7 @@ export class ServiceRepository {
     if (userId) mediaProbeQuery.where("j.user_id", userId);
     const mediaProbeRow = await mediaProbeQuery.first() as MediaProbeJobRow | undefined;
     if (mediaProbeRow) {
+      this.logJobTitleFallback([mediaProbeRow]);
       const mappedJob = mapMediaProbeJob(mediaProbeRow);
       return (await this.attachQueuedJobWaitDetails([mappedJob], userId, transaction))[0] ?? mappedJob;
     }
@@ -2856,6 +2900,7 @@ export class ServiceRepository {
       const probeRows = selectedMediaProbeJobIds.length > 0
         ? await mediaProbeQuery.clone().whereIn("j.id", selectedMediaProbeJobIds) as unknown as MediaProbeJobRow[]
         : [];
+      this.logJobTitleFallback([...scanRows, ...probeRows]);
       const groupOrder = new Map(selectedGroups.map((group, index) => [group.key, index]));
       const items = [...scanRows.map(mapJob), ...probeRows.map(mapMediaProbeJob)]
         .sort((left, right) => {
@@ -2877,6 +2922,7 @@ export class ServiceRepository {
       countQuery.count<{ count: string | number }[]>({ count: "j.id" }).first(),
       mediaProbeCountQuery.count<{ count: string | number }[]>({ count: "j.id" }).first(),
     ]);
+    this.logJobTitleFallback([...rows, ...mediaProbeRows]);
     const items = [...rows.map(mapJob), ...mediaProbeRows.map(mapMediaProbeJob)]
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
       .slice(filters.offset, filters.offset + filters.limit);
@@ -3676,6 +3722,17 @@ export class ServiceRepository {
       albumCount: counts.get("music.album") ?? 0,
       artistCount: counts.get("music.artist") ?? 0,
     };
+  }
+
+  /** 按所有来源子任务的最早启动时间，汇总云聚合父任务本次新增的影视内容。 */
+  public async getLibraryScanCreatedMediaCounts(
+    job: Pick<LibraryScanJobRecord, "libraryId" | "startedAt" | "sourceJobs">,
+  ): Promise<ScanCreatedMediaCounts> {
+    // 关键变量：父任务启动时间在首个子任务收尾时才写入，不能用于统计首个来源已经创建的内容。
+    const sourceStartedAt = job.sourceJobs
+      .flatMap((sourceJob) => sourceJob.startedAt ? [sourceJob.startedAt] : [])
+      .sort((left, right) => left.localeCompare(right))[0] ?? job.startedAt;
+    return this.getScanCreatedMediaCounts({ libraryId: job.libraryId, startedAt: sourceStartedAt });
   }
 
   /** 删除媒体库协议账号和观看状态，来源网盘服务不参与协议数据归属。 */
@@ -5378,6 +5435,15 @@ export class ServiceRepository {
       }
       return [...previousItemIds];
     }
+    const existingSeriesEpisodeRelation = input.relationType === "series_episode"
+      ? await this.database.query("media_relations").select("id").where({
+        user_id: input.userId,
+        library_id: input.libraryId,
+        parent_item_id: input.parentItemId,
+        child_item_id: input.childItemId,
+        relation_type: input.relationType,
+      }).first()
+      : undefined; // 关键变量：只有首次加入节目的单集才需要使整剧已观看状态失效。
     // 单集、曲目和章节只能属于一个同类型父项；解析规则修正后先移除旧父关系，避免海报墙残留错误节目。
     await this.database.query("media_relations").where({
       user_id: input.userId,
@@ -5397,6 +5463,30 @@ export class ServiceRepository {
       })
       .onConflict(["user_id", "parent_item_id", "child_item_id", "relation_type"])
       .merge({ sort_order: input.sortOrder });
+    if (input.relationType === "series_episode" && !existingSeriesEpisodeRelation) {
+      const now = new Date().toISOString();
+      const jellyfinChanged = await this.database.query("library_playback_progress").where({
+        library_id: input.libraryId,
+        item_id: input.parentItemId,
+        played: 1,
+      }).update({ played: 0, position_ticks: 0, hidden_from_resume: 0, play_count: 0, last_played_at: null, updated_at: now });
+      const embyChanged = await this.database.query("library_emby_playback_progress").where({
+        library_id: input.libraryId,
+        item_id: input.parentItemId,
+        played: 1,
+      }).update({ played: 0, position_ticks: 0, hidden_from_resume: 0, play_count: 0, last_played_at: null, updated_at: now });
+      if (Number(jellyfinChanged) > 0 || Number(embyChanged) > 0) {
+        this.logger?.("info", {
+          日志关键字: "codex-series-watched-state",
+          事件: "新增单集后取消整剧已观看状态",
+          媒体库ID: input.libraryId,
+          节目条目ID: input.parentItemId,
+          新增单集ID: input.childItemId,
+          Jellyfin更新账号数: Number(jellyfinChanged),
+          Emby更新账号数: Number(embyChanged),
+        });
+      }
+    }
     return [];
   }
 
@@ -5806,7 +5896,7 @@ export class ServiceRepository {
     // cloud_services 和 user_accounts 都是一对一连接，不需要 DISTINCT 产生额外临时表。
     const countRow = await base.clone().count<{ count: string | number }[]>({ count: "m.id" }).first();
     const rowsQuery = base.clone()
-      .select("m.*", "u.username as owner_username", "l.display_name as service_name");
+      .select("m.*", "u.username as owner_username", "l.display_name as service_name", "l.library_kind");
     // 所有排序都追加稳定主键，避免同年、同日或同名条目跨页时重复或遗漏。
     if (filters.sort === "title_asc" || filters.sort === "title_desc") {
       rowsQuery.orderBy("m.sort_title", filters.sort === "title_asc" ? "asc" : "desc").orderBy("m.id", "asc");
@@ -5827,16 +5917,20 @@ export class ServiceRepository {
     }
     // 关键变量：排序和分页必须全部追加后再执行，不能先 await 成数组。
     const rows = await rowsQuery.limit(filters.limit).offset(filters.offset);
-    const [fileCounts, mediaProbeSummaries] = await Promise.all([
+    const [fileCounts, mediaProbeSummaries, sourceNames] = await Promise.all([
       filters.includeFileCounts === false ? Promise.resolve(new Map<string, number>()) : this.loadCatalogFileCounts(rows),
       this.loadCatalogMediaProbeSummaries(rows),
+      this.loadCatalogSourceNames(rows),
     ]);
+    const items = rows.map((row) => this.mapMediaItem({
+      ...row,
+      file_count: fileCounts.get(String(row.id)) ?? 0,
+      media_probe_summary: mediaProbeSummaries.get(String(row.id)) ?? null,
+      source_names: sourceNames.get(String(row.id)) ?? [],
+    }));
+    this.logAggregateSourceLabels(items);
     return {
-      items: rows.map((row) => this.mapMediaItem({
-        ...row,
-        file_count: fileCounts.get(String(row.id)) ?? 0,
-        media_probe_summary: mediaProbeSummaries.get(String(row.id)) ?? null,
-      })),
+      items,
       total: Number(countRow?.count ?? 0),
     };
   }
@@ -5846,21 +5940,25 @@ export class ServiceRepository {
     const query = this.database.query("media_items as m")
       .join("media_libraries as l", "l.id", "m.library_id")
       .join("user_accounts as u", "u.id", "m.user_id")
-      .select("m.*", "u.username as owner_username", "l.display_name as service_name")
+      .select("m.*", "u.username as owner_username", "l.display_name as service_name", "l.library_kind")
       .where("m.id", itemId)
       .whereNull("m.deleted_at");
     if (userId) query.where("m.user_id", userId);
     const row = await query.first();
     if (!row) throw new ApiError(404, "media_item_not_found", "媒体条目不存在");
-    const [fileCounts, mediaProbeSummaries] = await Promise.all([
+    const [fileCounts, mediaProbeSummaries, sourceNames] = await Promise.all([
       this.loadCatalogFileCounts([row]),
       this.loadCatalogMediaProbeSummaries([row]),
+      this.loadCatalogSourceNames([row]),
     ]);
-    return this.mapMediaItem({
+    const item = this.mapMediaItem({
       ...row,
       file_count: fileCounts.get(String(row.id)) ?? 0,
       media_probe_summary: mediaProbeSummaries.get(String(row.id)) ?? null,
+      source_names: sourceNames.get(String(row.id)) ?? [],
     });
+    this.logAggregateSourceLabels([item]);
+    return item;
   }
 
   /**
@@ -5873,18 +5971,20 @@ export class ServiceRepository {
     const rows = await this.database.query("media_items as m")
       .join("media_libraries as l", "l.id", "m.library_id")
       .join("user_accounts as u", "u.id", "m.user_id")
-      .select("m.*", "u.username as owner_username", "l.display_name as service_name")
+      .select("m.*", "u.username as owner_username", "l.display_name as service_name", "l.library_kind")
       .where("m.user_id", userId)
       .whereIn("m.id", uniqueItemIds)
       .whereNull("m.deleted_at");
-    const [fileCounts, mediaProbeSummaries] = await Promise.all([
+    const [fileCounts, mediaProbeSummaries, sourceNames] = await Promise.all([
       this.loadCatalogFileCounts(rows),
       this.loadCatalogMediaProbeSummaries(rows),
+      this.loadCatalogSourceNames(rows),
     ]);
     return rows.map((row) => this.mapMediaItem({
       ...row,
       file_count: fileCounts.get(String(row.id)) ?? 0,
       media_probe_summary: mediaProbeSummaries.get(String(row.id)) ?? null,
+      source_names: sourceNames.get(String(row.id)) ?? [],
     }));
   }
 
@@ -5925,6 +6025,97 @@ export class ServiceRepository {
     }
 
     return new Map([...fileIdsByItem].map(([itemId, fileIds]) => [itemId, fileIds.size]));
+  }
+
+  /** 批量汇总条目自身及直接子项所属的网盘来源，供云聚合海报和详情展示。 */
+  private async loadCatalogSourceNames(rows: Record<string, unknown>[]): Promise<Map<string, string[]>> {
+    const aggregateRows = rows.filter((row) => String(row.library_kind) === "cloud_aggregate_video");
+    if (aggregateRows.length === 0) return new Map();
+    const sourcesByItem = new Map<string, Map<string, { name: string; sortOrder: number }>>();
+    const itemIdsByUser = new Map<string, string[]>();
+    for (const row of aggregateRows) {
+      const userId = String(row.user_id);
+      const itemId = String(row.id);
+      const itemIds = itemIdsByUser.get(userId) ?? [];
+      itemIds.push(itemId);
+      itemIdsByUser.set(userId, itemIds);
+      sourcesByItem.set(itemId, new Map());
+    }
+
+    /** 把直接文件和节目子集文件的来源合并到顶层条目。 */
+    const appendSourceRows = (sourceRows: Array<Record<string, unknown>>): void => {
+      for (const sourceRow of sourceRows) {
+        const itemSources = sourcesByItem.get(String(sourceRow.item_id));
+        if (!itemSources) continue;
+        const sourceId = String(sourceRow.library_source_id);
+        const sourceName = String(sourceRow.source_display_name || "已删除来源");
+        itemSources.set(sourceId, {
+          name: sourceName,
+          sortOrder: Number(sourceRow.source_sort_order ?? 0),
+        });
+      }
+    };
+
+    for (const [userId, itemIds] of itemIdsByUser) {
+      for (const itemIdChunk of chunkStrings(itemIds)) {
+        const sourceNameSql = "coalesce(nullif(trim(ls.display_name), ''), nullif(trim(source_service.display_name), ''), '已删除来源') as source_display_name";
+        const [directRows, childRows] = await Promise.all([
+          this.database.query("file_links as fl")
+            .join("source_files as f", "f.id", "fl.source_file_id")
+            .join("library_sources as ls", "ls.id", "f.library_source_id")
+            .leftJoin("cloud_services as source_service", "source_service.id", "ls.service_id")
+            .select(
+              "fl.item_id as item_id",
+              "f.library_source_id",
+              "ls.sort_order as source_sort_order",
+              this.database.query.raw(sourceNameSql),
+            )
+            .where("fl.user_id", userId)
+            .where("f.status", "active")
+            .whereIn("fl.item_id", itemIdChunk),
+          this.database.query("media_relations as mr")
+            .join("file_links as fl", function joinChildSourceFileLinks() {
+              this.on("fl.user_id", "=", "mr.user_id")
+                .andOn("fl.item_id", "=", "mr.child_item_id");
+            })
+            .join("source_files as f", "f.id", "fl.source_file_id")
+            .join("library_sources as ls", "ls.id", "f.library_source_id")
+            .leftJoin("cloud_services as source_service", "source_service.id", "ls.service_id")
+            .select(
+              "mr.parent_item_id as item_id",
+              "f.library_source_id",
+              "ls.sort_order as source_sort_order",
+              this.database.query.raw(sourceNameSql),
+            )
+            .where("mr.user_id", userId)
+            .where("f.status", "active")
+            .whereIn("mr.parent_item_id", itemIdChunk),
+        ]);
+        appendSourceRows([...directRows, ...childRows]);
+      }
+    }
+
+    return new Map([...sourcesByItem].map(([itemId, sources]) => [
+      itemId,
+      [...new Set([...sources.values()]
+        .sort((left, right) => left.sortOrder - right.sortOrder || left.name.localeCompare(right.name, "zh-CN"))
+        .map((source) => source.name))],
+    ]));
+  }
+
+  /** 记录云聚合条目的来源标签汇总结果，便于验证海报和详情展示。 */
+  private logAggregateSourceLabels(items: MediaItemRecord[]): void {
+    const aggregateItems = items.filter((item) => item.libraryKind === "cloud_aggregate_video"
+      && !this.loggedAggregateSourceLabelItemIds.has(item.id));
+    if (aggregateItems.length === 0) return;
+    aggregateItems.forEach((item) => this.loggedAggregateSourceLabelItemIds.add(item.id));
+    this.logger?.("info", {
+      日志关键字: "codex-aggregate-source-label",
+      事件: "返回云聚合媒体来源标签",
+      媒体库ID: aggregateItems[0]?.libraryId ?? "",
+      条目数量: aggregateItems.length,
+      缺少来源数量: aggregateItems.filter((item) => item.sourceNames.length === 0).length,
+    });
   }
 
   /** 批量汇总条目自身及直接子项已经完成的媒体规格，避免海报墙逐条查询。 */
@@ -5986,6 +6177,7 @@ export class ServiceRepository {
       userId: String(row.user_id),
       serviceId: String(row.service_id),
       libraryId: String(row.library_id),
+      libraryKind: String(row.library_kind ?? "legacy_single_source") as MediaLibraryKind,
       mediaType: row.media_type as MediaType,
       itemType: String(row.item_type),
       regionGroup: String(row.region_group ?? "other") as VideoRegionGroup,
@@ -6006,6 +6198,7 @@ export class ServiceRepository {
         : null,
       ownerUsername: String(row.owner_username),
       serviceName: String(row.service_name),
+      sourceNames: Array.isArray(row.source_names) ? row.source_names.map(String) : [],
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
     };
@@ -6020,18 +6213,20 @@ export class ServiceRepository {
     const childRows = await this.database.query("media_items as m")
       .join("media_libraries as l", "l.id", "m.library_id")
       .join("user_accounts as u", "u.id", "m.user_id")
-      .select("m.*", "u.username as owner_username", "l.display_name as service_name")
+      .select("m.*", "u.username as owner_username", "l.display_name as service_name", "l.library_kind")
       .where("m.user_id", parent.userId)
       .whereIn("m.id", childIds)
       .whereNull("m.deleted_at");
-    const [fileCounts, mediaProbeSummaries] = await Promise.all([
+    const [fileCounts, mediaProbeSummaries, sourceNames] = await Promise.all([
       this.loadCatalogFileCounts(childRows),
       this.loadCatalogMediaProbeSummaries(childRows),
+      this.loadCatalogSourceNames(childRows),
     ]);
     const childrenById = new Map(childRows.map((row) => [String(row.id), this.mapMediaItem({
       ...row,
       file_count: fileCounts.get(String(row.id)) ?? 0,
       media_probe_summary: mediaProbeSummaries.get(String(row.id)) ?? null,
+      source_names: sourceNames.get(String(row.id)) ?? [],
     })]));
     // 关键变量：数据库批量查询不保证 IN 条件顺序，返回时恢复媒体关系中的季集排序。
     return childIds.flatMap((childId) => {
@@ -6059,7 +6254,7 @@ export class ServiceRepository {
     const artistRows = await this.database.query("media_items as m")
       .join("media_libraries as l", "l.id", "m.library_id")
       .join("user_accounts as u", "u.id", "m.user_id")
-      .select("m.*", "u.username as owner_username", "l.display_name as service_name")
+      .select("m.*", "u.username as owner_username", "l.display_name as service_name", "l.library_kind")
       .where("m.user_id", item.userId)
       .where("m.library_id", item.libraryId)
       .where("m.item_type", "music.artist")
@@ -6089,6 +6284,8 @@ export class ServiceRepository {
         resourceId: row.provider_resource_id,
         linkedItemId: row.linked_item_id,
         linkedItemTitle: String(row.linked_item_title ?? ""),
+        sourceName: row.source_display_name,
+        providerType: row.source_provider_type,
         path: row.path,
         name: row.name,
         size: Number(row.size ?? 0),
@@ -6130,11 +6327,16 @@ export class ServiceRepository {
     for (const linkedItemIdChunk of chunkStrings(linkedItemIds)) {
       const rows = await this.database.query("file_links as fl")
         .join("source_files as f", "f.id", "fl.source_file_id")
+        .join("library_sources as ls", "ls.id", "f.library_source_id")
+        .leftJoin("cloud_services as source_service", "source_service.id", "ls.service_id")
         .join("media_items as linked", "linked.id", "fl.item_id")
         .select(
           "fl.id as file_link_id",
           "fl.item_id as linked_item_id",
           "fl.source_file_id",
+          "f.library_source_id",
+          this.database.query.raw("coalesce(nullif(trim(ls.display_name), ''), nullif(trim(source_service.display_name), ''), '已删除来源') as source_display_name"),
+          "ls.provider_type as source_provider_type",
           "fl.locator_json",
           "f.locator_json as source_locator_json",
           "f.provider_resource_id",
@@ -6165,6 +6367,8 @@ export class ServiceRepository {
           resourceId: String(row.provider_resource_id),
           linkedItemId: String(row.linked_item_id),
           linkedItemTitle: String(row.linked_item_title ?? ""),
+          sourceName: String(row.source_display_name),
+          providerType: String(row.source_provider_type),
           path: String(row.path),
           name: String(row.name),
           size: Number(row.size ?? 0),
@@ -6506,7 +6710,7 @@ export class ServiceRepository {
         "fl.item_id as linked_item_id",
         "fl.source_file_id",
         "f.library_source_id",
-        "ls.display_name as source_display_name",
+        transaction.raw("coalesce(nullif(trim(ls.display_name), ''), nullif(trim(source_service.display_name), ''), '已删除来源') as source_display_name"),
         "ls.provider_type as source_provider_type",
         "ls.sort_order as source_sort_order",
         "fl.locator_json",

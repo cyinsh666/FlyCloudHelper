@@ -18,7 +18,7 @@ import {
   getLibrary,
   getLibraryScanJob,
   getServiceAccessSettings,
-  listAdminServiceItems,
+  listAdminLibraryItems,
   listAvailableAiModels,
   listLibraryItems,
   revokeServiceAccessAccountSessions,
@@ -953,7 +953,11 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
       {!settings.navidromeSupported && <Panel title="Jellyfin 设置" description="协议播放、下载、分类和服务地址集中管理。">
         <div className="grid gap-2 md:grid-cols-3">
           <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/35 px-3 py-2.5">
-            <div className="min-w-0"><p className="text-sm font-medium">中转播放</p><p className="mt-0.5 truncate text-[11px] text-muted-foreground">关闭后优先使用网盘原始地址</p></div>
+            <div className="min-w-0">
+              <p className="text-sm font-medium">中转播放</p>
+              <p className="mt-0.5 text-[11px] text-muted-foreground">关闭后优先使用网盘原始地址</p>
+              {service.providerType === "baidupan" && <p className="mt-0.5 text-[11px] text-muted-foreground">百度直链服务仅 Flymby 可用，其他播放器请开启中转播放。</p>}
+            </div>
             <button type="button" role="switch" aria-checked={settings.jellyfinRelayPlaybackEnabled} aria-label="启用 Jellyfin 中转播放" disabled={(!settings.relayPlaybackSupported && !settings.jellyfinRelayPlaybackEnabled) || updatingPlayback} onClick={() => void toggleJellyfinRelayPlayback()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.jellyfinRelayPlaybackEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}><span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.jellyfinRelayPlaybackEnabled ? "translate-x-5" : "translate-x-0"}`} /></button>
           </div>
           <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/35 px-3 py-2.5">
@@ -1099,7 +1103,7 @@ export function LibraryCatalogPage({ serviceId, admin = false }: { serviceId: st
       offset: pageOffset,
     };
     const catalog = admin
-      ? await listAdminServiceItems(service.sourceServiceId, options)
+      ? await listAdminLibraryItems(service.id, options)
       : await listLibraryItems(service.id, options);
     return { service, catalog };
   }, [serviceId, admin, catalogQuery.search, catalogQuery.mediaType, catalogQuery.videoItemType, catalogQuery.musicItemType, catalogQuery.matchState, catalogQuery.sort, pageOffset]);

@@ -12,6 +12,10 @@ import {
 } from "../http.js";
 import type { ApiRuntime } from "../runtime.js";
 import {
+  buildAggregateScanCompletionMessage,
+  createEmptyScanCreatedMediaCounts,
+} from "../scan-notification.js";
+import {
   consumeProviderAuthorization,
   getScanRootsForMode,
   readProviderDirectoryParent,
@@ -58,6 +62,18 @@ export async function notifyFinishedLibraryScanJob(runtime: ApiRuntime, parentJo
   const parentJob = await runtime.repository.claimLibraryScanJobCompletionNotification(parentJobId, userId);
   if (!parentJob) return;
   const notificationEnabled = await runtime.repository.isLibraryNotificationEnabled(parentJob.libraryId);
+  let createdMediaCounts = createEmptyScanCreatedMediaCounts();
+  try {
+    createdMediaCounts = await runtime.repository.getLibraryScanCreatedMediaCounts(parentJob);
+  } catch (error) {
+    runtime.logBusinessEvent("warn", {
+      日志关键字: "codex-flycloud-helper-service-notification",
+      事件: "请求线程统计云聚合扫描新增入库内容失败",
+      父任务ID: parentJob.id,
+      媒体库ID: parentJob.libraryId,
+      错误信息: error instanceof Error ? error.message : "未知数据库错误",
+    });
+  }
   const hasFailure = parentJob.failedSourceCount > 0;
   const hasErrors = parentJob.errorCount > 0;
   const wasCancelled = parentJob.status === "cancelled" || parentJob.cancelledSourceCount > 0;
@@ -66,7 +82,7 @@ export async function notifyFinishedLibraryScanJob(runtime: ApiRuntime, parentJo
     category: "task",
     tone: hasFailure || hasErrors || wasCancelled ? "warning" : "success",
     title: hasFailure || hasErrors || wasCancelled ? "云聚合扫描异常结束" : "云聚合扫描已完成",
-    message: `媒体库扫描已结束：${parentJob.completedSourceCount} 个来源完成，${parentJob.failedSourceCount} 个来源失败，${parentJob.cancelledSourceCount} 个来源已取消；共处理 ${parentJob.processedCount} 项，错误 ${parentJob.errorCount} 项。`,
+    message: buildAggregateScanCompletionMessage(parentJob, createdMediaCounts),
     actionPath: "/app/jobs",
     deliverExternally: notificationEnabled,
   });
@@ -76,6 +92,8 @@ export async function notifyFinishedLibraryScanJob(runtime: ApiRuntime, parentJo
     父任务ID: parentJob.id,
     媒体库ID: parentJob.libraryId,
     最终状态: parentJob.status,
+    新增影视内容数量: createdMediaCounts.videoContentCount,
+    通知展示影视数量: createdMediaCounts.videoContents.length,
   });
 }
 

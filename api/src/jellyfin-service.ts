@@ -1139,7 +1139,7 @@ export class JellyfinCompatibilityService {
   private async loadPersonCache(context: JellyfinLibraryContext): Promise<JellyfinPersonCache> {
     const library = await this.runtime.database.query("media_libraries")
       .select("catalog_version")
-      .where({ id: context.libraryId, library_id: context.libraryId })
+      .where({ id: context.libraryId })
       .first();
     const catalogVersion = Number(library?.catalog_version ?? 0);
     const cacheKey = `${context.ownerUserId}:${context.libraryId}`;
@@ -1194,6 +1194,14 @@ export class JellyfinCompatibilityService {
     }
     cache = { catalogVersion, peopleById };
     this.personCaches.set(cacheKey, cache);
+    this.runtime.logBusinessEvent("info", {
+      日志关键字: "codex-jellyfin-person",
+      事件: "建立Jellyfin演员索引",
+      媒体库ID: context.libraryId,
+      目录版本: catalogVersion,
+      影视条目数量: rows.length,
+      演员数量: peopleById.size,
+    });
     return cache;
   }
 
@@ -1389,6 +1397,12 @@ export class JellyfinCompatibilityService {
       });
     }
     if (typeof body.Played === "boolean") await this.setPlayed(context, itemId, body.Played);
+    // 仅写入播放位置也会撤销单集已观看状态，需要同步刷新父节目汇总。
+    if (item.itemType === "video.episode"
+      && Object.prototype.hasOwnProperty.call(body, "PlaybackPositionTicks")
+      && typeof body.Played !== "boolean") {
+      await this.synchronizeParentSeriesProgress(context, internalItemId, new Date().toISOString());
+    }
     if (typeof body.IsFavorite === "boolean") await this.setFavorite(context, itemId, body.IsFavorite);
     return this.getUserData(context, itemId);
   }
@@ -1458,6 +1472,10 @@ export class JellyfinCompatibilityService {
         if (!existingHistory) await transaction("library_playback_history").insert({ id: randomUUID(), library_id: context.libraryId, account_id: context.accountId, item_id: itemId, play_session_id: playSessionId, position_ticks: positionTicks, completed: completed ? 1 : 0, started_at: existing?.started_at ?? now, stopped_at: now });
       }
     });
+    // 自动播放进度也属于单集状态变化，最后一集完播后应立即更新整剧完成标记。
+    if (item.itemType === "video.episode" && automaticallyMarkedPlayed) {
+      await this.synchronizeParentSeriesProgress(context, itemId, now);
+    }
     if (automaticallyMarkedPlayed) {
       this.runtime.logBusinessEvent("info", {
         日志关键字: "codex-jellyfin-user-state",
@@ -1528,6 +1546,9 @@ export class JellyfinCompatibilityService {
           .merge(["played", "position_ticks", "hidden_from_resume", "play_count", "last_played_at", "updated_at"]);
       }
     });
+    if (item.itemType === "video.episode") {
+      await this.synchronizeParentSeriesProgress(context, internalItemId, now);
+    }
     const progress = await this.readProgress(context, internalItemId);
     const runTimeTicks = await this.readItemRunTimeTicks(item);
     const userData = this.mapUserData(
@@ -1626,9 +1647,143 @@ export class JellyfinCompatibilityService {
     else await this.runtime.database.query("library_playback_progress").insert({ id: randomUUID(), library_id: context.libraryId, account_id: context.accountId, item_id: internalItemId, position_ticks: 0, played: 0, hidden_from_resume: hidden ? 1 : 0, play_count: 0, last_played_at: null, updated_at: now });
   }
 
-  /** 读取当前账号的条目进度。 */
+  /** 根据当前有效单集计算节目整体观看状态，新增单集会立即使整剧恢复为未看完。 */
+  private buildSeriesProgress(
+    itemId: string,
+    currentProgress: Record<string, unknown> | undefined,
+    episodeIds: string[],
+    progressByItemId: Map<string, Record<string, unknown>>,
+  ): Record<string, unknown> | undefined {
+    if (episodeIds.length === 0) return currentProgress;
+    const playedEpisodeCount = episodeIds.filter((episodeId) =>
+      Number(progressByItemId.get(episodeId)?.played ?? 0) === 1).length;
+    const allEpisodesPlayed = playedEpisodeCount === episodeIds.length; // 关键变量：整剧完成必须覆盖当前目录中的全部有效单集。
+    const latestEpisodePlayedAt = episodeIds.map((episodeId) =>
+      String(progressByItemId.get(episodeId)?.last_played_at ?? ""))
+      .filter(Boolean)
+      .sort()
+      .pop() ?? null;
+    return {
+      ...(currentProgress ?? {}),
+      item_id: itemId,
+      played: allEpisodesPlayed ? 1 : 0,
+      position_ticks: 0,
+      hidden_from_resume: allEpisodesPlayed ? 1 : 0,
+      play_count: allEpisodesPlayed ? Math.max(1, Number(currentProgress?.play_count ?? 0)) : 0,
+      last_played_at: allEpisodesPlayed ? currentProgress?.last_played_at ?? latestEpisodePlayedAt : null,
+      unplayed_item_count: episodeIds.length - playedEpisodeCount,
+    };
+  }
+
+  /** 读取单条进度；节目状态不直接相信历史父记录，而是按当前有效单集重新汇总。 */
   private async readProgress(context: JellyfinContext, itemId: string) {
-    return this.runtime.database.query("library_playback_progress").where({ library_id: context.libraryId, account_id: context.accountId, item_id: itemId }).first();
+    const currentProgress = await this.runtime.database.query("library_playback_progress")
+      .where({ library_id: context.libraryId, account_id: context.accountId, item_id: itemId }).first();
+    const episodeRows = await this.runtime.database.query("media_relations as relation")
+      .join("media_items as episode", "episode.id", "relation.child_item_id")
+      .select("relation.child_item_id")
+      .where({
+        "relation.library_id": context.libraryId,
+        "relation.parent_item_id": itemId,
+        "relation.relation_type": "series_episode",
+        "episode.library_id": context.libraryId,
+        "episode.item_type": "video.episode",
+      })
+      .whereNull("episode.deleted_at");
+    const episodeIds = episodeRows.map((row) => String(row.child_item_id));
+    if (episodeIds.length === 0) return currentProgress;
+    const episodeProgressRows = await this.runtime.database.query("library_playback_progress")
+      .where({ library_id: context.libraryId, account_id: context.accountId })
+      .whereIn("item_id", episodeIds);
+    const progressByItemId = new Map(episodeProgressRows.map((row) =>
+      [String(row.item_id), row as Record<string, unknown>]));
+    return this.buildSeriesProgress(itemId, currentProgress as Record<string, unknown> | undefined,
+      episodeIds, progressByItemId);
+  }
+
+  /** 为列表中的节目批量补齐按现有单集汇总的观看状态。 */
+  private async applySeriesProgressToMapping(
+    context: JellyfinContext,
+    itemIds: string[],
+    progressByItemId: Map<string, Record<string, unknown>>,
+  ): Promise<void> {
+    const relationRows = await this.runtime.database.query("media_relations as relation")
+      .join("media_items as episode", "episode.id", "relation.child_item_id")
+      .select("relation.parent_item_id", "relation.child_item_id")
+      .whereIn("relation.parent_item_id", itemIds)
+      .where({
+        "relation.library_id": context.libraryId,
+        "relation.relation_type": "series_episode",
+        "episode.library_id": context.libraryId,
+        "episode.item_type": "video.episode",
+      })
+      .whereNull("episode.deleted_at");
+    if (relationRows.length === 0) return;
+    const episodeIds = [...new Set(relationRows.map((row) => String(row.child_item_id)))];
+    const episodeProgressRows = await this.runtime.database.query("library_playback_progress")
+      .where({ library_id: context.libraryId, account_id: context.accountId })
+      .whereIn("item_id", episodeIds);
+    const episodeProgressByItemId = new Map(episodeProgressRows.map((row) =>
+      [String(row.item_id), row as Record<string, unknown>]));
+    const episodeIdsBySeriesId = new Map<string, string[]>();
+    relationRows.forEach((row) => {
+      const seriesId = String(row.parent_item_id);
+      const currentEpisodeIds = episodeIdsBySeriesId.get(seriesId) ?? [];
+      currentEpisodeIds.push(String(row.child_item_id));
+      episodeIdsBySeriesId.set(seriesId, currentEpisodeIds);
+    });
+    episodeIdsBySeriesId.forEach((seriesEpisodeIds, seriesId) => {
+      const seriesProgress = this.buildSeriesProgress(
+        seriesId, progressByItemId.get(seriesId), seriesEpisodeIds, episodeProgressByItemId);
+      if (seriesProgress) progressByItemId.set(seriesId, seriesProgress);
+    });
+  }
+
+  /** 单集状态变化后持久化整剧汇总，保证已观看筛选与普通列表使用同一结果。 */
+  private async synchronizeParentSeriesProgress(
+    context: JellyfinContext,
+    episodeItemId: string,
+    now: string,
+  ): Promise<void> {
+    const relation = await this.runtime.database.query("media_relations")
+      .select("parent_item_id")
+      .where({
+        library_id: context.libraryId,
+        child_item_id: episodeItemId,
+        relation_type: "series_episode",
+      }).first();
+    if (!relation) return;
+    const seriesItemId = String(relation.parent_item_id); // 关键变量：需要随当前单集重新汇总的节目条目。
+    const seriesProgress = await this.readProgress(context, seriesItemId);
+    if (!seriesProgress) return;
+    const existing = await this.runtime.database.query("library_playback_progress")
+      .where({ library_id: context.libraryId, account_id: context.accountId, item_id: seriesItemId }).first();
+    const patch = {
+      played: Number(seriesProgress.played ?? 0),
+      position_ticks: 0,
+      hidden_from_resume: Number(seriesProgress.hidden_from_resume ?? 0),
+      play_count: Number(seriesProgress.play_count ?? 0),
+      last_played_at: seriesProgress.last_played_at ?? null,
+      updated_at: now,
+    };
+    if (existing) {
+      await this.runtime.database.query("library_playback_progress").where({ id: existing.id }).update(patch);
+    } else {
+      await this.runtime.database.query("library_playback_progress").insert({
+        id: randomUUID(), library_id: context.libraryId, account_id: context.accountId,
+        item_id: seriesItemId, media_source_id: null, ...patch,
+      });
+    }
+    this.runtime.logBusinessEvent("info", {
+      日志关键字: "codex-series-watched-state",
+      事件: "单集状态变化后重算Jellyfin整剧观看状态",
+      服务ID: context.serviceId,
+      账号ID: context.accountId,
+      节目条目ID: seriesItemId,
+      单集条目ID: episodeItemId,
+      是否整剧已观看: Number(seriesProgress.played ?? 0) === 1,
+      未观看单集数: Number(seriesProgress.unplayed_item_count ?? 0),
+    });
   }
 
   /** 读取电影或单集实际源文件时长，指定媒体源时只使用该版本。 */
@@ -1697,6 +1852,7 @@ export class JellyfinCompatibilityService {
         .orderBy("f.path", "asc"),
     ]);
     const progressByItemId = new Map(progressRows.map((row) => [String(row.item_id), row as Record<string, unknown>]));
+    await this.applySeriesProgressToMapping(context, uniqueItemIds, progressByItemId);
     const favoriteItemIds = new Set(preferenceRows.map((row) => String(row.item_id)));
     const filesByItemId = new Map<string, JellyfinFileSummary[]>();
     for (const row of fileRows) {
@@ -1731,6 +1887,9 @@ export class JellyfinCompatibilityService {
     return {
       PlaybackPositionTicks: playbackPositionTicks, PlayCount: Number(progress?.play_count ?? 0), IsFavorite: favorite,
       Played: played, LastPlayedDate: progress?.last_played_at ?? undefined,
+      UnplayedItemCount: progress?.unplayed_item_count === undefined
+        ? undefined
+        : Number(progress.unplayed_item_count),
       PlayedPercentage: runTimeTicks > 0 && playbackPositionTicks > 0
         ? playbackPositionTicks / runTimeTicks * 100
         : undefined,
