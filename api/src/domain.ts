@@ -9,6 +9,15 @@ export type BackgroundJobType = "scan" | "media_probe";
 export type JobStage = "queued" | "enumerating" | "classifying" | "scraping" | "persisting" | "probing" | "completed";
 export type MediaType = "video" | "music" | "audiobook";
 export type MediaLibraryKind = "legacy_single_source" | "cloud_aggregate_video";
+/** 文件浏览启动的精确视频扫描范围，跟随任务快照持久化并用于重试。 */
+export interface TargetedVideoScanScope {
+  kind: "folder" | "video";
+  resourceId: string;
+  parentResourceId: string;
+  displayPath: string;
+  parentDisplayPath: string;
+  driveId?: string;
+}
 export type LibrarySourceMode = "linked_service" | "owned_copy";
 export type LibrarySourceStatus = "active" | "disabled" | "reauthorization_required" | "copy_failed" | "deleted";
 export type VideoRegionGroup = "chinese" | "japan_korea" | "europe_america" | "other";
@@ -64,13 +73,15 @@ export interface CloudServiceRecord {
   userId: string;
   ownerUsername: string;
   displayName: string;
+  /** 用户填写的服务描述，空字符串表示未填写。 */
+  description: string;
   providerType: string;
   status: ServiceStatus;
   connectionStatus: string;
   credentialRevision: number;
   /** 未建立旧单媒体库来源时允许从服务详情打开快速创建入口。 */
   canCreateLibrary: boolean;
-  /** 没有任何媒体库引用时才允许删除独立网盘服务。 */
+  /** 服务允许删除；删除时解除媒体库引用，有未结束任务时由接口拒绝。 */
   canDeleteService: boolean;
   createdAt: string;
   updatedAt: string;

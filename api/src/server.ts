@@ -31,6 +31,7 @@ import { EmbyAccessService } from "./emby-access.js";
 import { registerScanFailureReportRoutes } from "./routes/scan-failure-report-routes.js";
 import { registerServiceRoutes } from "./routes/service-routes.js";
 import { registerLibraryRoutes } from "./routes/library-routes.js";
+import { registerLibraryFileRoutes } from "./routes/library-file-routes.js";
 import { registerServiceAccessRoutes } from "./routes/service-access-routes.js";
 import { registerJellyfinRoutes } from "./routes/jellyfin-routes.js";
 import { registerEmbyRoutes } from "./routes/emby-routes.js";
@@ -431,6 +432,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerCloudAuthorizationRoutes(server, runtime);
   await registerServiceRoutes(server, runtime);
   await registerLibraryRoutes(server, runtime);
+  await registerLibraryFileRoutes(server, runtime);
   await registerScanScheduleRoutes(server, runtime, scanSchedules);
   await registerServiceAccessRoutes(server, runtime);
   await registerScanFailureReportRoutes(server, runtime);

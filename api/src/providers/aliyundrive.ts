@@ -6,6 +6,7 @@ import {
   type ProviderAdapter,
   type ProviderConnectionContext,
   type ProviderDescriptor,
+  type ProviderBrowseListing,
   type ProviderDirectoryListing,
   type ProviderEntry,
   type ProviderEnumerationOptions,
@@ -147,6 +148,37 @@ export class AliyunDriveProvider implements ProviderAdapter {
       },
       items,
     };
+  }
+
+  /** 列出虚拟盘根或真实目录的全部直接子项，保留盘 ID 和文件 ID。 */
+  public async browseEntries(connection: Record<string, unknown>, parent?: ScanRoot, signal?: AbortSignal, context?: ProviderConnectionContext): Promise<ProviderBrowseListing> {
+    const driveInfo = await this.resolveDriveInfo(connection, signal, context?.persistConnection);
+    if (!parent?.resourceId && !parent?.driveId) {
+      const virtual = this.createVirtualDriveListing(driveInfo);
+      return { current: virtual.current, items: virtual.items.map((item) => ({
+        ...item, parentResourceId: "", isDirectory: true, size: 0, modifiedAt: null, etag: null, locator: {},
+      })) };
+    }
+    const driveId = parent?.driveId || driveInfo.defaultDriveId;
+    const parentId = parent?.resourceId || "root";
+    const parentPath = parent?.displayPath || "/";
+    const items: ProviderBrowseListing["items"] = [];
+    let marker: string | null = null;
+    do {
+      const page = await this.listDirectory(connection, driveId, parentId, marker, 200, signal, context?.persistConnection);
+      for (const item of page.items) {
+        const resourceId = String(item.file_id ?? "");
+        if (!resourceId) continue;
+        const name = String(item.name ?? resourceId);
+        items.push({ name, resourceId, parentResourceId: item.parent_file_id || parentId,
+          displayPath: `${parentPath.replace(/\/$/u, "")}/${name}`, driveId,
+          isDirectory: item.type === "folder", size: toFileSize(item.size), modifiedAt: item.updated_at ?? null,
+          etag: item.content_hash ?? null, locator: { providerType: "aliyundrive", driveId, fileId: resourceId } });
+      }
+      marker = page.nextMarker;
+    } while (marker);
+    return { current: { name: parentPath === "/" ? "/" : parentPath.split("/").filter(Boolean).pop() || "/",
+      resourceId: parentId, displayPath: parentPath, driveId }, items };
   }
 
   /** 构造与 APP 本地阿里云盘一致的资源库、备份盘虚拟根目录。 */

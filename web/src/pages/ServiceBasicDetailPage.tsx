@@ -1,19 +1,43 @@
 import { Link } from "@tanstack/react-router";
-import { Database, KeyRound, Plus } from "lucide-react";
-import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
+import { Database, KeyRound, Pencil, Plus } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel } from "@/components/ui-kit";
-import { getService } from "@/lib/api";
+import { ServiceProfileEditDialog } from "@/components/ServiceProfileEditDialog";
+import { getService, type ServiceDetail } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
 
 /** 展示网盘服务基础信息、登录状态和重新登录入口。 */
 export function ServiceBasicDetailPage({ serviceId, admin = false }: { serviceId: string; admin?: boolean }) {
   const resource = useApiResource(() => getService(serviceId, admin), [serviceId, admin]);
-  const service = resource.data;
-  if (!service) return <Panel><p className="py-12 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取网盘服务…"}</p></Panel>;
+  // 关键变量：直接使用保存接口返回的新资料，标题和描述立即刷新。
+  const [savedService, setSavedService] = useState<ServiceDetail | null>(null);
+  const [editing, setEditing] = useState(false);
+  useEffect(() => {
+    setSavedService(null);
+    setEditing(false);
+  }, [serviceId, admin]);
+  const service = savedService ?? resource.data;
+  /** 关闭资料弹窗，草稿随弹窗销毁。 */
+  const closeEditor = useCallback(() => setEditing(false), []);
+  /** 将保存成功的资料显示到标题区域。 */
+  function handleSaved(updated: ServiceDetail): void {
+    setSavedService(updated);
+    setEditing(false);
+  }
+  if (!service && resource.error) return <Panel><p role="alert" className="py-12 text-center text-sm text-destructive">{resource.error}</p></Panel>;
+  if (!service) return <div aria-label="服务详情加载中" className="animate-pulse space-y-4"><div className="h-7 w-48 rounded bg-muted" /><div className="h-4 w-72 max-w-full rounded bg-muted" /><div className="grid gap-4 lg:grid-cols-2">{[0, 1].map((index) => <Panel key={index}><div className="h-40 rounded bg-muted" /></Panel>)}</div></div>;
   const servicesPath = admin ? "/admin/services" : "/app/services";
   const connectionPath = admin ? "/admin/services/$serviceId/connection" : "/app/services/$serviceId/connection";
   return <>
-    <PageHeader title={service.displayName} actions={<div className="flex gap-2"><Link to={servicesPath}><SecondaryButton>返回服务</SecondaryButton></Link>{service.canCreateLibrary && !admin && <Link to="/app/libraries/new/$serviceId" params={{ serviceId: service.id }}><PrimaryButton><Plus className="size-4" /> 创建媒体库</PrimaryButton></Link>}</div>} />
+    <header className="mb-6 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
+      <div className="min-w-0">
+        <div className="flex items-center gap-2"><h1 className="min-w-0 break-words text-xl font-semibold sm:text-2xl">{service.displayName}</h1><button type="button" aria-label="编辑服务名称和描述" title="编辑服务" onClick={() => setEditing(true)} className="grid size-8 shrink-0 cursor-pointer place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"><Pencil className="size-4" /></button></div>
+        {service.description && <p className="mt-2 whitespace-pre-line break-words text-sm text-muted-foreground">{service.description}</p>}
+      </div>
+      <div className="flex flex-wrap gap-2 sm:justify-end"><Link to={servicesPath}><SecondaryButton>返回服务</SecondaryButton></Link>{service.canCreateLibrary && !admin && <Link to="/app/libraries/new/$serviceId" params={{ serviceId: service.id }}><PrimaryButton><Plus className="size-4" /> 创建媒体库</PrimaryButton></Link>}</div>
+    </header>
+    {editing && <ServiceProfileEditDialog service={service} admin={admin} onClose={closeEditor} onSaved={handleSaved} />}
     <div className="grid gap-4 lg:grid-cols-2">
       <Panel title="基础信息">
         <dl className="grid gap-3 text-sm"><div className="flex justify-between gap-4"><dt className="text-muted-foreground">网盘类型</dt><dd>{service.providerType}</dd></div><div className="flex justify-between gap-4"><dt className="text-muted-foreground">所属用户</dt><dd>{service.ownerUsername}</dd></div><div className="flex justify-between gap-4"><dt className="text-muted-foreground">服务状态</dt><dd>{service.status === "active" ? "已启用" : "已停用"}</dd></div></dl>
@@ -27,5 +51,7 @@ export function ServiceBasicDetailPage({ serviceId, admin = false }: { serviceId
   </>;
 }
 
+/** 普通用户的服务详情入口。 */
 export function UserServiceBasicDetailPage({ serviceId }: { serviceId: string }) { return <ServiceBasicDetailPage serviceId={serviceId} />; }
+/** 管理员的服务详情入口。 */
 export function AdminServiceBasicDetailPage({ serviceId }: { serviceId: string }) { return <ServiceBasicDetailPage serviceId={serviceId} admin />; }

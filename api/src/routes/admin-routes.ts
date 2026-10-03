@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { FastifyInstance } from "fastify";
 import { authenticateUser, createUsernameLookup, hashPassword, validatePassword, validatePasswordConfirmation, validateUsername } from "../auth.js";
-import type { JobStatus, MatchState, MediaType, ServiceStatus, UserRole, UserStatus } from "../domain.js";
+import type { JobStatus, MatchState, MediaType, ServiceStatus, TargetedVideoScanScope, UserRole, UserStatus } from "../domain.js";
 import { ApiError, validationError } from "../errors.js";
 import {
   readPagination,
@@ -40,6 +40,7 @@ import {
   getScanRootsForMode,
   hasHttpProviderAddress,
   readProviderDirectoryParent,
+  readServiceDescription,
   readMusicMetadataLogFields,
   readVideoMetadataLogFields,
   resolveProviderConnection,
@@ -537,6 +538,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       serviceId: randomUUID(),
       userId: owner.id,
       displayName: requireString(request.body, "displayName", "服务名称", 100),
+      description: readServiceDescription(request.body),
       providerType,
       encryptedConnection: runtime.vault.encrypt(resolvedConnection.connection),
       providerSchemaVersion: adapter.descriptor.credentialSchemaVersion,
@@ -1016,6 +1018,20 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     },
   );
 
+  /** 管理员编辑目标用户的服务名称和描述，记录正式操作审计。 */
+  server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId", async (request) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    const displayName = requireString(request.body, "displayName", "服务名称", 100);
+    const expectedUpdatedAt = request.body.expectedUpdatedAt === undefined
+      ? undefined
+      : requireString(request.body, "expectedUpdatedAt", "服务更新时间", 40);
+    const service = await runtime.repository.updateServiceName(
+      request.params.serviceId, undefined, displayName, expectedUpdatedAt, readServiceDescription(request.body),
+    );
+    await audit(runtime, operator, "update_service_profile", "service", service.id, { 服务名称: service.displayName });
+    return { service: await attachConnectionAuthMode(runtime, service) };
+  });
+
   server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/status", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const status = request.body.status;
@@ -1029,7 +1045,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     const operator = await requireSuperAdmin(request, runtime.database);
     requireConfirmation(request.body, request.params.serviceId);
     // 关键变量：删除后无法再读取服务归属，先保存通知需要的用户和服务名称。
-    const service = await runtime.repository.getServiceMediaContext(request.params.serviceId);
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-service-delete",
       事件: "管理员开始删除云端服务",
@@ -1248,6 +1264,8 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       tmdbKeyPoolRevision: runtime.tmdb.revision,
       aiModel: aiModelSnapshot,
       taskPurpose: retriesAiSupplement ? "ai_supplement_unmatched" : "standard",
+      targetedScope: sourceJob.snapshot.targetedScope && typeof sourceJob.snapshot.targetedScope === "object"
+        ? sourceJob.snapshot.targetedScope as TargetedVideoScanScope : undefined,
       retryOfJobId: sourceJob.id,
       pluginVersions: await runtime.plugins.buildTaskSnapshots(profiles.metadataProfile),
     });

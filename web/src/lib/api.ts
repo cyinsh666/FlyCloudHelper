@@ -279,6 +279,8 @@ export interface CloudService {
   userId: string;
   ownerUsername: string;
   displayName: string;
+  /** 展示在服务标题下方的可选描述。 */
+  description: string;
   providerType: string;
   status: ServiceStatus;
   connectionStatus: string;
@@ -373,6 +375,7 @@ export interface ServiceListFilters {
 /** 创建云端服务时由 Web 端提交的完整配置。 */
 export interface CreateCloudServiceInput {
   displayName: string;
+  description?: string;
   provider: { type: string; connection: Record<string, string> };
   userId?: string;
 }
@@ -776,6 +779,122 @@ export interface ProviderDirectoryListing {
   items: ProviderDirectory[];
 }
 
+/** 视频媒体库文件浏览的当前目录条目。 */
+export interface LibraryBrowseEntry extends ProviderDirectory {
+  parentResourceId: string;
+  isDirectory: boolean;
+  size: number;
+  modifiedAt: string | null;
+  etag: string | null;
+}
+
+export interface LibraryBrowsePage {
+  current: ProviderDirectory;
+  items: LibraryBrowseEntry[];
+  total: number;
+  nextOffset: number | null;
+}
+
+export interface LibraryBrowseSummary {
+  resourceId: string;
+  linkedFileCount: number;
+  itemCount: number;
+  itemId: string | null;
+  title: string | null;
+  year: number | null;
+  posterUrl: string | null;
+  matchState: string | null;
+  manualMatched: boolean;
+}
+
+/** 读取媒体库来源当前目录的直接子项，分页时沿用同一完整目录排序。 */
+export function browseLibraryFiles(
+  libraryId: string, sourceId: string, parent: ProviderDirectory | undefined,
+  sort: "name" | "modified" | "size", descending: boolean, offset: number, admin = false, refresh = false,
+): Promise<LibraryBrowsePage> {
+  const prefix = admin ? "/api/v1/admin/libraries" : "/api/v1/libraries";
+  return requestJson(withQuery(`${prefix}/${libraryId}/sources/${sourceId}/browse`, {
+    resourceId: parent?.resourceId, displayPath: parent?.displayPath, driveId: parent?.driveId,
+    sort, descending: String(descending), offset, refresh: String(refresh),
+  }));
+}
+
+/** 批量查询本页网盘条目在当前视频媒体库中的刮削摘要。 */
+export async function listLibraryBrowseSummaries(
+  libraryId: string, sourceId: string, entries: LibraryBrowseEntry[], admin = false,
+): Promise<LibraryBrowseSummary[]> {
+  const prefix = admin ? "/api/v1/admin/libraries" : "/api/v1/libraries";
+  const result = await requestJson<{ items: LibraryBrowseSummary[] }>(
+    `${prefix}/${libraryId}/sources/${sourceId}/browse/summaries`, {
+      method: "POST", body: JSON.stringify({ targets: entries.map((entry) => ({
+        resourceId: entry.resourceId, displayPath: entry.displayPath, isDirectory: entry.isDirectory,
+      })) }),
+    });
+  return result.items;
+}
+
+/** 从文件浏览对指定来源的文件或目录创建精确视频扫描任务。 */
+export function createLibraryTargetedScan(
+  libraryId: string, sourceId: string, entry: LibraryBrowseEntry,
+  parent: ProviderDirectory | undefined, admin = false,
+): Promise<{ job: ScanJob }> {
+  const prefix = admin ? "/api/v1/admin/libraries" : "/api/v1/libraries";
+  return requestJson(`${prefix}/${libraryId}/sources/${sourceId}/browse/scan`, {
+    method: "POST",
+    body: JSON.stringify({ resourceId: entry.resourceId, isDirectory: entry.isDirectory, parent }),
+  });
+}
+
+export interface LibraryBrowseUnmatchPreview {
+  fileCount: number;
+  itemCount: number;
+  examples: string[];
+  revision: string;
+}
+
+/** 解除前预览当前来源目标范围的有效文件关联。 */
+export function previewLibraryBrowseUnmatch(libraryId: string, sourceId: string,
+  entry: LibraryBrowseEntry, parent: ProviderDirectory | undefined, admin = false,
+): Promise<LibraryBrowseUnmatchPreview> {
+  const prefix = admin ? "/api/v1/admin/libraries" : "/api/v1/libraries";
+  return requestJson(`${prefix}/${libraryId}/sources/${sourceId}/browse/unmatch/preview`, {
+    method: "POST", body: JSON.stringify({ resourceId: entry.resourceId, isDirectory: entry.isDirectory, parent }),
+  });
+}
+
+/** 确认预览版本后解除文件关联，网盘文件和扫描路径保持原状。 */
+export function unmatchLibraryBrowseRange(libraryId: string, sourceId: string,
+  entry: LibraryBrowseEntry, parent: ProviderDirectory | undefined, expectedRevision: string, admin = false,
+): Promise<{ fileCount: number; removedItemCount: number; retainedItemCount: number }> {
+  const prefix = admin ? "/api/v1/admin/libraries" : "/api/v1/libraries";
+  return requestJson(`${prefix}/${libraryId}/sources/${sourceId}/browse/unmatch`, {
+    method: "POST", body: JSON.stringify({ resourceId: entry.resourceId, isDirectory: entry.isDirectory, parent, expectedRevision }),
+  });
+}
+
+/** 以当前来源文件范围搜索 TMDB 候选，允许目录包含多个原始影视条目。 */
+export function searchLibraryBrowseRangeMatch(libraryId: string, sourceId: string,
+  input: { query: string; mediaType: ManualVideoMatchType; year?: number | null }, admin = false,
+): Promise<ManualVideoMatchCandidate[]> {
+  const prefix = admin ? "/api/v1/admin/libraries" : "/api/v1/libraries";
+  return requestJson<{ items: ManualVideoMatchCandidate[] }>(withQuery(
+    `${prefix}/${libraryId}/sources/${sourceId}/browse/manual-match/search`,
+    { query: input.query, mediaType: input.mediaType, year: input.year ?? undefined },
+  )).then((result) => result.items);
+}
+
+/** 把已预览范围内的所有视频绑定到同一个电影或节目。 */
+export function applyLibraryBrowseRangeMatch(libraryId: string, sourceId: string,
+  entry: LibraryBrowseEntry, parent: ProviderDirectory | undefined, expectedRevision: string,
+  input: { mediaType: ManualVideoMatchType; tmdbId: number }, admin = false,
+): Promise<{ itemId: string; fileCount: number }> {
+  const prefix = admin ? "/api/v1/admin/libraries" : "/api/v1/libraries";
+  return requestJson(`${prefix}/${libraryId}/sources/${sourceId}/browse/manual-match`, {
+    method: "POST", body: JSON.stringify({ resourceId: entry.resourceId,
+      isDirectory: entry.isDirectory, parent, expectedRevision, ...input }),
+  });
+}
+
 export interface AdminUser extends AuthUser {
   serviceCount: number;
   mediaCount: number;
@@ -846,6 +965,19 @@ export function listServices(
 export async function getService(serviceId: string, admin = false): Promise<ServiceDetail> {
   const result = await requestJson<{ service: ServiceDetail }>(
     admin ? `/api/v1/admin/services/${serviceId}` : `/api/v1/services/${serviceId}`,
+  );
+  return result.service;
+}
+
+/** 保存服务名称和描述，返回服务端最终详情。 */
+export async function updateServiceProfile(
+  serviceId: string,
+  input: { displayName: string; description: string; expectedUpdatedAt: string },
+  admin = false,
+): Promise<ServiceDetail> {
+  const result = await requestJson<{ service: ServiceDetail }>(
+    admin ? `/api/v1/admin/services/${serviceId}` : `/api/v1/services/${serviceId}`,
+    { method: "PATCH", body: JSON.stringify(input) },
   );
   return result.service;
 }

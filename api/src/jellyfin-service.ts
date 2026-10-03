@@ -8,6 +8,7 @@ import { JellyfinCatalogSort, readJellyfinSortQuery, type JellyfinSortEntry, typ
 import { ApiError } from "./errors.js";
 import type { ApiRuntime } from "./runtime.js";
 import { hydrateRealtimeVideoDetails } from "./media/realtime-video-details.js";
+import { readProtocolItemIdentityFilter, matchesProtocolItemIdentity, resolveProtocolItemIdentityIds } from "./media/protocol-item-identity-filter.js";
 import {
   parseCompletedMediaProbeResult,
   readJellyfinRunTimeTicks,
@@ -828,6 +829,9 @@ export class JellyfinCompatibilityService {
   public async listItems(context: JellyfinContext, query: Record<string, unknown>) {
     if (this.queryIncludesFilter(query, "IsFavorite", "IsFavorite")) return this.listFavoriteItems(context, query);
     if (this.queryIncludesFilter(query, "IsPlayed", "IsPlayed")) return this.listPlayedItems(context, query);
+    const identityFilter = readProtocolItemIdentityFilter(query, decodeProtocolItemId);
+    const identityIds = await resolveProtocolItemIdentityIds(this.runtime, context, identityFilter);
+    if (identityIds?.length === 0) return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
     const include = String(this.readQueryValue(query, "IncludeItemTypes") ?? "").split(",").map((type) => type.trim()).filter(Boolean);
     const parentId = String(this.readQueryValue(query, "ParentId") ?? "");
     const virtualLibrary = this.findLibraryDefinition(context, parentId);
@@ -837,7 +841,8 @@ export class JellyfinCompatibilityService {
       const internalParentId = decodeProtocolItemId(parentId);
       const parent = await this.runtime.repository.getCatalogItem(internalParentId, context.ownerUserId);
       if (parent.libraryId !== context.libraryId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
-      const children = await this.runtime.repository.listCatalogChildren(internalParentId, context.ownerUserId);
+      const children = (await this.runtime.repository.listCatalogChildren(internalParentId, context.ownerUserId))
+        .filter((item) => matchesProtocolItemIdentity(identityFilter, item.id, item.externalIds));
       const ordered = await this.sortChildRecords(context, query, children, (item) => item.id);
       const hydratedChildren = await Promise.all(ordered.map((item) => (
         item.itemType === "video.episode" ? hydrateRealtimeVideoDetails(this.runtime, item) : item
@@ -854,13 +859,14 @@ export class JellyfinCompatibilityService {
       : requestedTypes;
     if (virtualLibrary && effectiveTypes.length === 0) return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
     const personIds = String(this.readQueryValue(query, "PersonIds") ?? "").split(",").map((id) => id.trim().toLowerCase()).filter(Boolean);
-    let itemIds: string[] | undefined;
+    let itemIds = identityIds;
     if (personIds.length > 0) {
       const cache = await this.loadPersonCache(context);
-      itemIds = [...new Set(personIds.flatMap((id) => [...(cache.peopleById.get(id)?.itemIds ?? [])]))];
+      const personItemIds = new Set(personIds.flatMap((id) => [...(cache.peopleById.get(id)?.itemIds ?? [])]));
+      itemIds = itemIds === undefined ? [...personItemIds] : itemIds.filter((id) => personItemIds.has(id));
     }
     return this.listSortedCatalogPage(context, query, {
-      itemTypes: effectiveTypes, itemIds, topLevel: true,
+      itemTypes: effectiveTypes, itemIds, topLevel: identityFilter.itemIds === undefined,
       regionGroup: virtualLibrary?.regionGroup, genres: await this.readGenreNames(context, query),
       search: String(this.readQueryValue(query, "SearchTerm") ?? ""),
     });
@@ -878,6 +884,8 @@ export class JellyfinCompatibilityService {
 
   /** 用户状态过滤、媒体库范围和排序都在分页前完成。 */
   private async listSortedStateItems(context: JellyfinContext, query: Record<string, unknown>, favorite: boolean) {
+    const identityFilter = readProtocolItemIdentityFilter(query, decodeProtocolItemId);
+    const identityIds = await resolveProtocolItemIdentityIds(this.runtime, context, identityFilter);
     const include = String(this.readQueryValue(query, "IncludeItemTypes") ?? "").split(",").map((type) => type.trim()).filter(Boolean);
     let types = include.length === 0 ? ["video.movie", "video.series", "video.episode"]
       : include.map((type) => type === "Movie" ? "video.movie" : type === "Series" ? "video.series" : type === "Episode" ? "video.episode" : "").filter(Boolean);
@@ -894,7 +902,7 @@ export class JellyfinCompatibilityService {
       if (!favorite) plan.fields = [{ name: "dateplayed", descending: true }];
     }
     const entries = types.length === 0 ? [] : await this.catalogSort.load(context, {
-      itemTypes: types, favorite, played: !favorite, regionGroup: library?.regionGroup,
+      itemTypes: types, itemIds: identityIds, favorite, played: !favorite, regionGroup: library?.regionGroup,
       parentId: internalParentId, seasonNumber: season?.seasonNumber,
       search, genres: await this.readGenreNames(context, query),
     }, plan);
@@ -906,6 +914,8 @@ export class JellyfinCompatibilityService {
       for (const row of rows) {
         const person = await this.getPersonItem(context, String(row.protocol_item_id));
         if (!person || (search && !String(person.Name ?? "").toLocaleLowerCase("zh-CN").includes(search.toLocaleLowerCase("zh-CN")))) continue;
+        if (!matchesProtocolItemIdentity(identityFilter, decodeProtocolItemId(String(person.Id)),
+          (person.ProviderIds ?? {}) as Record<string, unknown>)) continue;
         const id = String(person.Id);
         peopleById.set(id, person);
         entries.push({ id, itemType: "Person", values: {
@@ -1035,6 +1045,7 @@ export class JellyfinCompatibilityService {
 
   /** 获取节目单集并按季集排序。 */
   public async listEpisodes(context: JellyfinContext, seriesId: string, query: Record<string, unknown>) {
+    const identityFilter = readProtocolItemIdentityFilter(query, decodeProtocolItemId);
     const pathSeason = this.parseSeasonReference(seriesId);
     const querySeason = this.parseSeasonReference(String(query.SeasonId ?? ""));
     const requestedSeriesId = String(query.SeriesId ?? "").trim() || pathSeason?.seriesId || querySeason?.seriesId || seriesId;
@@ -1045,6 +1056,7 @@ export class JellyfinCompatibilityService {
     const series = await this.runtime.repository.getCatalogItem(actualSeriesId, context.ownerUserId);
     if (series.libraryId !== context.libraryId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
     const children = (await this.runtime.repository.listCatalogChildren(actualSeriesId, context.ownerUserId))
+      .filter((item) => matchesProtocolItemIdentity(identityFilter, item.id, item.externalIds))
       .filter((item) => seasonNumber === null || Number(item.metadata.seasonNumber ?? 0) === seasonNumber)
       .sort((left, right) => Number(left.metadata.seasonNumber ?? 0) - Number(right.metadata.seasonNumber ?? 0)
         || Number(left.metadata.episodeNumber ?? 0) - Number(right.metadata.episodeNumber ?? 0));

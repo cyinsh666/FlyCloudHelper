@@ -6,7 +6,7 @@ import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
 import { createMusicScanTables } from "./music/scan-state.js";
 
-export const currentSchemaVersion = 60;
+export const currentSchemaVersion = 61;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -226,6 +226,7 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("id", 64).primary();
       table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
       table.string("display_name", 255).notNullable();
+      table.string("description", 500).notNullable().defaultTo("");
       table.string("provider_type", 64).notNullable();
       table.string("status", 32).notNullable();
       table.string("connection_status", 64).notNullable();
@@ -260,6 +261,10 @@ async function createServiceTables(database: Knex): Promise<void> {
       console.info(`[codex-cloud-service-schema] 事件=补齐网盘服务客户端来源字段 表名=cloud_services 缺失字段=${missingClientMetadataColumns.join(",")} 结果=成功`);
     }
   }
+  // 关键变量：旧服务默认没有描述，每次启动都检查字段，支持迁移中断后的重试。
+  await addColumnIfMissing(database, "cloud_services", "description", (table) => {
+    table.string("description", 500).notNullable().defaultTo("");
+  });
   if (!(await database.schema.hasTable("media_libraries"))) {
     await database.schema.createTable("media_libraries", (table) => {
       table.string("id", 64).primary();

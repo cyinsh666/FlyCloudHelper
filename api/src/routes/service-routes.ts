@@ -3,7 +3,7 @@ import { listMusicStageTasks } from "../music/task-query.js";
 import { retryMusicScan } from "../music/retry.js";
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
-import type { CloudServiceRecord, JobStatus, MediaType, ServiceDetailRecord, ServiceStatus } from "../domain.js";
+import type { CloudServiceRecord, JobStatus, MediaType, ServiceDetailRecord, ServiceStatus, TargetedVideoScanScope } from "../domain.js";
 import { ApiError, validationError } from "../errors.js";
 import {
   readPagination,
@@ -21,6 +21,16 @@ import {
   type ScanRoot,
 } from "../providers/types.js";
 import { streamJobEvents } from "./event-stream.js";
+
+/** 读取可选服务描述；空字符串允许清空，未提供字段时保持原值。 */
+export function readServiceDescription(body: Record<string, unknown>): string | undefined {
+  const value = body.description;
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || [...value].length > 500 || value.includes("\0")) {
+    throw validationError("description", "服务描述必须为文本，且不能超过 500 个字符");
+  }
+  return value.trim();
+}
 
 /** 当前版本允许创建的服务数据类型；有声书仍保留为后续阶段。 */
 const supportedServiceDataTypes = new Set<MediaType>(["video", "music"]);
@@ -380,7 +390,7 @@ export function readProviderDirectoryParent(query: Record<string, unknown>): Sca
     }
     return value.trim();
   };
-  const resourceId = readOptionalValue("resourceId", 500);
+  const resourceId = readOptionalValue("resourceId", 2000);
   const displayPath = readOptionalValue("displayPath", 2000);
   const driveId = readOptionalValue("driveId", 500);
   if (!resourceId && !displayPath && !driveId) return undefined;
@@ -661,6 +671,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
   server.post<{ Body: Record<string, unknown> }>("/api/v1/services", async (request, reply) => {
     const user = await requireRequestUser(request, runtime.database);
     const displayName = requireString(request.body, "displayName", "服务名称", 100);
+    const description = readServiceDescription(request.body);
     const provider = requireObject(request.body, "provider", "Provider");
     const providerType = requireString(provider, "type", "Provider 类型", 64);
     const resolvedConnection = resolveProviderConnection(
@@ -677,6 +688,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       serviceId: randomUUID(),
       userId: user.id,
       displayName,
+      description,
       providerType,
       encryptedConnection: runtime.vault.encrypt(connection),
       providerSchemaVersion: adapter.descriptor.credentialSchemaVersion,
@@ -809,14 +821,14 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     const expectedUpdatedAt = request.body.expectedUpdatedAt === undefined
       ? undefined
       : requireString(request.body, "expectedUpdatedAt", "服务更新时间", 40);
-    return {
-      service: await runtime.repository.updateServiceName(
-        request.params.serviceId,
-        user.id,
-        displayName,
-        expectedUpdatedAt,
-      ),
-    };
+    const service = await runtime.repository.updateServiceName(
+      request.params.serviceId,
+      user.id,
+      displayName,
+      expectedUpdatedAt,
+      readServiceDescription(request.body),
+    );
+    return { service: await attachConnectionAuthMode(runtime, service) };
   });
 
   server.get<{ Params: { serviceId: string }; Querystring: Record<string, unknown> }>("/api/v1/services/:serviceId/directories", async (request) => {
@@ -1255,6 +1267,8 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       tmdbKeyPoolRevision: runtime.tmdb.revision,
       aiModel: aiModelSnapshot,
       taskPurpose: retriesAiSupplement ? "ai_supplement_unmatched" : "standard",
+      targetedScope: sourceJob.snapshot.targetedScope && typeof sourceJob.snapshot.targetedScope === "object"
+        ? sourceJob.snapshot.targetedScope as TargetedVideoScanScope : undefined,
       retryOfJobId: sourceJob.id,
       pluginVersions: await runtime.plugins.buildTaskSnapshots(profiles.metadataProfile),
     });

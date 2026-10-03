@@ -1,5 +1,5 @@
 import { FolderOpen, Music2, RefreshCw, Search, Trash2, UserRound, WandSparkles, X } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   clearMediaItemMatch,
   getMediaItem,
@@ -458,6 +458,8 @@ export function MediaCatalogView({
   pageLimit = 60,
   onQueryChange,
   onPageChange,
+  initialItemId,
+  initialItemLibraryId,
 }: {
   contextDescription: string;
   items: MediaItem[];
@@ -473,6 +475,8 @@ export function MediaCatalogView({
   pageLimit?: number;
   onQueryChange?: (query: MediaCatalogQuery) => void;
   onPageChange?: (offset: number) => void;
+  initialItemId?: string;
+  initialItemLibraryId?: string;
 }) {
   const [search, setSearch] = useState("");
   const [mediaType, setMediaType] = useState<MediaType | "all">("all");
@@ -483,6 +487,7 @@ export function MediaCatalogView({
   const [matchState, setMatchState] = useState<MatchState | "all">("matched");
   const [sort, setSort] = useState<CatalogSort>("created_desc");
   const [selectedItem, setSelectedItem] = useState<MediaItem | null>(null);
+  const openedInitialItemId = useRef<string | null>(null);
   const [selectedChildren, setSelectedChildren] = useState<MediaItem[]>([]);
   const [selectedArtists, setSelectedArtists] = useState<MediaItem[]>([]);
   const [selectedPaths, setSelectedPaths] = useState<MediaPathItem[]>([]);
@@ -585,6 +590,21 @@ export function MediaCatalogView({
       setDetailLoading(false);
     }
   }
+
+  useEffect(() => {
+    if (!initialItemId || !initialItemLibraryId || openedInitialItemId.current === initialItemId) return;
+    openedInitialItemId.current = initialItemId;
+    /** 文件浏览打开海报墙时，直接读取指定条目详情而不依赖当前海报墙分页。 */
+    async function openInitialItem(): Promise<void> {
+      try {
+        const item = await getMediaItem({ id: initialItemId!, libraryId: initialItemLibraryId! }, admin);
+        await openMediaDetail(item);
+      } catch {
+        // 详情读取失败时保留海报墙，用户仍可继续浏览当前媒体库。
+      }
+    }
+    void openInitialItem();
+  }, [initialItemId, initialItemLibraryId, admin]);
 
   /** 接收手动匹配结果并刷新详情、路径和海报墙数据。 */
   async function applyManualMatchResult(updatedItem: MediaItem): Promise<void> {

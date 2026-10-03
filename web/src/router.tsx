@@ -4,6 +4,7 @@ import {
   createRootRoute,
   createRoute,
   createRouter,
+  redirect,
   useNavigate,
 } from "@tanstack/react-router";
 import { ShieldCheck } from "lucide-react";
@@ -14,7 +15,6 @@ import { SetupPage, LoginPage, RegisterPage } from "@/pages/AuthPages";
 import { OverviewPage } from "@/pages/OverviewPage";
 import {
   AdminServiceConnectionPage,
-  AdminServiceCreatePage,
   AdminServicesPage,
   ServiceCreatePage,
   UserServiceConnectionPage,
@@ -22,6 +22,7 @@ import {
 } from "@/pages/ServicePages";
 import { AdminServiceBasicDetailPage, UserServiceBasicDetailPage } from "@/pages/ServiceBasicDetailPage";
 import { LibraryCreatePage } from "@/pages/LibraryCreatePage";
+import { LibraryFileBrowsePage } from "@/pages/LibraryFileBrowsePage";
 import {
   AdminCatalogPage,
   AdminJobsPage,
@@ -207,6 +208,12 @@ function UserLibraryCatalogRouteComponent() {
   return <UserLibraryCatalogPage serviceId={serviceId} />;
 }
 
+/** 普通用户视频媒体库文件浏览。 */
+function UserLibraryFileBrowseRouteComponent() {
+  const { serviceId } = userLibraryFileBrowseRoute.useParams();
+  return <LibraryFileBrowsePage libraryId={serviceId} />;
+}
+
 /** 处理普通用户媒体库 Jellyfin 配置路由参数。 */
 function UserLibraryJellyfinSettingsRouteComponent() {
   const { serviceId } = userLibraryJellyfinSettingsRoute.useParams();
@@ -258,6 +265,12 @@ function AdminLibraryEmbySettingsRouteComponent() {
 function AdminLibraryCatalogRouteComponent() {
   const { serviceId } = adminLibraryCatalogRoute.useParams();
   return <AdminLibraryCatalogPage serviceId={serviceId} />;
+}
+
+/** 管理员视频媒体库文件浏览。 */
+function AdminLibraryFileBrowseRouteComponent() {
+  const { serviceId } = adminLibraryFileBrowseRoute.useParams();
+  return <LibraryFileBrowsePage libraryId={serviceId} admin />;
 }
 
 /** 处理管理员媒体库 Jellyfin 配置路由参数。 */
@@ -392,6 +405,12 @@ const userLibraryCatalogRoute = createRoute({
   component: UserLibraryCatalogRouteComponent,
 });
 
+const userLibraryFileBrowseRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "libraries/$serviceId/files",
+  component: UserLibraryFileBrowseRouteComponent,
+});
+
 const userLibraryScanScheduleRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "libraries/$serviceId/scan-schedules",
@@ -434,10 +453,13 @@ const adminServicesRoute = createRoute({
   component: AdminServicesPage,
 });
 
+/** 旧管理员创建地址切换到个人模式，创建归属当前登录账户。 */
 const adminServiceCreateRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "services/new",
-  component: AdminServiceCreatePage,
+  beforeLoad: () => {
+    throw redirect({ to: "/app/services/new", replace: true });
+  },
 });
 
 const adminServiceDetailRoute = createRoute({
@@ -474,6 +496,12 @@ const adminLibraryCatalogRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "libraries/$serviceId/catalog",
   component: AdminLibraryCatalogRouteComponent,
+});
+
+const adminLibraryFileBrowseRoute = createRoute({
+  getParentRoute: () => adminRoute,
+  path: "libraries/$serviceId/files",
+  component: AdminLibraryFileBrowseRouteComponent,
 });
 
 const adminLibraryScanScheduleRoute = createRoute({
@@ -549,6 +577,7 @@ const appRouteTree = appRoute.addChildren([
   userLibraryCreateWithoutSourceRoute,
   userLibrarySettingsRoute,
   userLibraryCatalogRoute,
+  userLibraryFileBrowseRoute,
   userLibraryScanScheduleRoute,
   userLibraryJellyfinSettingsRoute,
   userLibraryEmbySettingsRoute,
@@ -566,6 +595,7 @@ const adminRouteTree = adminRoute.addChildren([
   adminCatalogRoute,
   adminLibrarySettingsRoute,
   adminLibraryCatalogRoute,
+  adminLibraryFileBrowseRoute,
   adminLibraryScanScheduleRoute,
   adminLibraryJellyfinSettingsRoute,
   adminLibraryEmbySettingsRoute,

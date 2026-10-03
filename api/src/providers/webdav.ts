@@ -5,6 +5,7 @@ import { isFlymbyExcludedFolderName } from "../media/flymby-scan-exclusions.js";
 import { providerFetch, validateProviderUrl, type ProviderNetworkOptions } from "./network.js";
 import {
   type ProviderAdapter,
+  type ProviderBrowseListing,
   type ProviderDescriptor,
   type ProviderDirectoryListing,
   type ProviderEntry,
@@ -202,6 +203,27 @@ export class WebDavProvider implements ProviderAdapter {
       },
       items,
     };
+  }
+
+  /** 使用一次 Depth:1 PROPFIND 读取 WebDAV 当前目录的直接子项。 */
+  public async browseEntries(connection: Record<string, unknown>, parent?: ScanRoot, signal?: AbortSignal): Promise<ProviderBrowseListing> {
+    const baseUrl = await validateProviderUrl(requireConnectionString(connection, "baseUrl", "WebDAV 地址"), this.networkOptions);
+    const selectedPath = parent?.resourceId || parent?.displayPath || "/";
+    const directoryUrl = this.resolveSameOriginPath(baseUrl, selectedPath);
+    const currentPath = normalizeDirectoryPath(directoryUrl.pathname);
+    const entries = await this.propfind(directoryUrl, connection, "1", signal);
+    const items: ProviderBrowseListing["items"] = [];
+    for (const entry of entries) {
+      if (normalizeDirectoryPath(entry.resourceId) === currentPath) continue;
+      if (entry.isDirectory && isFlymbyExcludedFolderName(entry.name)) continue;
+      this.resolveEnumeratedPath(baseUrl, entry.resourceId);
+      const displayPath = this.toConfiguredPath(baseUrl, entry.resourceId);
+      items.push({ name: entry.name, resourceId: displayPath, parentResourceId: selectedPath,
+        displayPath, isDirectory: entry.isDirectory, size: entry.size, modifiedAt: entry.modifiedAt,
+        etag: entry.etag, locator: { providerType: "webdav", path: displayPath, resourceId: displayPath } });
+    }
+    return { current: { name: selectedPath === "/" ? "/" : selectedPath.replace(/\/+$/u, "").split("/").pop() || "/",
+      resourceId: selectedPath, displayPath: selectedPath }, items };
   }
 
   /** 按扫描根递归枚举 WebDAV 文件，避免使用可能被服务端禁用的 Depth:infinity。 */

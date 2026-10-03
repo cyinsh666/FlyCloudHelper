@@ -14,6 +14,7 @@ import {
   type ProviderAdapter,
   type ProviderConnectionContext,
   type ProviderDescriptor,
+  type ProviderBrowseListing,
   type ProviderDirectoryListing,
   type ProviderEntry,
   type ProviderEnumerationOptions,
@@ -136,6 +137,28 @@ export class BaiduPanProvider implements ProviderAdapter {
       },
       items,
     };
+  }
+
+  /** 使用百度文件列表分页读取当前目录的直接子项。 */
+  public async browseEntries(connection: Record<string, unknown>, parent?: ScanRoot, signal?: AbortSignal, context?: ProviderConnectionContext): Promise<ProviderBrowseListing> {
+    const directory = parent?.displayPath || parent?.resourceId || "/";
+    const items: ProviderBrowseListing["items"] = [];
+    let start = 0;
+    while (true) {
+      const page = await this.listDirectory(connection, directory, start, signal, context?.persistConnection);
+      for (const item of page.items) {
+        const displayPath = item.path || `${directory.replace(/\/$/u, "")}/${item.server_filename ?? ""}`;
+        const resourceId = String(item.fs_id ?? displayPath);
+        items.push({ name: item.server_filename || displayPath.split("/").pop() || resourceId,
+          resourceId, parentResourceId: directory, displayPath, isDirectory: item.isdir === 1,
+          size: toFileSize(item.size), modifiedAt: item.server_mtime ? new Date(item.server_mtime * 1000).toISOString() : null,
+          etag: item.md5 ?? null, locator: { providerType: "baidupan", fsId: resourceId, path: displayPath } });
+      }
+      if (!page.hasMore || page.items.length === 0) break;
+      start += page.items.length;
+    }
+    return { current: { name: directory === "/" ? "/" : directory.replace(/\/$/u, "").split("/").pop() || "/",
+      resourceId: parent?.resourceId || directory, displayPath: directory }, items };
   }
 
   /** 按目录 path 递归枚举百度网盘文件。 */

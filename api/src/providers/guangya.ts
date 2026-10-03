@@ -7,6 +7,7 @@ import {
   type ProviderAdapter,
   type ProviderConnectionContext,
   type ProviderDescriptor,
+  type ProviderBrowseListing,
   type ProviderDirectoryListing,
   type ProviderEntry,
   type ProviderEnumerationCheckpoint,
@@ -291,6 +292,29 @@ export class GuangyaProvider implements ProviderAdapter {
       },
       items,
     };
+  }
+
+  /** 沿用光鸭当前登录客户端读取目录中的文件和文件夹。 */
+  public async browseEntries(connection: Record<string, unknown>, parent?: ScanRoot, signal?: AbortSignal, context?: ProviderConnectionContext): Promise<ProviderBrowseListing> {
+    const parentId = parent?.resourceId || "root";
+    const parentPath = parent?.displayPath || "/";
+    const items: ProviderBrowseListing["items"] = [];
+    let page = 0;
+    let hasMore = false;
+    do {
+      const result = await this.listDirectory(connection, parentId, page, 100, context?.persistConnection, signal);
+      for (const item of result.items) {
+        if (item.isDirectory && isFlymbyExcludedFolderName(item.name)) continue;
+        items.push({ name: item.name, resourceId: item.fileId, parentResourceId: item.parentId || parentId,
+          displayPath: `${parentPath.replace(/\/$/u, "")}/${item.name}`, isDirectory: item.isDirectory,
+          size: item.size, modifiedAt: item.modifiedAt, etag: null,
+          locator: { providerType: "guangya", fileId: item.fileId, bizId: item.bizId } });
+      }
+      hasMore = result.hasMore;
+      page += 1;
+    } while (hasMore);
+    return { current: { name: parentPath === "/" ? "/" : parentPath.split("/").filter(Boolean).pop() || "/",
+      resourceId: parentId, displayPath: parentPath }, items };
   }
 
   /** 按稳定 fileId 广度优先枚举，并生成可恢复的 Provider 检查点。 */

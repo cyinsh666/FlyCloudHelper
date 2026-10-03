@@ -24,7 +24,6 @@ import {
   type CloudAuthorizationStatus,
   type CreateCloudServiceInput,
   type GuangyaAuthorizationStatus,
-  type MediaType,
   type ProviderDescriptor,
   type ServiceListFilters,
 } from "@/lib/api";
@@ -55,7 +54,7 @@ function ServiceCard({ service, admin, onChanged }: { service: CloudService; adm
   /** 二次确认后从服务卡片删除服务，并同步刷新服务列表。 */
   async function deleteCardService(): Promise<void> {
     if (!service.canDeleteService) {
-      setMessage("请先从所有媒体库中移除该来源，再删除网盘服务");
+      setMessage("请先解除该服务与所有媒体库的关联，再删除服务");
       return;
     }
     if (deletingRef.current) {
@@ -66,7 +65,7 @@ function ServiceCard({ service, admin, onChanged }: { service: CloudService; adm
       return;
     }
     const confirmed = window.confirm(
-      `确定删除“${service.displayName}”吗？删除后登录凭据无法恢复。已被媒体库引用时需要先移除全部来源关系。`,
+      `确定删除“${service.displayName}”吗？删除后服务基础信息和登录凭据将彻底删除，无法恢复。`,
     );
     if (!confirmed) return;
 
@@ -113,6 +112,7 @@ function ServiceCard({ service, admin, onChanged }: { service: CloudService; adm
           </span>
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold">{service.displayName}</h2>
+            {service.description && <p className="mt-1 line-clamp-2 whitespace-pre-line break-words text-xs text-muted-foreground">{service.description}</p>}
             <p className="truncate text-[11px] text-muted-foreground">{getServiceProviderLabel(service)}{admin ? ` · ${service.ownerUsername}` : ""}</p>
           </div>
         </div>
@@ -130,11 +130,10 @@ function ServiceCard({ service, admin, onChanged }: { service: CloudService; adm
       <footer className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/70 pt-3">
         <Link to={detailPath} params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Settings2 className="size-3.5" /> 配置</Link>
         {service.canCreateLibrary && !admin && <Link to="/app/libraries/new/$serviceId" params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-3 py-2 text-xs text-primary-soft"><Plus className="size-3.5" /> 创建媒体库</Link>}
-        <button type="button" aria-label={deleting ? `正在删除${service.displayName}` : `删除${service.displayName}`} title={!service.canDeleteService ? "请先从所有媒体库中移除该来源" : deleting ? "正在删除…" : "删除服务"} onClick={() => void deleteCardService()} disabled={deleting || !service.canDeleteService} className="ml-auto grid size-8 cursor-pointer place-items-center rounded-lg border border-destructive/50 bg-destructive/10 text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-50">
+        <button type="button" aria-label={deleting ? `正在删除${service.displayName}` : `删除${service.displayName}`} title={!service.canDeleteService ? "已关联媒体库，请先解除全部关联" : deleting ? "正在删除…" : "删除服务"} onClick={() => void deleteCardService()} disabled={deleting || !service.canDeleteService} className="ml-auto grid size-8 cursor-pointer place-items-center rounded-lg border border-destructive/50 bg-destructive/10 text-destructive transition-colors enabled:hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-50">
           <Trash2 className="size-3.5" />
         </button>
       </footer>
-      {!service.canDeleteService && <p className="mt-2 text-[11px] text-muted-foreground">该服务仍被媒体库引用，需先移除全部来源关系。</p>}
       {message && <p className="mt-3 text-xs text-muted-foreground">{message}</p>}
     </article>
   );
@@ -156,11 +155,12 @@ function ServicesListPage({ admin }: { admin: boolean }) {
     <>
       <PageHeader
         title={admin ? "全部服务" : "我的服务"}
-        actions={<Link to={admin ? "/admin/services/new" : "/app/services/new"}><PrimaryButton><Plus className="size-4" /> 创建云端服务</PrimaryButton></Link>}
+        actions={!admin && <Link to="/app/services/new"><PrimaryButton><Plus className="size-4" /> 创建云端服务</PrimaryButton></Link>}
       />
       {admin && <AdminServiceFilters value={filters} users={filterOptions.data?.users ?? []} providers={filterOptions.data?.providers ?? []} resultCount={resource.data?.total ?? 0} onChange={setFilters} />}
       {resource.error && <Panel><p className="text-sm text-destructive">{resource.error}</p></Panel>}
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        {resource.loading && !resource.data && Array.from({ length: 4 }, (_, index) => <div key={index} className="surface animate-pulse space-y-3 p-4" aria-label="服务加载中"><div className="h-5 w-2/3 rounded bg-muted" /><div className="h-4 w-full rounded bg-muted" /><div className="h-8 w-full rounded bg-muted" /></div>)}
         {resource.data?.items.map((service) => <ServiceCard key={service.id} service={service} admin={admin} onChanged={async () => { await resource.refresh(); }} />)}
       </div>
       {!resource.loading && resource.data?.items.length === 0 && <Panel><p className="py-10 text-center text-sm text-muted-foreground">还没有云端服务</p></Panel>}
@@ -171,14 +171,11 @@ function ServicesListPage({ admin }: { admin: boolean }) {
 export function UserServicesPage() { return <ServicesListPage admin={false} />; }
 export function AdminServicesPage() { return <ServicesListPage admin />; }
 
-/** 创建云端服务表单，字段由 Provider 描述动态生成。 */
-export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
+/** 在个人模式创建当前账户的云端服务，字段由 Provider 描述动态生成。 */
+export function ServiceCreatePage() {
   const navigate = useNavigate();
   const providers = useApiResource(() => listProviders(), []);
-  const users = useApiResource(() => admin ? listAdminUsers() : Promise.resolve({ items: [], total: 0 }), [admin]);
   const [providerType, setProviderType] = useState("");
-  const [dataType, setDataType] = useState<MediaType>("video");
-  const [adminTargetUserId, setAdminTargetUserId] = useState("");
   const [guangyaAuthorization, setGuangyaAuthorization] = useState<GuangyaAuthorizationStatus | null>(null);
   const [cloudAuthorization, setCloudAuthorization] = useState<CloudAuthorizationStatus | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -215,12 +212,13 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
     }
     const input: CreateCloudServiceInput = {
       displayName: String(form.get("displayName") ?? "").trim(),
+      description: String(form.get("description") ?? "").trim(),
       provider: { type: selectedType, connection },
-    };    if (admin) input.userId = adminTargetUserId;
+    };
     setMessage("正在验证连接并创建服务，不会自动开始扫描…");
     try {
-      const creation = await createService(input, admin);
-      await navigate({ to: admin ? "/admin/services/$serviceId" : "/app/services/$serviceId", params: { serviceId: creation.service.id } });
+      const creation = await createService(input);
+      await navigate({ to: "/app/services/$serviceId", params: { serviceId: creation.service.id } });
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "服务创建失败");
     }
@@ -239,8 +237,8 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
       <PageHeader title="创建云端服务" />
       <Panel>
         <form onSubmit={(event) => void submit(event)} className="grid gap-5 lg:grid-cols-2">
-          {admin && <label className="block"><span className="text-xs text-muted-foreground">所属用户</span><select name="userId" required value={adminTargetUserId} onChange={(event) => setAdminTargetUserId(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm"><option value="">选择目标用户</option>{users.data?.items.map((user) => <option key={user.userId} value={user.userId}>{user.username}</option>)}</select></label>}
           <label className="block"><span className="text-xs text-muted-foreground">服务名称</span><input name="displayName" required maxLength={100} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
+          <label className="block lg:col-span-2"><span className="text-xs text-muted-foreground">服务描述（选填）</span><textarea name="description" rows={2} maxLength={500} placeholder="填写服务用途或备注" className="mt-2 w-full resize-y rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
           <fieldset className="lg:col-span-2 pb-3">
             <legend className="mb-3 text-xs text-muted-foreground">Provider 类型</legend>
             <div role="radiogroup" aria-label="Provider 类型" className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -258,9 +256,9 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
             </div>
           </fieldset>
           {selectedProvider?.authenticationMode === "web_qr"
-            ? <GuangyaAuthorizationPanel admin={admin} targetUserId={adminTargetUserId || undefined} resetKey={`${selectedProvider.type}:${adminTargetUserId}`} onAuthorizationChange={setGuangyaAuthorization} />
+            ? <GuangyaAuthorizationPanel admin={false} resetKey={selectedProvider.type} onAuthorizationChange={setGuangyaAuthorization} />
             : selectedProvider?.authenticationMode === "authorization_session"
-              ? <CloudAuthorizationPanel descriptor={selectedProvider} admin={admin} targetUserId={adminTargetUserId || undefined} resetKey={`${selectedProvider.type}:${adminTargetUserId}`} onAuthorizationChange={setCloudAuthorization} />
+              ? <CloudAuthorizationPanel descriptor={selectedProvider} admin={false} resetKey={selectedProvider.type} onAuthorizationChange={setCloudAuthorization} />
             : selectedProvider?.connectionFields.map((field) => <label key={field.name} className="block"><span className="text-xs text-muted-foreground">{field.label}</span><input name={`connection.${field.name}`} type={field.type === "password" ? "password" : field.type} required={field.required} autoComplete="off" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>)}
           {selectedProvider && <ProviderConnectionGuide providerType={selectedProvider.type} />}
           <div className="lg:col-span-2 flex items-center justify-between gap-4"><p className="text-xs text-muted-foreground">创建后仅保存网盘基础信息和登录凭据，可从服务卡片快速创建媒体库。</p><PrimaryButton type="submit" disabled={(selectedProvider?.authenticationMode === "web_qr" && guangyaAuthorization?.status !== "authorized") || (selectedProvider?.authenticationMode === "authorization_session" && cloudAuthorization?.state !== "authorized")}>验证连接并创建服务</PrimaryButton></div>
@@ -427,7 +425,6 @@ export function ServiceConnectionPage({ serviceId, admin = false }: { serviceId:
   );
 }
 
-/** 云端服务详情与配置页面。 */
-export function AdminServiceCreatePage() { return <ServiceCreatePage admin />; }
+/** 个人模式下的云端服务连接配置入口。 */
 export function UserServiceConnectionPage({ serviceId }: { serviceId: string }) { return <ServiceConnectionPage serviceId={serviceId} />; }
 export function AdminServiceConnectionPage({ serviceId }: { serviceId: string }) { return <ServiceConnectionPage serviceId={serviceId} admin />; }

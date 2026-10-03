@@ -1,6 +1,6 @@
 import { loadEnumerationPage } from "./types.js";
 import type {
-  ProviderAdapter, ProviderConnectionContext, ProviderDescriptor, ProviderDirectoryListing,
+  ProviderAdapter, ProviderBrowseListing, ProviderConnectionContext, ProviderDescriptor, ProviderDirectoryListing,
   ProviderEntry, ProviderEnumerationOptions, ProviderEnumerationWarning, ProviderFileAccess,
   ProviderFileStreamAccess, ProviderValidationResult, ScanRoot,
 } from "./types.js";
@@ -80,6 +80,39 @@ export abstract class CloudDriveProviderBase implements ProviderAdapter {
       pageNumber += 1;
     } while (hasMore);
     items.sort((left, right) => left.name.localeCompare(right.name, "zh-CN", { numeric: true }));
+    return {
+      current: { name: parentPath === "/" ? "/" : parentPath.split("/").filter(Boolean).pop() || "/", resourceId: parentId, displayPath: parentPath },
+      items,
+    };
+  }
+
+  /** 复用网盘文件分页读取当前目录全部直接子项，不访问任何子目录。 */
+  public async browseEntries(connection: Record<string, unknown>, parent?: ScanRoot, signal?: AbortSignal, context?: ProviderConnectionContext): Promise<ProviderBrowseListing> {
+    const parentId = parent?.resourceId || this.rootResourceId;
+    const parentPath = parent?.displayPath || "/";
+    const items: ProviderBrowseListing["items"] = [];
+    let pageNumber = 1;
+    let pageToken = "";
+    let hasMore = false;
+    do {
+      const page = await this.listPage(connection, parentId, pageNumber, signal, context, pageToken);
+      for (const item of page.items) {
+        items.push({
+          name: item.name,
+          resourceId: item.id,
+          parentResourceId: item.parentId || parentId,
+          displayPath: `${parentPath.replace(/\/$/u, "")}/${item.name}`,
+          isDirectory: item.isDirectory,
+          size: item.size,
+          modifiedAt: item.modifiedAt,
+          etag: item.etag,
+          locator: item.locator,
+        });
+      }
+      pageToken = page.nextPageToken ?? "";
+      hasMore = page.hasMore;
+      pageNumber += 1;
+    } while (hasMore);
     return {
       current: { name: parentPath === "/" ? "/" : parentPath.split("/").filter(Boolean).pop() || "/", resourceId: parentId, displayPath: parentPath },
       items,

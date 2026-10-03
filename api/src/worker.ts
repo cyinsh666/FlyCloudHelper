@@ -5,7 +5,7 @@ import { musicFileNameHints } from "./music/name-hints.js";
 import { runMusicScan } from "./music/scan-coordinator.js";
 import type { ApiConfig } from "./config.js";
 import type { FlyCloudHelperDatabase } from "./database.js";
-import type { LibraryScanJobRecord, MediaItemRecord, MediaType, ScanJobRecord, SourceFileRecord } from "./domain.js";
+import type { LibraryScanJobRecord, MediaItemRecord, MediaType, ScanJobRecord, SourceFileRecord, TargetedVideoScanScope } from "./domain.js";
 import { ApiError, toSafeErrorMessage } from "./errors.js";
 import {
   createStableId,
@@ -57,6 +57,7 @@ import { MetadataPluginManager, type PluginTaskSnapshot } from "./plugin-manager
 import {
   readProviderConcurrency,
   type ProviderEntry,
+  type ProviderAdapter,
   type ProviderEnumerationCheckpoint,
   type ScanRoot,
 } from "./providers/types.js";
@@ -458,6 +459,40 @@ function findMatchingScanRoot(entryPath: string, roots: ScanRoot[]): ScanRoot | 
       const rightPath = right.displayPath || right.resourceId || "/";
       return rightPath.length - leftPath.length;
     })[0];
+}
+
+/** 单文件任务只枚举目标视频及同目录 NFO，不持久化其他视频文件。 */
+async function* enumerateTargetedVideoFile(
+  adapter: ProviderAdapter,
+  connection: Record<string, unknown>,
+  scope: TargetedVideoScanScope,
+  signal: AbortSignal,
+  persistConnection: (connection: Record<string, unknown>) => Promise<void>,
+): AsyncGenerator<ProviderEntry> {
+  const listing = await adapter.browseEntries(connection, {
+    resourceId: scope.parentResourceId,
+    displayPath: scope.parentDisplayPath,
+    ...(scope.driveId ? { driveId: scope.driveId } : {}),
+  }, signal, { persistConnection });
+  const target = listing.items.find((entry) => entry.resourceId === scope.resourceId && !entry.isDirectory);
+  if (!target) throw new ApiError(404, "targeted_video_missing", "目标视频文件已不存在，请刷新文件浏览");
+  const siblingDirectoryNames = listing.items.filter((entry) => entry.isDirectory).map((entry) => entry.name);
+  const sidecars = listing.items.filter((entry) => !entry.isDirectory && /\.nfo$/iu.test(entry.name));
+  for (const entry of [...sidecars, target]) {
+    if (signal.aborted) return;
+    yield {
+      resourceId: entry.resourceId,
+      parentResourceId: entry.parentResourceId,
+      path: entry.displayPath,
+      name: entry.name,
+      isDirectory: entry.isDirectory,
+      size: entry.size,
+      modifiedAt: entry.modifiedAt,
+      etag: entry.etag,
+      locator: entry.locator,
+      siblingDirectoryNames,
+    };
+  }
 }
 
 /** 轮询数据库任务队列并执行 Provider 扫描；当前只开放影视持久化。 */
@@ -1484,11 +1519,22 @@ export class ScanWorker {
     const recordScanFailure = (input: ScanFailureRecordInput): Promise<void> => (
       this.failureReports.record(job, input)
     );
-    const roots: ScanRoot[] = readScanRoots(runtime.scanProfile, job.scanMode);
+    // 关键变量：定向任务的扫描根来自文件浏览选中的来源，不依赖媒体库预设扫描路径。
+    const targetedScope = job.snapshot.targetedScope && typeof job.snapshot.targetedScope === "object"
+      ? job.snapshot.targetedScope as TargetedVideoScanScope : null;
+    const roots: ScanRoot[] = targetedScope ? [{
+      resourceId: targetedScope.kind === "folder" ? targetedScope.resourceId : targetedScope.parentResourceId,
+      displayPath: targetedScope.kind === "folder" ? targetedScope.displayPath : targetedScope.parentDisplayPath,
+      ...(targetedScope.driveId ? { driveId: targetedScope.driveId } : {}),
+      mediaTypes: ["video"],
+    }] : readScanRoots(runtime.scanProfile, job.scanMode);
+    // 关键变量：已在固定全量根内的定向文件沿用原扫描根键，后续正常全量扫描仍能发现其缺失状态。
+    const configuredFullRoots = targetedScope ? readScanRoots(runtime.scanProfile, "full") : [];
+    const configuredIncrementalRoots = targetedScope ? readScanRoots(runtime.scanProfile, "incremental") : [];
     if (roots.length === 0) {
       throw new ApiError(409, "scan_paths_not_configured", `未配置${job.scanMode === "full" ? "全量" : "增量"}扫描路径`);
     }
-    const defaultMediaTypes = readMediaTypes(runtime.scanProfile);
+    const defaultMediaTypes: MediaType[] = targetedScope ? ["video"] : readMediaTypes(runtime.scanProfile);
     const musicSourceSettings = defaultMediaTypes.includes("music")
       ? await loadMusicSourceSettings(this.database)
       : { enabledSources: [] as BuiltinMusicPlatformSource[], configurationRevision: 0, source: "default" as const };
@@ -1862,7 +1908,7 @@ export class ScanWorker {
               metadataProfiles: effectiveMetadataProfile,
               metadataCache,
               nfoSidecars,
-              forceCatalogChange: isRetryJob,
+              forceCatalogChange: isRetryJob || targetedScope !== null,
               signal,
             });
             if (signal.aborted) break;
@@ -2451,7 +2497,7 @@ export class ScanWorker {
     };
 
     try {
-      for await (const entry of adapter.enumerate(connection, roots, signal, (warning) => {
+      const scanEntries = adapter.enumerate(connection, roots, signal, (warning) => {
         providerWarningKeys.add(`${warning.code}\u0000${warning.path}`);
         void recordScanFailure({
           stage: "enumerating",
@@ -2517,7 +2563,17 @@ export class ScanWorker {
           目录警告数量: state.warningCount,
         });
       },
-      })) {
+      });
+      const selectedEntries = targetedScope?.kind === "video"
+        ? enumerateTargetedVideoFile(adapter, connection, targetedScope, signal, async (nextConnection) => {
+          await this.repository.refreshLibrarySourceEncryptedConnection({
+            librarySourceId: job.librarySourceId,
+            userId: job.userId,
+            credentialRevision: Number(job.snapshot.credentialRevision),
+            encryptedConnection: this.vault.encrypt(nextConnection),
+          });
+        }) : scanEntries;
+      for await (const entry of selectedEntries) {
       await scheduleCheckpointCandidate();
       throwCheckpointCommitError();
       await throwTmdbRecoveryAfterDraining();
@@ -2565,7 +2621,12 @@ export class ScanWorker {
         ? matchingRoot.mediaTypes.filter((item): item is MediaType => item === "video" || item === "music")
         : defaultMediaTypes;
       const rootPath = matchingRoot?.displayPath || matchingRoot?.resourceId || "/";
-      const scanRootKey = createScanRootKey(effectiveRoot ?? { displayPath: rootPath });
+      const persistenceRoot = targetedScope
+        ? findMatchingScanRoot(entry.path, configuredFullRoots)
+          ?? findMatchingScanRoot(entry.path, configuredIncrementalRoots)
+          ?? effectiveRoot
+        : effectiveRoot;
+      const scanRootKey = createScanRootKey(persistenceRoot ?? { displayPath: rootPath });
       const sourceGenerationId = scanRootGenerations.get(scanRootKey) ?? generationId;
       const directoryKey = `${rootPath}\u0000${entryDirectory}`;
       // Provider 按目录连续返回文件；切换目录表示上一个目录已完整，可立即识别并开始刮削。
@@ -2710,7 +2771,7 @@ export class ScanWorker {
           recognitionRevision,
           locator: entry.locator,
         },
-        skipIfUnchanged: !isRetryJob
+        skipIfUnchanged: !isRetryJob && !targetedScope
           && !replayingCheckpointWindow,
         reusedMatchedCatalog: false,
         sourceFile: null,
@@ -2861,8 +2922,9 @@ export class ScanWorker {
         generationId: rootRun.generationId,
       })),
       // 每个成功完整枚举的扫描根都必须与 Provider 当前内容一致；带警告根不会进入列表，不执行删除。
-      deleteMissing: completedRootRuns.length > 0,
-      allowDestructiveCleanup,
+      deleteMissing: !targetedScope && completedRootRuns.length > 0,
+      allowDestructiveCleanup: !targetedScope && allowDestructiveCleanup,
+      targeted: targetedScope !== null,
       changedItemIds: [...changedItemIds],
     });
     this.logger.info({
@@ -3036,6 +3098,12 @@ export class ScanWorker {
     resolvedMetadata?: EnrichedMetadata;
     signal: AbortSignal;
   }): Promise<{ changedItemIds: string[]; matched: boolean; providerUnavailable: boolean }> {
+    if (input.descriptor.mediaType === "video") {
+      const manualItemId = await this.repository.getManualVideoItemForSourceFile(
+        input.sourceFile.id, input.job.userId, input.job.libraryId);
+      if (manualItemId) return { changedItemIds: input.forceCatalogChange ? [manualItemId] : [],
+        matched: true, providerUnavailable: false };
+    }
     const metadata = input.resolvedMetadata ?? await this.enrichMetadata(
       input.descriptor,
       input.metadataProfiles,

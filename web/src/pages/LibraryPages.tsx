@@ -1,5 +1,5 @@
 import { Link, useNavigate } from "@tanstack/react-router";
-import { Bell, CalendarClock, Copy, Images, Pencil, Plus, ScanLine, Settings2, Trash2 } from "lucide-react";
+import { Bell, CalendarClock, Copy, FolderOpen, Images, Pencil, Plus, ScanLine, Settings2, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { MediaCatalogView, type MediaCatalogQuery } from "@/components/MediaCatalogView";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
@@ -181,6 +181,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   const fullAggregateScanSources = readyAggregateSources.filter((source) => hasAggregateSourceRoots(source, "full"));
   const incrementalAggregateScanSources = readyAggregateSources.filter((source) => hasAggregateSourceRoots(source, "incremental"));
   const catalogPath = admin ? "/admin/libraries/$serviceId/catalog" : "/app/libraries/$serviceId/catalog";
+  const filesPath = admin ? "/admin/libraries/$serviceId/files" : "/app/libraries/$serviceId/files";
   const jellyfinPath = admin ? "/admin/libraries/$serviceId/jellyfin" : "/app/libraries/$serviceId/jellyfin";
   const embyPath = admin ? "/admin/libraries/$serviceId/emby" : "/app/libraries/$serviceId/emby";
   const schedulePath = admin ? "/admin/libraries/$serviceId/scan-schedules" : "/app/libraries/$serviceId/scan-schedules";
@@ -497,6 +498,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
           <div className="flex flex-wrap gap-2">
             <Link to={librariesPath}><SecondaryButton>返回媒体库</SecondaryButton></Link>
             <Link to={schedulePath} params={{ serviceId }}><SecondaryButton><CalendarClock className="size-4" /> 定时任务</SecondaryButton></Link>
+            {service.dataType === "video" && <Link to={filesPath} params={{ serviceId }}><SecondaryButton><FolderOpen className="size-4" /> 文件浏览</SecondaryButton></Link>}
             <Link to={catalogPath} params={{ serviceId }}><PrimaryButton><Images className="size-4" /> 海报墙</PrimaryButton></Link>
           </div>
         )}
@@ -506,10 +508,10 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0">
             <p className="truncate text-sm font-medium">{service.sourceServiceName}</p>
-            <p className="mt-1 text-xs text-muted-foreground">{service.providerType} · {service.sourceConnectionStatus === "valid" ? "连接正常" : "需要重新登录"}</p>
+            <p className="mt-1 text-xs text-muted-foreground">{service.providerType} · {service.sourceConnectionStatus === "deleted" ? "服务已删除，来源已停用" : service.sourceConnectionStatus === "valid" ? "连接正常" : "需要重新登录"}</p>
           </div>
           <div className="flex flex-wrap gap-2">
-            <Link to={admin ? "/admin/services/$serviceId" : "/app/services/$serviceId"} params={{ serviceId: service.sourceServiceId }}><SecondaryButton>查看服务</SecondaryButton></Link>
+            {service.sourceServiceId && <Link to={admin ? "/admin/services/$serviceId" : "/app/services/$serviceId"} params={{ serviceId: service.sourceServiceId }}><SecondaryButton>查看服务</SecondaryButton></Link>}
             <button type="button" onClick={() => void unlinkLastService()} disabled={unlinkingService} className="inline-flex cursor-pointer items-center justify-center rounded-lg border border-destructive/50 bg-destructive/10 px-3 py-2 text-xs font-medium text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40">{unlinkingService ? "取消中…" : "取消关联"}</button>
           </div>
         </div>
@@ -1132,7 +1134,7 @@ export function LibraryCatalogPage({ serviceId, admin = false }: { serviceId: st
     <>
       <PageHeader title={`${service.displayName} · 海报墙`} actions={<div className="flex flex-wrap gap-2"><Link to={librariesPath}><SecondaryButton>返回媒体库</SecondaryButton></Link><Link to={settingsPath} params={{ serviceId }}><SecondaryButton>媒体库设置</SecondaryButton></Link></div>} />
       {resource.error && <Panel className="mb-4"><p className="text-sm text-destructive">{resource.error}</p></Panel>}
-      <MediaCatalogView contextDescription={`${admin ? `用户 ${service.ownerUsername} · ` : ""}${service.displayName} · ${service.libraryId}`} items={catalog.items} total={catalog.total} catalogVersion={service.catalogVersion} fixedService showOwner={admin} admin={admin} loading={resource.loading} onRefresh={() => void resource.refresh()} serverFiltered pageOffset={pageOffset} pageLimit={LIBRARY_CATALOG_PAGE_SIZE} onQueryChange={updateCatalogQuery} onPageChange={setPageOffset} />
+      <MediaCatalogView contextDescription={`${admin ? `用户 ${service.ownerUsername} · ` : ""}${service.displayName} · ${service.libraryId}`} items={catalog.items} total={catalog.total} catalogVersion={service.catalogVersion} fixedService showOwner={admin} admin={admin} loading={resource.loading} onRefresh={() => void resource.refresh()} serverFiltered pageOffset={pageOffset} pageLimit={LIBRARY_CATALOG_PAGE_SIZE} onQueryChange={updateCatalogQuery} onPageChange={setPageOffset} initialItemId={new URLSearchParams(window.location.search).get("itemId") ?? undefined} initialItemLibraryId={service.id} />
     </>
   );
 }

@@ -67,6 +67,23 @@ export interface ProviderDirectoryListing {
   items: ProviderDirectory[];
 }
 
+/** 视频媒体库文件浏览使用的当前目录条目；不包含访问令牌和临时下载地址。 */
+export interface ProviderBrowseEntry extends ProviderDirectory {
+  parentResourceId: string;
+  isDirectory: boolean;
+  size: number;
+  modifiedAt: string | null;
+  etag: string | null;
+  /** 扫描 Worker 内部使用；HTTP 文件列表必须剔除此字段。 */
+  locator: Record<string, unknown>;
+}
+
+/** 一个目录的完整直接子项；页面排序后按批显示，绝不递归读取子目录。 */
+export interface ProviderBrowseListing {
+  current: ProviderDirectory;
+  items: ProviderBrowseEntry[];
+}
+
 /**
  * Provider 返回给 APP 或 Jellyfin 客户端的临时文件访问结果。
  * 部分网盘协议允许在单次播放 URL 中携带即时访问令牌，客户端只能临时使用，不能持久化或写入日志。
@@ -184,6 +201,13 @@ export interface ProviderAdapter {
     signal?: AbortSignal,
     context?: ProviderConnectionContext,
   ): Promise<ProviderDirectoryListing>;
+  /** 读取当前目录的直接子目录和文件，供媒体库文件浏览与精确目标校验使用。 */
+  browseEntries(
+    connection: Record<string, unknown>,
+    parent?: ScanRoot,
+    signal?: AbortSignal,
+    context?: ProviderConnectionContext,
+  ): Promise<ProviderBrowseListing>;
   /** Provider 支持文件访问时，把扫描 locator 转换为短期有效的下载地址。 */
   resolveFileAccess?(
     connection: Record<string, unknown>,
