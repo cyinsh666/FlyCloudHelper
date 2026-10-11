@@ -27,6 +27,8 @@ export function ContentSourceLibraryPanel({ libraryId, admin, onChanged }: {
   const [submitting, setSubmitting] = useState(false);
   const [updatingSource, setUpdatingSource] = useState(false);
   const [activeDialog, setActiveDialog] = useState<ContentSourceDialog | null>(null);
+  // 关键变量：目录详情默认只展示前三个分类，展开状态仅属于当前弹窗。
+  const [showAllSyncCategories, setShowAllSyncCategories] = useState(false);
   const [detailsBusy, setDetailsBusy] = useState(false);
   // 关键变量：仅手动刷新或操作完成时更新子面板，不随同步轮询重复读取。
   const [detailsRefreshVersion, setDetailsRefreshVersion] = useState(0);
@@ -43,6 +45,10 @@ export function ContentSourceLibraryPanel({ libraryId, admin, onChanged }: {
   const pendingBatch = data?.sync.pendingBatch;
   const running = data?.sync.status === "queued" || data?.sync.status === "running";
   const sourceEnabled = data?.source.status === "active" && data.source.pluginStatus === "enabled";
+  // 关键变量：折叠只影响展示，完整分类及同步范围保持原样。
+  const syncCategoryIds = data?.configuration.categoryIds ?? [];
+  const visibleSyncCategoryIds = showAllSyncCategories ? syncCategoryIds : syncCategoryIds.slice(0, 3);
+  const hiddenSyncCategoryCount = syncCategoryIds.length - visibleSyncCategoryIds.length;
 
   /** 子设置和分类读取、保存都同步登记忙状态，保护背景、Esc 和关闭按钮。 */
   const changeDetailsBusy = useCallback((busy: boolean): void => {
@@ -54,6 +60,7 @@ export function ContentSourceLibraryPanel({ libraryId, admin, onChanged }: {
   function openDialog(dialog: ContentSourceDialog): void {
     if (!data || submittingRef.current || detailsBusyRef.current || activeDialogRef.current !== null) return;
     if (dialog === "categories" && (resource.loading || running || !sourceEnabled)) return;
+    if (dialog === "sync") setShowAllSyncCategories(false);
     activeDialogRef.current = dialog;
     setActiveDialog(dialog);
   }
@@ -158,20 +165,61 @@ export function ContentSourceLibraryPanel({ libraryId, admin, onChanged }: {
     setDetailsRefreshVersion((version) => version + 1);
   }
 
-  return <Panel title="在线内容源" className="mb-4" action={<SecondaryButton disabled={resource.loading || updatingSource || submitting || detailsBusy || activeDialog !== null} onClick={() => void refreshStatus()}>刷新状态</SecondaryButton>}>
+  return <Panel title="在线内容源" className="mb-4 [&>header]:items-center" action={<SecondaryButton disabled={resource.loading || updatingSource || submitting || detailsBusy || activeDialog !== null} onClick={() => void refreshStatus()}>刷新状态</SecondaryButton>}>
     {!data && !resource.error && <div aria-label="内容源配置加载中" className="animate-pulse space-y-3"><div className="h-5 w-48 rounded bg-muted" /><div className="h-14 rounded bg-muted" /><div className="h-9 w-32 rounded bg-muted" /></div>}
     {resource.error && <p role="alert" className="mb-3 text-xs text-destructive">内容源状态读取失败，请刷新重试。</p>}
     {data && <div className="grid gap-4">
-      <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-sm">{data.source.displayName}</p><p className="mt-1 text-xs text-muted-foreground">{data.source.pluginId} · {data.source.pluginVersion}</p></div><div className="flex items-center gap-2"><StatusPill>{sourceEnabled ? "配置已启用" : "内容源已停用"}</StatusPill><SecondaryButton disabled={updatingSource || submitting || running || detailsBusy || activeDialog !== null} onClick={() => void toggleSource()}>{updatingSource ? "正在保存…" : data.source.status === "active" ? "停用此配置" : "启用此配置"}</SecondaryButton></div></div>
-      <div className="flex flex-wrap items-center gap-3"><StatusPill>{syncStatusLabels[data.sync.status]}</StatusPill><span className="text-xs text-muted-foreground">本轮处理 {data.sync.processedCount} 个条目 · 已选 {data.configuration.categoryIds.length} 个分类</span>{data.sync.lastError && <span className="text-xs text-destructive">同步失败，可查看详情</span>}</div>
-      <div className="flex flex-wrap gap-2"><SecondaryButton disabled={updatingSource || submitting || detailsBusy || activeDialog !== null} onClick={() => openDialog("sync")}>手动同步 / 详情</SecondaryButton><SecondaryButton disabled={resource.loading || updatingSource || submitting || detailsBusy || activeDialog !== null || running || !sourceEnabled} onClick={() => openDialog("categories")}>修改分类</SecondaryButton></div>
+      {/* 摘要行使用一致的列宽与换行位置，标题、状态和右侧按钮垂直居中。 */}
+      <div className="grid min-h-12 min-w-0 grid-cols-1 items-center gap-x-4 gap-y-2 py-1 sm:grid-cols-[minmax(0,1fr)_auto] lg:grid-cols-[8rem_minmax(0,1fr)_auto]">
+        <p className="min-w-0 break-words text-sm">{data.source.displayName}</p>
+        <div className="min-w-0 sm:col-span-2 sm:row-start-2 lg:col-span-1 lg:col-start-2 lg:row-start-1">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <p className="min-w-0 break-all text-xs text-muted-foreground">{data.source.pluginId} · {data.source.pluginVersion}</p>
+            <StatusPill>{sourceEnabled ? "配置已启用" : "内容源已停用"}</StatusPill>
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center justify-end gap-2 sm:col-start-2 sm:row-start-1 lg:col-start-3">
+          <SecondaryButton disabled={updatingSource || submitting || running || detailsBusy || activeDialog !== null} onClick={() => void toggleSource()}>{updatingSource ? "正在保存…" : data.source.status === "active" ? "停用此配置" : "启用此配置"}</SecondaryButton>
+        </div>
+      </div>
+      <div className="grid min-h-12 min-w-0 grid-cols-1 items-center gap-x-4 gap-y-2 py-1 sm:grid-cols-[minmax(0,1fr)_auto] lg:grid-cols-[8rem_minmax(0,1fr)_auto]">
+        <p className="min-w-0 text-sm">手动同步</p>
+        <div className="min-w-0 sm:col-span-2 sm:row-start-2 lg:col-span-1 lg:col-start-2 lg:row-start-1">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <StatusPill>{syncStatusLabels[data.sync.status]}</StatusPill>
+            <span className="text-xs text-muted-foreground">本轮处理 {data.sync.processedCount} 个条目 · 已选 {data.configuration.categoryIds.length} 个分类</span>
+          </div>
+          {data.sync.lastError && <p className="mt-1 text-xs text-destructive">同步失败，可查看详情</p>}
+        </div>
+        <div className="flex flex-wrap items-center justify-end gap-2 sm:col-start-2 sm:row-start-1 lg:col-start-3">
+          <SecondaryButton disabled={updatingSource || submitting || detailsBusy || activeDialog !== null} onClick={() => openDialog("sync")}>手动同步 / 详情</SecondaryButton>
+          <SecondaryButton disabled={resource.loading || updatingSource || submitting || detailsBusy || activeDialog !== null || running || !sourceEnabled} onClick={() => openDialog("categories")}>修改分类</SecondaryButton>
+        </div>
+      </div>
       <ContentSourceAutoSyncSettings key={`${libraryId}:${admin}:auto-sync`} state={{ libraryId, admin, disabled: updatingSource || submitting || (activeDialog !== null && activeDialog !== "auto-sync"), refreshVersion: detailsRefreshVersion, open: activeDialog === "auto-sync", onOpen: () => openDialog("auto-sync"), onClose: closeDialog, onBusyChange: changeDetailsBusy }} />
       <ContentSourceDiagnostics key={`${libraryId}:${admin}:diagnostics`} state={{ libraryId, admin, disabled: updatingSource || submitting || (activeDialog !== null && activeDialog !== "diagnostics") || !sourceEnabled, refreshVersion: detailsRefreshVersion, open: activeDialog === "diagnostics", onOpen: () => openDialog("diagnostics"), onClose: closeDialog, onBusyChange: changeDetailsBusy }} />
       {notice && <p role="status" className="text-xs text-muted-foreground">{notice}</p>}
       {activeDialog === "sync" && <ContentSourceSettingsDialog state={{ title: "手动同步与目录详情", busy: submitting, onClose: closeDialog, children: <div className="grid gap-4">
         <div className="flex flex-wrap items-center gap-3"><StatusPill>{syncStatusLabels[data.sync.status]}</StatusPill><span className="text-xs text-muted-foreground">本轮已处理 {data.sync.processedCount} 个条目</span></div>
         {!sourceEnabled && <p className="text-xs text-muted-foreground">源插件或配置实例已停用，已有目录和播放记录保留；启用后可继续同步和播放。</p>}
-        <div className="grid gap-2"><p className="text-xs text-muted-foreground">已选 {data.configuration.categoryIds.length} 个分类</p><div className="grid gap-2 sm:grid-cols-2">{data.configuration.categoryIds.map((id) => <div key={id} className="rounded-lg border border-border px-3 py-2.5"><p className="text-sm">{data.configuration.categories?.find((category) => category.id === id)?.name ?? id}</p><p className="mt-1 text-xs text-muted-foreground">{pendingBatch?.completedCategoryIds.includes(id) ? "本批次已完成" : `${pendingBatch ? "本批次进度" : "下一批起始"}：第 ${data.sync.nextPageByCategory[id] ?? 1} 页`}{pendingBatch?.endPageExclusiveByCategory[id] !== undefined && ` · 本批次至第 ${pendingBatch.endPageExclusiveByCategory[id]! - 1} 页`}</p></div>)}</div></div>
+        <div className="grid gap-2">
+          <p className="text-xs text-muted-foreground">已选 {syncCategoryIds.length} 个分类</p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {visibleSyncCategoryIds.map((id) => <div key={id} className="rounded-lg border border-border px-3 py-2.5">
+              <p className="text-sm">{data.configuration.categories?.find((category) => category.id === id)?.name ?? id}</p>
+              <p className="mt-1 text-xs text-muted-foreground">{pendingBatch?.completedCategoryIds.includes(id) ? "本批次已完成" : `${pendingBatch ? "本批次进度" : "下一批起始"}：第 ${data.sync.nextPageByCategory[id] ?? 1} 页`}{pendingBatch?.endPageExclusiveByCategory[id] !== undefined && ` · 本批次至第 ${pendingBatch.endPageExclusiveByCategory[id]! - 1} 页`}</p>
+            </div>)}
+            {syncCategoryIds.length > 3 && <button
+              type="button"
+              aria-expanded={showAllSyncCategories}
+              aria-label={showAllSyncCategories ? "收起分类，仅展示前三个" : `展开其余 ${hiddenSyncCategoryCount} 个分类`}
+              onClick={() => setShowAllSyncCategories((expanded) => !expanded)}
+              className="flex min-h-16 items-center justify-center rounded-lg border border-border px-3 py-2.5 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground"
+            >
+              {showAllSyncCategories ? "收起" : `+${hiddenSyncCategoryCount}`}
+            </button>}
+          </div>
+        </div>
         {data.sync.lastError && <p role="alert" className="break-words text-xs text-destructive">{data.sync.lastError}</p>}
         {resource.error && <p role="alert" className="break-words text-xs text-destructive">{resource.error}</p>}
         <div className="flex flex-wrap items-end gap-3"><label><span className="text-xs text-muted-foreground">{pendingBatch ? "原批次页数（每个分类）" : "下一批页数（每个分类）"}</span><input type="number" min={1} max={20} step={1} disabled={updatingSource || submitting || running || Boolean(pendingBatch)} value={pendingBatch?.pageCount ?? pageCount} onChange={(event) => setPageCount(Number(event.target.value))} className="mt-2 block w-44 rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm" /></label><SecondaryButton disabled={updatingSource || submitting || running || !sourceEnabled} onClick={() => void continueSync("next")}>{submitting ? "正在启动…" : running ? "正在同步…" : pendingBatch ? "重试未完成批次" : "继续同步下一批"}</SecondaryButton><SecondaryButton disabled={updatingSource || submitting || running || !sourceEnabled} onClick={() => void continueSync("refresh")}>刷新已入库内容</SecondaryButton></div>

@@ -109,16 +109,14 @@ export function ContentSourceDiagnostics({ state }: { state: DiagnosticsState })
   }
 
   return <>
-    <section aria-label="内容源诊断" className="flex min-w-0 flex-wrap items-center justify-between gap-3 py-1">
-      <div className="min-w-0">
-        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
-          <p className="text-sm">源站与线路诊断</p>
-          {result && <p className="break-words text-xs text-muted-foreground">{result.catalog.status === "unknown" ? "尚未检测" : `分类接口${result.catalog.status === "ok" ? "通过" : "失败"} · ${diagnosticTime(result.checkedAt)}`}</p>}
-          {!result && !readError && <div aria-label="内容源诊断加载中" className="h-4 w-48 animate-pulse rounded bg-muted" />}
-        </div>
+    <section aria-label="内容源诊断" className="grid min-h-12 min-w-0 grid-cols-1 items-center gap-x-4 gap-y-2 py-1 sm:grid-cols-[minmax(0,1fr)_auto] lg:grid-cols-[8rem_minmax(0,1fr)_auto]">
+      <p className="min-w-0 text-sm">源站与线路诊断</p>
+      <div className="min-w-0 sm:col-span-2 sm:row-start-2 lg:col-span-1 lg:col-start-2 lg:row-start-1">
+        {result && <p className="break-words text-xs text-muted-foreground">{result.catalog.status === "unknown" ? "尚未检测" : `分类接口${result.catalog.status === "ok" ? "通过" : "失败"} · ${diagnosticTime(result.checkedAt)}`}</p>}
+        {!result && !readError && <div aria-label="内容源诊断加载中" className="h-4 w-48 animate-pulse rounded bg-muted" />}
         {readError && <p role="alert" className="mt-1 text-xs text-destructive">读取失败，可查看详情重试</p>}
       </div>
-      <div className="flex shrink-0 flex-wrap gap-2">
+      <div className="flex flex-wrap items-center justify-end gap-2 sm:col-start-2 sm:row-start-1 lg:col-start-3">
         {readError && <SecondaryButton disabled={resource.loading || checking !== null} onClick={reloadHistory}>重试</SecondaryButton>}
         <SecondaryButton disabled={checking !== null} onClick={openDiagnostics}>查看</SecondaryButton>
       </div>
