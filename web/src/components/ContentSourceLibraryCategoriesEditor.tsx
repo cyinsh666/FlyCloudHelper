@@ -20,7 +20,7 @@ interface CategoriesEditorState {
   onCancel: () => void;
 }
 
-/** 展开编辑在线库分类，取消仅丢弃草稿，保存不会自动启动同步。 */
+/** 弹窗内编辑在线库分类，取消仅丢弃草稿，保存不会自动启动同步。 */
 export function ContentSourceLibraryCategoriesEditor({ state }: { state: CategoriesEditorState }) {
   const [categories, setCategories] = useState<ContentSourceCategory[] | null>(null);
   const [draftIds, setDraftIds] = useState<string[]>([...state.selectedIds]);
@@ -86,23 +86,23 @@ export function ContentSourceLibraryCategoriesEditor({ state }: { state: Categor
       await updateContentSourceLibraryCategories(state.libraryId, draftIds, state.admin);
       await state.onSaved();
     } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : "分类保存失败");
+      if (mounted.current) setError(saveError instanceof Error ? saveError.message : "分类保存失败");
     } finally {
+      // 保存成功后父弹窗可能已关闭，操作锁仍须无条件释放。
       state.endOperation();
-      setSaving(false);
+      if (mounted.current) setSaving(false);
     }
   }
 
-  return <div className="grid gap-3 rounded-xl border border-border bg-secondary/20 p-4">
-    <div className="flex flex-wrap items-center justify-between gap-3"><p className="text-sm">修改导入分类</p><SecondaryButton disabled={loading || saving} onClick={state.onCancel}>取消</SecondaryButton></div>
-    {(loading || categories === null && error === null) && <div aria-label="在线分类加载中" className="grid animate-pulse gap-2 sm:grid-cols-3">{[0, 1, 2, 3, 4, 5].map((index) => <div key={index} className="h-10 rounded bg-muted" />)}</div>}
+  return <div className="grid gap-3">
+    {(loading || categories === null && error === null && !state.disabled) && <div aria-label="在线分类加载中" className="grid animate-pulse gap-2 sm:grid-cols-3">{[0, 1, 2, 3, 4, 5].map((index) => <div key={index} className="h-10 rounded bg-muted" />)}</div>}
     {error && <div><p role="alert" className="text-sm text-destructive">{error}</p>{categories === null && <div className="mt-2"><SecondaryButton disabled={blocked} onClick={() => void readCategories()}>重新读取分类</SecondaryButton></div>}</div>}
     {categories !== null && !loading && <>
       <div className="flex flex-wrap items-center gap-2"><span className="text-xs text-muted-foreground">已选 {draftIds.length} 个分类</span><SecondaryButton disabled={blocked} onClick={() => selectAll(true)}>全选</SecondaryButton><SecondaryButton disabled={blocked} onClick={() => selectAll(false)}>取消全选</SecondaryButton></div>
       <div className="grid gap-2 sm:grid-cols-3">{categories.map((category) => <button key={category.id} type="button" aria-pressed={draftSet.has(category.id)} disabled={blocked} onClick={() => toggleCategory(category.id)} className={`rounded-lg border px-3 py-2.5 text-left text-sm disabled:opacity-60 ${draftSet.has(category.id) ? "border-foreground" : "border-border"}`}>{category.name}</button>)}</div>
       {categories.length === 0 && <p className="text-xs text-muted-foreground">当前源没有可选择的视频分类。</p>}
       {unavailableIds.length > 0 && <div><p className="mb-2 text-xs text-muted-foreground">以下原分类当前已不可用，可取消选择后保存。</p><div className="grid gap-2 sm:grid-cols-3">{unavailableIds.map((id) => <button key={id} type="button" aria-pressed={draftSet.has(id)} disabled={blocked || !draftSet.has(id)} onClick={() => toggleCategory(id)} className={`rounded-lg border px-3 py-2.5 text-left text-sm disabled:opacity-60 ${draftSet.has(id) ? "border-foreground" : "border-border"}`}>{state.selectedCategories.find((category) => category.id === id)?.name ?? id}<span className="mt-1 block text-xs text-muted-foreground">{draftSet.has(id) ? "不可用 · 点击取消" : "已取消"}</span></button>)}</div></div>}
-      <div><PrimaryButton disabled={blocked || !changed || draftIds.length === 0} onClick={() => void saveCategories()}>{saving ? "正在保存…" : "保存分类"}</PrimaryButton></div>
+      <div className="flex flex-wrap gap-2"><PrimaryButton disabled={blocked || !changed || draftIds.length === 0} onClick={() => void saveCategories()}>{saving ? "正在保存…" : "保存分类"}</PrimaryButton><SecondaryButton disabled={loading || saving} onClick={state.onCancel}>取消</SecondaryButton></div>
     </>}
     {state.disabled && <p className="text-xs text-muted-foreground">同步运行中或内容源已停用，暂时不能修改分类。</p>}
     {state.pendingBatch && <p className="text-xs text-muted-foreground">保存分类修改会结束未完成批次，下次按新分类和当前进度同步。</p>}

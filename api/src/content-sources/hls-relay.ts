@@ -17,6 +17,8 @@ export interface ContentRelayContext {
 
 /** 服务端保存的资源定位，客户端只得到随机票据和自己的协议令牌。 */
 interface HlsResourceTicket {
+  /** 来源协议随子清单票据传递，诊断不能把 Emby 失败记为 Jellyfin。 */
+  protocol: ContentSourcePlaybackProtocol;
   ownerUserId: string;
   libraryId: string;
   accountId: string;
@@ -236,6 +238,10 @@ async function sendResource(
     const upstreamStatus = knownUpstreamStatuses[upstreamErrorCode]
       ?? (error instanceof ApiError && upstreamErrorCode === "provider_stream_request_failed"
         ? Number(error.message.match(/状态码\s+(\d{3})/u)?.[1] ?? 0) || null : null);
+    if (!request.raw.aborted && !reply.raw.destroyed) await runtime.contentSourceDiagnostics.recordPlaybackFailure({
+      libraryId: context.libraryId, ownerUserId: context.ownerUserId, itemId: ticket.itemId, sourceId: ticket.sourceId,
+      protocol: ticket.protocol, stage: "relay", error,
+    });
     runtime.logBusinessEvent("warn", {
       日志关键字: "codex-content-source-playback", 事件: "内容源中转资源读取失败",
       媒体库ID: context.libraryId, 媒体条目ID: ticket.itemId, 播放来源ID: ticket.sourceId,
@@ -269,8 +275,10 @@ export async function sendContentPlayback(
   request.raw.once("aborted", abort);
   reply.raw.once("close", abort);
   if (request.raw.aborted) abort();
+  let resolving = true; // 关键变量：即时取址失败与中转资源失败分别记录，不把中转错误重复记成取址失败。
   try {
     const resolved = await runtime.contentSources.resolvePlayback(source.id, context.ownerUserId, context.libraryId, controller.signal);
+    resolving = false;
     if (controller.signal.aborted) throw new ApiError(504, "content_playback_resolve_cancelled", "在线播放取址已取消或超时");
     const configuredMode = await runtime.contentSources.getLibraryPlaybackMode(context.libraryId, context.ownerUserId, options.protocol);
     controller.signal.throwIfAborted();
@@ -293,10 +301,17 @@ export async function sendContentPlayback(
     }
     controller.signal.throwIfAborted();
     return sendResource(runtime, context, request, reply, protocolItemId, {
+      protocol: options.protocol,
       ownerUserId: context.ownerUserId, libraryId: context.libraryId, accountId: context.accountId,
       itemId, sourceId: source.id, url: resolved.url, headers: resolved.headers,
       manifest: resolved.container === "hls", measureDuration: true,
     });
+  } catch (error) {
+    if (resolving && !request.raw.aborted && !reply.raw.destroyed) await runtime.contentSourceDiagnostics.recordPlaybackFailure({
+      libraryId: context.libraryId, ownerUserId: context.ownerUserId, itemId, sourceId: source.id,
+      protocol: options.protocol, stage: "resolve", error,
+    });
+    throw error;
   } finally {
     clearTimeout(timeout);
     request.raw.removeListener("aborted", abort);

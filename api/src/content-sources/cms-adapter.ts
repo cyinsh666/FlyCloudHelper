@@ -71,6 +71,9 @@ function readContentItem(value: unknown, manifest: ContentSourceManifest): CmsCo
   const title = plainText(raw.vod_name);
   if (!id || id.length > 128 || !title) return null;
   const parsedYear = Number(raw.vod_year);
+  // 关键变量：优先使用源站的豆瓣评分，缺失时读取源站评分；零分和越界值不能冒充真实评分。
+  const rating = [raw.vod_douban_score, raw.vod_score].map(Number)
+    .find((value) => Number.isFinite(value) && value > 0 && value <= 10) ?? null;
   return {
     id, title, categoryId: String(raw.type_id ?? ""),
     parentCategoryId: raw.type_id_1 ? String(raw.type_id_1) : null,
@@ -79,6 +82,8 @@ function readContentItem(value: unknown, manifest: ContentSourceManifest): CmsCo
     overview: plainText(raw.vod_content), posterUrl: artworkUrl(raw.vod_pic, manifest.endpoint),
     area: plainText(raw.vod_area),
     genres: plainText(raw.vod_class || raw.type_name).split(/[,，/]/u).filter(Boolean),
+    rating,
+    tags: [...new Set(plainText(raw.vod_tag).split(/[|,，/]/u).map((tag) => tag.trim()).filter(Boolean))],
     actors: plainText(raw.vod_actor).split(/[,，/]/u).filter(Boolean),
     directors: plainText(raw.vod_director).split(/[,，/]/u).filter(Boolean),
     episodes: parseCmsPlaybackEpisodes(raw),
@@ -146,7 +151,7 @@ export class CmsJsonAdapter {
   /** 单分类搜索携带 t 减少源扫描；实际范围仍由宿主按返回分类精确过滤。 */
   public async search(searchTerm: string, page: number, categoryId?: string, signal?: AbortSignal): Promise<CmsContentPage> {
     const payload = await this.request({ ac: "detail", wd: searchTerm, pg: String(page), ...(categoryId === undefined ? {} : { t: categoryId }) }, signal);
-    // 关键变量：两个内置源成功码为 1，明确失败即使附带空列表也不能伪装成没有匹配项。
+    // 关键变量：已接入的 CMS 源成功码为 1，明确失败即使附带空列表也不能伪装成没有匹配项。
     if (payload.code !== undefined && payload.code !== 1 && payload.code !== "1") throw new ApiError(502, "content_source_search_failed", "内容源搜索未成功，请稍后重试");
     return this.readPage(payload, page, categoryId, true);
   }

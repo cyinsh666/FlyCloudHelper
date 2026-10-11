@@ -88,6 +88,9 @@ export interface CmsContentItem {
   posterUrl: string | null;
   area: string;
   genres: string[];
+  /** 源站明确给出的有效评分和标签；旧浏览缓存没有这些字段时保留缺失。 */
+  rating?: number | null;
+  tags?: string[];
   actors: string[];
   directors: string[];
   episodes: CmsPlaybackEpisode[];

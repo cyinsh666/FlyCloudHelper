@@ -67,6 +67,8 @@ export async function persistCmsContent(input: {
   const metadata: Record<string, unknown> = {
     contentSource,
     genres, originCountries: originCountries(content.area), productionCountries: originCountries(content.area),
+    // 源评分和标签供标准协议展示与本地筛选，缺失数据不从分类名称推断。
+    rating: content.rating ?? 0, tags: content.tags ?? [],
     people: [...content.actors.map((name) => ({ name, type: "cast" })), ...content.directors.map((name) => ({ name, type: "director" }))],
   };
   const common = {

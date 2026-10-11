@@ -108,6 +108,26 @@ export async function registerContentSourceRoutes(server: FastifyInstance, runti
     server.get<{ Params: { libraryId: string } }>(base, async (request) => {
       return runtime.contentSources.getLibrary(request.params.libraryId, await ownerId(request.params.libraryId, request));
     });
+    server.get<{ Params: { libraryId: string } }>(`${base}/auto-sync`, async (request) => {
+      return runtime.contentSourceAutoSync.get(request.params.libraryId, await ownerId(request.params.libraryId, request));
+    });
+    server.patch<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(`${base}/auto-sync`, async (request) => {
+      const body = request.body ?? {};
+      return runtime.contentSourceAutoSync.save(request.params.libraryId, await ownerId(request.params.libraryId, request), {
+        ...(body.enabled !== undefined ? { enabled: body.enabled as boolean } : {}),
+        ...(body.intervalMinutes !== undefined ? { intervalMinutes: body.intervalMinutes as number } : {}),
+        ...(body.mode !== undefined ? { mode: body.mode as "latest" } : {}),
+        ...(body.pageCount !== undefined ? { pageCount: body.pageCount as number } : {}),
+      });
+    });
+    server.get<{ Params: { libraryId: string } }>(`${base}/diagnostics`, async (request) => {
+      return runtime.contentSourceDiagnostics.get(request.params.libraryId, await ownerId(request.params.libraryId, request));
+    });
+    server.post<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(`${base}/diagnostics`, async (request) => {
+      const checkPlayback = request.body?.checkPlayback;
+      if (checkPlayback !== undefined && typeof checkPlayback !== "boolean") throw validationError("checkPlayback", "线路抽查开关必须为布尔值");
+      return runtime.contentSourceDiagnostics.check(request.params.libraryId, await ownerId(request.params.libraryId, request), checkPlayback === true);
+    });
     server.get<{ Params: { libraryId: string } }>(`${base}/categories`, async (request) => {
       return { items: await runtime.contentSources.libraryCategories(request.params.libraryId, await ownerId(request.params.libraryId, request)) };
     });

@@ -13,6 +13,8 @@ import { TmdbMetadataCache } from "./metadata/tmdb-cache.js";
 import { TmdbKeyPool } from "./metadata/tmdb.js";
 import { MetadataPluginManager } from "./plugin-manager.js";
 import { ContentSourceManager } from "./content-sources/manager.js";
+import { ContentSourceAutoSyncWorker } from "./content-sources/auto-sync.js";
+import { ContentSourceDiagnostics } from "./content-sources/diagnostics.js";
 import { ProviderRegistry } from "./providers/registry.js";
 import { registerAdminRoutes } from "./routes/admin-routes.js";
 import { registerAdminNotificationSettingsRoutes } from "./routes/admin-notification-settings-routes.js";
@@ -197,6 +199,10 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   const plugins = new MetadataPluginManager(database, config, vault);
   const contentSources = new ContentSourceManager(database, config, repository);
   await contentSources.initialize();
+  const contentSourceAutoSync = new ContentSourceAutoSyncWorker({ database, contentSources, logBusinessEvent: logger });
+  await contentSourceAutoSync.initialize();
+  const contentSourceDiagnostics = new ContentSourceDiagnostics({ database, config, contentSources, logBusinessEvent: logger });
+  await contentSourceDiagnostics.initialize();
   const aiModels = new AiModelManager(database, vault);
   const failureReports = new ScanFailureReportService(config, server.log);
   const worker = new ScanWorker({
@@ -244,6 +250,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     scanScheduleWorker,
     plugins,
     contentSources,
+    contentSourceAutoSync,
+    contentSourceDiagnostics,
     aiModels,
     failureReports,
     publicAccess,
@@ -262,6 +270,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     },
   });
   server.addHook("onClose", async () => {
+    await contentSourceAutoSync.stop();
+    await contentSourceDiagnostics.shutdown();
     await contentSources.shutdown();
     await telegramNotifications.close();
     await scanScheduleWorker.stop();
@@ -484,5 +494,6 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   worker.start();
   mediaProbeWorker.start();
   scanScheduleWorker.start();
+  contentSourceAutoSync.start();
   return server;
 }

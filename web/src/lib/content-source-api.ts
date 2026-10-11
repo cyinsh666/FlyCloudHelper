@@ -63,6 +63,54 @@ export interface ContentSourcePlaybackModes {
   emby: ContentSourcePlaybackMode;
 }
 
+/** 自动同步固定读取当前已选分类的第一页。 */
+export type ContentSourceAutoSyncMode = "latest";
+
+/** 用户主动保存的计划配置，默认关闭，每个媒体库独立管理。 */
+export interface ContentSourceAutoSyncConfiguration {
+  enabled: boolean;
+  intervalMinutes: number;
+}
+
+/** 自动同步配置及最近调度状态；时间和错误由服务端提供。 */
+export interface ContentSourceAutoSync extends ContentSourceAutoSyncConfiguration {
+  readonly mode: ContentSourceAutoSyncMode;
+  readonly pageCount: 1;
+  nextRunAt: string | null;
+  lastTriggeredAt: string | null;
+  lastError: string | null;
+}
+
+/** 源站及线路抽样检查结果，不包含播放地址、请求头和访问凭据。 */
+export interface ContentSourceDiagnosticsResult {
+  checkedAt: string | null;
+  catalog: {
+    status: "unknown" | "ok" | "failed";
+    categoryCount: number | null;
+    elapsedMs: number | null;
+    error: string | null;
+  };
+  lines: Array<{
+    sourceId: string;
+    itemId: string;
+    title: string;
+    lineName: string;
+    episodeName: string;
+    container: string;
+    status: "ok" | "failed";
+    elapsedMs: number | null;
+    runTimeTicks: number | null;
+    error: string | null;
+  }>;
+  lastPlaybackFailure: {
+    at: string;
+    protocol: ContentSourcePlaybackProtocol;
+    stage: "resolve" | "relay";
+    message: string;
+    upstreamStatus: number | null;
+  } | null;
+}
+
 /** 创建时一次性返回的协议密码；后续管理页只提供修改密码。 */
 export interface ContentSourceLibraryCreateResult {
   libraryId: string;
@@ -166,5 +214,29 @@ export function updateContentSourcePlaybackMode(libraryId: string, protocol: Con
 export function syncContentSourceLibrary(libraryId: string, input: { mode: "next" | "refresh"; pageCount?: number }, admin = false): Promise<unknown> {
   return requestJson(`${admin ? "/api/v1/admin" : "/api/v1"}/content-source-libraries/${encodeURIComponent(libraryId)}/sync`, {
     method: "POST", body: JSON.stringify(input),
+  });
+}
+
+/** 读取计划和最近运行状态，不会开启自动同步。 */
+export function getContentSourceAutoSync(libraryId: string, admin = false): Promise<ContentSourceAutoSync> {
+  return requestJson(`${admin ? "/api/v1/admin" : "/api/v1"}/content-source-libraries/${encodeURIComponent(libraryId)}/auto-sync`);
+}
+
+/** 仅保存用户确认的启用状态和间隔，第一页同步规则由服务端固定。 */
+export function updateContentSourceAutoSync(libraryId: string, input: ContentSourceAutoSyncConfiguration, admin = false): Promise<ContentSourceAutoSync> {
+  return requestJson(`${admin ? "/api/v1/admin" : "/api/v1"}/content-source-libraries/${encodeURIComponent(libraryId)}/auto-sync`, {
+    method: "PATCH", body: JSON.stringify({ enabled: input.enabled, intervalMinutes: input.intervalMinutes }),
+  });
+}
+
+/** 读取最近诊断摘要，不触发源站检测或线路请求。 */
+export function getContentSourceDiagnostics(libraryId: string, admin = false): Promise<ContentSourceDiagnosticsResult> {
+  return requestJson(`${admin ? "/api/v1/admin" : "/api/v1"}/content-source-libraries/${encodeURIComponent(libraryId)}/diagnostics`);
+}
+
+/** 用户主动检测源分类；开启线路抽查时由服务端限制最多三个样本。 */
+export function checkContentSourceDiagnostics(libraryId: string, checkPlayback: boolean, admin = false): Promise<ContentSourceDiagnosticsResult> {
+  return requestJson(`${admin ? "/api/v1/admin" : "/api/v1"}/content-source-libraries/${encodeURIComponent(libraryId)}/diagnostics`, {
+    method: "POST", body: JSON.stringify({ checkPlayback }),
   });
 }

@@ -512,7 +512,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
         )}
       />
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
-      {isContentSource ? <ContentSourceLibraryPanel libraryId={serviceId} admin={admin} onChanged={resource.refresh} /> : isCloudAggregate ? <><CloudAggregateSourcesPanel library={service} admin={admin} onChanged={resource.refresh} onMessage={setMessage} /><CloudAggregateScanPathsPanel library={service} admin={admin} onChanged={resource.refresh} onMessage={setMessage} /></> : <Panel title="关联服务" description="当前媒体库使用这个网盘服务的登录凭据读取和扫描文件。" className="mb-4">
+      {isContentSource ? <ContentSourceLibraryPanel key={`${serviceId}:${admin}`} libraryId={serviceId} admin={admin} onChanged={resource.refresh} /> : isCloudAggregate ? <><CloudAggregateSourcesPanel library={service} admin={admin} onChanged={resource.refresh} onMessage={setMessage} /><CloudAggregateScanPathsPanel library={service} admin={admin} onChanged={resource.refresh} onMessage={setMessage} /></> : <Panel title="关联服务" description="当前媒体库使用这个网盘服务的登录凭据读取和扫描文件。" className="mb-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0">
             <p className="truncate text-sm font-medium">{service.sourceServiceName}</p>
@@ -655,8 +655,10 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   );
 }
 
-export function UserLibrarySettingsPage({ serviceId }: { serviceId: string }) { return <LibrarySettingsPage serviceId={serviceId} />; }
-export function AdminLibrarySettingsPage({ serviceId }: { serviceId: string }) { return <LibrarySettingsPage serviceId={serviceId} admin />; }
+/** 切换媒体库时重建设置页，避免旧读取结果及弹窗草稿留在新库中。 */
+export function UserLibrarySettingsPage({ serviceId }: { serviceId: string }) { return <LibrarySettingsPage key={`${serviceId}:user`} serviceId={serviceId} />; }
+/** 管理员切换媒体库时同样隔离当前设置页的请求和操作状态。 */
+export function AdminLibrarySettingsPage({ serviceId }: { serviceId: string }) { return <LibrarySettingsPage key={`${serviceId}:admin`} serviceId={serviceId} admin />; }
 
 /** 集中管理单个媒体库的 Jellyfin 中转、地区分组、地址和访问账号。 */
 export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serviceId: string; admin?: boolean }) {

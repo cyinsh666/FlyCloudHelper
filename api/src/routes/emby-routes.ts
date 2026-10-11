@@ -2,6 +2,7 @@ import type { IncomingMessage } from "node:http";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { ApiError } from "../errors.js";
 import { sendProtocolUserImage } from "../media/protocol-user-image.js";
+import { readProtocolContentFilters } from "../media/protocol-content-filters.js";
 import { buildEmbyPath } from "../emby-path.js";
 import { EmbyCompatibilityService, type EmbyContext, type EmbyLibraryContext } from "../emby-service.js";
 import { providerFetch, providerStream } from "../providers/network.js";
@@ -225,8 +226,12 @@ export async function registerEmbyRoutes(server: FastifyInstance, runtime: ApiRu
       const context = await authenticated(request);
       requireEmbyUser(context, String((request.params as { userId: string }).userId));
       const query = readQuery(request);
-      const favorite = String(query.IsFavorite ?? query.Filters ?? "").includes("true") || String(query.Filters ?? "").includes("IsFavorite");
-      const played = String(query.IsPlayed ?? query.Filters ?? "").includes("true") || String(query.Filters ?? "").includes("IsPlayed");
+      // 关键变量：在线库保留显式 false、camelCase 和组合条件，不能用字符串包含判断用户状态。
+      const contentFilters = isContentSourceLibrary(context.libraryKind) ? readProtocolContentFilters(query) : undefined;
+      const favorite = contentFilters ? contentFilters.favorite === true
+        : String(query.IsFavorite ?? query.Filters ?? "").includes("true") || String(query.Filters ?? "").includes("IsFavorite");
+      const played = contentFilters ? contentFilters.played === true
+        : String(query.IsPlayed ?? query.Filters ?? "").includes("true") || String(query.Filters ?? "").includes("IsPlayed");
       const sortFields = String(query.SortBy ?? query.sortBy ?? "").split(",").map((field) => field.trim().toLowerCase());
       // 关键变量：内容源排序不改成历史筛选；未知字段也不能因包含 DatePlayed 字样进入空历史列表。
       const historyRequested = context.libraryKind !== "content_source_video" && sortFields[0] === "dateplayed";

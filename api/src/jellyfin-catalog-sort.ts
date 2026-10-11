@@ -3,8 +3,9 @@ import type { Knex } from "knex";
 import { parseJsonObject, type VideoRegionGroup } from "./domain.js";
 import type { ApiRuntime } from "./runtime.js";
 import { matchesJellyfinSourceCategory, readJellyfinSourceGenres } from "./jellyfin-source-category.js";
+import { loadContentFilterUserStates, matchesContentFilterMetadata, matchesContentFilterUserState, type ContentFilterUserState, type ProtocolContentFilters } from "./media/protocol-content-filters.js";
 
-/** 排序只读取 Jellyfin 自己的账号状态，不修改共享目录或 Emby。 */
+/** 目录排序默认读取 Jellyfin 状态；在线 Emby 高级筛选显式指定自己的状态表。 */
 export interface JellyfinSortContext {
   serviceId: string;
   ownerUserId: string;
@@ -49,6 +50,10 @@ export interface JellyfinSortFilters {
   topLevel?: boolean;
   /** 在线库按源分类精确筛选；null 仅表示历史未分类，不能作为全库通配。 */
   sourceCategoryId?: string | null;
+  /** 已索引在线目录的标准高级筛选，在排序和分页前执行。 */
+  contentFilters?: ProtocolContentFilters;
+  /** 复用目录查询时显式区分两协议的账号状态。 */
+  stateProtocol?: "jellyfin" | "emby";
 }
 
 const SORT_FIELDS = new Set([
@@ -152,6 +157,8 @@ export class JellyfinCatalogSort {
     const query = this.runtime.database.query("media_items as m").where("m.library_id", context.libraryId);
     // 关键变量：在线库条目没有 service_id，不能经过网盘内连接；其他库继续保留原服务存在及未删除条件。
     const onlineLibrary = context.libraryKind === "content_source_video";
+    const contentFilters = onlineLibrary ? filters.contentFilters : undefined;
+    if (contentFilters?.impossible) return [];
     if (onlineLibrary) query.whereNull("m.service_id");
     else query.join("cloud_services as s", "s.id", "m.service_id").whereNull("s.deleted_at");
     query.where("m.user_id", context.ownerUserId).whereNull("m.deleted_at")
@@ -164,8 +171,9 @@ export class JellyfinCatalogSort {
     if (filters.search?.trim()) query.where((builder) => builder.whereLike("m.title", `%${filters.search!.trim()}%`).orWhereLike("m.subtitle", `%${filters.search!.trim()}%`));
     if (filters.genres?.length && !onlineLibrary) query.where((builder) => filters.genres!.forEach((genre) => builder.orWhereLike("m.metadata_json", `%${genre}%`)));
     // 关键变量：在线分类和风格读取独立字段，在全局排序、分页前精确筛选，兼容三种数据库。
-    const exactSourceMetadata = onlineLibrary && (filters.sourceCategoryId !== undefined || Boolean(filters.genres?.length));
+    const exactSourceMetadata = onlineLibrary && (filters.sourceCategoryId !== undefined || Boolean(filters.genres?.length) || Boolean(contentFilters?.active));
     if (exactSourceMetadata) query.select("m.metadata_json as source_metadata_json");
+    if (contentFilters?.active) query.select("m.overview", "m.external_ids_json");
     if (filters.parentId) {
       query.whereExists(this.runtime.database.query("media_relations as relation").select("relation.id")
         .whereRaw("?? = ??", ["relation.child_item_id", "m.id"]).where("relation.parent_item_id", filters.parentId).where("relation.user_id", context.ownerUserId));
@@ -178,7 +186,7 @@ export class JellyfinCatalogSort {
     if (names.has("parentindexnumber") || filters.seasonNumber !== undefined) metadataFields.push(["seasonNumber", "season_number"]);
     if (names.has("indexnumber")) metadataFields.push(["episodeNumber", "episode_number"]);
     metadataFields.forEach(([key, alias]) => query.select(this.metadataColumn(key, alias)));
-    if (filters.favorite || filters.played) {
+    if ((filters.favorite || filters.played) && !contentFilters?.active) {
       const stateTable = filters.favorite ? "library_item_preferences" : "library_playback_progress";
       const state = this.runtime.database.query(`${stateTable} as state`).select("state.id")
         .whereRaw("?? = ??", ["state.item_id", idColumn])
@@ -195,18 +203,29 @@ export class JellyfinCatalogSort {
       const ids = [...new Set(filters.itemIds)];
       for (let index = 0; index < ids.length; index += 300) rows.push(...await query.clone().whereIn(idColumn, ids.slice(index, index + 300)));
     } else rows = await query;
-    const entries = rows.filter((row) => {
+    const matchedRows = rows.filter((row) => {
       if (filters.seasonNumber !== undefined && Number(row.season_number ?? 0) !== filters.seasonNumber) return false;
       if (!exactSourceMetadata) return true;
       const metadata = parseJsonObject(row.source_metadata_json);
       if (!matchesJellyfinSourceCategory(metadata, filters.sourceCategoryId)) return false;
       const genres = readJellyfinSourceGenres(metadata);
-      return !filters.genres?.length || filters.genres.some((genre) => genres.includes(genre));
-    }).map((row): JellyfinSortEntry => ({
+      if (filters.genres?.length && !filters.genres.some((genre) => genres.includes(genre))) return false;
+      return !contentFilters || matchesContentFilterMetadata(contentFilters, {
+        year: row.year, rating: metadata.rating, overview: row.overview,
+        tags: metadata.tags, studios: metadata.studios, providerIds: parseJsonObject(row.external_ids_json),
+        folder: String(row.item_type) === "video.series",
+      });
+    });
+    // 关键变量：元数据先缩小候选，再按协议账号批量读取收藏、进度和当前有效单集汇总。
+    const userStates = contentFilters?.active ? await loadContentFilterUserStates(this.runtime, context,
+      filters.stateProtocol ?? "jellyfin", matchedRows.map((row) => ({ id: String(row.id), itemType: String(row.item_type) })), contentFilters) : new Map<string, ContentFilterUserState>();
+    const entries = matchedRows.filter((row) => !contentFilters || matchesContentFilterUserState(contentFilters, userStates.get(String(row.id))))
+      .map((row): JellyfinSortEntry => ({
       id: String(row.id), itemType: String(row.item_type), values: {
         sortname: String(row.sort_title ?? row.title ?? ""), name: String(row.title ?? ""),
         datecreated: readDate(row.created_at), datemodified: readDate(row.updated_at),
-        stateupdated: readDate(row.state_updated_at), starred: readDate(row.starred_at),
+        stateupdated: readDate(userStates.get(String(row.id))?.updatedAt ?? row.state_updated_at),
+        starred: readDate(userStates.get(String(row.id))?.starredAt ?? row.starred_at),
         productionyear: readNumber(row.year), premieredate: readDate(row.premiere_date),
         // 现有刮削以 0 表示尚无社区评分，与 DTO 省略 CommunityRating 的行为一致。
         communityrating: readNumber(row.rating) || null, criticrating: readNumber(row.critic_rating),

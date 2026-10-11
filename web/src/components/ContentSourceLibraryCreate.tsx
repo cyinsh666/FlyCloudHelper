@@ -145,7 +145,7 @@ export function ContentSourceLibraryCreate() {
   if (!resource.data) return resource.error
     ? <div><p role="alert" className="text-sm text-destructive">{resource.error}</p><div className="mt-3"><SecondaryButton onClick={() => void resource.refresh()}>重新读取</SecondaryButton></div></div>
     : <div aria-label="内容源加载中" className="animate-pulse space-y-4"><div className="h-5 w-40 rounded bg-muted" /><div className="h-12 rounded bg-muted" /><div className="h-12 rounded bg-muted" /></div>;
-  if (plugins.length === 0) return <p className="text-sm text-muted-foreground">暂无已启用的内容源插件，请管理员在“插件管理”中启用内容源。</p>;
+  if (plugins.length === 0) return <p className="text-sm text-muted-foreground">暂无已启用的内容源插件，请管理员在“插件管理 → 内容源插件”中导入并启用插件。</p>;
 
   return <form onSubmit={(event) => void submit(event)} className="grid gap-5">
     <p className="text-xs text-muted-foreground">每个内容源配置实例对应一个独立在线库，通过 Jellyfin、Emby 客户端访问。</p>

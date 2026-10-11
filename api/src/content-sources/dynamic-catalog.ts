@@ -36,11 +36,15 @@ interface CategoryIndex {
   candidateOffset: number;
   completed: boolean;
   tail: Promise<void>;
+  /** 同一类型只安排一个预取，排队期间可合并更远一页的目标。 */
+  prefetchTarget: number;
+  prefetchPromise: Promise<ContentSourceBrowseResult> | null;
 }
 
 interface CategoryWindow {
   libraryId: string;
   identity: string;
+  generation: number;
   expiresAt: number;
   activeRequests: number;
   pages: Map<number, CachedSourcePage>;
@@ -104,24 +108,53 @@ export class DynamicContentCatalog {
     const indexKey = itemTypes.join(",");
     let index = window.indexes.get(indexKey);
     if (!index) {
-      index = { itemIds: [], itemIdSet: new Set(), remoteIdSet: new Set(), sourcePage: 1, candidateOffset: 0, completed: false, tail: Promise.resolve() };
+      index = { itemIds: [], itemIdSet: new Set(), remoteIdSet: new Set(), sourcePage: 1, candidateOffset: 0, completed: false, tail: Promise.resolve(), prefetchTarget: 0, prefetchPromise: null };
       window.indexes.set(indexKey, index);
     }
+    const result = await this.queueExtension(context, window, index, startIndex, limit, itemTypes);
+    this.schedulePrefetch(context, window, index, startIndex, limit, itemTypes);
+    return result;
+  }
+
+  /** 前台和后台共用同一索引队列与收尾登记，下一页请求复用预取进度。 */
+  private async queueExtension(context: DynamicCatalogContext, window: CategoryWindow, index: CategoryIndex, startIndex: number, limit: number, itemTypes: string[], prefetch = false): Promise<ContentSourceBrowseResult> {
     window.activeRequests += 1;
-    const currentIndex = index;
-    const operation = currentIndex.tail.then(() => this.extendIndex(context, window, currentIndex, startIndex, limit, itemTypes));
-    currentIndex.tail = operation.then(() => undefined, () => undefined);
+    const operation = index.tail.then(() => this.extendIndex(context, window, index, startIndex, limit, itemTypes,
+      prefetch ? () => index.prefetchTarget : undefined));
+    index.tail = operation.then(() => undefined, () => undefined);
     this.requests.add(operation);
-    const libraryRequests = this.libraryRequests.get(libraryId) ?? new Set<Promise<ContentSourceBrowseResult>>();
+    const libraryRequests = this.libraryRequests.get(context.libraryId) ?? new Set<Promise<ContentSourceBrowseResult>>();
     libraryRequests.add(operation);
-    this.libraryRequests.set(libraryId, libraryRequests);
+    this.libraryRequests.set(context.libraryId, libraryRequests);
     try { return await operation; }
     finally {
       window.activeRequests -= 1;
       this.requests.delete(operation);
       libraryRequests.delete(operation);
-      if (libraryRequests.size === 0) this.libraryRequests.delete(libraryId);
+      if (libraryRequests.size === 0) this.libraryRequests.delete(context.libraryId);
     }
+  }
+
+  /** 当前页返回后后台补下一客户端页及真实 lookahead，失败不改变前台结果或源末页判断。 */
+  private schedulePrefetch(context: DynamicCatalogContext, window: CategoryWindow, index: CategoryIndex, startIndex: number, limit: number, itemTypes: string[]): void {
+    // 关键变量：页大小来自客户端 Limit，不把源站每页二十条当作客户端页大小。
+    const targetCount = startIndex + limit * 2 + 1;
+    if (!Number.isSafeInteger(targetCount) || this.closing || this.pausedLibraries.has(context.libraryId)
+      || window.generation !== (this.libraryGenerations.get(context.libraryId) ?? 0)
+      || window.expiresAt <= Date.now() || index.completed || index.itemIds.length >= targetCount) return;
+    index.prefetchTarget = Math.max(index.prefetchTarget, targetCount);
+    if (index.prefetchPromise) return;
+    const operation = this.queueExtension(context, window, index, startIndex + limit, limit, itemTypes, true);
+    index.prefetchPromise = operation;
+    /** 成功与失败都释放预取标记；失败保留已落库索引，下一次前台请求按原偏移重试。 */
+    const finish = () => {
+      if (index.prefetchPromise === operation) {
+        index.prefetchPromise = null;
+        index.prefetchTarget = 0;
+      }
+    };
+    // 后台错误仅结束此次预取，不能形成未处理拒绝或让已成功的第一页失败。
+    void operation.then(finish, finish);
   }
 
   /** 清空或删除前暂停该库浏览，取消网络并等待目录写入收尾，避免操作完成后继续回填。 */
@@ -150,8 +183,9 @@ export class DynamicContentCatalog {
   private queryWindow(context: DynamicCatalogContext): CategoryWindow {
     const key = JSON.stringify([context.userId, context.libraryId, context.query]);
     const identity = context.identity;
+    const generation = this.libraryGenerations.get(context.libraryId) ?? 0;
     const previous = this.windows.get(key);
-    if (previous && previous.identity === identity && (previous.expiresAt > Date.now() || previous.activeRequests > 0)) return previous;
+    if (previous && previous.identity === identity && previous.generation === generation && (previous.expiresAt > Date.now() || previous.activeRequests > 0)) return previous;
     for (const [cachedKey, cached] of this.windows) {
       if (cached.activeRequests === 0 && (cached.expiresAt <= Date.now() || cachedKey === key)) this.windows.delete(cachedKey);
     }
@@ -160,7 +194,7 @@ export class DynamicContentCatalog {
       if (idleKey) this.windows.delete(idleKey);
       else throw new ApiError(503, "content_browse_busy", "动态浏览请求较多，请稍后重试");
     }
-    const window: CategoryWindow = { libraryId: context.libraryId, identity, expiresAt: Date.now() + DynamicContentCatalog.WINDOW_TTL_MS, activeRequests: 0, pages: new Map(), pendingPages: new Map(), indexes: new Map() };
+    const window: CategoryWindow = { libraryId: context.libraryId, identity, generation, expiresAt: Date.now() + DynamicContentCatalog.WINDOW_TTL_MS, activeRequests: 0, pages: new Map(), pendingPages: new Map(), indexes: new Map() };
     this.windows.set(key, window);
     return window;
   }
@@ -199,9 +233,9 @@ export class DynamicContentCatalog {
   }
 
   /** 补足请求页和一个真实可查询条目作为下一页依据，未写入候选不计入 TotalRecordCount。 */
-  private async extendIndex(context: DynamicCatalogContext, window: CategoryWindow, index: CategoryIndex, startIndex: number, limit: number, itemTypes: string[]): Promise<ContentSourceBrowseResult> {
+  private async extendIndex(context: DynamicCatalogContext, window: CategoryWindow, index: CategoryIndex, startIndex: number, limit: number, itemTypes: string[], prefetchTarget?: () => number): Promise<ContentSourceBrowseResult> {
     if (this.closing) throw new ApiError(503, "content_source_stopping", "服务正在停止，请稍后浏览");
-    if (this.pausedLibraries.has(context.libraryId)) throw new ApiError(409, "content_catalog_changing", "媒体库正在修改目录，请稍后浏览");
+    if (this.pausedLibraries.has(context.libraryId) || window.generation !== (this.libraryGenerations.get(context.libraryId) ?? 0)) throw new ApiError(409, "content_catalog_changing", "媒体库正在修改目录，请稍后浏览");
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), DynamicContentCatalog.REQUEST_BUDGET_MS);
     this.controllers.add(controller);
@@ -210,7 +244,7 @@ export class DynamicContentCatalog {
     this.libraryControllers.set(context.libraryId, libraryControllers);
     let newPages = 0;
     // 关键变量：总数只含已成功持久化的索引，额外一个实际条目让客户端能够继续请求下一页。
-    const targetCount = startIndex + limit + 1;
+    const targetCount = () => prefetchTarget?.() ?? startIndex + limit + 1;
     try {
       await this.assertContext(context);
       // 清空目录、迁类或同步停用线路后不继续返回旧索引，重新读取源页建立当前可查询集合。
@@ -223,17 +257,17 @@ export class DynamicContentCatalog {
         index.completed = false;
         window.pages.clear();
       }
-      while (index.itemIds.length < targetCount && !index.completed) {
+      while (index.itemIds.length < targetCount() && !index.completed) {
         controller.signal.throwIfAborted();
         if (!window.pages.has(index.sourcePage) && !window.pendingPages.has(index.sourcePage)) {
           if (newPages >= DynamicContentCatalog.MAX_NEW_PAGES) throw new ApiError(503, "content_browse_scan_limit", "当前范围有效条目较少，本次查询已达扫描预算，请重试继续加载");
           newPages += 1;
         }
         const page = await this.sourcePage(context, window, index.sourcePage, controller.signal);
-        while (index.candidateOffset < page.candidates.length && index.itemIds.length < targetCount) {
+        while (index.candidateOffset < page.candidates.length && index.itemIds.length < targetCount()) {
           controller.signal.throwIfAborted();
-          // 关键变量：仅并发当前需求，不额外写入未来页；同批远端身份去重。
-          const batchLimit = Math.min(DynamicContentCatalog.MAX_PERSIST_CONCURRENCY, targetCount - index.itemIds.length);
+          // 关键变量：仅并发本次前台或预取目标范围；同批远端身份去重。
+          const batchLimit = Math.min(DynamicContentCatalog.MAX_PERSIST_CONCURRENCY, targetCount() - index.itemIds.length);
           const batch: Array<{ content: CmsCatalogContentItem; offset: number }> = [];
           const batchRemoteIds = new Set<string>();
           let nextOffset = index.candidateOffset;

@@ -12,6 +12,7 @@ import { getProtocolUserImageTag } from "./media/protocol-user-image.js";
 import { prepareNextEpisodeResume } from "./media/episode-resume.js";
 import { contentPlaybackServerRoot, isContentSourceLibrary, mapContentMediaSource, prioritizeContentSources, readContentRunTimeTicks } from "./content-sources/playback.js";
 import { readProtocolItemIdentityFilter, matchesProtocolItemIdentity, resolveProtocolItemIdentityIds } from "./media/protocol-item-identity-filter.js";
+import { matchesContentFilterDto, readContentFilterNames, readProtocolContentFilters } from "./media/protocol-content-filters.js";
 import type { ContentSourceCategoryDefinition } from "./content-sources/types.js";
 import { matchesJellyfinSourceCategory, readJellyfinSourceCategoryId, readJellyfinSourceGenres } from "./jellyfin-source-category.js";
 import {
@@ -552,9 +553,16 @@ export class JellyfinCompatibilityService {
   private async sortChildRecords<T>(
     context: JellyfinContext, query: Record<string, unknown>, records: T[], readId: (record: T) => string,
   ): Promise<T[]> {
-    if (!readJellyfinSortQuery(query, "SortBy") || records.length === 0) return records;
+    const hasRequestedSort = Boolean(readJellyfinSortQuery(query, "SortBy"));
+    const contentFilters = isContentSourceLibrary(context.libraryKind) ? readProtocolContentFilters(query) : undefined;
+    if ((!hasRequestedSort && !contentFilters?.active) || records.length === 0) return records;
     const plan = this.catalogSort.readPlan(context, query);
-    const entries = await this.catalogSort.load(context, { itemIds: records.map(readId) }, plan);
+    const entries = await this.catalogSort.load(context, { itemIds: records.map(readId), contentFilters }, plan);
+    if (!hasRequestedSort) {
+      // 关键变量：仅筛选时保留原季集顺序，不能用目录默认排序打乱单集。
+      const allowedIds = new Set(entries.map((entry) => entry.id));
+      return records.filter((record) => allowedIds.has(readId(record)));
+    }
     const recordsById = new Map(records.map((record) => [readId(record), record]));
     this.catalogSort.log(context, plan, entries, 0, entries.length);
     return entries.map((entry) => recordsById.get(entry.id)).filter((record): record is T => record !== undefined);
@@ -598,7 +606,8 @@ export class JellyfinCompatibilityService {
   /** 候选集合完成全局排序后再分页，文件、规格、图片仍使用原映射逻辑。 */
   private async listSortedCatalogPage(context: JellyfinContext, query: Record<string, unknown>, filters: JellyfinSortFilters) {
     const plan = this.catalogSort.readPlan(context, query);
-    const entries = await this.catalogSort.load(context, filters, plan);
+    const contentFilters = isContentSourceLibrary(context.libraryKind) ? readProtocolContentFilters(query) : undefined;
+    const entries = await this.catalogSort.load(context, { ...filters, contentFilters }, plan);
     const page = this.paginate(entries, { ...query, Limit: this.readQueryValue(query, "Limit") ?? 100 });
     const items = await this.mapSortedMediaEntries(context, page.Items);
     this.catalogSort.log(context, plan, entries, page.StartIndex, items.length);
@@ -841,6 +850,7 @@ export class JellyfinCompatibilityService {
       Type: type, MediaType: "Video", IsFolder: type === "Series", LocationType: onlineLibrary ? "Remote" : "FileSystem",
       CanDownload: context.downloadEnabled && type !== "Series" && itemFiles.length > 0,
       Genres: genreNames,
+      ...(onlineLibrary ? { Tags: readContentFilterNames(metadata.tags), Studios: readContentFilterNames(metadata.studios).map((Name) => ({ Name })) } : {}),
       GenreItems: genreNames.map((name) => ({ Name: name, Id: this.encodeGenreId(name) })),
       People: people.map((person) => {
         const personRecord = person as Record<string, unknown>;
@@ -961,6 +971,8 @@ export class JellyfinCompatibilityService {
 
   /** 源分类浏览和普通搜索按需查源；账号筛选、复杂条件与最新内容仍使用本地目录。 */
   public async listItems(context: JellyfinContext, query: Record<string, unknown>, options: { localOnly?: boolean } = {}) {
+    // 在线高级筛选先校验，避免动态、空类型或身份查询提前返回后静默忽略条件。
+    if (isContentSourceLibrary(context.libraryKind)) readProtocolContentFilters(query);
     if (this.queryIncludesFilter(query, "IsFavorite", "IsFavorite")) return this.listFavoriteItems(context, query);
     if (this.queryIncludesFilter(query, "IsPlayed", "IsPlayed")) return this.listPlayedItems(context, query);
     const identityFilter = readProtocolItemIdentityFilter(query, decodeProtocolItemId);
@@ -1083,6 +1095,9 @@ export class JellyfinCompatibilityService {
 
   /** 用户状态过滤、媒体库范围和排序都在分页前完成。 */
   private async listSortedStateItems(context: JellyfinContext, query: Record<string, unknown>, favorite: boolean) {
+    // 关键变量：账号专属入口仍要求收藏或已看；其他高级条件与它们取交集。
+    const contentFilters = isContentSourceLibrary(context.libraryKind)
+      ? readProtocolContentFilters(query, favorite ? { favorite: true } : { played: true }) : undefined;
     const identityFilter = readProtocolItemIdentityFilter(query, decodeProtocolItemId);
     const identityIds = await resolveProtocolItemIdentityIds(this.runtime, context, identityFilter);
     const include = String(this.readQueryValue(query, "IncludeItemTypes") ?? "").split(",").map((type) => type.trim()).filter(Boolean);
@@ -1105,6 +1120,7 @@ export class JellyfinCompatibilityService {
       sourceCategoryId: library?.sourceCategoryId,
       parentId: internalParentId, seasonNumber: season?.seasonNumber,
       search, genres: await this.readGenreNames(context, query),
+      contentFilters,
     }, plan);
     const peopleById = new Map<string, Record<string, unknown>>();
     if (favorite && (include.length === 0 || include.includes("Person"))) {
@@ -1119,6 +1135,7 @@ export class JellyfinCompatibilityService {
         if (!person || (search && !String(person.Name ?? "").toLocaleLowerCase("zh-CN").includes(search.toLocaleLowerCase("zh-CN")))) continue;
         if (!matchesProtocolItemIdentity(identityFilter, decodeProtocolItemId(String(person.Id)),
           (person.ProviderIds ?? {}) as Record<string, unknown>)) continue;
+        if (contentFilters && !matchesContentFilterDto(contentFilters, person)) continue;
         const id = String(person.Id);
         peopleById.set(id, person);
         entries.push({ id, itemType: "Person", values: {

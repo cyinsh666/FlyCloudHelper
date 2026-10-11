@@ -17,6 +17,8 @@ import type { MediaProbeWorker } from "./media-probe-worker.js";
 import type { ScanScheduleStore, ScanScheduleWorker } from "./scan-schedule-service.js";
 import type { TelegramNotificationService } from "./telegram-notification-service.js";
 import type { ContentSourceManager } from "./content-sources/manager.js";
+import type { ContentSourceAutoSyncWorker } from "./content-sources/auto-sync.js";
+import type { ContentSourceDiagnostics } from "./content-sources/diagnostics.js";
 
 /** 后台路由共享的已初始化运行时依赖。 */
 export interface ApiRuntime {
@@ -35,6 +37,10 @@ export interface ApiRuntime {
   plugins: MetadataPluginManager;
   /** 独立内容源插件、配置实例、在线目录与即时播放取址。 */
   contentSources: ContentSourceManager;
+  /** 用户主动开启的内容源更新计划，不与网盘定时扫描混用。 */
+  contentSourceAutoSync: ContentSourceAutoSyncWorker;
+  /** 内容源目录、线路抽查与最近播放失败的持久摘要。 */
+  contentSourceDiagnostics: ContentSourceDiagnostics;
   aiModels: AiModelManager;
   failureReports: ScanFailureReportService;
   publicAccess: PublicAccessService;

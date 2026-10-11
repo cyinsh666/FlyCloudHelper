@@ -8,8 +8,6 @@ import { validateProviderUrl } from "../providers/network.js";
 import { categoryMatches, persistCmsContent } from "./catalog.js";
 import { CmsJsonAdapter, contentKey, validateContentManifest } from "./cms-adapter.js";
 import { DynamicContentCatalog, type DynamicCatalogContext, type DynamicCatalogQuery } from "./dynamic-catalog.js";
-import { huyaResourcesManifest } from "./plugins/huya-resources.js";
-import { movieParadiseManifest } from "./plugins/movie-paradise.js";
 import { initializeContentSourceSchema } from "./schema.js";
 import { mergeCategoryCatalog, SourceCategoryLibraryReader } from "./source-category-library.js";
 import type { CmsCatalogContentItem, ContentPlaybackSource, ContentSourceBrowseOptions, ContentSourceBrowseResult, ContentSourceCategory, ContentSourceCategoryDefinition, ContentSourceInstance, ContentSourceManifest, ContentSourcePendingBatch, ContentSourcePlaybackMode, ContentSourcePlaybackModes, ContentSourcePlaybackProtocol, ContentSourcePluginRecord, ContentSourceSearchOptions, ContentSourceSyncState } from "./types.js";
@@ -85,18 +83,10 @@ export class ContentSourceManager {
     );
   }
 
-  /** 创建内容表并登记内置源；保留用户手动停用、卸载以及历史版本状态。 */
+  /** 创建内容表，不自动安装插件；保留已有插件记录并处理重启中断的同步。 */
   public async initialize(): Promise<void> {
     await initializeContentSourceSchema(this.database);
     const now = new Date().toISOString();
-    // 关键变量：每个内置源独立登记；已有同版本记录不覆盖清单或启停状态。
-    const builtInManifests = [movieParadiseManifest, huyaResourcesManifest];
-    for (const manifest of builtInManifests) {
-      await this.database.query("content_source_plugins").insert({
-        plugin_id: manifest.pluginId, version: manifest.version,
-        manifest_json: JSON.stringify(manifest), status: "enabled", created_at: now, updated_at: now,
-      }).onConflict(["plugin_id", "version"]).ignore();
-    }
     const interrupted = await this.database.query("content_source_libraries").whereIn("sync_status", ["queued", "running"]);
     for (const binding of interrupted) {
       const previous = parseJsonObject(binding.sync_json) as unknown as ContentSourceSyncState;
@@ -236,7 +226,7 @@ export class ContentSourceManager {
     }
   }
 
-  /** 两个已确认支持 CMS 搜索的内置源实时查词，其他插件和停用源继续原本地搜索。 */
+  /** 两个已确认支持 CMS 搜索的源在导入启用后实时查词，其他插件和停用源继续原本地搜索。 */
   public async searchLibrary(libraryId: string, userId: string, options: ContentSourceSearchOptions): Promise<ContentSourceBrowseResult | null> {
     try { return await this.dynamicCatalog.search(libraryId, userId, options); }
     catch (error) {
@@ -291,7 +281,7 @@ export class ContentSourceManager {
     finally { release(); if (this.contentWrites.get(key) === current) this.contentWrites.delete(key); }
   }
 
-  /** 只落库当前需求和真实 lookahead；人工类型优先，成功写入并验证后才给动态索引返回父 ID。 */
+  /** 落库前台需求与后台预取目录；人工类型优先，写入并验证后才返回动态索引父 ID。 */
   private async persistDynamicContent(context: DynamicCatalogContext, content: CmsCatalogContentItem, itemTypes: string[], signal: AbortSignal): Promise<string | null> {
     return this.withContentWrite(context.libraryId, context.instanceId, content.id, async () => {
       const current = await this.dynamicContext(context.libraryId, context.userId, context.query);
@@ -444,18 +434,33 @@ export class ContentSourceManager {
     await this.repository.publishContentSourceCatalogChanges(userId, libraryId, [...itemIds, ...parentIds]);
   }
 
-  /** 抢占媒体库同步；next连续导入目录，refresh只更新已入库条目和最新集数。 */
-  public async startLibrarySync(libraryId: string, userId: string, options: { pageCount?: number; mode?: "next" | "refresh"; sample?: boolean } = {}): Promise<ContentSourceSyncState> {
+  /** 抢占媒体库同步；latest读取已选分类首页，next连续导入，refresh更新已入库条目。 */
+  public async startLibrarySync(libraryId: string, userId: string, options: {
+    pageCount?: number;
+    mode?: "next" | "refresh" | "latest";
+    sample?: boolean;
+    /** 自动同步专用领取身份；手动同步不传，也不受计划开关影响。 */
+    autoSyncClaim?: { revision: number; token: string };
+  } = {}): Promise<ContentSourceSyncState> {
     if (this.closing) throw new ApiError(503, "content_source_stopping", "服务正在停止，请稍后同步");
     if (this.jobs.has(libraryId)) throw new ApiError(409, "content_sync_running", "此在线库已经在同步");
     const mode = options.mode ?? "next";
     const detail = await this.getLibrary(libraryId, userId);
     await this.adapter(detail.source.id, userId);
-    const requestedPageCount = pageCount(options.pageCount);
+    // 关键变量：自动首页同步固定每分类一页，不借用或推进手动下一批的页数。
+    const requestedPageCount = mode === "latest" ? 1 : pageCount(options.pageCount);
     const sync = await this.database.query.transaction(async (transaction) => {
       const libraryQuery = transaction("media_libraries").where({ id: libraryId, user_id: userId, status: "active" });
       if (this.database.databaseType !== "sqlite") libraryQuery.forUpdate();
       if (!(await libraryQuery.first())) throw new ApiError(409, "content_library_disabled", "媒体库已停用或不存在");
+      if (options.autoSyncClaim) {
+        // 关键变量：计划保存与同步入队锁同一库行，关闭或改计划先提交后，旧领取不能继续排队。
+        const currentClaim = await transaction("content_source_auto_sync_plans")
+          .where({ library_id: libraryId, user_id: userId, enabled: 1,
+            revision: options.autoSyncClaim.revision, claim_token: options.autoSyncClaim.token })
+          .select("library_id").first();
+        if (!currentClaim) throw new ApiError(409, "content_auto_sync_plan_changed", "自动同步计划已修改或关闭，本次任务未启动");
+      }
       // 关键变量：分类编辑可能先取得锁，目标范围必须使用锁内最新配置，不能复用事务外的旧详情。
       const binding = await transaction("content_source_libraries").where({ library_id: libraryId, user_id: userId }).first();
       if (!binding) throw new ApiError(404, "content_library_not_found", "内容源媒体库不存在");
@@ -485,8 +490,8 @@ export class ContentSourceManager {
     return sync;
   }
 
-  /** 后台同步按成功页面保存检查点，失败、停用或重启后保留已有目录和播放记录。 */
-  private async runSync(libraryId: string, userId: string, sync: ContentSourceSyncState, mode: "next" | "refresh", signal: AbortSignal): Promise<void> {
+  /** 后台同步保留已入库资料；首页更新不写连续导入游标，其他模式沿用原检查点。 */
+  private async runSync(libraryId: string, userId: string, sync: ContentSourceSyncState, mode: "next" | "refresh" | "latest", signal: AbortSignal): Promise<void> {
     try {
       sync.status = "running";
       await this.saveSync(libraryId, sync);
@@ -532,6 +537,22 @@ export class ContentSourceManager {
             await this.saveSync(libraryId, sync);
           }
         }
+      } else if (mode === "latest") {
+        // 关键变量：只处理当前仍有效的已选视频叶分类，源新增分类需用户选择后才参与自动同步。
+        const availableIds = new Set(selectableVideoCategories(categories, runtime.manifest).map((category) => category.id));
+        const selectedCategoryIds = detail.configuration.categoryIds.filter((id) => availableIds.has(id));
+        const processedRemoteIds = new Set<string>();
+        for (const categoryId of selectedCategoryIds) {
+          signal.throwIfAborted();
+          const firstPage = await runtime.adapter.page(categoryId, 1, signal);
+          for (const content of firstPage.items) {
+            // 源站必须返回该叶分类的真实作品；同一源条目在本次同步中只写入一次。
+            if (content.categoryId !== categoryId || processedRemoteIds.has(content.id)) continue;
+            await persist(content);
+            processedRemoteIds.add(content.id);
+          }
+        }
+        // 首页只是本轮样本，离开首页的旧作品继续保留，手动游标和未完成批次不变。
       } else {
         const batch = sync.pendingBatch;
         if (!batch) throw new ApiError(500, "content_sync_batch_missing", "目录同步缺少批次范围，请重新发起同步");
