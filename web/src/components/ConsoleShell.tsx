@@ -149,6 +149,34 @@ function Brand() {
   );
 }
 
+/** 桌面和手机侧栏共用账号操作，管理员可切换控制台，所有账号均可退出。 */
+function ConsoleAccountActions({ role, actualRole, onNavigate }: {
+  role: AuthRole;
+  actualRole: AuthRole;
+  onNavigate?: () => void;
+}) {
+  /** 关闭手机导航后退出当前会话，完成请求后返回登录页。 */
+  function exitConsole(): void {
+    onNavigate?.();
+    void logout().finally(() => window.location.assign("/login"));
+  }
+
+  return <div className="space-y-3">
+    {actualRole === "super_admin" && <Link
+      to={role === "super_admin" ? "/app" : "/admin"}
+      onClick={onNavigate}
+      className="block rounded-lg border border-border px-3 py-2.5 text-center text-xs text-muted-foreground transition-colors hover:text-foreground"
+    >
+      {role === "super_admin" ? "进入个人控制台" : "进入管理后台"}
+    </Link>}
+    <button
+      type="button"
+      onClick={exitConsole}
+      className="w-full rounded-lg border border-border px-3 py-2.5 text-center text-xs text-muted-foreground transition-colors hover:text-foreground"
+    >退出登录</button>
+  </div>;
+}
+
 /**
  * 渲染普通用户或超级管理员的控制台框架。
  */
@@ -273,25 +301,7 @@ export function ConsoleShell({
               最后更新 {serviceStatusUpdatedAt?.toLocaleTimeString("zh-CN", { hour12: false }) ?? "--:--:--"}
             </p>
           </div>
-          {actualRole === "super_admin" && (
-            <Link
-              to={role === "super_admin" ? "/app" : "/admin"}
-              className="block rounded-lg border border-border px-3 py-2.5 text-center text-xs text-muted-foreground transition-colors hover:text-foreground"
-            >
-              {role === "super_admin" ? "进入个人控制台" : "进入管理后台"}
-            </Link>
-          )}
-          <button
-            type="button"
-            onClick={() => {
-              void logout().finally(() => {
-                window.location.assign("/login");
-              });
-            }}
-            className="w-full rounded-lg border border-border px-3 py-2.5 text-center text-xs text-muted-foreground transition-colors hover:text-foreground"
-          >
-            退出登录
-          </button>
+          <ConsoleAccountActions role={role} actualRole={actualRole} />
         </div>
       </aside>
 
@@ -303,8 +313,9 @@ export function ConsoleShell({
             onClick={() => setMobileNavigationOpen(false)}
             className="absolute inset-0 bg-background/80 backdrop-blur-sm"
           />
-          <div className="absolute top-0 bottom-0 left-0 w-[272px] border-r border-sidebar-border bg-sidebar px-4 py-6">
-            <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
+          {/* 手机侧栏跟随可见视口高度，导航独立滚动，底部账号操作始终保留空间。 */}
+          <div className="absolute top-0 left-0 flex h-dvh max-h-full w-[272px] max-w-full flex-col border-r border-sidebar-border bg-sidebar px-4 pt-[max(1.5rem,env(safe-area-inset-top))] pb-[max(1.5rem,env(safe-area-inset-bottom))]">
+            <div className="grid shrink-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
               <Brand />
               <button
                 type="button"
@@ -315,11 +326,14 @@ export function ConsoleShell({
                 <X className="size-4" />
               </button>
             </div>
-            <div className="mt-8">
+            <div className="mt-6 min-h-0 flex-1 overflow-y-auto overscroll-contain">
               <NavigationList
                 items={navigationItems}
                 onNavigate={() => setMobileNavigationOpen(false)}
               />
+            </div>
+            <div className="mt-4 shrink-0 border-t border-sidebar-border pt-4">
+              <ConsoleAccountActions role={role} actualRole={actualRole} onNavigate={() => setMobileNavigationOpen(false)} />
             </div>
           </div>
         </div>

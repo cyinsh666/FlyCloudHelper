@@ -7,6 +7,7 @@ import { parseJsonObject, type CatalogSort, type MediaItemRecord, type VideoRegi
 import { ApiError } from "./errors.js";
 import type { ApiRuntime } from "./runtime.js";
 import { hydrateRealtimeVideoDetails } from "./media/realtime-video-details.js";
+import { prepareNextEpisodeResume } from "./media/episode-resume.js";
 import { readProtocolItemIdentityFilter, matchesProtocolItemIdentity, resolveProtocolItemIdentityIds } from "./media/protocol-item-identity-filter.js";
 import { parseCompletedMediaProbeResult, readJellyfinRunTimeTicks, type MediaProbeResult } from "./media/media-probe.js";
 
@@ -416,9 +417,13 @@ export class EmbyCompatibilityService {
     return this.filterAndPaginate(items, query);
   }
 
-  /** 继续观看只返回未看完且未隐藏的电影/单集。 */
+  /** 继续观看返回已有进度和单集完播生成的待播入口，排除已看完或隐藏的条目。 */
   public async listResume(context: EmbyContext, query: Record<string, unknown>) {
-    const rows = await this.runtime.database.query("library_emby_playback_progress as p").join("media_items as m", "m.id", "p.item_id").select("m.id").where({ "p.library_id": context.libraryId, "p.account_id": context.accountId, "p.played": 0, "p.hidden_from_resume": 0 }).where("p.position_ticks", ">", 0).whereNull("m.deleted_at").orderBy("p.updated_at", "desc").limit(500);
+    const rows = await this.runtime.database.query("library_emby_playback_progress as p")
+      .join("media_items as m", "m.id", "p.item_id").select("m.id")
+      .where({ "p.library_id": context.libraryId, "p.account_id": context.accountId, "p.played": 0, "p.hidden_from_resume": 0 })
+      .where((builder) => builder.where("p.position_ticks", ">", 0).orWhere("p.resume_pending", 1))
+      .whereNull("m.deleted_at").orderBy("p.updated_at", "desc").limit(500);
     const items: Record<string, unknown>[] = [];
     for (const row of rows) { try { items.push(await this.getItem(context, encodeItemId(String(row.id)))); } catch { /* 删除条目不返回。 */ } }
     return this.paginate(items, query);
@@ -591,6 +596,9 @@ export class EmbyCompatibilityService {
       if (existingSession) await transaction("library_emby_playback_sessions").where({ id: playSessionId }).update(sessionPatch); else await transaction("library_emby_playback_sessions").insert({ id: playSessionId, library_id: context.libraryId, account_id: context.accountId, ...sessionPatch, started_at: now });
       automaticallyMarkedPlayed = await this.upsertProgress(transaction, context, item.id,
         mediaSourceId || null, positionTicks, kind === "stopped", completed, now);
+      if (item.itemType === "video.episode" && automaticallyMarkedPlayed) {
+        await prepareNextEpisodeResume(transaction, "library_emby_playback_progress", context, item.id, now);
+      }
       if (kind === "stopped") { const history = await transaction("library_emby_playback_history").where({ library_id: context.libraryId, account_id: context.accountId, play_session_id: playSessionId }).first(); if (!history) await transaction("library_emby_playback_history").insert({ id: randomUUID(), library_id: context.libraryId, account_id: context.accountId, item_id: item.id, play_session_id: playSessionId, position_ticks: positionTicks, completed: completed ? 1 : 0, started_at: existingSession?.started_at ?? now, stopped_at: now }); }
     });
     // 自动播放进度也属于单集状态变化，最后一集完播后应立即更新整剧完成标记。
@@ -626,7 +634,7 @@ export class EmbyCompatibilityService {
       const now = new Date().toISOString();
       const existing = await this.readProgress(context, item.id);
       // 关键变量：客户端显式写入进度时恢复继续观看可见性，并清除之前的已观看状态。
-      const patch = { position_ticks: positionTicks, played: 0, hidden_from_resume: 0, updated_at: now };
+      const patch = { position_ticks: positionTicks, played: 0, hidden_from_resume: 0, resume_pending: 0, updated_at: now };
       if (existing) await this.runtime.database.query("library_emby_playback_progress").where({ id: existing.id }).update(patch);
       else await this.runtime.database.query("library_emby_playback_progress").insert({
         id: randomUUID(), library_id: context.libraryId, account_id: context.accountId, item_id: item.id,
@@ -684,6 +692,7 @@ export class EmbyCompatibilityService {
           played: played ? 1 : 0,
           position_ticks: 0,
           hidden_from_resume: played ? 1 : 0,
+          resume_pending: 0,
           play_count: played ? Math.max(1, Number(existing?.play_count ?? 0)) : 0,
           last_played_at: played ? now : null,
           updated_at: now,
@@ -693,7 +702,7 @@ export class EmbyCompatibilityService {
         await transaction("library_emby_playback_progress")
           .insert(rows.slice(offset, offset + EMBY_USER_STATE_BATCH_SIZE))
           .onConflict(["library_id", "account_id", "item_id"])
-          .merge(["played", "position_ticks", "hidden_from_resume", "play_count", "last_played_at", "updated_at"]);
+          .merge(["played", "position_ticks", "hidden_from_resume", "resume_pending", "play_count", "last_played_at", "updated_at"]);
       }
     });
     if (item.itemType === "video.episode") {
@@ -859,7 +868,40 @@ export class EmbyCompatibilityService {
   private userData(progress: Record<string, unknown> | null | undefined, runTimeTicks: number, favorite: boolean, protocolItemId?: string) { const played = Number(progress?.played ?? 0) === 1; const position = played ? 0 : Number(progress?.position_ticks ?? 0); const source = String(progress?.media_source_id ?? ""); return { PlaybackPositionTicks: position, PlayCount: Number(progress?.play_count ?? 0), IsFavorite: favorite, Played: played, LastPlayedDate: progress?.last_played_at ?? undefined, UnplayedItemCount: progress?.unplayed_item_count === undefined ? undefined : Number(progress.unplayed_item_count), PlayedPercentage: runTimeTicks > 0 && position > 0 ? position / runTimeTicks * 100 : undefined, Key: "", ItemId: protocolItemId, MediaSourceId: source ? (INTERNAL_ITEM_ID_PATTERN.test(source) ? encodeItemId(source) : source) : undefined }; }
   private async readItemRunTimeTicks(item: MediaItemRecord, mediaSourceId?: string) { const files = (await this.runtime.repository.listItemFiles(item.id, item.userId)).filter((file) => String(file.itemId) === item.id); const probes = files.map((file) => parseCompletedMediaProbeResult(file.mediaProbeStatus, file.mediaProbeResult)); if (files.length === 0 || probes.some((probe) => !probe)) return 0; if (mediaSourceId) { const index = mediaSourceId === item.id ? 0 : files.findIndex((file) => String(file.fileId) === mediaSourceId); return index >= 0 ? probes[index]?.runTimeTicks ?? 0 : 0; } return readJellyfinRunTimeTicks(probes); }
   /** 新增或更新播放进度，并返回本次是否首次达到完播阈值。 */
-  private async upsertProgress(transaction: Knex | Knex.Transaction, context: EmbyContext, itemId: string, mediaSourceId: string | null, position: number, stopped: boolean, completed: boolean, now: string): Promise<boolean> { const existing = await transaction("library_emby_playback_progress").where({ library_id: context.libraryId, account_id: context.accountId, item_id: itemId }).first(); const alreadyPlayed = Number(existing?.played ?? 0) === 1; const newlyCompleted = completed && !alreadyPlayed; const playCount = newlyCompleted ? Math.max(1, Number(existing?.play_count ?? 0)) : Number(existing?.play_count ?? 0) + (stopped && !completed ? 1 : 0); const patch = { media_source_id: mediaSourceId ?? existing?.media_source_id ?? null, position_ticks: completed ? 0 : position, played: completed || alreadyPlayed ? 1 : 0, hidden_from_resume: completed || alreadyPlayed ? 1 : 0, last_played_at: now, updated_at: now, play_count: playCount }; if (existing) await transaction("library_emby_playback_progress").where({ id: existing.id }).update(patch); else await transaction("library_emby_playback_progress").insert({ id: randomUUID(), library_id: context.libraryId, account_id: context.accountId, item_id: itemId, ...patch }); return newlyCompleted; }
+  private async upsertProgress(
+    transaction: Knex | Knex.Transaction,
+    context: EmbyContext,
+    itemId: string,
+    mediaSourceId: string | null,
+    position: number,
+    stopped: boolean,
+    completed: boolean,
+    now: string,
+  ): Promise<boolean> {
+    const existing = await transaction("library_emby_playback_progress")
+      .where({ library_id: context.libraryId, account_id: context.accountId, item_id: itemId }).first();
+    const alreadyPlayed = Number(existing?.played ?? 0) === 1;
+    const newlyCompleted = completed && !alreadyPlayed;
+    const playCount = newlyCompleted
+      ? Math.max(1, Number(existing?.play_count ?? 0))
+      : Number(existing?.play_count ?? 0) + (stopped && !completed ? 1 : 0);
+    const patch = {
+      media_source_id: mediaSourceId ?? existing?.media_source_id ?? null,
+      position_ticks: completed ? 0 : position,
+      played: completed || alreadyPlayed ? 1 : 0,
+      hidden_from_resume: completed || alreadyPlayed ? 1 : 0,
+      // 关键变量：待播入口开始播放后仍可续播，完播时清除待播标记。
+      resume_pending: completed || alreadyPlayed ? 0 : Number(existing?.resume_pending ?? 0),
+      last_played_at: now,
+      updated_at: now,
+      play_count: playCount,
+    };
+    if (existing) await transaction("library_emby_playback_progress").where({ id: existing.id }).update(patch);
+    else await transaction("library_emby_playback_progress").insert({
+      id: randomUUID(), library_id: context.libraryId, account_id: context.accountId, item_id: itemId, ...patch,
+    });
+    return newlyCompleted;
+  }
   /** 按媒体库目录版本建立完整演员索引，供标准人物详情、头像和关联作品接口共用。 */
   private async loadPersonCache(context: EmbyLibraryContext): Promise<EmbyPersonCache> {
     const cacheKey = `${context.serviceId}:${context.libraryId}`;

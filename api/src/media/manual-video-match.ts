@@ -43,8 +43,10 @@ export async function searchManualVideoMatches(
   if (tmdbStatus.configuredCount === 0) {
     throw new ApiError(503, "tmdb_not_configured", "系统尚未配置 TMDB Key");
   }
+  const temporaryError = runtime.tmdb.getTemporaryUnavailableError();
+  if (temporaryError) throw temporaryError;
   if (tmdbStatus.healthyCount === 0) {
-    throw new ApiError(503, "tmdb_temporarily_unavailable", "当前没有可用的 TMDB Key，请稍后重试");
+    throw new ApiError(503, "tmdb_unavailable", "已配置的 TMDB Key 无法使用，请检查 Key 或代理地址；Key 配置仍然保留");
   }
   return runtime.tmdb.searchVideoCandidates({
     mediaType,

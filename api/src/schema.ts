@@ -6,7 +6,7 @@ import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
 import { createMusicScanTables } from "./music/scan-state.js";
 
-export const currentSchemaVersion = 61;
+export const currentSchemaVersion = 62;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -2321,6 +2321,12 @@ export async function migrateDatabase(database: Knex, exportDirectory: string): 
   await backfillLibrarySourceOwnership(database);
   await createPlaybackTables(database);
   await createEmbyProtocolTables(database);
+  // 待播单集允许以零进度进入继续观看；旧记录默认关闭，保留原有试播过滤规则。
+  for (const tableName of ["library_playback_progress", "library_emby_playback_progress"]) {
+    await addColumnIfMissing(database, tableName, "resume_pending", (table) => {
+      table.integer("resume_pending").notNullable().defaultTo(0);
+    });
+  }
   await migrateProtocolOwnershipToLibraries(database);
   await createOperationTables(database);
   await createMusicScanTables(database);

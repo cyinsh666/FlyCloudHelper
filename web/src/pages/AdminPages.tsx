@@ -95,11 +95,14 @@ function SystemSummaryItem({
 
 /** 将后台脱敏配置转换为中文系统摘要，不展示 JSON 原文。 */
 function SystemConfigurationSummary({ config, compact = false }: { config: AdminConfigStatus; compact?: boolean }) {
+  // 关键变量：已保存数量与运行时可用数量分开显示，冷却期间不能表示为配置被清空。
   const tmdbConfigured = config.tmdb.configuredCount > 0;
+  const tmdbStatus = !tmdbConfigured ? "未配置" : config.tmdb.healthyCount > 0 ? "可用"
+    : config.tmdb.coolingCount > 0 ? "暂时冷却" : "需要检查";
   return (
     <div className={`grid sm:grid-cols-2 ${compact ? "gap-2" : "gap-3"}`}>
       <SystemSummaryItem compact={compact} label="数据库" value={`${databaseTypeLabels[config.database.type]} · 架构 v${config.database.schemaVersion}`} status="正常" tone="success" />
-      <SystemSummaryItem compact={compact} label="TMDB" value={`${config.tmdb.healthyCount}/${config.tmdb.configuredCount} 个 Key 可用 · 并发 ${config.tmdb.effectiveConcurrency} · 配置 r${config.tmdb.configurationRevision}`} status={tmdbConfigured ? "已配置" : "未配置"} tone={tmdbConfigured ? "success" : "warning"} />
+      <SystemSummaryItem compact={compact} label="TMDB" value={`已配置 ${config.tmdb.configuredCount} 个 · 可用 ${config.tmdb.healthyCount} 个 · 冷却 ${config.tmdb.coolingCount} 个 · 无效 ${config.tmdb.disabledCount} 个 · 配置 r${config.tmdb.configurationRevision}`} status={tmdbStatus} tone={config.tmdb.healthyCount > 0 ? "success" : "warning"} />
       <SystemSummaryItem compact={compact} label="音乐刮削" value={`已启用 ${config.music.sources.enabledSources.length} / 6 个来源`} status={config.music.sources.enabledSources.length > 0 ? "可用" : "已关闭"} tone={config.music.sources.enabledSources.length > 0 ? "success" : "warning"} />
       <SystemSummaryItem compact={compact} label="凭据主密钥" value={configurationSourceLabels[config.credentials.source]} status={config.credentials.configured ? "已配置" : "未配置"} tone={config.credentials.configured ? "success" : "danger"} />
       <SystemSummaryItem compact={compact} label="元数据插件" value={`已启用 ${config.plugins.enabledCount} / 已安装 ${config.plugins.installedCount}`} status={config.plugins.directoryReady ? "目录正常" : "目录异常"} tone={config.plugins.directoryReady ? "success" : "danger"} />
@@ -524,7 +527,7 @@ export function AdminConfigurationPage() {
         <form onSubmit={(event) => void saveTmdbKeys(event)} className="grid gap-4">
           <label className="block">
             <span className="text-xs font-medium">完整新 Key 列表</span>
-            <span className="mt-1 block text-[11px] text-muted-foreground">已有 Key 不会回显。保存后会整组替换，并立即更新后续刮削任务使用的 Key 池。</span>
+            <span className="mt-1 block text-[11px] text-muted-foreground">当前已保存 {resource.data?.tmdb.configuredCount ?? 0} 个 Key，原文不会回显；输入框留空不代表 Key 已删除。保存后会整组替换，网络失败或临时冷却不会清空配置。</span>
             <textarea name="tmdbKeys" required autoComplete="off" spellCheck={false} placeholder="每行输入一个 TMDB Key 或 Read Access Token" className="mt-2 min-h-52 w-full rounded-lg border border-input bg-background/50 p-3 font-mono text-xs" />
           </label>
           <div className="flex flex-wrap items-center justify-between gap-3">

@@ -8,6 +8,7 @@ import { JellyfinCatalogSort, readJellyfinSortQuery, type JellyfinSortEntry, typ
 import { ApiError } from "./errors.js";
 import type { ApiRuntime } from "./runtime.js";
 import { hydrateRealtimeVideoDetails } from "./media/realtime-video-details.js";
+import { prepareNextEpisodeResume } from "./media/episode-resume.js";
 import { readProtocolItemIdentityFilter, matchesProtocolItemIdentity, resolveProtocolItemIdentityIds } from "./media/protocol-item-identity-filter.js";
 import {
   parseCompletedMediaProbeResult,
@@ -1319,8 +1320,9 @@ export class JellyfinCompatibilityService {
       .join("file_links as fl", "fl.item_id", "m.id")
       .join("source_files as f", "f.id", "fl.source_file_id")
       .distinct("m.id", "p.updated_at").where({ "p.library_id": context.libraryId, "p.account_id": context.accountId, "p.played": 0, "p.hidden_from_resume": 0, "f.status": "active" })
-      // 关键变量：低于 60 秒的试播不进入继续观看，避免首页堆积误触记录。
-      .where("p.position_ticks", ">=", 600_000_000).whereNull("m.deleted_at").orderBy("p.updated_at", "desc").limit(500);
+      // 关键变量：普通试播仍要求 60 秒，完播生成的下一集则允许零进度续播。
+      .where((builder) => builder.where("p.position_ticks", ">=", 600_000_000).orWhere("p.resume_pending", 1))
+      .whereNull("m.deleted_at").orderBy("p.updated_at", "desc").limit(500);
     const rawRecords = await Promise.all(rows.map(async (row) => {
       const item = await this.runtime.repository.getCatalogItem(String(row.id), context.ownerUserId);
       const parent = item.itemType === "video.episode" ? await this.findParent(item.id, context.ownerUserId) : undefined;
@@ -1400,6 +1402,7 @@ export class JellyfinCompatibilityService {
         position_ticks: positionTicks,
         played: 0,
         hidden_from_resume: 0,
+        resume_pending: 0,
         updated_at: now,
       };
       if (existing) await this.runtime.database.query("library_playback_progress").where({ id: existing.id }).update(patch);
@@ -1480,6 +1483,9 @@ export class JellyfinCompatibilityService {
         completed,
         now,
       );
+      if (item.itemType === "video.episode" && automaticallyMarkedPlayed) {
+        await prepareNextEpisodeResume(transaction, "library_playback_progress", context, itemId, now);
+      }
       if (kind === "stopped") {
         if (!existingHistory) await transaction("library_playback_history").insert({ id: randomUUID(), library_id: context.libraryId, account_id: context.accountId, item_id: itemId, play_session_id: playSessionId, position_ticks: positionTicks, completed: completed ? 1 : 0, started_at: existing?.started_at ?? now, stopped_at: now });
       }
@@ -1546,6 +1552,7 @@ export class JellyfinCompatibilityService {
           played: played ? 1 : 0,
           position_ticks: 0,
           hidden_from_resume: played ? 1 : 0,
+          resume_pending: 0,
           play_count: played ? Math.max(1, Number(existing?.play_count ?? 0)) : 0,
           updated_at: now,
           last_played_at: played ? now : null,
@@ -1555,7 +1562,7 @@ export class JellyfinCompatibilityService {
         await transaction("library_playback_progress")
           .insert(rows.slice(offset, offset + JELLYFIN_USER_STATE_BATCH_SIZE))
           .onConflict(["library_id", "account_id", "item_id"])
-          .merge(["played", "position_ticks", "hidden_from_resume", "play_count", "last_played_at", "updated_at"]);
+          .merge(["played", "position_ticks", "hidden_from_resume", "resume_pending", "play_count", "last_played_at", "updated_at"]);
       }
     });
     if (item.itemType === "video.episode") {
@@ -1966,6 +1973,8 @@ export class JellyfinCompatibilityService {
       // 已观看状态只由显式“标记未观看”撤销，后续播放上报不能反向清除。
       played: completed || alreadyPlayed ? 1 : 0,
       hidden_from_resume: completed || alreadyPlayed ? 1 : 0,
+      // 从下一集入口开始播放时保留待播标记，避免前 60 秒又从继续观看消失。
+      resume_pending: completed || alreadyPlayed ? 0 : Number(existing?.resume_pending ?? 0),
       last_played_at: now,
       updated_at: now,
     };

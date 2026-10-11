@@ -4,6 +4,7 @@ import {
   mergeTmdbCandidates, pickAppTmdbFallbackCandidate, pickStrictTmdbCandidate,
 } from "./tmdb-candidate-matcher.js";
 import type { ApiConfig } from "../config.js";
+import { ApiError } from "../errors.js";
 import { FlymbyVideoTitleCleaner } from "../media/flymby-video-title-cleaner.js";
 import {
   tmdbDefaultApiBaseUrl,
@@ -42,27 +43,31 @@ type TmdbDiagnosticLogger = (fields: Record<string, unknown>) => void;
 const TMDB_REQUEST_TIMEOUT_MS = 20_000;
 
 /** 区分 TMDB 的未找到与真实请求失败，避免把网络异常统计成“未匹配”。 */
-class TmdbRequestError extends Error {
+class TmdbRequestError extends ApiError {
   public readonly status: number;
 
+  /** 将上游错误转换成可返回的 502，同时保留 TMDB 状态码供内部判断。 */
   public constructor(message: string, status = 0) {
-    super(message);
+    super(502, "tmdb_request_failed", message);
     this.name = "TmdbRequestError";
     this.status = status;
   }
 }
 
 /** 表示 TMDB Key 池暂时没有可用 Key，Worker 应保留检查点并延迟恢复。 */
-export class TmdbTemporarilyUnavailableError extends Error {
-  public readonly code = "tmdb_temporarily_unavailable";
+export class TmdbTemporarilyUnavailableError extends ApiError {
   public readonly nextRetryAt: string;
   public readonly reasonCode: "tmdb_rate_limit" | "tmdb_server_error" | "tmdb_network";
 
+  /** 返回明确的临时失败提示，并保留 Worker 延迟恢复所需的时间与原因。 */
   public constructor(
     nextRetryAt: string,
     reasonCode: "tmdb_rate_limit" | "tmdb_server_error" | "tmdb_network",
   ) {
-    super(`TMDB 暂时不可用，将在 ${nextRetryAt} 后自动恢复`);
+    // 关键变量：Key 的临时冷却只影响调度，不修改数据库中的已保存配置。
+    const reason = reasonCode === "tmdb_rate_limit" ? "TMDB 请求被限流"
+      : reasonCode === "tmdb_server_error" ? "TMDB 服务暂时异常" : "TMDB 网络连接失败，请检查网络或 TMDB 代理地址";
+    super(503, "tmdb_temporarily_unavailable", `${reason}；已保存的 Key 未被删除，请稍后重试`);
     this.name = "TmdbTemporarilyUnavailableError";
     this.nextRetryAt = nextRetryAt;
     this.reasonCode = reasonCode;

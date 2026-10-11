@@ -272,8 +272,13 @@ export async function registerLibraryFileRoutes(server: FastifyInstance, runtime
           throw validationError("year", "年份必须在 1800 到 2200 之间");
         }
         const status = runtime.tmdb.getStatus();
-        if (status.configuredCount === 0 || status.healthyCount === 0) {
-          throw new ApiError(503, "tmdb_unavailable", "当前没有可用的 TMDB Key，请稍后重试");
+        if (status.configuredCount === 0) {
+          throw new ApiError(503, "tmdb_not_configured", "系统尚未配置 TMDB Key");
+        }
+        const temporaryError = runtime.tmdb.getTemporaryUnavailableError();
+        if (temporaryError) throw temporaryError;
+        if (status.healthyCount === 0) {
+          throw new ApiError(503, "tmdb_unavailable", "已配置的 TMDB Key 无法使用，请检查 Key 或代理地址；Key 配置仍然保留");
         }
         return { items: await runtime.tmdb.searchVideoCandidates({
           mediaType, title: query.trim(), year, language: "zh-CN", region: "CN",
@@ -293,6 +298,9 @@ export async function registerLibraryFileRoutes(server: FastifyInstance, runtime
       const mediaType = readManualVideoMatchType(request.body.mediaType);
       const tmdbId = Number(request.body.tmdbId);
       if (!Number.isInteger(tmdbId) || tmdbId <= 0) throw validationError("tmdbId", "请选择有效的 TMDB 条目");
+      if (runtime.tmdb.getStatus().configuredCount === 0) {
+        throw new ApiError(503, "tmdb_not_configured", "系统尚未配置 TMDB Key");
+      }
       const metadata = await runtime.tmdb.readVideoMetadata(mediaType, tmdbId, "zh-CN", "CN");
       if (!metadata) throw new ApiError(502, "tmdb_item_unavailable", "无法读取所选 TMDB 条目");
       return runtime.repository.applyBrowseManualMatch({ userId: context.library.userId,
