@@ -12,6 +12,7 @@ import { MusicBrainzClient } from "./metadata/musicbrainz.js";
 import { TmdbMetadataCache } from "./metadata/tmdb-cache.js";
 import { TmdbKeyPool } from "./metadata/tmdb.js";
 import { MetadataPluginManager } from "./plugin-manager.js";
+import { ContentSourceManager } from "./content-sources/manager.js";
 import { ProviderRegistry } from "./providers/registry.js";
 import { registerAdminRoutes } from "./routes/admin-routes.js";
 import { registerAdminNotificationSettingsRoutes } from "./routes/admin-notification-settings-routes.js";
@@ -25,6 +26,7 @@ import { registerNavidromeRoutes } from "./routes/navidrome-routes.js";
 import { registerNotificationRoutes } from "./routes/notification-routes.js";
 import { registerScanScheduleRoutes } from "./routes/scan-schedule-routes.js";
 import { registerPluginRoutes } from "./routes/plugin-routes.js";
+import { registerContentSourceRoutes } from "./routes/content-source-routes.js";
 import { PublicAccessService } from "./public-access.js";
 import { ServiceAccessService } from "./service-access.js";
 import { EmbyAccessService } from "./emby-access.js";
@@ -193,6 +195,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   });
   const musicBrainz = new MusicBrainzClient(config);
   const plugins = new MetadataPluginManager(database, config, vault);
+  const contentSources = new ContentSourceManager(database, config, repository);
+  await contentSources.initialize();
   const aiModels = new AiModelManager(database, vault);
   const failureReports = new ScanFailureReportService(config, server.log);
   const worker = new ScanWorker({
@@ -239,6 +243,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     scanSchedules,
     scanScheduleWorker,
     plugins,
+    contentSources,
     aiModels,
     failureReports,
     publicAccess,
@@ -257,6 +262,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     },
   });
   server.addHook("onClose", async () => {
+    await contentSources.shutdown();
     await telegramNotifications.close();
     await scanScheduleWorker.stop();
     await worker.stop();
@@ -447,6 +453,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerAdminRoutes(server, runtime);
   await registerAiModelRoutes(server, runtime);
   await registerPluginRoutes(server, runtime);
+  await registerContentSourceRoutes(server, runtime);
 
   if (fs.existsSync(config.webDistDirectory)) {
     await server.register(fastifyStatic, {

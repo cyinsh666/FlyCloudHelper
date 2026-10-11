@@ -1090,6 +1090,14 @@ export class FlyCloudHelperDatabase {
     if (scanJob || mediaProbeJob) {
       throw new ApiError(409, "user_has_active_background_job", "该用户仍有未结束后台任务，请先终止后再彻底删除");
     }
+    // 内容源目录同步不使用网盘任务表，彻底删除同样需要等待目录写入结束。
+    if (await transaction.schema.hasTable("content_source_libraries")) {
+      const contentSync = await transaction("content_source_libraries")
+        .where({ user_id: userId }).whereIn("sync_status", ["queued", "running"]).first();
+      if (contentSync) {
+        throw new ApiError(409, "user_has_active_content_sync", "该用户仍有在线内容同步，请等待同步结束后再彻底删除");
+      }
+    }
     return user;
   }
 

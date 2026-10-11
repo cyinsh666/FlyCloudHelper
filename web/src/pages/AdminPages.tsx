@@ -3,6 +3,7 @@ import { Bell, Music2, Plus, Puzzle, RefreshCw, Save, ServerCog, Trash2, Upload 
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, ProgressMeter, StatusPill } from "@/components/ui-kit";
+import { AdminContentSourcePluginsPanel } from "@/components/AdminContentSourcePluginsPanel";
 import {
   clearAdminTmdbCache,
   createAdminUser,
@@ -366,7 +367,7 @@ export function AdminUsersPage() {
   );
 }
 
-/** 声明式元数据插件管理页面。 */
+/** 分别管理独立内容源与声明式元数据插件。 */
 export function AdminPluginsPage() {
   const resource = useApiResource(() => listPlugins(), []);
   const [message, setMessage] = useState<string | null>(null);
@@ -376,7 +377,7 @@ export function AdminPluginsPage() {
     setMessage("正在导入并预检插件…");
     try { const plugin = await importPlugin(file); setMessage(`${plugin.displayName} ${plugin.version} 导入成功`); await resource.refresh(); } catch (error) { setMessage(error instanceof Error ? error.message : "插件导入失败"); }
   }
-  return <><PageHeader title="插件管理" actions={<label className="glow-ring inline-flex cursor-pointer items-center gap-2 rounded-lg px-4 py-2.5 text-sm text-primary-foreground" style={{ backgroundImage: "var(--gradient-primary)" }}><Upload className="size-4" /> 导入插件<input type="file" accept=".flymby-plugin" className="hidden" onChange={(event) => void selectPlugin(event.target.files?.[0])} /></label>} />{message && <p className="mb-4 text-sm text-muted-foreground">{message}</p>}<div className="grid gap-4 lg:grid-cols-2">{resource.data?.items.map((plugin) => <article key={`${plugin.pluginId}@${plugin.version}`} className="surface p-5"><header className="flex items-start justify-between gap-3"><div><h2 className="text-sm font-semibold">{plugin.displayName}</h2><p className="mt-1 font-mono text-[11px] text-muted-foreground">{plugin.pluginId} · {plugin.version}</p></div><StatusPill tone={plugin.status === "enabled" ? "success" : "neutral"}>{plugin.status}</StatusPill></header><div className="mt-4 flex flex-wrap gap-2"><StatusPill tone="info">配置修订 r{plugin.configurationRevision}</StatusPill><StatusPill>SHA256 {plugin.sha256.slice(0, 12)}</StatusPill></div><footer className="mt-5"><button type="button" onClick={() => void updatePluginStatus(plugin, plugin.status !== "enabled").then(() => resource.refresh()).catch((error: unknown) => setMessage(error instanceof Error ? error.message : "插件状态修改失败"))} className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">{plugin.status === "enabled" ? "停用" : "启用"}</button></footer></article>)}</div></>;
+  return <><PageHeader title="插件管理" actions={<label className="glow-ring inline-flex cursor-pointer items-center gap-2 rounded-lg px-4 py-2.5 text-sm text-primary-foreground" style={{ backgroundImage: "var(--gradient-primary)" }}><Upload className="size-4" /> 导入元数据插件<input type="file" accept=".flymby-plugin" className="hidden" onChange={(event) => void selectPlugin(event.target.files?.[0])} /></label>} /><AdminContentSourcePluginsPanel /><h2 className="mb-3 text-sm font-medium">元数据插件</h2>{message && <p className="mb-4 text-sm text-muted-foreground">{message}</p>}<div className="grid gap-4 lg:grid-cols-2">{resource.data?.items.map((plugin) => <article key={`${plugin.pluginId}@${plugin.version}`} className="surface p-5"><header className="flex items-start justify-between gap-3"><div><h2 className="text-sm font-semibold">{plugin.displayName}</h2><p className="mt-1 font-mono text-[11px] text-muted-foreground">{plugin.pluginId} · {plugin.version}</p></div><StatusPill tone={plugin.status === "enabled" ? "success" : "neutral"}>{plugin.status}</StatusPill></header><div className="mt-4 flex flex-wrap gap-2"><StatusPill tone="info">配置修订 r{plugin.configurationRevision}</StatusPill><StatusPill>SHA256 {plugin.sha256.slice(0, 12)}</StatusPill></div><footer className="mt-5"><button type="button" onClick={() => void updatePluginStatus(plugin, plugin.status !== "enabled").then(() => resource.refresh()).catch((error: unknown) => setMessage(error instanceof Error ? error.message : "插件状态修改失败"))} className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">{plugin.status === "enabled" ? "停用" : "启用"}</button></footer></article>)}</div></>;
 }
 
 /** 超级管理员系统配置页面；Secret 只允许整组替换，不回显已有原文。 */

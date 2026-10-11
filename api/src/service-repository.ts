@@ -38,6 +38,7 @@ import {
   type AudioTagReadResult,
 } from "./music/audio-tag-reader.js";
 import { ServiceAccessService, type GeneratedLibraryAccessCredentials } from "./service-access.js";
+import { EmbyAccessService, type GeneratedEmbyAccessCredentials } from "./emby-access.js";
 
 type ServiceRepositoryLogger = (
   level: "info" | "warn",
@@ -1176,6 +1177,69 @@ export class ServiceRepository {
     return { library: await this.getLibrary(input.libraryId, input.userId), accessCredentials };
   }
 
+  /** 创建独立在线内容源视频库，并立即建立两套互不共享会话的标准协议账号。 */
+  public async createContentSourceVideoLibrary(input: {
+    libraryId: string;
+    sourceId: string;
+    instanceId: string;
+    userId: string;
+    displayName: string;
+    sourceName: string;
+    configuration: Record<string, unknown>;
+    syncState: Record<string, unknown>;
+  }): Promise<{ library: MediaLibraryRecord; accessCredentials: GeneratedLibraryAccessCredentials; embyAccessCredentials: GeneratedEmbyAccessCredentials }> {
+    const now = new Date().toISOString();
+    const credentials = await this.database.query.transaction(async (transaction) => {
+      const instanceQuery = transaction("content_source_instances").where({ id: input.instanceId, user_id: input.userId, status: "active" });
+      if (this.database.databaseType !== "sqlite") instanceQuery.forUpdate();
+      const instance = await instanceQuery.first();
+      if (!instance) throw new ApiError(404, "content_source_not_found", "内容源实例不存在或已停用");
+      const plugin = await transaction("content_source_plugins").where({ plugin_id: instance.plugin_id, version: instance.plugin_version, status: "enabled" }).first();
+      if (!plugin) throw new ApiError(409, "content_source_plugin_disabled", "请先启用内容源插件");
+      const bound = await transaction("content_source_libraries").where({ instance_id: input.instanceId }).first();
+      if (bound) throw new ApiError(409, "content_source_library_exists", "此源实例已经创建在线媒体库");
+      await transaction("media_libraries").insert({
+        id: input.libraryId, user_id: input.userId, display_name: input.displayName,
+        data_type: "video", library_kind: "content_source_video", singleton_key: null,
+        catalog_version: 0, notification_enabled: 0, scan_profile_revision: 1, metadata_profile_revision: 1,
+        last_scan_at: null, jellyfin_relay_playback_enabled: 1, jellyfin_download_enabled: 0,
+        jellyfin_region_libraries_enabled: 0, jellyfin_enabled: 1,
+        emby_relay_playback_enabled: 1, emby_download_enabled: 0, emby_region_libraries_enabled: 0, emby_enabled: 1,
+        navidrome_enabled: 0, navidrome_relay_playback_enabled: 1,
+        navidrome_path_suffix: input.libraryId, navidrome_path_suffix_lookup: input.libraryId.toLowerCase(),
+        jellyfin_path_suffix: input.libraryId, jellyfin_path_suffix_lookup: input.libraryId.toLowerCase(),
+        emby_path_suffix: input.libraryId, emby_path_suffix_lookup: input.libraryId.toLowerCase(),
+        status: "active", created_at: now, updated_at: now,
+      });
+      await transaction("library_sources").insert({
+        id: input.sourceId, user_id: input.userId, library_id: input.libraryId, service_id: null,
+        source_mode: "content_source", display_name: input.sourceName, provider_type: "cms_json",
+        connection_status: "valid", credential_revision: 0,
+        configuration_json: JSON.stringify({ instanceId: input.instanceId }),
+        status: "active", sort_order: 0, last_scan_at: null, created_at: now, updated_at: now,
+      });
+      await transaction("content_source_libraries").insert({
+        library_id: input.libraryId, user_id: input.userId, instance_id: input.instanceId,
+        library_source_id: input.sourceId, configuration_json: JSON.stringify(input.configuration),
+        sync_json: JSON.stringify(input.syncState), sync_status: "idle", updated_at: now,
+      });
+      await transaction("library_scan_profiles").insert({
+        id: randomUUID(), user_id: input.userId, library_id: input.libraryId, revision: 1,
+        configuration_json: JSON.stringify({ mediaTypes: ["video"], fullRoots: [], incrementalRoots: [] }), created_at: now,
+      });
+      await transaction("library_metadata_profiles").insert({
+        id: randomUUID(), user_id: input.userId, library_id: input.libraryId, revision: 1,
+        configuration_json: JSON.stringify({ profiles: { video: { providerId: "content_source", language: "zh-CN", analyzeMediaSpecs: false } } }), created_at: now,
+      });
+      // 关键变量：媒体库创建和两个协议账号处于同一事务，客户端无需重启服务等待补齐。
+      return {
+        accessCredentials: await this.serviceAccess.createForLibrary(input.libraryId, transaction),
+        embyAccessCredentials: await new EmbyAccessService(this.database).createForLibrary(input.libraryId, transaction),
+      };
+    });
+    return { library: await this.getLibrary(input.libraryId, input.userId), ...credentials };
+  }
+
   /** 创建每个用户唯一的云聚合视频库；来源后续逐个复制，单个来源失败不回滚媒体库。 */
   public async createCloudAggregateVideoLibrary(input: {
     libraryId: string;
@@ -1681,6 +1745,11 @@ export class ServiceRepository {
           .andOn("lsc.revision", "=", "ls.credential_revision")
           .andOnVal("lsc.status", "=", "active");
       })
+      .leftJoin("content_source_libraries as csl", "csl.library_source_id", "ls.id")
+      .leftJoin("content_source_instances as csi", "csi.id", "csl.instance_id")
+      .leftJoin("content_source_plugins as csp", function joinContentPluginVersion() {
+        this.on("csp.plugin_id", "=", "csi.plugin_id").andOn("csp.version", "=", "csi.plugin_version");
+      })
       .select(
         "ls.*",
         "s.display_name as linked_display_name",
@@ -1691,6 +1760,8 @@ export class ServiceRepository {
         "sc.id as linked_credential_id",
         "l.library_kind",
         "lsc.id as owned_credential_id",
+        "csi.status as content_instance_status",
+        "csp.status as content_plugin_status",
       )
       .where("ls.library_id", libraryId)
       .whereNot("ls.status", "deleted")
@@ -1700,9 +1771,11 @@ export class ServiceRepository {
     const rows = await query;
     return rows.map((row) => {
       const linked = String(row.source_mode ?? "linked_service") === "linked_service";
+      const contentSource = String(row.source_mode) === "content_source";
+      const contentAvailable = row.content_instance_status === "active" && row.content_plugin_status === "enabled";
       const linkedServiceStatus = String(row.linked_service_status ?? "active");
       const localStatus = String(row.status) as LibrarySourceRecord["status"];
-      const effectiveStatus = linked && localStatus !== "disabled"
+      const effectiveStatus = contentSource && !contentAvailable ? "disabled" : linked && localStatus !== "disabled"
         ? linkedServiceStatus === "reauthorization_required" ? "reauthorization_required"
           : linkedServiceStatus === "disabled" ? "disabled" : "active"
         : localStatus;
@@ -1711,15 +1784,15 @@ export class ServiceRepository {
         userId: String(row.user_id),
         libraryId: String(row.library_id),
         serviceId: row.service_id ? String(row.service_id) : null,
-        sourceMode: linked ? "linked_service" : "owned_copy",
+        sourceMode: linked ? "linked_service" : String(row.source_mode) === "content_source" ? "content_source" : "owned_copy",
         displayName: String(linked && String(row.library_kind) === "legacy_single_source"
           ? row.linked_display_name ?? row.display_name
           : row.display_name),
         providerType: String(linked ? row.linked_provider_type ?? row.provider_type : row.provider_type),
         serviceStatus: linked ? linkedServiceStatus as LibrarySourceRecord["serviceStatus"] : null,
-        connectionStatus: String(linked ? row.linked_connection_status ?? row.connection_status : row.connection_status),
+        connectionStatus: contentSource ? contentAvailable ? "valid" : "disabled" : String(linked ? row.linked_connection_status ?? row.connection_status : row.connection_status),
         credentialRevision: Number(linked ? row.linked_credential_revision ?? row.credential_revision : row.credential_revision),
-        credentialConfigured: linked ? Boolean(row.linked_credential_id) : Boolean(row.owned_credential_id),
+        credentialConfigured: contentSource ? false : linked ? Boolean(row.linked_credential_id) : Boolean(row.owned_credential_id),
         configuration: parseJsonObject(row.configuration_json),
         status: effectiveStatus,
         sortOrder: Number(row.sort_order),
@@ -1781,6 +1854,9 @@ export class ServiceRepository {
         .forUpdate()
         .first();
       if (!library) throw new ApiError(404, "library_not_found", "媒体库不存在");
+      if (String(library.library_kind) === "content_source_video" && patch.dataType && patch.dataType !== "video") {
+        throw new ApiError(409, "content_library_video_only", "内容源视频库不能改变媒体类型");
+      }
       if (patch.dataType && patch.dataType !== String(library.data_type)) {
         // 关键变量：已有目录、任务或协议配置时改变类型会使扫描结果和对外协议语义不一致。
         const [catalog, job] = await Promise.all([
@@ -1795,6 +1871,7 @@ export class ServiceRepository {
         }
       }
       if (patch.status === "disabled") {
+        await this.assertContentSourceSyncIdle(transaction, libraryId, String(library.library_kind));
         const activeJob = await transaction("scan_jobs")
           .where({ library_id: libraryId })
           .whereIn("status", ["queued", "running", "retry_waiting", "paused"])
@@ -3795,10 +3872,12 @@ export class ServiceRepository {
   /** 删除媒体库、扫描目录和协议数据，保留来源网盘服务。 */
   public async deleteLibrary(libraryId: string, userId?: string): Promise<void> {
     await this.database.query.transaction(async (transaction) => {
-      const query = transaction("media_libraries").select("id").where({ id: libraryId });
+      const query = transaction("media_libraries").select("id", "library_kind").where({ id: libraryId });
       if (userId) query.where({ user_id: userId });
+      if (this.database.databaseType !== "sqlite") query.forUpdate();
       const library = await query.first();
       if (!library) throw new ApiError(404, "library_not_found", "媒体库不存在");
+      await this.assertContentSourceSyncIdle(transaction, libraryId, String(library.library_kind));
       const [activeScanJob, activeMediaProbeJob] = await Promise.all([
         transaction("scan_jobs").where({ library_id: libraryId }).whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first(),
         transaction("media_probe_jobs").where({ library_id: libraryId }).whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first(),
@@ -3951,6 +4030,7 @@ export class ServiceRepository {
         if (this.database.databaseType !== "sqlite") libraryQuery = libraryQuery.forUpdate();
         const library = await libraryQuery.first();
         if (!library) throw new ApiError(404, "library_not_found", "媒体库不存在");
+        await this.assertContentSourceSyncIdle(transaction, libraryId, String(library.library_kind));
         const [activeScanJob, activeMediaProbeJob] = await Promise.all([
           transaction("scan_jobs").where({ library_id: libraryId }).whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first(),
           transaction("media_probe_jobs").where({ library_id: libraryId }).whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first(),
@@ -3979,6 +4059,13 @@ export class ServiceRepository {
           last_scan_at: null,
           updated_at: new Date().toISOString(),
         });
+        if (String(library.library_kind) === "content_source_video") {
+          await transaction("content_source_libraries").where({ library_id: libraryId }).update({
+            sync_status: "idle",
+            sync_json: JSON.stringify({ status: "idle", processedCount: 0, pageCount: 0, nextPageByCategory: {}, startedAt: null, finishedAt: null, lastError: null }),
+            updated_at: new Date().toISOString(),
+          });
+        }
         return {
           mediaItemCount: Number(mediaItemCountRow?.count ?? 0),
           sourceFileCount: Number(sourceFileCountRow?.count ?? 0),
@@ -5103,7 +5190,7 @@ export class ServiceRepository {
   public async upsertMediaItem(input: {
     id: string;
     userId: string;
-    serviceId: string;
+    serviceId: string | null;
     libraryId: string;
     librarySourceId?: string;
     sourceFileId?: string;
@@ -6440,7 +6527,7 @@ export class ServiceRepository {
     return {
       id: String(row.id),
       userId: String(row.user_id),
-      serviceId: String(row.service_id),
+      serviceId: row.service_id ? String(row.service_id) : "",
       libraryId: String(row.library_id),
       libraryKind: String(row.library_kind ?? "legacy_single_source") as MediaLibraryKind,
       mediaType: row.media_type as MediaType,
@@ -7216,6 +7303,28 @@ export class ServiceRepository {
       });
     }
     return changedItemIds;
+  }
+
+  /** 在线内容同步时阻止删除、清空或停用媒体库，和同步抢占共用媒体库行锁。 */
+  private async assertContentSourceSyncIdle(transaction: Knex.Transaction, libraryId: string, libraryKind: string): Promise<void> {
+    if (libraryKind !== "content_source_video") return;
+    const binding = await transaction("content_source_libraries").where({ library_id: libraryId }).whereIn("sync_status", ["queued", "running"]).first();
+    if (binding) throw new ApiError(409, "content_library_sync_running", "在线媒体库正在同步，请等待同步结束后操作");
+  }
+
+  /** 在线条目更新沿用标准目录增量版本，不执行依赖网盘文件的孤儿清理。 */
+  public async publishContentSourceCatalogChanges(userId: string, libraryId: string, itemIds: string[]): Promise<void> {
+    await this.database.query.transaction(async (transaction) => {
+      const libraryQuery = transaction("media_libraries").where({ id: libraryId, user_id: userId });
+      if (this.database.databaseType !== "sqlite") libraryQuery.forUpdate();
+      if (!(await libraryQuery.first())) throw new ApiError(404, "library_not_found", "媒体库不存在");
+      const now = new Date().toISOString();
+      // 关键变量：新增分集或线路变化也改变协议 Etag，避免节目元数据相同导致客户端继续使用旧缓存。
+      for (const itemIdBatch of chunkStrings([...new Set(itemIds)])) {
+        await transaction("media_items").where({ user_id: userId, library_id: libraryId }).whereIn("id", itemIdBatch).update({ updated_at: now });
+      }
+      await this.recordCatalogItemChanges(transaction, userId, libraryId, itemIds, now);
+    });
   }
 
   /** 为人工修改的媒体条目递增目录版本，并根据软删除状态写入 upsert 或 delete 变化。 */

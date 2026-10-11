@@ -108,7 +108,7 @@ function createRequestId(): string {
 }
 
 /** 发起同源 API 请求并统一处理错误响应。 */
-async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+export async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
     // 关键变量：没有请求体时不能声明 JSON，否则 Fastify 会把空请求体判定为 JSON 解析失败。
@@ -143,7 +143,7 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export type MediaType = "video" | "music" | "audiobook";
-export type MediaLibraryKind = "legacy_single_source" | "cloud_aggregate_video";
+export type MediaLibraryKind = "legacy_single_source" | "cloud_aggregate_video" | "content_source_video";
 export type CatalogSort = "created_desc" | "year_desc" | "premiere_date_desc" | "title_asc";
 export type MatchState = "matched" | "needs_review" | "unmatched" | "processing";
 export type ServiceStatus = "active" | "scanning" | "disabled" | "reauthorization_required";
@@ -308,7 +308,7 @@ export interface CloudService {
 export interface LibrarySource {
   id: string;
   libraryId: string;
-  sourceMode: "linked_service" | "owned_copy";
+  sourceMode: "linked_service" | "owned_copy" | "content_source";
   serviceId: string | null;
   displayName: string;
   providerType: string;
@@ -608,7 +608,7 @@ export interface MediaItem {
   userId: string;
   serviceId: string;
   libraryId: string;
-  libraryKind: "legacy_single_source" | "cloud_aggregate_video";
+  libraryKind: MediaLibraryKind;
   mediaType: MediaType;
   itemType: string;
   title: string;

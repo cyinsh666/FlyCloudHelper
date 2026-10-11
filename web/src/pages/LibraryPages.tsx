@@ -5,6 +5,8 @@ import { MediaCatalogView, type MediaCatalogQuery } from "@/components/MediaCata
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, StatusPill } from "@/components/ui-kit";
 import { ServicePathPicker, toProviderDirectory } from "@/components/ServicePathPicker";
+import { ContentSourceLibraryPanel } from "@/components/ContentSourceLibraryPanel";
+import { ContentSourcePlaybackModeSettings } from "@/components/ContentSourcePlaybackModeSettings";
 import { CloudAggregateSourcesPanel } from "@/components/CloudAggregateSourcesPanel";
 import { CloudAggregateScanPathsPanel } from "@/components/CloudAggregateScanPathsPanel";
 import { AiCleaningSettingsFields, type AiCleaningSettingsValue } from "@/components/AiCleaningSettingsFields";
@@ -140,8 +142,9 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   }, [serviceId, admin]);
   // 关键变量：AI 模型单独读取；模型接口异常时仍允许用户管理媒体库的其他配置。
   const aiModelsResource = useApiResource(
-    () => listAvailableAiModels(serviceId),
-    [serviceId],
+    async () => resource.data?.service.dataType === "video" && resource.data.service.libraryKind !== "content_source_video"
+      ? listAvailableAiModels(serviceId) : { items: [] },
+    [serviceId, resource.data?.service.libraryKind, resource.data?.service.dataType],
   );
   const [message, setMessage] = useState<string | null>(null);
   const [updatingJellyfin, setUpdatingJellyfin] = useState(false);
@@ -176,6 +179,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   const scanProfile = resource.data?.scanProfile ?? {};
   const metadataProfile = resource.data?.metadataProfile ?? {};
   const isCloudAggregate = service?.libraryKind === "cloud_aggregate_video";
+  const isContentSource = service?.libraryKind === "content_source_video";
   // 关键变量：聚合扫描只计入状态正常且已配置当前模式路径的来源。
   const readyAggregateSources = service?.sources.filter(isReadyAggregateSource) ?? [];
   const fullAggregateScanSources = readyAggregateSources.filter((source) => hasAggregateSourceRoots(source, "full"));
@@ -421,7 +425,9 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   /** 二次确认后清空媒体库中的扫描和刮削结果。 */
   async function clearCatalog(): Promise<void> {
     if (!service || clearingCatalogRef.current) return;
-    if (!window.confirm(`确定清空“${service.displayName}”媒体库的全部内容吗？媒体条目、文件索引和目录版本将被清空，服务连接与扫描配置会保留。`)) return;
+    if (!window.confirm(isContentSource
+      ? `确定清空“${service.displayName}”的在线目录吗？内容源配置和协议账号会保留。`
+      : `确定清空“${service.displayName}”媒体库的全部内容吗？媒体条目、文件索引和目录版本将被清空，服务连接与扫描配置会保留。`)) return;
     clearingCatalogRef.current = true;
     setClearingCatalog(true);
     setMessage("正在清空当前媒体库…");
@@ -439,7 +445,9 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
 
   /** 删除媒体库并返回媒体库列表，来源网盘服务继续保留。 */
   async function deleteCurrentLibrary(): Promise<void> {
-    if (!service || !window.confirm(`确定删除“${service.displayName}”媒体库吗？扫描结果、任务配置和协议账号会被删除，来源网盘服务会保留。`)) return;
+    if (!service || !window.confirm(isContentSource
+      ? `确定删除“${service.displayName}”在线媒体库吗？在线目录和协议账号会被删除，源插件继续保留。`
+      : `确定删除“${service.displayName}”媒体库吗？扫描结果、任务配置和协议账号会被删除，来源网盘服务会保留。`)) return;
     try {
       await deleteLibrary(serviceId, admin);
       await navigate({ to: librariesPath, replace: true });
@@ -482,7 +490,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   }
 
   if (!service || !settings) {
-    return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取媒体库设置…"}</div></Panel>;
+    return <Panel>{resource.error ? <p role="alert" className="text-sm text-destructive">{resource.error}</p> : <div aria-label="媒体库设置加载中" className="animate-pulse space-y-4"><div className="h-7 w-48 rounded bg-muted" /><div className="h-20 rounded bg-muted" /><div className="h-40 rounded bg-muted" /></div>}</Panel>;
   }
   // 关键变量：音乐库展示 Navidrome 状态，视频库展示 Jellyfin 状态。
   const libraryProtocolName = settings.navidromeSupported ? "Navidrome" : "Jellyfin";
@@ -497,14 +505,14 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
         actions={(
           <div className="flex flex-wrap gap-2">
             <Link to={librariesPath}><SecondaryButton>返回媒体库</SecondaryButton></Link>
-            <Link to={schedulePath} params={{ serviceId }}><SecondaryButton><CalendarClock className="size-4" /> 定时任务</SecondaryButton></Link>
-            {service.dataType === "video" && <Link to={filesPath} params={{ serviceId }}><SecondaryButton><FolderOpen className="size-4" /> 文件浏览</SecondaryButton></Link>}
+            {!isContentSource && <Link to={schedulePath} params={{ serviceId }}><SecondaryButton><CalendarClock className="size-4" /> 定时任务</SecondaryButton></Link>}
+            {!isContentSource && service.dataType === "video" && <Link to={filesPath} params={{ serviceId }}><SecondaryButton><FolderOpen className="size-4" /> 文件浏览</SecondaryButton></Link>}
             <Link to={catalogPath} params={{ serviceId }}><PrimaryButton><Images className="size-4" /> 海报墙</PrimaryButton></Link>
           </div>
         )}
       />
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
-      {isCloudAggregate ? <><CloudAggregateSourcesPanel library={service} admin={admin} onChanged={resource.refresh} onMessage={setMessage} /><CloudAggregateScanPathsPanel library={service} admin={admin} onChanged={resource.refresh} onMessage={setMessage} /></> : <Panel title="关联服务" description="当前媒体库使用这个网盘服务的登录凭据读取和扫描文件。" className="mb-4">
+      {isContentSource ? <ContentSourceLibraryPanel libraryId={serviceId} admin={admin} onChanged={resource.refresh} /> : isCloudAggregate ? <><CloudAggregateSourcesPanel library={service} admin={admin} onChanged={resource.refresh} onMessage={setMessage} /><CloudAggregateScanPathsPanel library={service} admin={admin} onChanged={resource.refresh} onMessage={setMessage} /></> : <Panel title="关联服务" description="当前媒体库使用这个网盘服务的登录凭据读取和扫描文件。" className="mb-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0">
             <p className="truncate text-sm font-medium">{service.sourceServiceName}</p>
@@ -535,7 +543,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
           <span className="text-sm font-semibold">{settings.embyEnabled ? "已启用" : "未启用"}</span>
         </div>}
       </div>
-      <div className="mt-4 grid gap-4 xl:grid-cols-2">
+      {!isContentSource && <div className="mt-4 grid gap-4 xl:grid-cols-2">
         {isCloudAggregate ? <Panel title="聚合扫描" description="每个参与来源作为独立子任务并行扫描，扫描结果通过公共队列依次合并到同一媒体库。">
           <p className="text-xs text-muted-foreground">只扫描当前模式下已配置目录的正常来源；未配置路径、失效或停用的来源不会进入本轮任务。</p>
           <div className="mt-3 flex flex-wrap gap-2">
@@ -584,10 +592,10 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
           </div>}
           <div className="mt-4"><PrimaryButton disabled={savingMetadata} onClick={() => void saveMetadataSettings()}>{savingMetadata ? "正在保存…" : "保存元数据配置"}</PrimaryButton></div>
         </Panel>
-      </div>
-      <Panel title="任务通知" className="mt-4">
+      </div>}
+      {!isContentSource && <Panel title="任务通知" className="mt-4">
         <div className="flex items-center justify-between gap-4"><div className="flex items-center gap-3"><Bell className="size-5 text-muted-foreground" /><div><p className="text-sm font-medium">后台任务完成通知</p><p className="mt-1 text-xs text-muted-foreground">通知渠道由云助手系统设置统一管理。</p></div></div><button type="button" role="switch" aria-checked={service.notificationEnabled} disabled={updatingNotification} onClick={() => void toggleNotification()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:opacity-40 ${service.notificationEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}><span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${service.notificationEnabled ? "translate-x-5" : "translate-x-0"}`} /></button></div>
-      </Panel>
+      </Panel>}
       <div className="mt-4 grid items-start gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(240px,1fr)]">
         <Panel title="播放与协议" description={settings.navidromeSupported ? "管理 Navidrome 客户端访问。" : "管理 Jellyfin、Emby 客户端访问。"}>
           <div className="divide-y divide-border overflow-hidden rounded-xl border border-border">
@@ -638,7 +646,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
             </div>}
           </div>
         </Panel>
-        <Panel title="危险操作" description="清空媒体条目、文件索引和目录版本。" className="self-start">
+        <Panel title="危险操作" description={isContentSource ? "清空在线目录或删除当前媒体库。" : "清空媒体条目、文件索引和目录版本。"} className="self-start">
           <button type="button" onClick={() => void clearCatalog()} disabled={clearingCatalog} className="inline-flex w-full cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm font-medium text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {clearingCatalog ? "正在清空…" : "清空媒体库"}</button>
           <button type="button" onClick={() => void deleteCurrentLibrary()} className="mt-2 inline-flex w-full cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive/50 px-4 py-2.5 text-sm font-medium text-destructive transition-colors hover:bg-destructive/10"><Trash2 className="size-4" /> 删除媒体库</button>
         </Panel>
@@ -677,6 +685,7 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
   // 关键变量：账号操作同步写入引用，拦截 React 更新按钮状态之前的重复提交。
   const pendingAccountActionRef = useRef<string | null>(null);
   const service = resource.data?.service;
+  const isContentSource = service?.libraryKind === "content_source_video";
   const settings = resource.data?.settings;
   const settingsPath = admin ? "/admin/libraries/$serviceId/settings" : "/app/libraries/$serviceId/settings";
 
@@ -952,26 +961,26 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
     <>
       <PageHeader title={`${service.displayName} · ${settings.navidromeSupported ? "协议访问账号" : "Jellyfin 配置"}`} actions={<Link to={settingsPath} params={{ serviceId }}><SecondaryButton>返回媒体库设置</SecondaryButton></Link>} />
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
-      {!settings.navidromeSupported && <Panel title="Jellyfin 设置" description="协议播放、下载、分类和服务地址集中管理。">
-        <div className="grid gap-2 md:grid-cols-3">
-          <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/35 px-3 py-2.5">
+      {!settings.navidromeSupported && <Panel title="Jellyfin 设置" description={isContentSource ? "在线内容支持自动、直连和中转，管理节目分类和协议服务地址。" : "协议播放、下载、分类和服务地址集中管理。"}>
+        <div className={`grid gap-2 ${isContentSource ? "md:grid-cols-2" : "md:grid-cols-3"}`}>
+          {isContentSource ? <ContentSourcePlaybackModeSettings key={`${serviceId}:${admin}:jellyfin`} state={{ libraryId: serviceId, admin, protocol: "jellyfin" }} /> : <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/35 px-3 py-2.5">
             <div className="min-w-0">
               <p className="text-sm font-medium">中转播放</p>
               <p className="mt-0.5 text-[11px] text-muted-foreground">关闭后优先使用网盘原始地址</p>
               {service.providerType === "baidupan" && <p className="mt-0.5 text-[11px] text-muted-foreground">百度直链服务仅 Flymby 可用，其他播放器请开启中转播放。</p>}
             </div>
             <button type="button" role="switch" aria-checked={settings.jellyfinRelayPlaybackEnabled} aria-label="启用 Jellyfin 中转播放" disabled={(!settings.relayPlaybackSupported && !settings.jellyfinRelayPlaybackEnabled) || updatingPlayback} onClick={() => void toggleJellyfinRelayPlayback()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.jellyfinRelayPlaybackEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}><span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.jellyfinRelayPlaybackEnabled ? "translate-x-5" : "translate-x-0"}`} /></button>
-          </div>
-          <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/35 px-3 py-2.5">
+          </div>}
+          {!isContentSource && <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/35 px-3 py-2.5">
             <div className="min-w-0"><p className="text-sm font-medium">允许下载</p><p className="mt-0.5 truncate text-[11px] text-muted-foreground">传输原始文件，不转码</p></div>
             <button type="button" role="switch" aria-checked={settings.jellyfinDownloadEnabled} aria-label="允许 Jellyfin 下载影片" disabled={updatingDownload} onClick={() => void toggleJellyfinDownload()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.jellyfinDownloadEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}><span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.jellyfinDownloadEnabled ? "translate-x-5" : "translate-x-0"}`} /></button>
-          </div>
+          </div>}
           <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/35 px-3 py-2.5">
             <div className="min-w-0"><p className="text-sm font-medium">节目地区分组</p><p className="mt-0.5 truncate text-[11px] text-muted-foreground">拆分为华语、日韩、欧美和其他</p></div>
             <button type="button" role="switch" aria-checked={settings.jellyfinRegionLibrariesEnabled} aria-label="启用 Jellyfin 节目地区分组" disabled={updatingRegionLibraries} onClick={() => void toggleRegionLibraries()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.jellyfinRegionLibrariesEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}><span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.jellyfinRegionLibrariesEnabled ? "translate-x-5" : "translate-x-0"}`} /></button>
           </div>
         </div>
-        {!settings.relayPlaybackSupported && <p className="mt-2 text-[11px] text-muted-foreground">当前网盘类型暂不支持中转播放。</p>}
+        {!isContentSource && !settings.relayPlaybackSupported && <p className="mt-2 text-[11px] text-muted-foreground">当前网盘类型暂不支持中转播放。</p>}
         <div className="mt-3 grid gap-3 border-t border-border pt-3 xl:grid-cols-[minmax(0,3fr)_minmax(260px,2fr)]">
           <form onSubmit={(event) => void saveJellyfinPath(event)} className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
             <div className="flex min-w-0 flex-1 overflow-hidden rounded-lg border border-input bg-background/50"><span className="flex shrink-0 items-center border-r border-border bg-secondary/60 px-3 font-mono text-sm text-muted-foreground">/j/</span><input value={jellyfinPathSuffix} maxLength={64} onChange={(event) => setJellyfinPathSuffix(event.target.value)} aria-label="Jellyfin 地址后缀" className="min-w-0 flex-1 bg-transparent px-3 py-2 font-mono text-sm outline-none" /></div>

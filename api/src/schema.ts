@@ -5,8 +5,17 @@ import type { Knex } from "knex";
 import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
 import { createMusicScanTables } from "./music/scan-state.js";
+import {
+  allowHistoricalServiceIdNull,
+  backfillHistoricalProtocolPaths,
+  migrateHistoricalProtocolTables,
+  migrateHistoricalScanSchedules,
+  preserveDuplicateSourceFileReferences,
+  readHistoricalLibraryOwnership,
+  requireHistoricalLibrary,
+} from "./schema-upgrade-compatibility.js";
 
-export const currentSchemaVersion = 62;
+export const currentSchemaVersion = 63;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -55,6 +64,7 @@ async function addUniqueIfMissing(
   } catch (error) {
     const databaseError = error as Error & { code?: string };
     const duplicateIndex = databaseError.code === "42P07"
+      || databaseError.code === "42710"
       || databaseError.code === "ER_DUP_KEYNAME"
       || /(?:index|constraint) .* already exists/iu.test(databaseError.message);
     if (!duplicateIndex) throw error;
@@ -510,10 +520,13 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.unique(["library_id", "username_lookup"], { indexName: "uq_library_access_username" });
     });
   }
-  await addColumnIfMissing(database, "library_access_accounts", "password_required", (table) => {
-    // 关键变量：缺少密码状态字段的旧结构按新的默认规则补为免密码。
-    table.integer("password_required").notNullable().defaultTo(0);
-  });
+  if (!(await database.schema.hasColumn("library_access_accounts", "password_required"))) {
+    await addColumnIfMissing(database, "library_access_accounts", "password_required", (table) => {
+      // 历史账号的非空密码哈希仍需校验；新账号继续使用建表分支的免密码默认值。
+      table.integer("password_required").notNullable().defaultTo(1);
+    });
+    await database("library_access_accounts").where({ password_hash: "" }).update({ password_required: 0 });
+  }
   await addColumnIfMissing(database, "library_access_accounts", "protocol_password_encrypted", (table) => {
     table.text("protocol_password_encrypted").nullable();
   });
@@ -911,21 +924,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
     });
   }
   if (await database.schema.hasTable("service_scan_schedules")) {
-    const legacySchedules = await database("service_scan_schedules as schedule")
-      .join("library_sources as source", "source.service_id", "schedule.service_id")
-      .select("schedule.*", "source.library_id");
-    for (const schedule of legacySchedules) {
-      const exists = await database("library_scan_schedules").where({
-        user_id: schedule.user_id,
-        library_id: schedule.library_id,
-        scan_mode: schedule.scan_mode,
-      }).first();
-      if (!exists) {
-        const { service_id: _serviceId, library_id: libraryId, ...values } = schedule;
-        await database("library_scan_schedules").insert({ ...values, library_id: libraryId });
-      }
-    }
-    await database.schema.dropTable("service_scan_schedules");
+    await migrateHistoricalScanSchedules(database);
   }
 
 
@@ -1353,12 +1352,10 @@ async function migrateCatalogChangeVersions(database: Knex): Promise<void> {
 
 /** 为媒体目录分页、排序和概览统计补充查询索引。 */
 async function migrateCatalogQueryIndexes(database: Knex): Promise<void> {
-  await database.schema.alterTable("media_items", (table) => {
-    table.index(["user_id", "library_id", "deleted_at", "created_at"], "idx_media_items_catalog_created");
-    table.index(["user_id", "library_id", "deleted_at", "sort_title"], "idx_media_items_catalog_title");
-    table.index(["user_id", "library_id", "deleted_at", "year"], "idx_media_items_catalog_year");
-    table.index(["user_id", "deleted_at", "match_state"], "idx_media_items_user_match");
-  });
+  await addIndexIfMissing(database, "media_items", ["user_id", "library_id", "deleted_at", "created_at"], "idx_media_items_catalog_created");
+  await addIndexIfMissing(database, "media_items", ["user_id", "library_id", "deleted_at", "sort_title"], "idx_media_items_catalog_title");
+  await addIndexIfMissing(database, "media_items", ["user_id", "library_id", "deleted_at", "year"], "idx_media_items_catalog_year");
+  await addIndexIfMissing(database, "media_items", ["user_id", "deleted_at", "match_state"], "idx_media_items_user_match");
 }
 
 /** 从历史元数据 JSON 中读取可排序的电影上映日或节目首播日。 */
@@ -1392,12 +1389,7 @@ async function migrateMediaPremiereDate(database: Knex): Promise<void> {
       await transaction("media_items").where({ id: row.id }).update({ premiere_date: premiereDate });
     }
   });
-  await database.schema.alterTable("media_items", (table) => {
-    table.index(
-      ["user_id", "library_id", "deleted_at", "premiere_date"],
-      "idx_media_items_catalog_premiere",
-    );
-  });
+  await addIndexIfMissing(database, "media_items", ["user_id", "library_id", "deleted_at", "premiere_date"], "idx_media_items_catalog_premiere");
 }
 
 /** 为按服务清空媒体库补齐过滤和外键级联删除索引，避免 PostgreSQL 逐条全表扫描。 */
@@ -1606,61 +1598,28 @@ async function migrateLibraryJellyfinOwnership(database: Knex): Promise<void> {
     .select("id")
     .where({ jellyfin_enabled: 1 })
     .whereNull("deleted_at");
-  const serviceIds = enabledServices.map((service) => String(service.id));
-  if (serviceIds.length > 0) {
-    await database("media_libraries").whereIn("service_id", serviceIds).update({ jellyfin_enabled: 1 });
+  const ownership = await readHistoricalLibraryOwnership(database);
+  for (const service of enabledServices) {
+    const libraryId = requireHistoricalLibrary(ownership, service.id, "cloud_services");
+    await database("media_libraries").where({ id: libraryId }).update({ jellyfin_enabled: 1 });
   }
 }
 
 /** 为已有媒体库生成默认 Jellyfin 地址后缀，并建立全局唯一约束。 */
 async function migrateLibraryJellyfinPathSuffix(database: Knex): Promise<void> {
-  const libraries = await database("media_libraries")
-    .select("service_id", "jellyfin_path_suffix", "jellyfin_path_suffix_lookup");
-  for (const library of libraries) {
-    // 关键变量：历史媒体库继续使用服务 ID 作为后缀，避免升级时发生地址归属冲突。
-    const pathSuffix = String(library.jellyfin_path_suffix ?? "").trim() || String(library.service_id);
-    const pathSuffixLookup = String(library.jellyfin_path_suffix_lookup ?? "").trim() || pathSuffix.toLowerCase();
-    await database("media_libraries").where({ service_id: library.service_id }).update({
-      jellyfin_path_suffix: pathSuffix,
-      jellyfin_path_suffix_lookup: pathSuffixLookup,
-    });
-  }
+  await backfillHistoricalProtocolPaths(database, "jellyfin");
   await addUniqueIfMissing(database, "media_libraries", ["jellyfin_path_suffix_lookup"], "uq_media_libraries_jellyfin_path_suffix");
 }
 
 /** 为已有媒体库生成默认 Navidrome 地址后缀，并建立全局唯一约束。 */
 async function migrateLibraryNavidromePathSuffix(database: Knex): Promise<void> {
-  const libraries = await database("media_libraries")
-    .select("service_id", "navidrome_path_suffix", "navidrome_path_suffix_lookup");
-  for (const library of libraries) {
-    // 关键变量：升级前的音乐库沿用服务 ID，确保不同服务的 /n/ 地址不会冲突。
-    const pathSuffix = String(library.navidrome_path_suffix ?? "").trim() || String(library.service_id);
-    const pathSuffixLookup = String(library.navidrome_path_suffix_lookup ?? "").trim() || pathSuffix.toLowerCase();
-    await database("media_libraries").where({ service_id: library.service_id }).update({
-      navidrome_path_suffix: pathSuffix,
-      navidrome_path_suffix_lookup: pathSuffixLookup,
-    });
-  }
+  await backfillHistoricalProtocolPaths(database, "navidrome");
   await addUniqueIfMissing(database, "media_libraries", ["navidrome_path_suffix_lookup"], "uq_media_libraries_navidrome_path_suffix");
 }
 
 /** 为已有媒体库补齐 Emby 独立协议配置和全局唯一地址后缀。 */
 async function migrateLibraryEmbyProtocol(database: Knex): Promise<void> {
-  const libraries = await database("media_libraries")
-    .select("service_id", "emby_path_suffix", "emby_path_suffix_lookup");
-  for (const library of libraries) {
-    // 关键变量：Emby 与 Jellyfin 可使用相同文本后缀，但各自在自己的 URL 前缀下全局唯一。
-    const pathSuffix = String(library.emby_path_suffix ?? "").trim() || String(library.service_id);
-    const pathSuffixLookup = String(library.emby_path_suffix_lookup ?? "").trim() || pathSuffix.toLowerCase();
-    await database("media_libraries").where({ service_id: library.service_id }).update({
-      emby_enabled: 0,
-      emby_relay_playback_enabled: 0,
-      emby_download_enabled: 1,
-      emby_region_libraries_enabled: 0,
-      emby_path_suffix: pathSuffix,
-      emby_path_suffix_lookup: pathSuffixLookup,
-    });
-  }
+  await backfillHistoricalProtocolPaths(database, "emby");
   await addUniqueIfMissing(database, "media_libraries", ["emby_path_suffix_lookup"], "uq_media_libraries_emby_path_suffix");
 }
 
@@ -1669,15 +1628,18 @@ async function migrateEmbyRelayPlaybackDefault(database: Knex): Promise<void> {
   await database("media_libraries").update({ emby_relay_playback_enabled: 0 });
 }
 
-/** 将旧服务级中转开关迁移为媒体库 APP 中转开关，并保留 Jellyfin 原有中转能力。 */
+/** 迁入历史 Jellyfin 中转配置；已经下线的 APP 中转字段不再重建。 */
 async function migrateLibraryRelayPlaybackSettings(database: Knex): Promise<void> {
+  if (!(await database.schema.hasColumn("cloud_services", "relay_playback_enabled"))) return;
   const services = await database("cloud_services")
     .select("id", "relay_playback_enabled", "deleted_at");
+  const ownership = await readHistoricalLibraryOwnership(database);
   for (const service of services) {
-    // 关键变量：APP 中转沿用升级前的服务开关，Jellyfin 中转默认启用以保持升级前行为。
+    // 关键变量：Jellyfin 中转默认启用，以保持旧客户端原有播放路线。
     const serviceDeleted = Boolean(service.deleted_at);
-    await database("media_libraries").where({ service_id: service.id }).update({
-      app_relay_playback_enabled: !serviceDeleted && Number(service.relay_playback_enabled) === 1 ? 1 : 0,
+    const target = ownership.get(String(service.id));
+    if (!target) continue;
+    await database("media_libraries").where({ id: target.libraryId }).update({
       jellyfin_relay_playback_enabled: serviceDeleted ? 0 : 1,
     });
   }
@@ -1685,6 +1647,7 @@ async function migrateLibraryRelayPlaybackSettings(database: Knex): Promise<void
 
 /** 每台设备只保留一个指向同一云端服务的本地卡片绑定。 */
 async function migrateUniqueCloudServiceDeviceBinding(database: Knex): Promise<void> {
+  if (!(await database.schema.hasTable("client_service_links"))) return;
   const bindings = await database("client_service_links")
     .select("id", "user_id", "service_id", "client_device_id", "updated_at")
     .orderBy("updated_at", "desc");
@@ -1732,7 +1695,11 @@ async function purgeDeletedServicesV55(database: Knex, exportDirectory: string):
         ? await transaction("library_sources").select("library_id").where({ service_id: serviceId })
         : [];
       const sourceLibraryIds = sources.map((source) => String(source.library_id));
-      const libraryIds = new Set<string>([legacyLibraryId, ...sourceLibraryIds].filter(Boolean));
+      const legacyLibraries = hasLegacyServiceId
+        ? await transaction("media_libraries").select("id").where({ service_id: serviceId, user_id: userId })
+        : [];
+      const libraryIds = new Set<string>([legacyLibraryId, ...sourceLibraryIds,
+        ...legacyLibraries.map((library) => String(library.id))].filter(Boolean));
       if (libraryIds.size > 1) {
         console.error(`[codex-media-library-deleted-service-purge] 阶段=校验归属 结果=失败 服务ID=${serviceId} 原因=多个媒体库`);
         throw new Error("Schema 55 升级停止：已删除服务关联了多个媒体库");
@@ -1749,7 +1716,7 @@ async function purgeDeletedServicesV55(database: Knex, exportDirectory: string):
         }
         const library = await transaction("media_libraries").where({ id: libraryId }).first();
         if (library && (String(library.user_id) !== userId
-          || (hasLegacyServiceId && String(library.service_id) !== serviceId))) {
+          || (hasLegacyServiceId && library.service_id && String(library.service_id) !== serviceId))) {
           console.error(`[codex-media-library-deleted-service-purge] 阶段=校验归属 结果=失败 服务ID=${serviceId} 媒体库ID=${libraryId} 原因=旧关系不一致`);
           throw new Error("Schema 55 升级停止：已删除服务与媒体库归属不一致");
         }
@@ -1801,40 +1768,30 @@ async function purgeDeletedServicesV55(database: Knex, exportDirectory: string):
 async function migrateServiceLibraryOwnershipV55(database: Knex): Promise<void> {
   const hasLegacyServiceLibraryId = await database.schema.hasColumn("cloud_services", "library_id");
   const hasLegacyLibraryServiceId = await database.schema.hasColumn("media_libraries", "service_id");
-  if (!hasLegacyServiceLibraryId || !hasLegacyLibraryServiceId) return;
+  const hasLegacyProfiles = await database.schema.hasTable("service_scan_profiles")
+    || await database.schema.hasTable("service_metadata_profiles");
+  if (!hasLegacyServiceLibraryId && !hasLegacyLibraryServiceId && !hasLegacyProfiles) return;
 
   const now = new Date().toISOString();
-  const services = await database("cloud_services")
-    .select(
-      "id",
-      "user_id",
-      "library_id",
-      "display_name",
-      "provider_type",
-      "connection_status",
-      "credential_revision",
-      "data_type",
-      "notification_enabled",
-      "scan_profile_revision",
-      "metadata_profile_revision",
-      "last_scan_at",
-    )
-    .whereNull("deleted_at");
-  const libraries = await database("media_libraries").select("id", "user_id", "service_id");
+  // 关键变量：早期版本没有部分配置字段，select(*) 后逐项保留媒体库现值，避免查询不存在的列。
+  const historicalOwnership = await readHistoricalLibraryOwnership(database);
+  const serviceRows = await database("cloud_services").select("*").whereNull("deleted_at");
+  const services = serviceRows.filter((service) => historicalOwnership.has(String(service.id)))
+    .map((service) => ({ ...service, library_id: historicalOwnership.get(String(service.id))!.libraryId }));
+  const libraries = await database("media_libraries").select("*");
   const libraryById = new Map(libraries.map((library) => [String(library.id), library]));
   const serviceById = new Map(services.map((service) => [String(service.id), service]));
 
   // 关键变量：软删除服务已提前清理，剩余关系不一致时仍停止升级，避免迁错目录或协议账号。
   const invalidRelations: string[] = [];
-  for (const service of services) {
-    const libraryId = String(service.library_id ?? "");
-    const library = libraryById.get(libraryId);
-    if (!library || String(library.service_id ?? "") !== String(service.id) || String(library.user_id) !== String(service.user_id)) {
-      invalidRelations.push(`服务ID=${String(service.id)},媒体库ID=${libraryId || "空"}`);
+  for (const service of serviceRows) {
+    if (service.library_id && !historicalOwnership.has(String(service.id))) {
+      invalidRelations.push(`服务ID=${String(service.id)},媒体库ID=${String(service.library_id)}`);
     }
   }
   for (const library of libraries) {
     const serviceId = String(library.service_id ?? "");
+    if (!serviceId) continue;
     const service = serviceById.get(serviceId);
     if (!service || String(service.library_id ?? "") !== String(library.id) || String(service.user_id) !== String(library.user_id)) {
       invalidRelations.push(`服务ID=${serviceId || "空"},媒体库ID=${String(library.id)}`);
@@ -1850,18 +1807,20 @@ async function migrateServiceLibraryOwnershipV55(database: Knex): Promise<void> 
     for (const service of services) {
       const serviceId = String(service.id);
       const libraryId = String(service.library_id);
+      const library = libraryById.get(libraryId)!;
       await transaction("media_libraries").where({ id: libraryId, user_id: service.user_id }).update({
         display_name: String(service.display_name),
-        data_type: String(service.data_type ?? "video"),
-        notification_enabled: Number(service.notification_enabled ?? 0),
-        scan_profile_revision: Number(service.scan_profile_revision ?? 1),
-        metadata_profile_revision: Number(service.metadata_profile_revision ?? 1),
-        last_scan_at: service.last_scan_at ?? null,
+        data_type: String(service.data_type ?? library.data_type ?? "video"),
+        notification_enabled: Number(service.notification_enabled ?? library.notification_enabled ?? 0),
+        scan_profile_revision: Number(service.scan_profile_revision ?? library.scan_profile_revision ?? 1),
+        metadata_profile_revision: Number(service.metadata_profile_revision ?? library.metadata_profile_revision ?? 1),
+        last_scan_at: service.last_scan_at ?? library.last_scan_at ?? null,
         updated_at: now,
       });
       const existingSource = await transaction("library_sources").where({
         user_id: service.user_id,
         service_id: serviceId,
+        library_id: libraryId,
       }).first();
       if (!existingSource) {
         await transaction("library_sources").insert({
@@ -1888,18 +1847,17 @@ async function migrateServiceLibraryOwnershipV55(database: Knex): Promise<void> 
     if (await transaction.schema.hasTable("service_scan_profiles")) {
       const rows = await transaction("service_scan_profiles").select("*");
       for (const row of rows) {
-        const service = serviceById.get(String(row.service_id));
-        if (!service) continue;
+        const libraryId = requireHistoricalLibrary(historicalOwnership, row.service_id, "service_scan_profiles", row.user_id);
         const exists = await transaction("library_scan_profiles").where({
           user_id: row.user_id,
-          library_id: service.library_id,
+          library_id: libraryId,
           revision: row.revision,
         }).first();
         if (!exists) {
           await transaction("library_scan_profiles").insert({
             id: row.id,
             user_id: row.user_id,
-            library_id: service.library_id,
+            library_id: libraryId,
             revision: row.revision,
             configuration_json: row.configuration_json,
             created_at: row.created_at,
@@ -1910,18 +1868,17 @@ async function migrateServiceLibraryOwnershipV55(database: Knex): Promise<void> 
     if (await transaction.schema.hasTable("service_metadata_profiles")) {
       const rows = await transaction("service_metadata_profiles").select("*");
       for (const row of rows) {
-        const service = serviceById.get(String(row.service_id));
-        if (!service) continue;
+        const libraryId = requireHistoricalLibrary(historicalOwnership, row.service_id, "service_metadata_profiles", row.user_id);
         const exists = await transaction("library_metadata_profiles").where({
           user_id: row.user_id,
-          library_id: service.library_id,
+          library_id: libraryId,
           revision: row.revision,
         }).first();
         if (!exists) {
           await transaction("library_metadata_profiles").insert({
             id: row.id,
             user_id: row.user_id,
-            library_id: service.library_id,
+            library_id: libraryId,
             revision: row.revision,
             configuration_json: row.configuration_json,
             created_at: row.created_at,
@@ -2048,40 +2005,19 @@ async function migrateCloudAggregateV56(database: Knex): Promise<void> {
     ["user_id", "library_id", "provider_resource_id"],
     "uq_source_files_resource",
   );
-  await addUniqueIfMissing(
-    database,
-    "source_files",
-    ["user_id", "library_id", "library_source_id", "provider_resource_id"],
-    "uq_source_files_source_resource",
-  );
   await dropUniqueIfExists(
     database,
     "nfo_sidecar_cache",
     ["user_id", "library_id", "provider_resource_id"],
     "uq_nfo_sidecar_cache_resource",
   );
-  await addUniqueIfMissing(
-    database,
-    "nfo_sidecar_cache",
-    ["user_id", "library_id", "library_source_id", "provider_resource_id"],
-    "uq_nfo_sidecar_cache_source_resource",
-  );
+  // 先处理历史重复资源，再补建唯一约束，否则升级会在到达 Schema 59 修复前就失败。
+  await migrateCloudAggregateSourceUniqueConstraintsV59(database);
   await addIndexIfMissing(database, "scan_jobs", ["parent_job_id", "status"], "idx_scan_jobs_parent_status");
   await addIndexIfMissing(database, "scan_jobs", ["library_source_id", "status"], "idx_scan_jobs_source_status");
 
   // 关键字段：owned_copy 来源不再指向原 cloud_services，任务同样只依赖 library_source_id。
-  await database.schema.alterTable("library_sources", (table) => {
-    table.string("service_id", 64).nullable().references("id").inTable("cloud_services").onDelete("RESTRICT").alter();
-  });
-  await database.schema.alterTable("scan_jobs", (table) => {
-    table.string("service_id", 64).nullable().references("id").inTable("cloud_services").onDelete("CASCADE").alter();
-  });
-  await database.schema.alterTable("nfo_sidecar_cache", (table) => {
-    table.string("service_id", 64).nullable().references("id").inTable("cloud_services").onDelete("CASCADE").alter();
-  });
-  await database.schema.alterTable("media_probe_jobs", (table) => {
-    table.string("service_id", 64).nullable().references("id").inTable("cloud_services").onDelete("CASCADE").alter();
-  });
+  await allowHistoricalServiceIdNull(database, ["library_sources", "scan_jobs", "nfo_sidecar_cache", "media_probe_jobs"]);
 
   console.info(JSON.stringify({
     日志关键字: "codex-library-source-config",
@@ -2092,13 +2028,7 @@ async function migrateCloudAggregateV56(database: Knex): Promise<void> {
 
 /** 修复已升级到 Schema 56 的 PostgreSQL 仍保留 service_id 非空约束，允许聚合库来源独立于网盘服务。 */
 async function migrateCloudAggregateSourceNullableV57(database: Knex): Promise<void> {
-  if (database.client.config.client === "pg") {
-    await database.raw("ALTER TABLE library_sources ALTER COLUMN service_id DROP NOT NULL");
-  } else {
-    await database.schema.alterTable("library_sources", (table) => {
-      table.string("service_id", 64).nullable().references("id").inTable("cloud_services").onDelete("RESTRICT").alter();
-    });
-  }
+  await allowHistoricalServiceIdNull(database, ["library_sources", "scan_jobs", "nfo_sidecar_cache", "media_probe_jobs"]);
   console.info(JSON.stringify({
     日志关键字: "codex-library-source-config",
     事件: "Schema57放宽聚合来源服务ID非空约束",
@@ -2220,6 +2150,9 @@ async function migrateCloudAggregateSourceUniqueConstraintsV59(database: Knex): 
           .orderBy("created_at", "desc");
         const duplicateIds = rows.slice(1).map((row) => String(row.id)); // 关键变量：第一条是保留的最新资源记录。
         if (duplicateIds.length === 0) continue;
+        if (tableName === "source_files") {
+          await preserveDuplicateSourceFileReferences(transaction, String(rows[0].id), duplicateIds);
+        }
         await transaction(tableName).whereIn("id", duplicateIds).delete();
         removedCount += duplicateIds.length;
       }
@@ -2253,59 +2186,7 @@ async function migrateCloudAggregateSourceUniqueConstraintsV59(database: Knex): 
 
 /** 将旧服务级协议账号、会话和播放状态迁移到媒体库作用域。 */
 async function migrateProtocolOwnershipToLibraries(database: Knex): Promise<void> {
-  const sourceRows = await database("library_sources").select("service_id", "library_id");
-  const libraryByServiceId = new Map(sourceRows.map((row) => [String(row.service_id), String(row.library_id)]));
-  const tableMappings: Array<{ legacy: string; current: string; hasServiceId: boolean }> = [
-    { legacy: "service_access_accounts", current: "library_access_accounts", hasServiceId: true },
-    { legacy: "service_protocol_sessions", current: "library_protocol_sessions", hasServiceId: true },
-    { legacy: "service_playback_progress", current: "library_playback_progress", hasServiceId: true },
-    { legacy: "service_playback_sessions", current: "library_playback_sessions", hasServiceId: true },
-    { legacy: "service_playback_history", current: "library_playback_history", hasServiceId: true },
-    { legacy: "service_item_preferences", current: "library_item_preferences", hasServiceId: true },
-    { legacy: "service_jellyfin_virtual_preferences", current: "library_jellyfin_virtual_preferences", hasServiceId: true },
-    { legacy: "service_music_playlists", current: "library_music_playlists", hasServiceId: true },
-    { legacy: "service_music_playlist_items", current: "library_music_playlist_items", hasServiceId: false },
-    { legacy: "service_emby_accounts", current: "library_emby_accounts", hasServiceId: true },
-    { legacy: "service_emby_sessions", current: "library_emby_sessions", hasServiceId: true },
-    { legacy: "service_emby_playback_progress", current: "library_emby_playback_progress", hasServiceId: true },
-    { legacy: "service_emby_playback_sessions", current: "library_emby_playback_sessions", hasServiceId: true },
-    { legacy: "service_emby_playback_history", current: "library_emby_playback_history", hasServiceId: true },
-    { legacy: "service_emby_item_preferences", current: "library_emby_item_preferences", hasServiceId: true },
-    { legacy: "service_emby_virtual_preferences", current: "library_emby_virtual_preferences", hasServiceId: true },
-  ];
-  let migratedRows = 0; // 关键变量：记录本次真正迁入新媒体库表的数据量，便于正式环境核对。
-  for (const mapping of tableMappings) {
-    if (!(await database.schema.hasTable(mapping.legacy))) continue;
-    const rows = await database(mapping.legacy).select("*");
-    for (const row of rows) {
-      const values: Record<string, unknown> = { ...row };
-      if (mapping.legacy === "service_playback_progress") {
-        // 旧版总时长字段已由媒体规格提供，新表不再存储；保留其余观看进度字段。
-        delete values.duration_ticks;
-      }
-      if (mapping.hasServiceId) {
-        const libraryId = libraryByServiceId.get(String(row.service_id));
-        if (!libraryId) {
-          console.error(`[codex-protocol-library-migration] 阶段=迁移协议数据 结果=失败 旧表=${mapping.legacy} 服务ID=${String(row.service_id)} 原因=缺少媒体库来源关系`);
-          throw new Error("Schema 55 升级停止：协议数据找不到对应媒体库");
-        }
-        delete values.service_id;
-        values.library_id = libraryId;
-      }
-      const inserted = await database(mapping.current).insert(values).onConflict("id").ignore();
-      if (inserted !== undefined) migratedRows += 1;
-    }
-    if (mapping.legacy === "service_playback_progress" && rows.length > 0) {
-      console.info(`[codex-protocol-library-migration] 阶段=迁移观看进度 结果=成功 记录数=${rows.length} 略过旧字段=duration_ticks`);
-    }
-  }
-  // 关键变量：按外键依赖倒序删除旧表，升级完成后不保留两套协议状态。
-  for (const mapping of [...tableMappings].reverse()) {
-    if (await database.schema.hasTable(mapping.legacy)) await database.schema.dropTable(mapping.legacy);
-  }
-  if (migratedRows > 0) {
-    console.info(`[codex-protocol-library-migration] 阶段=迁移协议数据 结果=成功 数据行数=${migratedRows}`);
-  }
+  await migrateHistoricalProtocolTables(database);
 }
 
 /** 创建或升级 FlyCloudHelper 全部后台表。 */
@@ -2313,6 +2194,10 @@ export async function migrateDatabase(database: Knex, exportDirectory: string): 
   // 关键变量：只有升级旧结构时才可能存在首期的一库一来源唯一约束。
   const hadLibrarySourcesTable = await database.schema.hasTable("library_sources");
   await createIdentityTables(database);
+  const existingState = await database("system_state").where({ singleton_id: 1 }).first();
+  if (Number(existingState?.schema_version ?? 0) > currentSchemaVersion) {
+    throw new Error(`当前程序支持数据库版本 ${currentSchemaVersion}，不能降级已升级到 ${String(existingState.schema_version)} 的数据库`);
+  }
   await createServiceTables(database);
   if (hadLibrarySourcesTable) await dropLegacyLibrarySingleSourceUnique(database);
   await purgeDeletedServicesV55(database, exportDirectory);
@@ -2332,7 +2217,6 @@ export async function migrateDatabase(database: Knex, exportDirectory: string): 
   await createMusicScanTables(database);
 
   const now = new Date().toISOString();
-  const existingState = await database("system_state").where({ singleton_id: 1 }).first();
   if (!existingState) {
     await dropRemovedAppSyncTables(database);
     await dropLegacyServiceLibraryColumns(database);
@@ -2348,57 +2232,45 @@ export async function migrateDatabase(database: Knex, exportDirectory: string): 
       updated_at: now,
     });
   } else {
-    if (Number(existingState.schema_version ?? 0) < 5) {
-      await migrateCatalogChangeVersions(database);
-    }
-    if (Number(existingState.schema_version ?? 0) < 8) {
-      await migrateCatalogQueryIndexes(database);
-    }
-    if (Number(existingState.schema_version ?? 0) < 11) {
-      await migrateMediaPremiereDate(database);
-    }
-    if (Number(existingState.schema_version ?? 0) < 16) {
-      await migrateCatalogDeletionIndexes(database);
-    }
-    if (Number(existingState.schema_version ?? 0) < 20) {
-      await migrateUniqueSourceFileOwnership(database);
-    }
-    if (Number(existingState.schema_version ?? 0) < 29) {
-      await migrateLibraryJellyfinOwnership(database);
-    }
-    if (Number(existingState.schema_version ?? 0) < 30) {
+    let completedVersion = Number(existingState.schema_version ?? 0); // 关键变量：每个步骤完成后立即保存进度。
+    /** 只在步骤执行成功后记录版本，中断重试不会重置前面已迁入的协议配置。 */
+    const applyMigration = async (version: number, action: () => Promise<void>): Promise<void> => {
+      if (completedVersion >= version) return;
+      await action();
+      await database("system_state").where({ singleton_id: 1 }).update({
+        schema_version: version, updated_at: new Date().toISOString(),
+      });
+      completedVersion = version;
+    };
+    await applyMigration(5, () => migrateCatalogChangeVersions(database));
+    await applyMigration(8, () => migrateCatalogQueryIndexes(database));
+    await applyMigration(11, () => migrateMediaPremiereDate(database));
+    await applyMigration(16, () => migrateCatalogDeletionIndexes(database));
+    await applyMigration(20, () => migrateUniqueSourceFileOwnership(database));
+    await applyMigration(29, () => migrateLibraryJellyfinOwnership(database));
+    await applyMigration(30, () => migrateLibraryJellyfinPathSuffix(database));
+    await applyMigration(31, () => migrateLibraryRelayPlaybackSettings(database));
+    await applyMigration(32, () => migrateUniqueCloudServiceDeviceBinding(database));
+    await applyMigration(44, () => migrateLibraryNavidromePathSuffix(database));
+    await applyMigration(47, () => migrateLibraryEmbyProtocol(database));
+    await applyMigration(48, () => migrateEmbyRelayPlaybackDefault(database));
+    await applyMigration(54, () => dropRemovedAggregateServiceTables(database));
+    await applyMigration(56, () => migrateCloudAggregateV56(database));
+    await applyMigration(57, () => migrateCloudAggregateSourceNullableV57(database));
+    await applyMigration(58, () => migrateCloudAggregateServiceLinksV58(database));
+    await applyMigration(59, () => migrateCloudAggregateSourceUniqueConstraintsV59(database));
+    await applyMigration(63, async () => {
+      // 历史版本可能写回过版本号但未放宽全部字段，按实际列约束重新修复。
+      await allowHistoricalServiceIdNull(database, ["library_sources", "scan_jobs", "nfo_sidecar_cache", "media_probe_jobs"]);
       await migrateLibraryJellyfinPathSuffix(database);
-    }
-    if (Number(existingState.schema_version ?? 0) < 31) {
-      await migrateLibraryRelayPlaybackSettings(database);
-    }
-    if (Number(existingState.schema_version ?? 0) < 32) {
-      await migrateUniqueCloudServiceDeviceBinding(database);
-    }
-    if (Number(existingState.schema_version ?? 0) < 44) {
-      await migrateLibraryNavidromePathSuffix(database);
-    }
-    if (Number(existingState.schema_version ?? 0) < 47) {
       await migrateLibraryEmbyProtocol(database);
-    }
-    if (Number(existingState.schema_version ?? 0) < 48) {
-      await migrateEmbyRelayPlaybackDefault(database);
-    }
-    if (Number(existingState.schema_version ?? 0) < 54) {
-      await dropRemovedAggregateServiceTables(database);
-    }
-    if (Number(existingState.schema_version ?? 0) < 56) {
-      await migrateCloudAggregateV56(database);
-    }
-    if (Number(existingState.schema_version ?? 0) < 57) {
-      await migrateCloudAggregateSourceNullableV57(database);
-    }
-    if (Number(existingState.schema_version ?? 0) < 58) {
-      await migrateCloudAggregateServiceLinksV58(database);
-    }
-    if (Number(existingState.schema_version ?? 0) < 59) {
+      await migrateLibraryNavidromePathSuffix(database);
+      await migrateCatalogQueryIndexes(database);
+      await migrateMediaPremiereDate(database);
       await migrateCloudAggregateSourceUniqueConstraintsV59(database);
-    }
+      await dropRemovedAppSyncTables(database);
+      await dropLegacyServiceLibraryColumns(database);
+    });
     await dropRemovedAppSyncTables(database);
     await dropLegacyServiceLibraryColumns(database);
     await database("system_state").where({ singleton_id: 1 }).update({

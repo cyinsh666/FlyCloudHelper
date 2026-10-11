@@ -6,13 +6,13 @@ import { buildEmbyPath, validateEmbyPathSuffix } from "../emby-path.js";
 import { buildNavidromePath, validateNavidromePathSuffix } from "../navidrome-path.js";
 import type { ApiRuntime } from "../runtime.js";
 
-/** 校验媒体库归属；云聚合库使用库本身作为协议配置日志主体。 */
+/** 校验媒体库归属；聚合库和在线库使用库本身作为协议配置日志主体。 */
 async function requireManagedLibrary(runtime: ApiRuntime, request: FastifyRequest, libraryId: string, admin: boolean) {
   const operator = admin
     ? await requireSuperAdmin(request, runtime.database)
     : await requireRequestUser(request, runtime.database);
   const library = await runtime.repository.getLibrary(libraryId, admin ? undefined : operator.id);
-  const service = library.libraryKind === "cloud_aggregate_video"
+  const service = library.libraryKind !== "legacy_single_source"
     ? { id: library.id, providerType: library.sources[0]?.providerType ?? "" }
     : await runtime.repository.getServiceDetail(library.sourceServiceId, admin ? undefined : operator.id);
   return { operator, service, library };
@@ -30,6 +30,7 @@ function librarySupportsRelayPlayback(
   runtime: ApiRuntime,
   library: Awaited<ReturnType<ApiRuntime["repository"]["getLibrary"]>>,
 ): boolean {
+  if (library.libraryKind === "content_source_video") return true;
   if (library.libraryKind !== "cloud_aggregate_video") return supportsRelayPlayback(runtime, library.providerType);
   return library.sources.length > 0
     && library.sources.every((source) => supportsRelayPlayback(runtime, source.providerType));
@@ -240,6 +241,9 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       if (changesDownloadEnabled && typeof request.body.jellyfinDownloadEnabled !== "boolean") {
         throw new ApiError(422, "jellyfin_download_enabled_invalid", "Jellyfin 允许下载开关必须是布尔值");
       }
+      if (library.libraryKind === "content_source_video" && request.body.jellyfinDownloadEnabled === true) {
+        throw new ApiError(409, "content_source_download_unsupported", "在线内容源首批只提供播放，暂不提供完整影片下载");
+      }
       const pathSuffix = changesPathSuffix ? validateJellyfinPathSuffix(request.body.jellyfinPathSuffix) : null;
       const publicAccess = await runtime.publicAccess.getStatus();
       const now = new Date().toISOString();
@@ -315,6 +319,9 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       }
       if (changesDownload && typeof request.body.embyDownloadEnabled !== "boolean") {
         throw new ApiError(422, "emby_download_enabled_invalid", "Emby 允许下载开关必须是布尔值");
+      }
+      if (library.libraryKind === "content_source_video" && request.body.embyDownloadEnabled === true) {
+        throw new ApiError(409, "content_source_download_unsupported", "在线内容源首批只提供播放，暂不提供完整影片下载");
       }
       if (changesRegions && typeof request.body.embyRegionLibrariesEnabled !== "boolean") {
         throw new ApiError(422, "emby_region_libraries_invalid", "Emby 节目地区分组开关必须是布尔值");
@@ -467,6 +474,10 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       const { service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
       const changesJellyfinRelay = request.body.jellyfinRelayPlaybackEnabled !== undefined;
       const changesEmbyRelay = request.body.embyRelayPlaybackEnabled !== undefined;
+      if (library.libraryKind === "content_source_video"
+        && (request.body.jellyfinRelayPlaybackEnabled === false || request.body.embyRelayPlaybackEnabled === false)) {
+        throw new ApiError(409, "content_source_relay_required", "在线内容源首批通过云助手中转播放");
+      }
       if (!changesJellyfinRelay && !changesEmbyRelay) {
         throw new ApiError(422, "library_playback_settings_empty", "没有需要保存的媒体库播放设置");
       }

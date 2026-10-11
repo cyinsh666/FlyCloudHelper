@@ -14,11 +14,9 @@ import type { ApiRuntime } from "../runtime.js";
 /** 查询媒体库并强制当前用户归属。 */
 async function requireLibrary(runtime: ApiRuntime, libraryId: string, userId: string) {
   const row = await runtime.database.query("media_libraries as l")
-    .join("library_sources as ls", "ls.library_id", "l.id").join("cloud_services as s", "s.id", "ls.service_id")
     .select("l.id", "l.catalog_version")
     .where("l.id", libraryId)
     .where("l.user_id", userId)
-    .whereNull("s.deleted_at")
     .first();
   if (!row) throw new ApiError(404, "library_not_found", "媒体库不存在");
   return row;

@@ -74,6 +74,11 @@ export async function enqueueProtocolScan(
   itemId?: string,
 ): Promise<void> {
   const library = await runtime.repository.getLibrary(context.libraryId, context.ownerUserId);
+  // 在线目录刷新由源插件负责；不创建要求网盘凭据和物理路径的扫描任务。
+  if (library.libraryKind === "content_source_video") {
+    await runtime.contentSources.startLibrarySync(library.id, context.ownerUserId, { mode: "refresh" });
+    return;
+  }
   const profiles = await runtime.repository.getLibraryProfiles(context.libraryId, context.ownerUserId);
   const unfinishedJob = await runtime.repository.findUnfinishedLibraryScanJob(context.libraryId, context.ownerUserId);
   if (unfinishedJob) throw new ApiError(409, "scan_job_conflict", "当前媒体库已有未结束扫描任务");

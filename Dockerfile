@@ -63,6 +63,7 @@ COPY --from=production-dependencies --chown=node:node /app/api/node_modules ./ap
 COPY --from=build --chown=node:node /app/package.json ./package.json
 COPY --from=build --chown=node:node /app/api/package.json ./api/package.json
 COPY --from=build --chown=node:node /app/api/dist ./api/dist
+COPY --from=build --chown=node:node /app/api/assets ./api/assets
 COPY --from=build --chown=node:node /app/web/dist ./web/dist
 COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 

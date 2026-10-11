@@ -25,6 +25,21 @@ export default defineConfig({
         // 保留浏览器访问时的 Host，供后台进行同源 CSRF 校验。
         changeOrigin: false,
       },
+      "/j/": {
+        target: "http://127.0.0.1:9934",
+        // Jellyfin 客户端经开发端口访问协议；保留 Host，让媒体地址沿用客户端可达入口。
+        changeOrigin: false,
+      },
+      "/e/": {
+        target: "http://127.0.0.1:9934",
+        // Emby 客户端使用同一开发入口，协议请求和媒体流统一转发到 API。
+        changeOrigin: false,
+      },
+      "/n/": {
+        target: "http://127.0.0.1:9934",
+        // Navidrome 的音乐和头像请求使用同一开发入口，避免落到 Web 页面。
+        changeOrigin: false,
+      },
     },
   },
 });

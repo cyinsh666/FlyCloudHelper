@@ -1,12 +1,15 @@
 import type { IncomingMessage } from "node:http";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { ApiError } from "../errors.js";
+import { sendProtocolUserImage } from "../media/protocol-user-image.js";
 import { buildEmbyPath } from "../emby-path.js";
 import { EmbyCompatibilityService, type EmbyContext, type EmbyLibraryContext } from "../emby-service.js";
 import { providerFetch, providerStream } from "../providers/network.js";
 import type { ProviderConnectionContext, ProviderFileAccess } from "../providers/types.js";
 import type { ApiRuntime } from "../runtime.js";
 import { enqueueProtocolScan, listProtocolVirtualFolders } from "../protocol-scan-service.js";
+import { contentPlaybackServerRoot, isContentSourceLibrary } from "../content-sources/playback.js";
+import { sendContentPlayback, sendContentResource } from "../content-sources/hls-relay.js";
 import { buildUpstreamHeaders, copyMediaResponseHeaders, handleProviderAuthenticationFailure, resolveRelayAccess, type RelayLibraryRow } from "./media-stream-routes.js";
 
 /** 读取 Emby 查询参数，保留官方 PascalCase 与部分客户端 camelCase。 */
@@ -30,19 +33,6 @@ function readPlaybackRoute(request: FastifyRequest): "auto" | "origin" | "server
 /** 限定 URL 中的用户 ID 只能等于当前 Emby 登录账号。 */
 function requireEmbyUser(context: EmbyContext, userId: string): void {
   if (context.accountId !== userId) throw new ApiError(403, "emby_user_scope_mismatch", "不能访问其他 Emby 账号的数据");
-}
-
-/** 转义用户名称，避免生成的 SVG 头像包含无效 XML。 */
-function escapeUserImageText(value: string): string {
-  return value.replace(/&/gu, "&amp;").replace(/</gu, "&lt;").replace(/>/gu, "&gt;").replace(/"/gu, "&quot;").replace(/'/gu, "&apos;");
-}
-
-/** 返回云助手生成的 Emby 用户头像，供 Flymby 服务卡片直接展示。 */
-function sendUserImage(context: EmbyContext, request: FastifyRequest, reply: FastifyReply) {
-  const avatarText = escapeUserImageText(Array.from(context.accountUsername.trim())[0] ?? "F");
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256"><rect width="256" height="256" rx="56" fill="#30343b"/><text x="128" y="142" text-anchor="middle" dominant-baseline="middle" font-family="sans-serif" font-size="128" font-weight="600" fill="#f3f4f6">${avatarText}</text></svg>`;
-  reply.header("Content-Type", "image/svg+xml; charset=utf-8").header("Cache-Control", "private, max-age=86400");
-  return request.method === "HEAD" ? reply.send() : reply.send(Buffer.from(svg));
 }
 
 /** 构造 Emby 官方 RootItem 的 BaseItemDto。 */
@@ -142,6 +132,12 @@ async function sendMediaStream(runtime: ApiRuntime, compatibility: EmbyCompatibi
   const internalItemId = compatibility.toInternalItemId(itemId);
   const item = await runtime.repository.getCatalogItem(internalItemId, context.ownerUserId);
   if (item.libraryId !== context.libraryId) throw new ApiError(404, "emby_item_not_found", "媒体条目不存在");
+  if (isContentSourceLibrary(service.library_kind)) {
+    if (download) throw new ApiError(422, "content_download_unsupported", "在线内容源暂不提供原文件下载");
+    return sendContentPlayback(runtime, context, request, reply, internalItemId,
+      compatibility.toProtocolItemId(internalItemId), compatibility.toInternalMediaSourceId(internalItemId, readMediaSourceId(request)),
+      { protocol: "emby", route });
+  }
   const files = (await runtime.repository.listItemFiles(item.id, context.ownerUserId)).filter((file) => String(file.itemId) === item.id);
   const sourceId = compatibility.toInternalMediaSourceId(item.id, readMediaSourceId(request));
   const selected = !sourceId || sourceId === item.id ? files[0] : files.find((file) => String(file.fileId) === sourceId);
@@ -213,21 +209,42 @@ export async function registerEmbyRoutes(server: FastifyInstance, runtime: ApiRu
     server.get(`${prefix}/Users/:userId`, async (request) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); return compatibility.mapUser(context.accountId, context.accountUsername, context.libraryId, context.accountHasPassword, context.downloadEnabled); });
     server.get(`${prefix}/Users/Me`, async (request) => { const context = await authenticated(request); return compatibility.mapUser(context.accountId, context.accountUsername, context.libraryId, context.accountHasPassword, context.downloadEnabled); });
     server.get(`${prefix}/Users/Public`, async (request) => { await libraryId(request); return []; });
-    server.route({ method: ["GET", "HEAD"], url: `${prefix}/Users/:userId/Images/Primary`, handler: async (request, reply) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); return sendUserImage(context, request, reply); } });
+    // 默认头像只有第 0 张，兼容标准的无索引及带索引图片路径。
+    for (const userImagePath of [`${prefix}/Users/:userId/Images/Primary`, `${prefix}/Users/:userId/Images/Primary/0`]) {
+      server.route({ method: ["GET", "HEAD"], url: userImagePath, handler: async (request, reply) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); return sendProtocolUserImage("emby", request, reply); } });
+    }
     server.get(`${prefix}/Users/:userId/Views`, async (request) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); return compatibility.listLibraries(context); });
     server.get(`${prefix}/UserViews`, async (request) => compatibility.listLibraries(await authenticated(request)));
     server.get(`${prefix}/Users/:userId/Items/Resume`, async (request) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); return compatibility.listResume(context, readQuery(request)); });
     server.get(`${prefix}/Users/:userId/Items/Root`, async (request) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); return buildRootItem(context); });
-    server.get(`${prefix}/Users/:userId/Items/Latest`, async (request) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); return (await compatibility.listItems(context, { ...readQuery(request), SortBy: "DateCreated", SortOrder: "Descending" })).Items; });
+    server.get(`${prefix}/Users/:userId/Items/Latest`, async (request) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); return (await compatibility.listItems(context, { ...readQuery(request), SortBy: "DateCreated", SortOrder: "Descending" }, { localOnly: true })).Items; });
     server.get(`${prefix}/Users/:userId/Items/:itemId`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireEmbyUser(context, params.userId); return compatibility.getItemDetail(context, params.itemId); });
     server.get(`${prefix}/Users/:userId/Items/:itemId/UserData`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireEmbyUser(context, params.userId); return compatibility.getUserData(context, params.itemId); });
     server.post(`${prefix}/Users/:userId/Items/:itemId/UserData`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireEmbyUser(context, params.userId); return compatibility.updateUserData(context, params.itemId, (request.body ?? {}) as Record<string, unknown>); });
-    server.get(`${prefix}/Users/:userId/Items`, async (request) => { const context = await authenticated(request); requireEmbyUser(context, String((request.params as { userId: string }).userId)); const query = readQuery(request); const favorite = String(query.IsFavorite ?? query.Filters ?? "").includes("true") || String(query.Filters ?? "").includes("IsFavorite"); const played = String(query.IsPlayed ?? query.Filters ?? "").includes("true") || String(query.Filters ?? "").includes("IsPlayed"); return favorite ? compatibility.listFavoriteItems(context, query) : played ? compatibility.listPlayedItems(context, query) : String(query.SortBy ?? "").includes("DatePlayed") ? compatibility.listHistory(context, query) : compatibility.listItems(context, query); });
+    server.get(`${prefix}/Users/:userId/Items`, async (request) => {
+      const context = await authenticated(request);
+      requireEmbyUser(context, String((request.params as { userId: string }).userId));
+      const query = readQuery(request);
+      const favorite = String(query.IsFavorite ?? query.Filters ?? "").includes("true") || String(query.Filters ?? "").includes("IsFavorite");
+      const played = String(query.IsPlayed ?? query.Filters ?? "").includes("true") || String(query.Filters ?? "").includes("IsPlayed");
+      const sortFields = String(query.SortBy ?? query.sortBy ?? "").split(",").map((field) => field.trim().toLowerCase());
+      // 关键变量：内容源排序不改成历史筛选；未知字段也不能因包含 DatePlayed 字样进入空历史列表。
+      const historyRequested = context.libraryKind !== "content_source_video" && sortFields[0] === "dateplayed";
+      return favorite ? compatibility.listFavoriteItems(context, query) : played ? compatibility.listPlayedItems(context, query)
+        : historyRequested ? compatibility.listHistory(context, query) : compatibility.listItems(context, query);
+    });
     server.get(`${prefix}/Items`, async (request) => compatibility.listItems(await authenticated(request), readQuery(request)));
     server.get(`${prefix}/Items/:itemId`, async (request) => compatibility.getItemDetail(await authenticated(request), String((request.params as { itemId: string }).itemId)));
     server.get(`${prefix}/Items/:itemId/Ancestors`, async (request) => compatibility.listItemAncestors(await authenticated(request), String((request.params as { itemId: string }).itemId)));
     server.get(`${prefix}/Items/:itemId/Similar`, async (request) => compatibility.listSimilar(await authenticated(request), String((request.params as { itemId: string }).itemId), readQuery(request)));
-    server.get(`${prefix}/Search/Hints`, async (request) => { const result = await compatibility.listItems(await authenticated(request), { ...readQuery(request), Limit: readQuery(request).Limit ?? 50 }); return { SearchHints: result.Items.map((item) => ({ ItemId: item.Id, Id: item.Id, Name: item.Name, Type: item.Type, ProductionYear: item.ProductionYear, PrimaryImageTag: (item.ImageTags as Record<string, unknown> | undefined)?.Primary })), TotalRecordCount: result.TotalRecordCount }; });
+    server.get(`${prefix}/Search/Hints`, async (request) => {
+      const context = await authenticated(request);
+      const query = readQuery(request);
+      // 关键变量：只为非空关键词开启实时源搜索，空词不触发分类查源。
+      const searchTerm = String(query.SearchTerm ?? query.searchTerm ?? "").trim();
+      const result = await compatibility.listItems(context, { ...query, SearchTerm: searchTerm, Limit: query.Limit ?? query.limit ?? 50 }, { localOnly: !searchTerm });
+      return { SearchHints: result.Items.map((item) => ({ ItemId: item.Id, Id: item.Id, Name: item.Name, Type: item.Type, ProductionYear: item.ProductionYear, PrimaryImageTag: (item.ImageTags as Record<string, unknown> | undefined)?.Primary })), TotalRecordCount: result.TotalRecordCount };
+    });
     server.get(`${prefix}/Items/Counts`, async (request) => compatibility.getItemCounts(await authenticated(request)));
     server.get(`${prefix}/Persons`, async (request) => compatibility.listPersons(await authenticated(request), readQuery(request)));
     server.get(`${prefix}/Persons/:name`, async (request) => { const context = await authenticated(request); const person = await compatibility.getPersonByName(context, String((request.params as { name: string }).name)); if (!person) throw new ApiError(404, "emby_person_not_found", "演员不存在"); return person; });
@@ -239,12 +256,20 @@ export async function registerEmbyRoutes(server: FastifyInstance, runtime: ApiRu
     server.get(`${prefix}/Shows/:seriesId/Seasons`, async (request) => compatibility.listSeasons(await authenticated(request), String((request.params as { seriesId: string }).seriesId)));
     server.get(`${prefix}/Shows/:seriesId/Episodes`, async (request) => compatibility.listEpisodes(await authenticated(request), String((request.params as { seriesId: string }).seriesId), readQuery(request)));
     server.get(`${prefix}/Shows/NextUp`, async (request) => compatibility.listNextUp(await authenticated(request), readQuery(request)));
-    server.route({ method: ["GET", "POST"], url: `${prefix}/Items/:itemId/PlaybackInfo`, handler: async (request) => { const context = await authenticated(request); return compatibility.buildPlaybackInfo(context, String((request.params as { itemId: string }).itemId), { mediaSourceId: readMediaSourceId(request) || undefined, playSessionId: String(readQuery(request).PlaySessionId ?? readQuery(request).playSessionId ?? "") || undefined, route: readPlaybackRoute(request) }); } });
+    server.route({ method: ["GET", "POST"], url: `${prefix}/Items/:itemId/PlaybackInfo`, handler: async (request) => { const context = await authenticated(request); const body = request.body && typeof request.body === "object" ? request.body as Record<string, unknown> : {}; return compatibility.buildPlaybackInfo(context, String((request.params as { itemId: string }).itemId), { mediaSourceId: readMediaSourceId(request) || undefined, playSessionId: String(readQuery(request).PlaySessionId ?? readQuery(request).playSessionId ?? body.CurrentPlaySessionId ?? "") || undefined, route: readPlaybackRoute(request), serverRoot: contentPlaybackServerRoot(request) }); } });
     server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Download`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId), true) });
     server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/File`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId), true) });
     server.route({ method: ["GET", "HEAD"], url: `${prefix}/Video/:itemId/stream`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId)) });
     server.route({ method: ["GET", "HEAD"], url: `${prefix}/Videos/:itemId/stream`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId)) });
     server.route({ method: ["GET", "HEAD"], url: `${prefix}/Videos/:itemId/stream.:container`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId)) });
+    server.route({ method: ["GET", "HEAD"], url: `${prefix}/Videos/:itemId/master.m3u8`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId)) });
+    server.route({ method: ["GET", "HEAD"], url: `${prefix}/Videos/:itemId/content/:ticket`, handler: async (request, reply) => {
+      const context = await authenticated(request);
+      if (!isContentSourceLibrary(context.libraryKind)) throw new ApiError(404, "content_resource_not_found", "播放资源不存在");
+      const params = request.params as { itemId: string; ticket: string };
+      const internalItemId = compatibility.toInternalItemId(params.itemId);
+      return sendContentResource(runtime, context, request, reply, internalItemId, compatibility.toProtocolItemId(internalItemId), params.ticket);
+    } });
     server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType`, handler: async (request, reply) => sendImage(compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
     server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType/:index`, handler: async (request, reply) => sendImage(compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
     server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType/:index/:tag/:format/:maxWidth/:maxHeight/:percentPlayed/:unplayedCount`, handler: async (request, reply) => sendImage(compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });

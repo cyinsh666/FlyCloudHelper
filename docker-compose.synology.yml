@@ -1,36 +1,23 @@
-# 群晖 Container Manager：把本文件作为项目的 docker-compose.yml 使用。
-# 使用 SQLite，首次启动自动初始化数据库和凭据主密钥，无需 .env 文件。
+# 群晖 Container Manager：新建项目并把本文件粘贴为 docker-compose.yml。
+# 默认使用 volume1；其他存储卷只需修改下面 volumes 的宿主机路径。
+name: flycloud-helper
+
 services:
   flycloud-helper:
     image: fbinba3955/flycloud-helper:latest
     container_name: flycloud-helper
     restart: unless-stopped
     ports:
+      # 端口被占用时，只修改冒号左侧的宿主机端口。
       - "9934:9934"
     environment:
       TZ: Asia/Shanghai
-      NODE_ENV: production
-      FLYCLOUDHELPER_API_HOST: 0.0.0.0
-      FLYCLOUDHELPER_API_PORT: "9934"
-      # 群晖常见用户 UID/GID；入口脚本会修复数据目录权限后启动服务。
+      # 群晖常见 UID/GID；按挂载目录实际所有者修改，入口脚本会修复目录权限。
       FLYCLOUDHELPER_PUID: "1026"
       FLYCLOUDHELPER_PGID: "100"
       FLYCLOUDHELPER_DATABASE_TYPE: sqlite
       FLYCLOUDHELPER_SQLITE_PATH: /data/database/flycloud-helper.db
-      # 自动生成的密钥随 /data 一起持久化，重建容器时继续使用同一密钥。
+      # 首次启动自动生成密钥，和数据库一起保存在 /data 中。
       FLYCLOUDHELPER_GENERATED_CREDENTIAL_KEY_PATH: /data/secrets/credential-master-key
-      FLYCLOUDHELPER_COOKIE_SECURE: "false"
-      FLYCLOUDHELPER_WORKER_ENABLED: "true"
     volumes:
-      # 如果使用其他存储卷，只需修改冒号左侧的群晖路径。
       - /volume1/docker/flycloud-helper/data:/data
-    healthcheck:
-      test:
-        - CMD
-        - node
-        - -e
-        - "fetch('http://127.0.0.1:9934/api/v1/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
-      interval: 30s
-      timeout: 5s
-      start_period: 60s
-      retries: 3

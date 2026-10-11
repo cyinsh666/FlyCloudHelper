@@ -1014,11 +1014,11 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
             <header className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
               <div className="flex min-w-0 items-center gap-3">
                 <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-border text-xs font-semibold" style={{ backgroundImage: "var(--gradient-surface)" }}>
-                  <ProviderSelectionIcon providerType={library.libraryKind === "cloud_aggregate_video" ? "aggregate" : library.providerType} />
+                  {library.libraryKind === "content_source_video" ? <Images className="size-5 text-muted-foreground" /> : <ProviderSelectionIcon providerType={library.libraryKind === "cloud_aggregate_video" ? "aggregate" : library.providerType} />}
                 </span>
                 <div className="min-w-0">
                   <h2 className="truncate text-sm font-semibold">{library.displayName}</h2>
-                  <p className="truncate text-[11px] text-muted-foreground">{library.libraryKind === "cloud_aggregate_video" ? `云聚合视频库 · ${library.sourceCount} 个来源` : `${library.sourceServiceName} · ${library.providerType}`}{admin ? ` · ${library.ownerUsername}` : ""}</p>
+                  <p className="truncate text-[11px] text-muted-foreground">{library.libraryKind === "content_source_video" ? `在线内容源 · ${library.sourceServiceName}` : library.libraryKind === "cloud_aggregate_video" ? `云聚合视频库 · ${library.sourceCount} 个来源` : `${library.sourceServiceName} · ${library.providerType}`}{admin ? ` · ${library.ownerUsername}` : ""}</p>
                 </div>
               </div>
               <span className={`mt-1 size-2.5 rounded-full ${library.status === "active" && library.sourceConnectionStatus === "valid" ? "bg-success" : "bg-warning"}`} title={library.status === "active" ? "媒体库已启用" : "媒体库已停用"} />

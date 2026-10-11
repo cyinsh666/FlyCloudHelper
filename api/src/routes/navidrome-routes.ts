@@ -6,7 +6,9 @@ import fs from "node:fs";
 import path from "node:path";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { MediaItemRecord } from "../domain.js";
+import { createUsernameLookup } from "../auth.js";
 import { ApiError } from "../errors.js";
+import { sendProtocolUserImage } from "../media/protocol-user-image.js";
 import { providerStream } from "../providers/network.js";
 import type { ApiRuntime } from "../runtime.js";
 import { buildUpstreamHeaders, copyMediaResponseHeaders, resolveRelayAccess, type RelayLibraryRow } from "./media-stream-routes.js";
@@ -946,8 +948,25 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
       const method = requestedMethod.replace(/\.(?:view|json)$/iu, "");
       // 关键变量：部分客户端使用 .json 后缀代替 f=json，服务端应返回同样的 JSON 信封。
       if (/\.json$/iu.test(requestedMethod) && query.f === undefined) query.f = "json";
+      // getAvatar 成功直接返回图片；失败按标准返回 XML，不受 f 或 .json 后缀影响。
+      if (method === "getAvatar") query.f = "xml";
       try {
         const context = await authenticateRequest(runtime, request.params.pathSuffix, query);
+        if (method === "getAvatar") {
+          // 关键变量：username 是目标头像账号，u 仍用于本次请求认证。
+          const username = readQueryString(query.username);
+          if (!username) {
+            return sendSubsonicResponse(reply, query, {
+              error: { code: 10, message: "缺少必填参数 username" },
+            }, "failed");
+          }
+          const account = await runtime.database.query("library_access_accounts")
+            .select("id")
+            .where({ library_id: context.libraryId, username_lookup: createUsernameLookup(username), status: "active" })
+            .first();
+          if (!account) throw new ApiError(404, "navidrome_avatar_user_not_found", "头像账号不存在");
+          return sendProtocolUserImage("navidrome", request, reply);
+        }
         if (method === "stream" || method === "download") {
           const itemId = readQueryString(query.id);
           if (!itemId) throw new ApiError(422, "navidrome_song_id_required", "缺少歌曲 ID");

@@ -16,6 +16,7 @@ import type { EmbyAccessService } from "./emby-access.js";
 import type { MediaProbeWorker } from "./media-probe-worker.js";
 import type { ScanScheduleStore, ScanScheduleWorker } from "./scan-schedule-service.js";
 import type { TelegramNotificationService } from "./telegram-notification-service.js";
+import type { ContentSourceManager } from "./content-sources/manager.js";
 
 /** 后台路由共享的已初始化运行时依赖。 */
 export interface ApiRuntime {
@@ -32,6 +33,8 @@ export interface ApiRuntime {
   scanSchedules: ScanScheduleStore;
   scanScheduleWorker: ScanScheduleWorker;
   plugins: MetadataPluginManager;
+  /** 独立内容源插件、配置实例、在线目录与即时播放取址。 */
+  contentSources: ContentSourceManager;
   aiModels: AiModelManager;
   failureReports: ScanFailureReportService;
   publicAccess: PublicAccessService;

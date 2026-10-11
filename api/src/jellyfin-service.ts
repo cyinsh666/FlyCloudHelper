@@ -8,8 +8,12 @@ import { JellyfinCatalogSort, readJellyfinSortQuery, type JellyfinSortEntry, typ
 import { ApiError } from "./errors.js";
 import type { ApiRuntime } from "./runtime.js";
 import { hydrateRealtimeVideoDetails } from "./media/realtime-video-details.js";
+import { getProtocolUserImageTag } from "./media/protocol-user-image.js";
 import { prepareNextEpisodeResume } from "./media/episode-resume.js";
+import { contentPlaybackServerRoot, isContentSourceLibrary, mapContentMediaSource, prioritizeContentSources, readContentRunTimeTicks } from "./content-sources/playback.js";
 import { readProtocolItemIdentityFilter, matchesProtocolItemIdentity, resolveProtocolItemIdentityIds } from "./media/protocol-item-identity-filter.js";
+import type { ContentSourceCategoryDefinition } from "./content-sources/types.js";
+import { matchesJellyfinSourceCategory, readJellyfinSourceCategoryId, readJellyfinSourceGenres } from "./jellyfin-source-category.js";
 import {
   parseCompletedMediaProbeResult,
   readJellyfinRunTimeTicks,
@@ -24,6 +28,8 @@ export interface JellyfinLibraryContext {
   libraryKind: string;
   /** 是否按节目地区拆分 Jellyfin 虚拟媒体库。 */
   regionLibrariesEnabled: boolean;
+  /** 在线库当前选中分类及历史未分类快照；网盘库不读取此配置。 */
+  sourceCategoryDefinitions?: ContentSourceCategoryDefinition[];
 }
 
 export interface JellyfinContext extends JellyfinLibraryContext {
@@ -32,6 +38,8 @@ export interface JellyfinContext extends JellyfinLibraryContext {
   accountHasPassword: boolean;
   credentialRevision: number;
   accessToken: string;
+  /** 当前请求实际使用的协议根地址，仅供在线 Http 媒体源返回服务内 Path。 */
+  contentServerRoot?: string;
   /** 当前媒体库是否允许 Jellyfin 客户端下载原始影片文件。 */
   downloadEnabled: boolean;
 }
@@ -61,9 +69,11 @@ interface JellyfinLibraryDefinition {
   /** 返回给 Jellyfin 客户端的标准 UUID。 */
   id: string;
   name: string;
-  collectionType: JellyfinCollectionType;
-  itemType: "video.movie" | "video.series";
+  collectionType?: JellyfinCollectionType;
+  itemType?: "video.movie" | "video.series";
   regionGroup?: VideoRegionGroup;
+  /** 源分类入口不依赖条目 Movie/Series 类型；null 仅为历史未分类。 */
+  sourceCategoryId?: string | null;
 }
 
 interface JellyfinGenreSummary {
@@ -333,6 +343,8 @@ export class JellyfinCompatibilityService {
       libraryId,
       libraryKind: String(service.library_kind ?? "single_source"),
       regionLibrariesEnabled: Number(service.jellyfin_region_libraries_enabled) === 1,
+      sourceCategoryDefinitions: isContentSourceLibrary(service.library_kind)
+        ? await this.runtime.contentSources.listLibraryCategoryDefinitions(libraryId, String(service.user_id)) : undefined,
     };
   }
 
@@ -413,9 +425,12 @@ export class JellyfinCompatibilityService {
       serviceId: String(row.service_id), ownerUserId: String(row.user_id), libraryId,
       libraryKind: String(row.library_kind ?? "single_source"),
       regionLibrariesEnabled: Number(row.jellyfin_region_libraries_enabled) === 1,
+      sourceCategoryDefinitions: isContentSourceLibrary(row.library_kind)
+        ? await this.runtime.contentSources.listLibraryCategoryDefinitions(libraryId, String(row.user_id)) : undefined,
       accountId: String(row.account_id), accountUsername: String(row.username),
       accountHasPassword: Number(row.password_required ?? 1) !== 0,
       credentialRevision: Number(row.account_revision), accessToken: token,
+      contentServerRoot: isContentSourceLibrary(row.library_kind) ? contentPlaybackServerRoot(request) : undefined,
       downloadEnabled: Number(row.jellyfin_download_enabled) === 1,
     };
   }
@@ -438,8 +453,8 @@ export class JellyfinCompatibilityService {
     hasPassword = true,
     downloadEnabled = true,
   ) {
-    // 关键变量：Flymby 会依据 PrimaryImageTag 请求用户头像，使用账号和服务生成稳定缓存标记。
-    const primaryImageTag = createJellyfinImageTag(`${serviceId}:${accountId}:${username}`);
+    // 关键变量：默认头像使用 Jellyfin 图标的内容版本，替换图标时客户端更新图片缓存。
+    const primaryImageTag = getProtocolUserImageTag("jellyfin");
     return {
       Name: username, ServerId: serviceId, Id: accountId,
       PrimaryImageTag: primaryImageTag,
@@ -452,8 +467,26 @@ export class JellyfinCompatibilityService {
     };
   }
 
-  /** 根据媒体库开关返回电影和节目虚拟媒体库定义。 */
+  /** 在线库按实际源分类输出入口，网盘库继续使用电影和节目定义。 */
   private getLibraryDefinitions(context: JellyfinLibraryContext): JellyfinLibraryDefinition[] {
+    if (isContentSourceLibrary(context.libraryKind)) {
+      return (context.sourceCategoryDefinitions ?? []).map((category) => this.sourceCategoryLibrary(context, category));
+    }
+    return this.getLegacyLibraryDefinitions(context);
+  }
+
+  /** 源分类身份只由库与分类 ID 生成，改名或重新选择不会改变客户端 UUID。 */
+  private sourceCategoryLibrary(context: JellyfinLibraryContext, category: ContentSourceCategoryDefinition): JellyfinLibraryDefinition {
+    const identity = category.categoryId === null ? "unknown" : `id:${encodeURIComponent(category.categoryId)}`;
+    const internalId = `${context.libraryId}:source-category:${identity}`;
+    return {
+      internalId, id: createProtocolUuid("content_source_category", internalId), name: category.name,
+      sourceCategoryId: category.categoryId, collectionType: category.collectionType,
+    };
+  }
+
+  /** 保留既有网盘库定义，同时用于在线客户端缓存旧电影/节目入口时的列表兼容。 */
+  private getLegacyLibraryDefinitions(context: JellyfinLibraryContext): JellyfinLibraryDefinition[] {
     const movieInternalId = `${context.libraryId}:movies`;
     const movieLibrary: JellyfinLibraryDefinition = {
       internalId: movieInternalId,
@@ -495,7 +528,12 @@ export class JellyfinCompatibilityService {
 
   /** 根据 Jellyfin 虚拟媒体库 ID 读取媒体类型约束。 */
   private findLibraryDefinition(context: JellyfinLibraryContext, libraryId: string): JellyfinLibraryDefinition | undefined {
-    return this.getLibraryDefinitions(context).find((library) => library.id === libraryId || library.internalId === libraryId);
+    const definitions = this.getLibraryDefinitions(context);
+    const current = definitions.find((library) => library.id === libraryId || library.internalId === libraryId);
+    if (current || !isContentSourceLibrary(context.libraryKind)) return current;
+    // 关键变量：旧入口只兼容缓存请求，不再出现在在线库 Views 列表中。
+    return [...this.getLegacyLibraryDefinitions(context), ...this.getLegacyLibraryDefinitions({ ...context, regionLibrariesEnabled: false })]
+      .find((library) => library.id === libraryId || library.internalId === libraryId);
   }
 
   /** 解析云助手生成的虚拟季 ID，供季集查询和图片路由共用。 */
@@ -567,12 +605,94 @@ export class JellyfinCompatibilityService {
     return { Items: items, TotalRecordCount: entries.length, StartIndex: page.StartIndex };
   }
 
-  /** 获取媒体条目在 Jellyfin 中所属的电影或节目媒体库。 */
+  /** 获取条目所属源分类；普通网盘条目仍归电影或节目媒体库。 */
   private getItemLibraryDefinition(context: JellyfinContext, item: MediaItemRecord): JellyfinLibraryDefinition {
+    if (isContentSourceLibrary(context.libraryKind)) {
+      const categoryId = readJellyfinSourceCategoryId(item.metadata);
+      // 关键变量：取消分类只隐藏入口，已有条目仍使用原类别身份，不能混入未分类。
+      const source = item.metadata.contentSource as Record<string, unknown> | undefined;
+      return this.getLibraryDefinitions(context).find((library) => library.sourceCategoryId === categoryId)
+        ?? this.sourceCategoryLibrary(context, {
+          categoryId, name: categoryId === null ? "未分类" : String(source?.categoryName ?? `分类 ${categoryId}`),
+          parentId: source?.parentCategoryId === undefined || source.parentCategoryId === null ? null : String(source.parentCategoryId),
+        });
+    }
     const collectionType: JellyfinCollectionType = item.itemType === "video.movie" ? "movies" : "tvshows";
     return this.getLibraryDefinitions(context).find((library) => library.collectionType === collectionType
       && (collectionType === "movies" || !context.regionLibrariesEnabled || library.regionGroup === item.regionGroup))
       ?? this.getLibraryDefinitions(context)[0]!;
+  }
+
+  /** 在线分类只约束源身份；普通电影/节目入口继续与请求类型取交集。 */
+  private libraryItemTypes(library: JellyfinLibraryDefinition | undefined, requestedTypes: string[], defaults: string[]): string[] {
+    if (!library?.itemType) return requestedTypes.length > 0 ? requestedTypes : defaults;
+    return requestedTypes.length === 0 || requestedTypes.includes(library.itemType) ? [library.itemType] : [];
+  }
+
+  /** 在线分类的统计和封面使用与 Items 相同的筛选，在分页前限定源分类。 */
+  private async readLibraryCatalog(context: JellyfinLibraryContext, library: JellyfinLibraryDefinition): Promise<{ total: number; items: MediaItemRecord[] }> {
+    if (!isContentSourceLibrary(context.libraryKind)) {
+      return this.runtime.repository.listCatalogItems({
+        userId: context.ownerUserId, libraryId: context.libraryId, mediaType: "video", itemType: library.itemType,
+        regionGroup: library.regionGroup, sort: "updated_desc", limit: 60, offset: 0, includeFileCounts: false,
+      });
+    }
+    const entries = await this.catalogSort.load({ ...context, accountId: "", accessToken: "" }, {
+      itemTypes: library.itemType ? [library.itemType] : undefined, topLevel: true,
+      regionGroup: library.regionGroup, sourceCategoryId: library.sourceCategoryId,
+    }, { fields: [{ name: "datemodified", descending: true }], randomSeed: "" });
+    const items = await this.runtime.repository.listCatalogItemsByIds(entries.slice(0, 60).map((entry) => entry.id), context.ownerUserId);
+    const byId = new Map(items.map((item) => [item.id, item]));
+    return { total: entries.length, items: entries.slice(0, 60).map((entry) => byId.get(entry.id)).filter((item): item is MediaItemRecord => item !== undefined) };
+  }
+
+  /** 将在线列表的 ParentId 还原为源分类或真实节目/季范围，不把未知入口当作全库。 */
+  private async readOnlineParentFilters(context: JellyfinContext, query: Record<string, unknown>): Promise<JellyfinSortFilters> {
+    if (!isContentSourceLibrary(context.libraryKind)) return {};
+    const parentId = String(this.readQueryValue(query, "ParentId") ?? "").trim();
+    if (!parentId || parentId === context.libraryId) return {};
+    const library = this.findLibraryDefinition(context, parentId);
+    if (library) return {
+      sourceCategoryId: library.sourceCategoryId, regionGroup: library.regionGroup,
+      itemTypes: library.itemType === "video.movie" ? ["video.movie"]
+        : library.itemType === "video.series" ? ["video.series", "video.episode"] : undefined,
+    };
+    const season = this.parseSeasonReference(parentId);
+    const internalParentId = season?.seriesId ?? decodeProtocolItemId(parentId);
+    const parent = await this.runtime.repository.getCatalogItem(internalParentId, context.ownerUserId);
+    if (parent.libraryId !== context.libraryId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
+    return { parentId: parent.id, seasonNumber: season?.seasonNumber };
+  }
+
+  /** 在线播放记录先限定真实父节目，再按分类和季过滤；网盘查询保持原有逻辑。 */
+  private applyOnlineProgressParent(query: Knex.QueryBuilder, context: JellyfinContext, filters: JellyfinSortFilters): void {
+    if (!isContentSourceLibrary(context.libraryKind)) return;
+    query.where({ "m.user_id": context.ownerUserId, "m.library_id": context.libraryId }).whereNull("m.service_id")
+      .select("m.metadata_json as source_metadata_json", "m.item_type as source_item_type");
+    if (filters.parentId) query.whereExists(this.runtime.database.query("media_relations as relation").select("relation.id")
+      .whereRaw("?? = ??", ["relation.child_item_id", "m.id"])
+      .where({ "relation.parent_item_id": filters.parentId, "relation.user_id": context.ownerUserId, "relation.library_id": context.libraryId }));
+  }
+
+  /** 源分类过滤在播放记录截取和分页前完成，未分类不会混入任何已有分类。 */
+  private matchesOnlineProgressScope(row: Record<string, unknown>, filters: JellyfinSortFilters): boolean {
+    const metadata = parseJsonObject(row.source_metadata_json);
+    if (!matchesJellyfinSourceCategory(metadata, filters.sourceCategoryId)) return false;
+    if (filters.itemTypes?.length && !filters.itemTypes.includes(String(row.source_item_type))) return false;
+    return filters.seasonNumber === undefined || readVideoSeason(metadata.seasonNumber) === filters.seasonNumber;
+  }
+
+  /** 人物列表或人物收藏也限定为当前在线分类内真实关联的顶层作品。 */
+  private async readOnlinePersonScope(context: JellyfinContext, query: Record<string, unknown>): Promise<Set<string> | undefined> {
+    if (!isContentSourceLibrary(context.libraryKind)) return undefined;
+    const parentId = String(this.readQueryValue(query, "ParentId") ?? "").trim();
+    if (!parentId || parentId === context.libraryId) return undefined;
+    const filters = await this.readOnlineParentFilters(context, query);
+    if (filters.parentId) return new Set([filters.parentId]);
+    const entries = await this.catalogSort.load(context, {
+      ...filters, itemTypes: filters.itemTypes?.filter((type) => type !== "video.episode"), topLevel: true,
+    }, { fields: [{ name: "sortname", descending: false }], randomSeed: "" });
+    return new Set(entries.map((entry) => entry.id));
   }
 
   /** 将分类名称编码为标准且稳定的 Jellyfin 分类 UUID。 */
@@ -651,8 +771,12 @@ export class JellyfinCompatibilityService {
     const itemLibrary = this.getItemLibraryDefinition(context, item);
     const protocolItemId = encodeProtocolItemId(item.id);
     const protocolParentItemId = parent ? encodeProtocolItemId(parent.id) : undefined;
+    // 关键变量：在线库只读取独立播放来源，不能把 URL 伪装成网盘文件摘要。
+    const onlineLibrary = isContentSourceLibrary(context.libraryKind);
     let itemFiles: JellyfinFileSummary[];
-    if (mapping) {
+    if (onlineLibrary) {
+      itemFiles = [];
+    } else if (mapping) {
       itemFiles = mapping.filesByItemId.get(item.id) ?? [];
     } else {
       const linkedFiles = await this.runtime.repository.listItemFiles(item.id, context.ownerUserId);
@@ -668,6 +792,10 @@ export class JellyfinCompatibilityService {
         }));
     }
     const recentSourceId = String(progress?.media_source_id ?? "");
+    const onlineSources = onlineLibrary
+      ? prioritizeContentSources(await this.runtime.contentSources.listPlaybackSources(item.id, context.ownerUserId), recentSourceId)
+      : [];
+    // 详情沿用标准本地媒体入口，不读取源站地址；真正播放时执行该 Jellyfin 库的三模式策略。
     if (recentSourceId) {
       // 关键变量：账号最近成功使用的版本优先，其余版本继续保持来源稳定顺序。
       itemFiles = [...itemFiles].sort((left, right) =>
@@ -676,7 +804,7 @@ export class JellyfinCompatibilityService {
     // 关键变量：规格分析开关只控制扫描后是否自动分析；Jellyfin 只判断现有数据是否完整。
     const mediaSpecsReady = itemFiles.length > 0
       && itemFiles.every((file) => file.mediaProbe !== null);
-    const runTimeTicks = mediaSpecsReady
+    const runTimeTicks = onlineLibrary ? readContentRunTimeTicks(onlineSources) : mediaSpecsReady
       ? readJellyfinRunTimeTicks(itemFiles.map((file) => file.mediaProbe))
       : 0;
     const primaryProbe = mediaSpecsReady ? itemFiles[0]?.mediaProbe ?? null : null;
@@ -710,7 +838,7 @@ export class JellyfinCompatibilityService {
       OfficialRating: metadata.officialRating ? String(metadata.officialRating) : undefined,
       CriticRating: metadata.criticRating === undefined || metadata.criticRating === null || metadata.criticRating === ""
         ? undefined : Number.isFinite(Number(metadata.criticRating)) ? Number(metadata.criticRating) : undefined,
-      Type: type, MediaType: "Video", IsFolder: type === "Series", LocationType: "FileSystem",
+      Type: type, MediaType: "Video", IsFolder: type === "Series", LocationType: onlineLibrary ? "Remote" : "FileSystem",
       CanDownload: context.downloadEnabled && type !== "Series" && itemFiles.length > 0,
       Genres: genreNames,
       GenreItems: genreNames.map((name) => ({ Name: name, Id: this.encodeGenreId(name) })),
@@ -732,10 +860,10 @@ export class JellyfinCompatibilityService {
       PrimaryImageItemId: primaryImageItemId ? encodeProtocolItemId(primaryImageItemId) : undefined,
       BackdropImageTags: item.backdropUrl ? [String(Date.parse(item.updatedAt) || 1)] : [],
       RunTimeTicks: runTimeTicks || undefined,
-      Container: primaryProbe?.container || undefined,
+      Container: onlineSources[0]?.container ?? primaryProbe?.container ?? undefined,
       Bitrate: primaryProbe?.bitRate || undefined,
       MediaStreams: primaryProbe?.mediaStreams,
-      MediaSources: itemFiles.map((file, index) => mapCatalogMediaSource(
+      MediaSources: onlineLibrary ? onlineSources.map((source) => mapContentMediaSource(source, protocolItemId, context.accessToken, "", context.contentServerRoot)) : itemFiles.map((file, index) => mapCatalogMediaSource(
         file,
         mediaSpecsReady,
         context.libraryKind === "cloud_aggregate_video" || index > 0 ? file.fileId : protocolItemId,
@@ -759,7 +887,7 @@ export class JellyfinCompatibilityService {
     };
   }
 
-  /** 映射一个电影或节目虚拟媒体库。 */
+  /** 将源分类或原电影/节目入口映射为标准 CollectionFolder。 */
   public mapLibrary(context: JellyfinContext, library: JellyfinLibraryDefinition, itemCount = 0, coverItem?: MediaItemRecord) {
     const primaryImageTag = coverItem?.posterUrl ? String(Date.parse(coverItem.updatedAt) || 1) : "";
     const backdropImageTag = coverItem?.backdropUrl ? String(Date.parse(coverItem.updatedAt) || 1) : "";
@@ -776,13 +904,21 @@ export class JellyfinCompatibilityService {
     };
   }
 
-  /** 返回指定媒体条目所属的电影或节目媒体库 DTO。 */
+  /** 返回指定条目所属的源分类或原电影/节目媒体库 DTO。 */
   public mapItemLibrary(context: JellyfinContext, item: MediaItemRecord) {
     return this.mapLibrary(context, this.getItemLibraryDefinition(context, item), 0, item);
   }
 
   /** 按协议条目 ID 读取当前 Jellyfin 服务的媒体详情。 */
   public async getItemDetail(context: JellyfinContext, protocolItemId: string): Promise<Record<string, unknown>> {
+    if (isContentSourceLibrary(context.libraryKind)) {
+      const library = this.findLibraryDefinition(context, protocolItemId);
+      if (library) {
+        const catalog = await this.readLibraryCatalog(context, library);
+        const cover = catalog.items.find((item) => Boolean(item.posterUrl)) ?? catalog.items.find((item) => Boolean(item.backdropUrl));
+        return this.mapLibrary(context, library, catalog.total, cover);
+      }
+    }
     const sourceItem = await this.runtime.repository.getCatalogItem(
       this.toInternalItemId(protocolItemId),
       context.ownerUserId,
@@ -799,6 +935,7 @@ export class JellyfinCompatibilityService {
 
   /** 返回条目的 Jellyfin 面包屑。 */
   public async listItemAncestors(context: JellyfinContext, protocolItemId: string): Promise<Array<Record<string, unknown>>> {
+    if (isContentSourceLibrary(context.libraryKind) && this.findLibraryDefinition(context, protocolItemId)) return [];
     const item = await this.runtime.repository.getCatalogItem(this.toInternalItemId(protocolItemId), context.ownerUserId);
     if (item.libraryId !== context.libraryId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
     if (item.itemType !== "video.episode") return [this.mapItemLibrary(context, item)];
@@ -808,14 +945,10 @@ export class JellyfinCompatibilityService {
     return [this.mapItemLibrary(context, parent), await this.mapItem(context, parent)];
   }
 
-  /** 返回当前服务的电影媒体库，以及按开关决定是否拆分地区的节目媒体库。 */
+  /** 返回在线源分类媒体库；普通网盘继续返回电影和可选地区节目媒体库。 */
   public async listLibraries(context: JellyfinContext) {
     const libraries = this.getLibraryDefinitions(context);
-    const counts = await Promise.all(libraries.map((library) => this.runtime.repository.listCatalogItems({
-      userId: context.ownerUserId, libraryId: context.libraryId, mediaType: "video", itemType: library.itemType,
-      regionGroup: library.regionGroup,
-      sort: "updated_desc", limit: 60, offset: 0, includeFileCounts: false,
-    })));
+    const counts = await Promise.all(libraries.map((library) => this.readLibraryCatalog(context, library)));
     const items = libraries.map((library, index) => {
       const result = counts[index];
       // 关键变量：虚拟媒体库使用最近更新且真实拥有海报的条目作为封面，不生成无效的虚拟图片地址。
@@ -826,8 +959,8 @@ export class JellyfinCompatibilityService {
     return { Items: items, TotalRecordCount: items.length, StartIndex: 0 };
   }
 
-  /** 使用当前服务目录和账号状态处理 Jellyfin 条目排序。 */
-  public async listItems(context: JellyfinContext, query: Record<string, unknown>) {
+  /** 源分类浏览和普通搜索按需查源；账号筛选、复杂条件与最新内容仍使用本地目录。 */
+  public async listItems(context: JellyfinContext, query: Record<string, unknown>, options: { localOnly?: boolean } = {}) {
     if (this.queryIncludesFilter(query, "IsFavorite", "IsFavorite")) return this.listFavoriteItems(context, query);
     if (this.queryIncludesFilter(query, "IsPlayed", "IsPlayed")) return this.listPlayedItems(context, query);
     const identityFilter = readProtocolItemIdentityFilter(query, decodeProtocolItemId);
@@ -854,12 +987,35 @@ export class JellyfinCompatibilityService {
     }
     const requestedTypes = include.map((type) => type === "Movie" ? "video.movie" : type === "Series" ? "video.series" : type === "Episode" ? "video.episode" : "").filter(Boolean);
     if (include.length > 0 && requestedTypes.length === 0) return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
-    // 关键变量：虚拟媒体库与请求类型取交集，地区分组不会因排序改动而失效。
-    const effectiveTypes = virtualLibrary
-      ? requestedTypes.length === 0 || requestedTypes.includes(virtualLibrary.itemType) ? [virtualLibrary.itemType] : []
-      : requestedTypes;
-    if (virtualLibrary && effectiveTypes.length === 0) return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
+    // 关键变量：源分类允许其实际 Movie/Series/Episode 类型，不能按入口声明的 CollectionType 排除单集。
+    const effectiveTypes = this.libraryItemTypes(virtualLibrary, requestedTypes, []);
+    if (virtualLibrary?.itemType && effectiveTypes.length === 0) return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
     const personIds = String(this.readQueryValue(query, "PersonIds") ?? "").split(",").map((id) => id.trim().toLowerCase()).filter(Boolean);
+    const genres = await this.readGenreNames(context, query);
+    const search = String(this.readQueryValue(query, "SearchTerm") ?? "");
+    // 关键变量：源搜索以整部影片/节目为单位，混入 Episode/Person 不排除允许的 Movie/Series。
+    const sourceSearchTypes = effectiveTypes.filter((type) => type === "video.movie" || type === "video.series");
+    // 关键变量：搜索只接受全库、精确源分类或旧单一类型入口，不能忽略季、地区及未分类范围。
+    const sourceSearchScope = !parentId || parentId === context.libraryId || typeof virtualLibrary?.sourceCategoryId === "string"
+      || Boolean(virtualLibrary?.itemType && !virtualLibrary.regionGroup);
+    if (!options.localOnly && isContentSourceLibrary(context.libraryKind) && search.trim() && sourceSearchScope
+      && identityFilter.itemIds === undefined && identityFilter.providerIds === undefined
+      && personIds.length === 0 && genres.length === 0
+      && (effectiveTypes.length === 0 || sourceSearchTypes.length > 0)
+      && !this.hasLocalContentFilters(query)) {
+      const sourcePage = await this.listContentSourcePage(context, query,
+        typeof virtualLibrary?.sourceCategoryId === "string" ? virtualLibrary.sourceCategoryId : undefined, sourceSearchTypes, search.trim());
+      if (sourcePage) return sourcePage;
+    }
+    if (!options.localOnly && isContentSourceLibrary(context.libraryKind)
+      && typeof virtualLibrary?.sourceCategoryId === "string"
+      && identityFilter.itemIds === undefined && identityFilter.providerIds === undefined
+      && personIds.length === 0 && genres.length === 0 && !search.trim()
+      && effectiveTypes.every((type) => type === "video.movie" || type === "video.series")
+      && !this.hasLocalContentFilters(query)) {
+      const dynamicPage = await this.listContentSourcePage(context, query, virtualLibrary.sourceCategoryId, effectiveTypes);
+      if (dynamicPage) return dynamicPage;
+    }
     let itemIds = identityIds;
     if (personIds.length > 0) {
       const cache = await this.loadPersonCache(context);
@@ -868,9 +1024,51 @@ export class JellyfinCompatibilityService {
     }
     return this.listSortedCatalogPage(context, query, {
       itemTypes: effectiveTypes, itemIds, topLevel: identityFilter.itemIds === undefined,
-      regionGroup: virtualLibrary?.regionGroup, genres: await this.readGenreNames(context, query),
-      search: String(this.readQueryValue(query, "SearchTerm") ?? ""),
+      regionGroup: virtualLibrary?.regionGroup, genres,
+      sourceCategoryId: virtualLibrary?.sourceCategoryId,
+      search,
     });
+  }
+
+  /** 这些筛选由现有本地目录处理，不能查完源页后忽略条件或再截取一页。 */
+  private hasLocalContentFilters(query: Record<string, unknown>): boolean {
+    const keys = ["Filters", "IsFavorite", "IsPlayed", "IsUnplayed", "IsResumable", "GenreIds", "Genres", "Years", "Tags",
+      "Studios", "StudioIds", "Person", "PersonTypes", "MinCommunityRating", "MaxOfficialRating", "MinOfficialRating",
+      "HasOverview", "HasImdbId", "HasTmdbId", "HasTvdbId", "IsMissing", "IsUnaired", "IsFolder"];
+    return keys.some((key) => {
+      const value = this.readQueryValue(query, key);
+      return value !== undefined && value !== null && String(value).trim() !== "";
+    });
+  }
+
+  /** 源搜索与分类窗口都由后端筛选分页，这里只按稳定 ID 装配标准 DTO。 */
+  private async listContentSourcePage(context: JellyfinContext, query: Record<string, unknown>, categoryId: string | undefined, itemTypes: string[], searchTerm?: string) {
+    const requestedStart = Number(this.readQueryValue(query, "StartIndex") ?? 0);
+    const requestedLimit = Number(this.readQueryValue(query, "Limit") ?? 100);
+    const startIndex = Number.isFinite(requestedStart) ? Math.max(0, Math.floor(requestedStart)) : 0;
+    const limit = Number.isFinite(requestedLimit) ? Math.min(500, Math.max(1, Math.floor(requestedLimit))) : 100;
+    // 关键变量：搜索与分类共用源窗口参数，后端完成类型筛选后一次性分页。
+    const sourceOptions = { startIndex, limit, itemTypes: itemTypes as Array<"video.movie" | "video.series"> };
+    const page = searchTerm
+      ? await this.runtime.contentSources.searchLibrary(context.libraryId, context.ownerUserId, { ...sourceOptions, searchTerm, categoryId })
+      : categoryId !== undefined
+        ? await this.runtime.contentSources.browseLibraryCategory(context.libraryId, context.ownerUserId, { ...sourceOptions, categoryId })
+        : null;
+    // 关键变量：未支持实时搜索或源停用才回本地目录，网络、解析与权限错误继续原样抛出。
+    if (!page) return null;
+    // 关键变量：原序 ID 包含稳定顶层条目；不能本地再次排序或分页，否则下一页跳项。
+    const entries = page.itemIds.map((id): JellyfinSortEntry => ({ id, itemType: "", values: {} }));
+    const items = await this.mapSortedMediaEntries(context, entries);
+    if (items.length !== page.itemIds.length) throw new ApiError(409, "content_category_changed", "内容源目录已变化，请重新加载当前页");
+    // 临时分页诊断：只记录安全的数量与分类身份，用户确认修复后清理此日志。
+    this.runtime.logBusinessEvent("info", {
+      日志关键字: "codex-content-source-browse", 协议: "Jellyfin", 操作: searchTerm ? "实时搜索" : "分类浏览",
+      媒体库ID: context.libraryId, 源分类ID: categoryId ?? null,
+      请求起点: startIndex, 请求条数: limit,
+      排序字段: String(this.readQueryValue(query, "SortBy") ?? ""), 排序方向: String(this.readQueryValue(query, "SortOrder") ?? ""),
+      返回条数: items.length, 当前目录总数: page.totalRecordCount, 是否还有下一页: startIndex + limit < page.totalRecordCount,
+    });
+    return { Items: items, TotalRecordCount: page.totalRecordCount, StartIndex: page.startIndex };
   }
 
   /** 按当前 Jellyfin 账号返回收藏，保留单服务的 Person 虚拟收藏。 */
@@ -892,7 +1090,7 @@ export class JellyfinCompatibilityService {
       : include.map((type) => type === "Movie" ? "video.movie" : type === "Series" ? "video.series" : type === "Episode" ? "video.episode" : "").filter(Boolean);
     const parentId = String(this.readQueryValue(query, "ParentId") ?? "");
     const library = this.findLibraryDefinition(context, parentId);
-    if (library) types = types.filter((type) => library.itemType === "video.movie" ? type === "video.movie" : type !== "video.movie");
+    if (library?.itemType) types = types.filter((type) => library.itemType === "video.movie" ? type === "video.movie" : type !== "video.movie");
     const season = this.parseSeasonReference(parentId);
     const internalParentId = !parentId || parentId === context.libraryId || library ? undefined
       : season?.seriesId ?? decodeProtocolItemId(parentId);
@@ -904,15 +1102,19 @@ export class JellyfinCompatibilityService {
     }
     const entries = types.length === 0 ? [] : await this.catalogSort.load(context, {
       itemTypes: types, itemIds: identityIds, favorite, played: !favorite, regionGroup: library?.regionGroup,
+      sourceCategoryId: library?.sourceCategoryId,
       parentId: internalParentId, seasonNumber: season?.seasonNumber,
       search, genres: await this.readGenreNames(context, query),
     }, plan);
     const peopleById = new Map<string, Record<string, unknown>>();
     if (favorite && (include.length === 0 || include.includes("Person"))) {
+      const personScope = await this.readOnlinePersonScope(context, query);
+      const personCache = personScope ? await this.loadPersonCache(context) : undefined;
       const rows = await this.runtime.database.query("library_jellyfin_virtual_preferences").select("protocol_item_id", "starred_at")
         .where({ library_id: context.libraryId, account_id: context.accountId, item_type: "Person" });
       // 关键变量：只装配已收藏的人物，不因媒体排序改动丢掉虚拟条目。
       for (const row of rows) {
+        if (personScope && ![...(personCache?.peopleById.get(String(row.protocol_item_id))?.itemIds ?? [])].some((id) => personScope.has(id))) continue;
         const person = await this.getPersonItem(context, String(row.protocol_item_id));
         if (!person || (search && !String(person.Name ?? "").toLocaleLowerCase("zh-CN").includes(search.toLocaleLowerCase("zh-CN")))) continue;
         if (!matchesProtocolItemIdentity(identityFilter, decodeProtocolItemId(String(person.Id)),
@@ -939,26 +1141,38 @@ export class JellyfinCompatibilityService {
 
   /** 返回当前电影或节目媒体库的 Jellyfin 分类列表。 */
   public async listGenres(context: JellyfinContext, query: Record<string, unknown>) {
-    const parentId = String(query.ParentId ?? "");
+    const parentId = String(this.readQueryValue(query, "ParentId") ?? "");
     const virtualLibrary = this.findLibraryDefinition(context, parentId);
-    const include = String(query.IncludeItemTypes ?? "").split(",").filter(Boolean);
+    const include = String(this.readQueryValue(query, "IncludeItemTypes") ?? "").split(",").filter(Boolean);
     const requestedTypes = include.map((type) => type === "Movie" ? "video.movie" : type === "Series" ? "video.series" : "")
       .filter((type) => type.length > 0);
     if (include.length > 0 && requestedTypes.length === 0) return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
-    const effectiveTypes = virtualLibrary
-      ? requestedTypes.length === 0 || requestedTypes.includes(virtualLibrary.itemType) ? [virtualLibrary.itemType] : []
-      : requestedTypes.length > 0 ? requestedTypes : ["video.movie", "video.series"];
+    const effectiveTypes = this.libraryItemTypes(virtualLibrary, requestedTypes, ["video.movie", "video.series"]);
     if (effectiveTypes.length === 0) return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
     const rowsQuery = this.runtime.database.query("media_items")
       .select("metadata_json").where({ user_id: context.ownerUserId, library_id: context.libraryId, media_type: "video" })
       .whereIn("item_type", effectiveTypes).whereNull("deleted_at");
     if (virtualLibrary?.regionGroup) rowsQuery.where("region_group", virtualLibrary.regionGroup);
-    const rows = await rowsQuery;
+    // 在线风格聚合复用 Items 的源分类候选集合，不能把其他分类的 Genres 混入当前入口。
+    let metadataRows: Array<Record<string, unknown>>;
+    if (isContentSourceLibrary(context.libraryKind)) {
+      const parentFilters = await this.readOnlineParentFilters(context, query);
+      const entries = await this.catalogSort.load(context, { ...parentFilters, itemTypes: effectiveTypes }, {
+        fields: [{ name: "sortname", descending: false }], randomSeed: "",
+      });
+      metadataRows = [];
+      // 关键变量：全类 Genres 只分批读取元数据，避免大分类触及数据库参数上限或装配无关文件规格。
+      const ids = entries.map((entry) => entry.id);
+      for (let offset = 0; offset < ids.length; offset += 300) {
+        const rows = await this.runtime.database.query("media_items").select("metadata_json")
+          .where({ user_id: context.ownerUserId, library_id: context.libraryId }).whereNull("deleted_at")
+          .whereIn("id", ids.slice(offset, offset + 300));
+        metadataRows.push(...rows.map((row) => parseJsonObject(row.metadata_json)));
+      }
+    } else metadataRows = (await rowsQuery).map((row) => parseJsonObject(row.metadata_json));
     const counts = new Map<string, number>();
-    rows.forEach((row) => {
-      const metadata = parseJsonObject(row.metadata_json);
-      if (!Array.isArray(metadata.genres)) return;
-      const itemGenres = [...new Set(metadata.genres.map((genre) => String(genre).trim()).filter(Boolean))];
+    metadataRows.forEach((metadata) => {
+      const itemGenres = readJellyfinSourceGenres(metadata);
       itemGenres.forEach((genre) => counts.set(genre, (counts.get(genre) ?? 0) + 1));
     });
     const searchTerm = String(query.SearchTerm ?? "").trim().toLocaleLowerCase("zh-CN");
@@ -1004,11 +1218,24 @@ export class JellyfinCompatibilityService {
       ? current.metadata.genres.map((genre) => String(genre).trim()).filter(Boolean).slice(0, 3)
       : [];
     const requestedLimit = Math.min(100, Math.max(1, Number(query.Limit ?? 20)));
-    const result = await this.runtime.repository.listCatalogItems({
-      userId: context.ownerUserId, libraryId: context.libraryId, mediaType: "video", itemType: current.itemType,
-      genres: genreNames, sort: "updated_desc", limit: requestedLimit + 1, offset: 0, includeFileCounts: false,
-    });
-    const records = result.items.filter((item) => item.id !== current.id).slice(0, requestedLimit);
+    let records: MediaItemRecord[];
+    if (isContentSourceLibrary(context.libraryKind)) {
+      const parentFilters = await this.readOnlineParentFilters(context, query);
+      if (parentFilters.itemTypes && !parentFilters.itemTypes.includes(current.itemType)) return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
+      const entries = await this.catalogSort.load(context, {
+        ...parentFilters, itemTypes: [current.itemType], genres: genreNames,
+      }, { fields: [{ name: "datemodified", descending: true }], randomSeed: "" });
+      const ids = entries.filter((entry) => entry.id !== current.id).slice(0, requestedLimit).map((entry) => entry.id);
+      const candidates = await this.runtime.repository.listCatalogItemsByIds(ids, context.ownerUserId);
+      const byId = new Map(candidates.map((item) => [item.id, item]));
+      records = ids.map((id) => byId.get(id)).filter((item): item is MediaItemRecord => item !== undefined);
+    } else {
+      const result = await this.runtime.repository.listCatalogItems({
+        userId: context.ownerUserId, libraryId: context.libraryId, mediaType: "video", itemType: current.itemType,
+        genres: genreNames, sort: "updated_desc", limit: requestedLimit + 1, offset: 0, includeFileCounts: false,
+      });
+      records = result.items.filter((item) => item.id !== current.id).slice(0, requestedLimit);
+    }
     const mapping = await this.loadItemMappingContext(context, records.map((item) => item.id));
     const items = await Promise.all(records.map((item) => this.mapItem(context, item, undefined, mapping)));
     return { Items: items, TotalRecordCount: items.length, StartIndex: 0 };
@@ -1079,11 +1306,7 @@ export class JellyfinCompatibilityService {
   public async resolveImageItem(context: JellyfinLibraryContext, itemId: string, imageType: string): Promise<MediaItemRecord> {
     const library = this.findLibraryDefinition(context, itemId);
     if (library) {
-      const result = await this.runtime.repository.listCatalogItems({
-        userId: context.ownerUserId, libraryId: context.libraryId, mediaType: "video", itemType: library.itemType,
-        regionGroup: library.regionGroup,
-        sort: "updated_desc", limit: 60, offset: 0, includeFileCounts: false,
-      });
+      const result = await this.readLibraryCatalog(context, library);
       const coverItem = result.items.find((item) => Boolean(readJellyfinImageUrl(item, imageType)))
         ?? result.items.find((item) => Boolean(item.posterUrl || item.backdropUrl));
       if (!coverItem) throw new ApiError(404, "jellyfin_image_not_found", "媒体库没有可用封面");
@@ -1258,9 +1481,11 @@ export class JellyfinCompatibilityService {
   /** 返回 Jellyfin 标准演员列表。 */
   public async listPersons(context: JellyfinContext, query: Record<string, unknown>) {
     const cache = await this.loadPersonCache(context);
+    const sourceScope = await this.readOnlinePersonScope(context, query);
     const searchTerm = String(query.SearchTerm ?? "").trim().toLocaleLowerCase("zh-CN");
     const descending = String(query.SortOrder ?? "Ascending").toLowerCase() === "descending";
     const people = [...cache.peopleById.values()]
+      .filter((person) => sourceScope === undefined || [...person.itemIds].some((id) => sourceScope.has(id)))
       .filter((person) => !searchTerm || person.name.toLocaleLowerCase("zh-CN").includes(searchTerm))
       .sort((left, right) => left.name.localeCompare(right.name, "zh-CN") * (descending ? -1 : 1));
     const offset = Math.max(0, Number(query.StartIndex ?? 0));
@@ -1315,14 +1540,26 @@ export class JellyfinCompatibilityService {
 
   /** 查询继续观看条目。 */
   public async listResume(context: JellyfinContext, query: Record<string, unknown>) {
-    const rows = await this.runtime.database.query("library_playback_progress as p")
-      .join("media_items as m", "m.id", "p.item_id")
-      .join("file_links as fl", "fl.item_id", "m.id")
-      .join("source_files as f", "f.id", "fl.source_file_id")
-      .distinct("m.id", "p.updated_at").where({ "p.library_id": context.libraryId, "p.account_id": context.accountId, "p.played": 0, "p.hidden_from_resume": 0, "f.status": "active" })
+    const onlineLibrary = isContentSourceLibrary(context.libraryKind);
+    const parentFilters = await this.readOnlineParentFilters(context, query);
+    const resumeQuery = this.runtime.database.query("library_playback_progress as p")
+      .join("media_items as m", "m.id", "p.item_id");
+    if (onlineLibrary) {
+      // 在线续播依据独立来源，不能要求存在 file_links 或 source_files。
+      resumeQuery.join("content_playback_sources as source", "source.item_id", "m.id").where("source.status", "active");
+    } else {
+      resumeQuery.join("file_links as fl", "fl.item_id", "m.id").join("source_files as f", "f.id", "fl.source_file_id").where("f.status", "active");
+    }
+    const candidates = resumeQuery
+      .distinct("m.id", "p.updated_at").where({ "p.library_id": context.libraryId, "p.account_id": context.accountId, "p.played": 0, "p.hidden_from_resume": 0 })
       // 关键变量：普通试播仍要求 60 秒，完播生成的下一集则允许零进度续播。
       .where((builder) => builder.where("p.position_ticks", ">=", 600_000_000).orWhere("p.resume_pending", 1))
-      .whereNull("m.deleted_at").orderBy("p.updated_at", "desc").limit(500);
+      .whereNull("m.deleted_at").orderBy("p.updated_at", "desc");
+    this.applyOnlineProgressParent(candidates, context, parentFilters);
+    if (!onlineLibrary) candidates.limit(500);
+    const candidateRows = await candidates;
+    // 关键变量：在线记录先按源分类过滤，再保留最近 500 条，不能让其他分类占用本类续播名额。
+    const rows = onlineLibrary ? candidateRows.filter((row) => this.matchesOnlineProgressScope(row, parentFilters)).slice(0, 500) : candidateRows;
     const rawRecords = await Promise.all(rows.map(async (row) => {
       const item = await this.runtime.repository.getCatalogItem(String(row.id), context.ownerUserId);
       const parent = item.itemType === "video.episode" ? await this.findParent(item.id, context.ownerUserId) : undefined;
@@ -1339,7 +1576,9 @@ export class JellyfinCompatibilityService {
       return true;
     });
     const mapping = await this.loadItemMappingContext(context, records.map((record) => record.item.id));
-    const items = await Promise.all(records.map((record) => this.mapItem(context, record.item, record.parent, mapping)));
+    const mappedItems = await Promise.all(records.map((record) => this.mapItem(context, record.item, record.parent, mapping)));
+    // 停用源仍保留目录和历史，但继续观看入口只返回当前可播放的来源。
+    const items = onlineLibrary ? mappedItems.filter((item) => item.MediaSources.length > 0) : mappedItems;
     const progressItems = items.filter((item) => Number(item.UserData?.PlaybackPositionTicks ?? 0) > 0);
     const percentageItems = progressItems.filter((item) => Number(item.UserData?.PlayedPercentage ?? 0) > 0);
     this.runtime.logBusinessEvent("info", {
@@ -1357,10 +1596,16 @@ export class JellyfinCompatibilityService {
 
   /** 查询去重后的最近播放记录。 */
   public async listHistory(context: JellyfinContext, query: Record<string, unknown>) {
-    const rows = await this.runtime.database.query("library_playback_progress as p")
+    const onlineLibrary = isContentSourceLibrary(context.libraryKind);
+    const parentFilters = await this.readOnlineParentFilters(context, query);
+    const candidates = this.runtime.database.query("library_playback_progress as p")
       .join("media_items as m", "m.id", "p.item_id").select("m.id")
       .where({ "p.library_id": context.libraryId, "p.account_id": context.accountId })
-      .whereNotNull("p.last_played_at").whereNull("m.deleted_at").orderBy("p.last_played_at", "desc").limit(500);
+      .whereNotNull("p.last_played_at").whereNull("m.deleted_at").orderBy("p.last_played_at", "desc");
+    this.applyOnlineProgressParent(candidates, context, parentFilters);
+    if (!onlineLibrary) candidates.limit(500);
+    const candidateRows = await candidates;
+    const rows = onlineLibrary ? candidateRows.filter((row) => this.matchesOnlineProgressScope(row, parentFilters)).slice(0, 500) : candidateRows;
     const records = await Promise.all(rows.map(async (row) => {
       const item = await this.runtime.repository.getCatalogItem(String(row.id), context.ownerUserId);
       const parent = item.itemType === "video.episode" ? await this.findParent(item.id, context.ownerUserId) : undefined;
@@ -1424,12 +1669,21 @@ export class JellyfinCompatibilityService {
 
   /** 查询指定节目的下一集。 */
   public async listNextUp(context: JellyfinContext, query: Record<string, unknown>) {
-    const requestedSeriesId = String(query.SeriesId ?? "");
+    const requestedSeriesId = String(this.readQueryValue(query, "SeriesId") ?? "");
     if (!requestedSeriesId) return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
     const seriesId = decodeProtocolItemId(requestedSeriesId);
     const series = await this.runtime.repository.getCatalogItem(seriesId, context.ownerUserId);
     if (series.libraryId !== context.libraryId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
+    const parentFilters = await this.readOnlineParentFilters(context, query);
+    if (isContentSourceLibrary(context.libraryKind)
+      && (!matchesJellyfinSourceCategory(series.metadata, parentFilters.sourceCategoryId)
+        || (parentFilters.parentId !== undefined && parentFilters.parentId !== series.id)
+        || (parentFilters.itemTypes !== undefined && !parentFilters.itemTypes.includes(series.itemType)))) {
+      return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
+    }
     const children = (await this.runtime.repository.listCatalogChildren(seriesId, context.ownerUserId))
+      .filter((item) => !isContentSourceLibrary(context.libraryKind) || (matchesJellyfinSourceCategory(item.metadata, parentFilters.sourceCategoryId)
+        && (parentFilters.seasonNumber === undefined || readVideoSeason(item.metadata.seasonNumber) === parentFilters.seasonNumber)))
       .sort((left, right) => Number(left.metadata.seasonNumber ?? 0) - Number(right.metadata.seasonNumber ?? 0)
         || Number(left.metadata.episodeNumber ?? 0) - Number(right.metadata.episodeNumber ?? 0));
     const progressRows = await this.runtime.database.query("library_playback_progress")
@@ -1810,6 +2064,13 @@ export class JellyfinCompatibilityService {
     item: MediaItemRecord,
     mediaSourceId?: string,
   ): Promise<number> {
+    if (item.metadata.contentSource && typeof item.metadata.contentSource === "object") {
+      const sources = await this.runtime.contentSources.listPlaybackSources(item.id, item.userId);
+      if (sources.length > 0 && mediaSourceId && mediaSourceId !== item.id && !sources.some((source) => source.id === mediaSourceId)) {
+        throw new ApiError(404, "content_playback_source_not_found", "指定在线播放来源不存在");
+      }
+      return readContentRunTimeTicks(sources, mediaSourceId, item.id);
+    }
     const query = this.runtime.database.query("file_links as fl")
       .join("source_files as f", "f.id", "fl.source_file_id")
       .leftJoin("media_file_probes as p", "p.source_file_id", "f.id")

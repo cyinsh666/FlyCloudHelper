@@ -272,7 +272,8 @@ function MediaDetailDialog({
   const metadata = getDisplayMetadata(item.metadata);
   const externalIds = Object.entries(item.externalIds).filter(([, value]) => Boolean(value));
   const mediaProbeSummary = item.mediaProbeSummary;
-  const canMatchVideo = item.mediaType === "video" && (item.itemType === "video.movie" || item.itemType === "video.series");
+  const isContentSource = item.libraryKind === "content_source_video";
+  const canMatchVideo = !isContentSource && item.mediaType === "video" && (item.itemType === "video.movie" || item.itemType === "video.series");
   const aggregateSourceNames = item.libraryKind === "cloud_aggregate_video" && Array.isArray(item.sourceNames) ? item.sourceNames : [];
   // 关键变量：只有节目详情使用季集位置展示子项，电影及其他媒体保持原展示。
   const isSeries = item.itemType === "video.series";
@@ -299,7 +300,7 @@ function MediaDetailDialog({
               <div className="mt-4 flex flex-wrap gap-2">
                 <StatusPill tone={item.matchState === "matched" ? "success" : item.matchState === "unmatched" ? "danger" : "warning"}>{matchStateLabels[item.matchState]}</StatusPill>
                 <StatusPill>{item.year ?? "年份未知"}</StatusPill>
-                <StatusPill>{item.fileCount} 个文件</StatusPill>
+                <StatusPill>{isContentSource ? "在线内容源" : `${item.fileCount} 个文件`}</StatusPill>
                 {aggregateSourceNames.map((sourceName) => <StatusPill key={sourceName} tone="info">来源：{sourceName}</StatusPill>)}
               </div>
               {canMatchVideo && (
@@ -354,7 +355,7 @@ function MediaDetailDialog({
                 <div className="mt-3 flex flex-wrap gap-2">{externalIds.map(([key, value]) => <StatusPill key={key}>{key.toLocaleUpperCase("zh-CN")}：{value}</StatusPill>)}</div>
               </div>
             )}
-            <div>
+            {isContentSource ? <div className="rounded-xl border border-border bg-secondary/30 p-4"><p className="text-xs text-muted-foreground">内容和分集来自在线源，通过该媒体库的 Jellyfin、Emby 服务地址播放。</p></div> : <div>
               <h3 className="flex items-center gap-2 text-sm font-semibold"><FolderOpen className="size-4" /> 文件路径</h3>
               {loading ? <p className="mt-3 text-sm text-muted-foreground">正在读取路径…</p> : paths.length > 0 ? (
                 <ul className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
@@ -380,7 +381,7 @@ function MediaDetailDialog({
                   ))}
                 </ul>
               ) : <p className="mt-3 text-sm text-muted-foreground">当前条目没有可展示的文件路径</p>}
-            </div>
+            </div>}
           </div>
 
           <div className="space-y-5">
@@ -548,7 +549,7 @@ export function MediaCatalogView({
         getMediaItem(item, admin),
         listMediaItemChildren(item, admin),
         item.itemType === "music.album" ? listMediaItemArtists(item, admin) : Promise.resolve([]),
-        listMediaItemPaths(item, admin),
+        item.libraryKind === "content_source_video" ? Promise.resolve([]) : listMediaItemPaths(item, admin),
       ]);
       setSelectedItem(detail);
       setSelectedChildren(children);

@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { Knex } from "knex";
-import type { VideoRegionGroup } from "./domain.js";
+import { parseJsonObject, type VideoRegionGroup } from "./domain.js";
 import type { ApiRuntime } from "./runtime.js";
+import { matchesJellyfinSourceCategory, readJellyfinSourceGenres } from "./jellyfin-source-category.js";
 
 /** 排序只读取 Jellyfin 自己的账号状态，不修改共享目录或 Emby。 */
 export interface JellyfinSortContext {
@@ -9,6 +10,8 @@ export interface JellyfinSortContext {
   ownerUserId: string;
   /** Jellyfin 当前服务对应的媒体库，用于隔离排序、播放和收藏状态。 */
   libraryId: string;
+  /** 协议认证上下文提供的媒体库类型；仅在线源库允许独立于网盘服务的目录。 */
+  libraryKind?: string;
   accountId: string;
   accessToken: string;
 }
@@ -44,6 +47,8 @@ export interface JellyfinSortFilters {
   favorite?: boolean;
   played?: boolean;
   topLevel?: boolean;
+  /** 在线库按源分类精确筛选；null 仅表示历史未分类，不能作为全库通配。 */
+  sourceCategoryId?: string | null;
 }
 
 const SORT_FIELDS = new Set([
@@ -145,8 +150,11 @@ export class JellyfinCatalogSort {
     const idColumn = "m.id";
     const typeColumn = "m.item_type";
     const query = this.runtime.database.query("media_items as m").where("m.library_id", context.libraryId);
-    query.join("cloud_services as s", "s.id", "m.service_id")
-      .where("m.user_id", context.ownerUserId).whereNull("m.deleted_at").whereNull("s.deleted_at")
+    // 关键变量：在线库条目没有 service_id，不能经过网盘内连接；其他库继续保留原服务存在及未删除条件。
+    const onlineLibrary = context.libraryKind === "content_source_video";
+    if (onlineLibrary) query.whereNull("m.service_id");
+    else query.join("cloud_services as s", "s.id", "m.service_id").whereNull("s.deleted_at");
+    query.where("m.user_id", context.ownerUserId).whereNull("m.deleted_at")
       .select({ id: idColumn, item_type: typeColumn, sort_title: "m.sort_title",
         title: "m.title", year: "m.year", premiere_date: "m.premiere_date",
         created_at: "m.created_at", updated_at: "m.updated_at" });
@@ -154,7 +162,10 @@ export class JellyfinCatalogSort {
     else if (filters.topLevel) query.whereIn(typeColumn, ["video.movie", "video.series"]);
     if (filters.regionGroup) this.applyRegion(query, context, filters.regionGroup);
     if (filters.search?.trim()) query.where((builder) => builder.whereLike("m.title", `%${filters.search!.trim()}%`).orWhereLike("m.subtitle", `%${filters.search!.trim()}%`));
-    if (filters.genres?.length) query.where((builder) => filters.genres!.forEach((genre) => builder.orWhereLike("m.metadata_json", `%${genre}%`)));
+    if (filters.genres?.length && !onlineLibrary) query.where((builder) => filters.genres!.forEach((genre) => builder.orWhereLike("m.metadata_json", `%${genre}%`)));
+    // 关键变量：在线分类和风格读取独立字段，在全局排序、分页前精确筛选，兼容三种数据库。
+    const exactSourceMetadata = onlineLibrary && (filters.sourceCategoryId !== undefined || Boolean(filters.genres?.length));
+    if (exactSourceMetadata) query.select("m.metadata_json as source_metadata_json");
     if (filters.parentId) {
       query.whereExists(this.runtime.database.query("media_relations as relation").select("relation.id")
         .whereRaw("?? = ??", ["relation.child_item_id", "m.id"]).where("relation.parent_item_id", filters.parentId).where("relation.user_id", context.ownerUserId));
@@ -184,7 +195,14 @@ export class JellyfinCatalogSort {
       const ids = [...new Set(filters.itemIds)];
       for (let index = 0; index < ids.length; index += 300) rows.push(...await query.clone().whereIn(idColumn, ids.slice(index, index + 300)));
     } else rows = await query;
-    const entries = rows.filter((row) => filters.seasonNumber === undefined || Number(row.season_number ?? 0) === filters.seasonNumber).map((row): JellyfinSortEntry => ({
+    const entries = rows.filter((row) => {
+      if (filters.seasonNumber !== undefined && Number(row.season_number ?? 0) !== filters.seasonNumber) return false;
+      if (!exactSourceMetadata) return true;
+      const metadata = parseJsonObject(row.source_metadata_json);
+      if (!matchesJellyfinSourceCategory(metadata, filters.sourceCategoryId)) return false;
+      const genres = readJellyfinSourceGenres(metadata);
+      return !filters.genres?.length || filters.genres.some((genre) => genres.includes(genre));
+    }).map((row): JellyfinSortEntry => ({
       id: String(row.id), itemType: String(row.item_type), values: {
         sortname: String(row.sort_title ?? row.title ?? ""), name: String(row.title ?? ""),
         datecreated: readDate(row.created_at), datemodified: readDate(row.updated_at),
@@ -253,6 +271,12 @@ export class JellyfinCatalogSort {
     if (plan.fields.some((field) => field.name === "random")) entries.forEach((entry) => {
       entry.values.random = createHash("sha256").update(`${plan.randomSeed}:${entry.id}`).digest("hex");
     });
+    // 关键变量：支持字段全部缺值时按标题升序返回原候选，零次播放等有效数值不视为缺失。
+    const hasSortValues = entries.some((entry) => plan.fields.some((field) => {
+      const value = entry.values[field.name];
+      return value !== null && value !== undefined && value !== "";
+    }));
+    if (entries.length > 0 && !hasSortValues) plan.fields = [{ name: "sortname", descending: false }];
     return entries.sort((left, right) => {
       for (const field of plan.fields) {
         const a = left.values[field.name] ?? null;

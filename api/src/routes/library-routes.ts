@@ -107,6 +107,13 @@ function readExpectedRevision(value: unknown): number | undefined {
   return revision;
 }
 
+/** 在线内容由源插件同步目录，不能进入网盘路径、刮削和文件规格任务。 */
+export function requireDriveLibrary(libraryKind: string): void {
+  if (libraryKind === "content_source_video") {
+    throw new ApiError(409, "content_source_requires_catalog_sync", "在线内容库请在内容源设置中同步目录");
+  }
+}
+
 /** 为本次唯一来源写入稳定来源 ID，供后续多来源目录隔离直接复用。 */
 export function attachLibrarySourceId(
   profile: Record<string, unknown>,
@@ -535,6 +542,7 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
   server.put<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/libraries/:libraryId/scan-profile", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     const library = await runtime.repository.getLibrary(request.params.libraryId, user.id);
+    requireDriveLibrary(library.libraryKind);
     if (library.libraryKind === "cloud_aggregate_video") {
       throw new ApiError(409, "aggregate_scan_profile_is_source_scoped", "云聚合扫描路径需要在各来源中分别配置");
     }
@@ -581,6 +589,7 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
   server.put<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/libraries/:libraryId/metadata-profile", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     const library = await runtime.repository.getLibrary(request.params.libraryId, user.id);
+    requireDriveLibrary(library.libraryKind);
     const profile = validateMetadataProfile(requireObject(request.body, "metadata", "元数据配置"), library.dataType);
     await runtime.aiModels.validateMetadataProfile(profile);
     const updated = await runtime.repository.updateMetadataProfile(
@@ -617,6 +626,7 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
   server.post<{ Params: { libraryId: string } }>("/api/v1/libraries/:libraryId/media-probes/backfill", async (request, reply) => {
     const user = await requireRequestUser(request, runtime.database);
     const library = await runtime.repository.getLibrary(request.params.libraryId, user.id);
+    requireDriveLibrary(library.libraryKind);
     if (library.dataType !== "video") throw new ApiError(409, "media_probe_video_only", "只有影视媒体库可以分析视频规格");
     if (library.libraryKind === "cloud_aggregate_video") {
       const result = await runtime.repository.enqueueExistingLibraryMediaProbes(library.id, user.id, user.id);
@@ -636,6 +646,7 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     }
     const library = await runtime.repository.getLibrary(request.params.libraryId, user.id);
     if (library.status !== "active") throw new ApiError(409, "library_not_active", "请先启用媒体库");
+    requireDriveLibrary(library.libraryKind);
     if (await runtime.repository.findUnfinishedLibraryScanJob(library.id, user.id)) {
       throw new ApiError(409, "scan_job_conflict", "当前媒体库已有未结束任务，不能重复启动");
     }
@@ -820,7 +831,10 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     const user = await requireRequestUser(request, runtime.database);
     requireConfirmation(request.body, request.params.libraryId);
     const library = await runtime.repository.getLibrary(request.params.libraryId, user.id);
-    const cleared = await runtime.repository.clearLibraryCatalog(library.id, user.id);
+    // 关键变量：在线库清空前暂停动态入库并清理窗口，避免旧分页缓存或正在写入的内容回填。
+    const cleared = library.libraryKind === "content_source_video"
+      ? await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, user.id))
+      : await runtime.repository.clearLibraryCatalog(library.id, user.id);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-media-library-catalog-clear",
       事件: "清空媒体库目录",
@@ -837,7 +851,10 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     const operator = await requireSuperAdmin(request, runtime.database);
     requireConfirmation(request.body, request.params.libraryId);
     const library = await runtime.repository.getLibrary(request.params.libraryId);
-    const cleared = await runtime.repository.clearLibraryCatalog(library.id, library.userId);
+    // 管理员清空在线库也等待该库动态写入收尾，再沿用原目录清空流程。
+    const cleared = library.libraryKind === "content_source_video"
+      ? await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, library.userId))
+      : await runtime.repository.clearLibraryCatalog(library.id, library.userId);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-media-library-catalog-clear",
       事件: "管理员清空媒体库目录",
@@ -854,7 +871,12 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     const user = await requireRequestUser(request, runtime.database);
     requireConfirmation(request.body, request.params.libraryId);
     const library = await runtime.repository.getLibrary(request.params.libraryId, user.id);
-    await runtime.repository.deleteLibrary(library.id, user.id);
+    // 删除在线库前暂停新分页并等待已有动态请求，避免删除后继续使用旧库写入。
+    if (library.libraryKind === "content_source_video") {
+      await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id, user.id));
+    } else {
+      await runtime.repository.deleteLibrary(library.id, user.id);
+    }
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-media-library-delete",
       事件: "删除媒体库并保留来源服务",
@@ -869,7 +891,12 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     const operator = await requireSuperAdmin(request, runtime.database);
     requireConfirmation(request.body, request.params.libraryId);
     const library = await runtime.repository.getLibrary(request.params.libraryId);
-    await runtime.repository.deleteLibrary(library.id);
+    // 管理员删除在线库与个人入口使用相同的动态浏览生命周期。
+    if (library.libraryKind === "content_source_video") {
+      await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id));
+    } else {
+      await runtime.repository.deleteLibrary(library.id);
+    }
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-media-library-delete",
       事件: "管理员删除媒体库并保留来源服务",

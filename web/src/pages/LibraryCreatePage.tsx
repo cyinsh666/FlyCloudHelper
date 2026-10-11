@@ -2,6 +2,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { PageHeader, PrimaryButton } from "@/components/ConsoleShell";
 import { Panel } from "@/components/ui-kit";
+import { ContentSourceLibraryCreate } from "@/components/ContentSourceLibraryCreate";
 import { createLibrary, getService, listServices, type MediaType } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
 
@@ -13,7 +14,7 @@ export function LibraryCreatePage({ serviceId = "" }: { serviceId?: string }) {
     const result = await listServices(false);
     return result.items;
   }, [serviceId]);
-  const [libraryKind, setLibraryKind] = useState<"legacy_single_source" | "cloud_aggregate_video">("cloud_aggregate_video");
+  const [libraryKind, setLibraryKind] = useState<"legacy_single_source" | "cloud_aggregate_video" | "content_source_video">("cloud_aggregate_video");
   const [selectedServiceId, setSelectedServiceId] = useState(serviceId);
   const [selectedSourceServiceIds, setSelectedSourceServiceIds] = useState<string[]>(serviceId ? [serviceId] : []);
   const [displayName, setDisplayName] = useState("");
@@ -96,13 +97,14 @@ export function LibraryCreatePage({ serviceId = "" }: { serviceId?: string }) {
     }
   }
 
-  if (!services.data) return <Panel><p className="py-12 text-center text-sm text-muted-foreground">{services.error ?? "正在读取来源服务…"}</p></Panel>;
-  const availableLegacyServices = services.data.filter((service) => service.canCreateLibrary);
-  return <><PageHeader title="创建媒体库" /><Panel><form onSubmit={(event) => void submit(event)} className="grid gap-5">
-    {!serviceId && <fieldset><legend className="text-xs text-muted-foreground">媒体库模式</legend><div className="mt-2 grid gap-2 sm:grid-cols-2">
-      <button type="button" onClick={() => { setLibraryKind("cloud_aggregate_video"); setDataType("video"); }} className={`rounded-xl border p-4 text-left ${libraryKind === "cloud_aggregate_video" ? "border-foreground" : "border-border"}`}><span className="block text-sm font-medium">云聚合视频库</span><span className="mt-1 block text-xs text-muted-foreground">多个网盘来源，共用一个影视海报墙。</span></button>
-      <button type="button" onClick={() => setLibraryKind("legacy_single_source")} className={`rounded-xl border p-4 text-left ${libraryKind === "legacy_single_source" ? "border-foreground" : "border-border"}`}><span className="block text-sm font-medium">旧单源媒体库</span><span className="mt-1 block text-xs text-muted-foreground">保留现有单个服务对应一个媒体库的模式。</span></button>
-    </div></fieldset>}
+  const modeSelection = !serviceId && <fieldset><legend className="text-xs text-muted-foreground">媒体库模式</legend><div className="mt-2 grid gap-2 sm:grid-cols-3">
+    <button type="button" onClick={() => { setLibraryKind("cloud_aggregate_video"); setDataType("video"); }} className={`rounded-xl border p-4 text-left ${libraryKind === "cloud_aggregate_video" ? "border-foreground" : "border-border"}`}><span className="block text-sm font-medium">云聚合视频库</span><span className="mt-1 block text-xs text-muted-foreground">多个网盘来源，共用一个影视海报墙。</span></button>
+    <button type="button" onClick={() => setLibraryKind("legacy_single_source")} className={`rounded-xl border p-4 text-left ${libraryKind === "legacy_single_source" ? "border-foreground" : "border-border"}`}><span className="block text-sm font-medium">旧单源媒体库</span><span className="mt-1 block text-xs text-muted-foreground">保留现有单个服务对应一个媒体库的模式。</span></button>
+    <button type="button" onClick={() => { setLibraryKind("content_source_video"); setDataType("video"); }} className={`rounded-xl border p-4 text-left ${libraryKind === "content_source_video" ? "border-foreground" : "border-border"}`}><span className="block text-sm font-medium">在线内容源媒体库</span><span className="mt-1 block text-xs text-muted-foreground">选择独立源插件，提供 Jellyfin、Emby 影视库。</span></button>
+  </div></fieldset>;
+  const availableLegacyServices = services.data?.filter((service) => service.canCreateLibrary) ?? [];
+  return <><PageHeader title="创建媒体库" /><Panel><div className="grid gap-5">{modeSelection}
+    {libraryKind === "content_source_video" ? <ContentSourceLibraryCreate /> : !services.data ? <div>{services.error ? <p role="alert" className="text-sm text-destructive">{services.error}</p> : <div aria-label="来源服务加载中" className="animate-pulse space-y-3"><div className="h-5 w-48 rounded bg-muted" /><div className="h-12 rounded bg-muted" /><div className="h-12 rounded bg-muted" /></div>}</div> : <form onSubmit={(event) => void submit(event)} className="grid gap-5">
     {libraryKind === "cloud_aggregate_video" ? <fieldset><legend className="text-xs text-muted-foreground">初始网盘来源（可稍后添加）</legend><div className="mt-2 grid gap-2 sm:grid-cols-2">
       {services.data.map((service) => <button key={service.id} type="button" onClick={() => toggleAggregateSource(service.id)} className={`rounded-xl border px-4 py-3 text-left ${selectedSourceServiceIds.includes(service.id) ? "border-foreground" : "border-border"}`}><span className="block truncate text-sm">{service.displayName}</span><span className="mt-1 block text-xs text-muted-foreground">{service.providerType} · {service.connectionStatus === "valid" ? "连接正常" : "需要重新登录"}</span></button>)}
       {services.data.length === 0 && <p className="text-xs text-muted-foreground">当前没有可添加的网盘服务，也可以先创建空的云聚合库。</p>}
@@ -110,5 +112,5 @@ export function LibraryCreatePage({ serviceId = "" }: { serviceId?: string }) {
     <label><span className="text-xs text-muted-foreground">媒体库名称</span><input required value={displayName} onChange={(event) => changeDisplayName(event.target.value)} maxLength={100} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
     {libraryKind === "legacy_single_source" && <fieldset><legend className="text-xs text-muted-foreground">媒体库类型</legend><div className="mt-2 flex gap-2">{(["video", "music"] as MediaType[]).map((type) => <button key={type} type="button" onClick={() => setDataType(type)} className={`rounded-lg border px-4 py-2 text-sm ${dataType === type ? "border-foreground" : "border-border"}`}>{type === "video" ? "影视" : "音乐"}</button>)}</div></fieldset>}
     <p className="text-xs text-muted-foreground">创建后在媒体库设置中配置每个来源自己的扫描路径，再统一配置元数据、通知及 Jellyfin、Emby 对外协议。</p><div><PrimaryButton type="submit" disabled={!displayName.trim() || (libraryKind === "legacy_single_source" && !selectedServiceId)}>创建媒体库</PrimaryButton></div>{message && <p className="text-sm text-muted-foreground">{message}</p>}
-  </form></Panel></>;
+  </form>}</div></Panel></>;
 }

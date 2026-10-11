@@ -33,7 +33,7 @@ import {
   validateTmdbKeyList,
 } from "../system-settings.js";
 import { streamJobEvents } from "./event-stream.js";
-import { attachLibrarySourceId, notifyFinishedLibraryScanJob } from "./library-routes.js";
+import { attachLibrarySourceId, notifyFinishedLibraryScanJob, requireDriveLibrary } from "./library-routes.js";
 import {
   consumeProviderAuthorization,
   attachConnectionAuthMode,
@@ -723,6 +723,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.put<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/admin/libraries/:libraryId/scan-profile", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const library = await runtime.repository.getLibrary(request.params.libraryId);
+    requireDriveLibrary(library.libraryKind);
     if (library.libraryKind === "cloud_aggregate_video") {
       throw new ApiError(409, "aggregate_scan_profile_is_source_scoped", "云聚合扫描路径需要由媒体库所属用户在各来源中分别配置");
     }
@@ -789,6 +790,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.put<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/admin/libraries/:libraryId/metadata-profile", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const library = await runtime.repository.getLibrary(request.params.libraryId);
+    requireDriveLibrary(library.libraryKind);
     const profile = validateMetadataProfile(requireObject(request.body, "metadata", "元数据配置"), library.dataType);
     await runtime.aiModels.validateMetadataProfile(profile);
     const updated = await runtime.repository.updateMetadataProfile(
@@ -814,6 +816,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.post<{ Params: { libraryId: string } }>("/api/v1/admin/libraries/:libraryId/media-probes/backfill", async (request, reply) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const library = await runtime.repository.getLibrary(request.params.libraryId);
+    requireDriveLibrary(library.libraryKind);
     if (library.dataType !== "video") throw new ApiError(409, "media_probe_video_only", "只有影视媒体库可以分析视频规格");
     if (library.status !== "active") throw new ApiError(409, "library_not_active", "请先启用媒体库，再分析已有视频规格");
     runtime.logBusinessEvent("info", {
@@ -881,6 +884,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.post<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/admin/libraries/:libraryId/scan-jobs", async (request, reply) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const library = await runtime.repository.getLibrary(request.params.libraryId);
+    requireDriveLibrary(library.libraryKind);
     const profiles = await runtime.repository.getLibraryProfiles(library.id, library.userId);
     const scanMode = request.body.scanMode;
     if (scanMode !== "incremental" && scanMode !== "full") throw validationError("scanMode", "扫描模式无效");

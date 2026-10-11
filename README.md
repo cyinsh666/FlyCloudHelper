@@ -2,7 +2,7 @@
 
 <img src="web/public/flycloud-helper-icon.png" alt="FlyCloudHelper 图标" width="96" />
 
-FlyCloudHelper 是一个可自部署的网盘媒体扫描、元数据刮削、媒体目录和协议兼容服务。它可以直接连接 WebDAV 和主流网盘，建立影视库或音乐库，并通过 Web 管理端、REST API、Jellyfin、Emby 与 Navidrome/Subsonic 协议提供访问能力。
+FlyCloudHelper 是一个可自部署的媒体扫描、元数据刮削、媒体目录和协议兼容服务。它可以直接连接 WebDAV 和主流网盘，建立影视库或音乐库，并通过 Web 管理端、REST API、Jellyfin、Emby 与 Navidrome/Subsonic 协议提供访问能力。
 
 项目不依赖特定客户端才能运行。用户可以直接在 Web 管理端完成网盘登录、路径选择、扫描刮削、媒体库管理、协议账号配置和任务维护，也可以使用兼容客户端访问云端媒体库。Flymby 鸿蒙 APP 只负责上传已有网盘服务的基础信息与登录凭据，并通过普通 Jellyfin、Emby 或 Navidrome 服务使用云端媒体库。
 
@@ -62,6 +62,17 @@ FlyCloudHelper 是一个可自部署的网盘媒体扫描、元数据刮削、�
 - 支持 TMDB 多 Key 动态并发、故障冷却与自动恢复，以及当前部署内跨用户、跨服务共享 14 天的成功结果缓存。
 - 支持手动搜索与匹配、清除匹配结果、匹配状态筛选，以及按加入时间、年份、首映日期和名称排序。
 - 用户按媒体库浏览海报墙、详情、真实文件路径与源文件信息；管理员可跨用户筛选查看。
+- 影视媒体库提供文件浏览，可按目录或文件触发定向扫描刮削、解除匹配、手动搜索和匹配；音乐与有声书暂不提供此入口，Web 页面不直接播放。
+- 云聚合视频库可关联多个网盘来源，每个来源独立配置扫描路径，共用媒体目录和协议地址。
+
+### 在线内容源（当前源码）
+
+- 在线内容源与网盘 Provider、元数据插件独立管理，可在媒体库创建页面选择“在线内容源媒体库”。
+- 管理员管理 CMS JSON 内容源插件，用户创建源实例、选择分类并分批同步目录，再通过 Jellyfin 或 Emby 访问。
+- 内置「电影｜天堂」和「虎牙｜资源」两个独立内容源插件，首次登记默认启用，可在「插件管理 → 内容源插件」直接管理；后续启动保留已有的停用、卸载状态。
+- Jellyfin、Emby 的已选源分类支持按需浏览与下一页加载；电影天堂和虎牙支持客户端源站实时搜索及搜索分页，目录缓存沿用稳定媒体 ID。动态分类和搜索使用源站顺序，当前目录数量随加载扩展；收藏、已看等用户状态筛选继续使用已有缓存。
+- 当前提供目录同步、线路与单集映射、即时播放地址解析，以及按媒体库配置直连或中转；不使用网盘扫描路径与文件浏览。
+- 这些能力以当前源码为准，使用公开镜像时需确认所部署的版本已包含相关修改。
 
 ### 任务与自动化
 
@@ -76,6 +87,7 @@ FlyCloudHelper 是一个可自部署的网盘媒体扫描、元数据刮削、�
 
 - 影视库可分别启用 Jellyfin `/j/` 和 Emby `/e/` 地址，音乐库可启用 Navidrome/Subsonic `/n/` 地址，地址后缀均可在媒体库设置中修改。
 - Jellyfin 与 Emby 覆盖登录、媒体库、首页、列表、搜索、详情、季集、图片、播放定位、直连或中转播放、下载控制及观看状态上报等常用接口。
+- 网盘节目单集达到 90% 完播条件后，继续观看会提供后续未观看单集的零进度入口，支持跨季；下一集已有进度时保留原位置。
 - Navidrome/Subsonic 覆盖音乐库、艺术家、专辑、歌曲、封面、歌词、收藏、播放历史、播放定位和下载等常用接口；关闭中转后优先返回网盘直连，直连无法满足请求时回退中转。
 - 每个协议地址可以创建多个独立账号；账号的会话、收藏、最近播放、观看进度和已播放状态相互隔离，Emby 与 Jellyfin 账号也互不共用。
 - 协议层直接使用原始媒体文件，不提供视频或音频转码。
@@ -124,22 +136,28 @@ npm run dev:web
 
 #### 使用 Docker Compose（推荐）
 
-Docker 部署也比较简单，新建 `docker-compose.yml` 并写入以下内容：
+新建一个部署目录，在其中创建 `docker-compose.yml` 并复制下面的完整内容。默认使用 SQLite，无需 `.env`、数据库账号、手动填写加密密钥或额外容器；Web、API 和扫描 Worker 由同一个镜像提供。
 
 ```yaml
+name: flycloud-helper
+
 services:
   flycloud-helper:
+    # 镜像集成 Web、API 和扫描 Worker，无需另外启动前端或数据库。
     image: fbinba3955/flycloud-helper:latest
     container_name: flycloud-helper
     restart: unless-stopped
     ports:
+      # 端口被占用时，只修改冒号左侧的宿主机端口。
       - "9934:9934"
     environment:
-      FLYCLOUDHELPER_DATABASE_TYPE: sqlite
-      FLYCLOUDHELPER_COOKIE_SECURE: "false"
-      FLYCLOUDHELPER_ALLOW_INSECURE_HTTP: "true"
+      TZ: Asia/Shanghai
       FLYCLOUDHELPER_PUID: "1000"
       FLYCLOUDHELPER_PGID: "1000"
+      FLYCLOUDHELPER_DATABASE_TYPE: sqlite
+      FLYCLOUDHELPER_SQLITE_PATH: /data/database/flycloud-helper.db
+      # 首次启动自动生成密钥，和数据库一起保存在 /data 中。
+      FLYCLOUDHELPER_GENERATED_CREDENTIAL_KEY_PATH: /data/secrets/credential-master-key
     volumes:
       - flycloud_helper_data:/data
 
@@ -147,38 +165,37 @@ volumes:
   flycloud_helper_data:
 ```
 
-然后启动服务：
+启动服务：
 
 ```sh
 docker compose up -d
 ```
 
-也可以直接下载项目提供的完整配置文件：
+启动后访问 `http://服务器IP:9934/setup`，按页面提示创建超级管理员。TMDB Key、网盘登录凭据和媒体协议账号在 Web 页面中配置，不需要写进 Compose。
+
+也可以下载与上述内容一致的 [docker-compose.yml](docker-compose.yml)：
 
 ```sh
-# 下载配置文件
-curl -o docker-compose.yml https://raw.githubusercontent.com/fbinba3955/FlyCloudHelper/master/docker-compose.yml
-
-# 启动服务
+curl -fL -o docker-compose.yml https://raw.githubusercontent.com/fbinba3955/FlyCloudHelper/master/docker-compose.yml
 docker compose up -d
-
-# 查看日志
-docker compose logs -f
 ```
 
-该编排默认拉取 `fbinba3955/flycloud-helper:latest`，使用 SQLite，并把数据库、凭据主密钥、插件和导出文件保存在 `flycloud_helper_data` 持久卷中。启动完成后访问：
+默认 `9934` 端口可直接使用；被其他程序占用时，将 `ports` 改成例如 `"19934:9934"`，然后访问 `http://服务器IP:19934`。使用 Docker 命名卷时无需修改 UID/GID 或数据路径。需要固定镜像版本时，直接修改 `image` 中的 `latest` 标签。
 
-```text
-http://服务器IP:9934/setup
-```
+[compose.yml](compose.yml) 与 [docker-compose.yml](docker-compose.yml) 使用相同配置。两者都会明确使用 SQLite，不会读取宿主机 `.env` 中的数据库或密钥变量；不要将默认部署的 `.env` 当作容器配置文件。
 
-首次进入初始化页面设置超级管理员。需要修改对外端口或连接外部数据库时，在 `docker-compose.yml` 同目录创建 `.env`；例如修改宿主机端口：
+#### 群晖 Container Manager
 
-```dotenv
-FLYCLOUDHELPER_HOST_PORT=19934
-```
+默认命名卷方案也能用于群晖。如果希望在 File Station 中直接管理数据，使用 [docker-compose.synology.yml](docker-compose.synology.yml)：
 
-常用维护命令：
+1. 在 Container Manager 中新建项目，粘贴该文件的完整内容。
+2. 默认映射 `/volume1/docker/flycloud-helper/data:/data`；存储卷不是 `volume1` 时，只修改冒号左侧的宿主机路径。
+3. 默认 UID/GID 为 `1026:100`；需要以其他群晖用户管理数据时，修改 `FLYCLOUDHELPER_PUID` 和 `FLYCLOUDHELPER_PGID`。
+4. 启动项目后访问 `http://群晖IP:9934/setup`。
+
+无需准备数据库或密钥文件。镜像入口会创建并修复数据目录权限，随后以指定 UID/GID 启动服务；容器不要额外设置 `user` 或将 `/data` 挂载为只读。
+
+#### 升级与维护
 
 ```sh
 # 查看运行状态
@@ -195,9 +212,9 @@ docker compose up -d
 docker compose down
 ```
 
-不要使用 `docker compose down -v`，该命令会同时删除持久卷。需要固定镜像版本时，在 `.env` 中设置 `FLYCLOUDHELPER_IMAGE_TAG=0.1.15`；移除该配置后会继续使用 `latest`。
+命名卷或群晖挂载目录保存数据库、凭据主密钥、插件、封面和导出文件，重建容器时继续使用同一个数据卷或目录。不要使用 `docker compose down -v`，它会删除命名卷。
 
-如果已经克隆项目，进入项目目录直接执行 `docker compose -f docker-compose.yml up -d` 即可。完整编排文件见 [docker-compose.yml](docker-compose.yml)。
+升级已有部署时先备份数据，并保留原项目名称与挂载。新示例的项目名称为 `flycloud-helper`；如果旧项目使用其他名称，请把 `name` 改为原名称，避免 Docker 创建新的空卷。原先使用 PostgreSQL、MySQL 或自定义主密钥的部署必须保留原配置，不能直接套用默认 SQLite 配置。
 
 #### 直接使用 Docker 命令
 
@@ -212,7 +229,7 @@ docker run -d \
   fbinba3955/flycloud-helper:latest
 ```
 
-镜像同时支持 `linux/amd64` 和 `linux/arm64`。固定版本可将 `latest` 改为 `0.1.15`。
+镜像同时支持 `linux/amd64` 和 `linux/arm64`。固定版本时直接将 `latest` 改为已发布的版本标签。
 
 容器内部端口固定为 `9934`，`-p` 左侧可以修改宿主机端口。`/data` 必须持久化，其中保存 SQLite 数据库、凭据主密钥、插件和导出文件。即使改用 PostgreSQL 或 MySQL，也不能删除这个数据卷。
 
@@ -222,7 +239,7 @@ docker run -d \
 
 ### 连接已有 PostgreSQL
 
-创建不会提交到 Git 的 `.env`：
+以下为外部数据库的可选方案，默认 SQLite 部署无需设置。创建用于 `docker run --env-file .env` 的 `.env`（不要提交到 Git）：
 
 ```dotenv
 FLYCLOUDHELPER_DATABASE_TYPE=postgres
@@ -311,21 +328,20 @@ docker compose -f compose.yml -f compose.build.yml up -d --build
 
 默认通过 `http://localhost:9934` 访问服务。生产镜像由同一个 API 进程提供后台接口、Web 静态文件和扫描 Worker。
 
-生产镜像已经直接安装 `ffprobe`（由 Debian `ffmpeg` 软件包提供），同时支持 `linux/amd64` 和 `linux/arm64`。服务详情中的“分析视频规格（ffprobe）”默认关闭；开启后无需在宿主机安装程序或向容器挂载可执行文件。
+生产镜像已经直接安装 `ffprobe`（由 Debian `ffmpeg` 软件包提供），同时支持 `linux/amd64` 和 `linux/arm64`。媒体库元数据设置中的“分析视频规格（ffprobe）”默认关闭；开启后无需在宿主机安装程序或向容器挂载可执行文件。
 
 ## 配置方式
 
-复制示例文件后按需修改：
+本地源码运行可复制示例文件后按需修改；默认 Docker Compose 部署无需此步骤：
 
 ```sh
 cp .env.example .env
 ```
 
-常用环境变量如下。镜像已经在 `ENV` 元数据中声明数据库拆分字段、自动建库、Cookie 和 HTTP Provider 开关，因此 Docker 管理界面可以直接显示这些配置项；数据库地址、端口、名称、用户名和密码默认留空。
+常用环境变量如下。Docker Compose 只会向容器传入 `environment` 或 `env_file` 中指定的变量；需要调整高级选项时，将对应变量直接添加到服务的 `environment` 中。镜像提供数据库、Cookie、HTTP Provider、程序路径等默认值，未写入 Compose 的选项继续使用镜像和程序默认配置。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `FLYCLOUDHELPER_HOST_PORT` | `9934` | Docker 对外端口 |
 | `FLYCLOUDHELPER_PUID` | `1000` | 容器内后台进程使用的用户 ID；启动时用于修复 `/data` 权限 |
 | `FLYCLOUDHELPER_PGID` | `1000` | 容器内后台进程使用的用户组 ID；启动时用于修复 `/data` 权限 |
 | `FLYCLOUDHELPER_DATABASE_TYPE` | `sqlite` | 数据库类型：`sqlite`、`postgres` 或 `mysql` |
@@ -356,7 +372,7 @@ TMDB Key 不再通过环境变量配置。超级管理员登录后，在“系�
 
 PostgreSQL 与 MySQL 使用拆分字段时，服务会自动处理密码中的特殊字符。目标数据库不存在且自动创建开启时，PostgreSQL 用户需要 `CREATEDB` 权限，MySQL 用户需要 `CREATE` 权限；服务只创建指定数据库，之后自动初始化自身表结构，不会创建数据库用户。
 
-网盘服务会根据 Provider 类型为每个服务写入默认扫描任务数和刮削任务数，并允许在服务设置中手动调整为任意正整数，不设置 Provider 最大值；全量和增量扫描都使用当前服务自己的扫描任务数。影片任务使用服务配置的刮削任务数，TMDB 网络请求由当前可用 Key 容量独立调度，不会因为 Key 数量减少而把本地解析和数据库落库一起降为低并发。同一节目目录中的单集文件并发落库；重复全量扫描仍会枚举全部路径并执行缺失对账，但会复用源文件未变化、已匹配且元数据配置修订一致的目录结果。
+媒体库来源会根据 Provider 类型提供默认扫描任务数和刮削任务数，并允许在媒体库设置中调整；全量和增量扫描使用当前来源的扫描任务数。影片任务使用媒体库配置的刮削任务数，TMDB 网络请求由当前可用 Key 容量独立调度，不会因为 Key 数量减少而把本地解析和数据库落库一起降为低并发。同一节目目录中的单集文件并发落库；重复全量扫描仍会枚举全部路径并执行缺失对账，但会复用源文件未变化、已匹配且元数据配置修订一致的目录结果。
 
 影视文件名使用内置清洗规则生成刮削查询词，依次移除站点和分类前缀、TMDB/IMDb 标记、合集范围、清晰度和尺寸、来源、编码与位深、音轨字幕、平台、文件大小及发布组；清洗只影响识别查询，不修改网盘中的真实路径和文件名。该规则与已适配客户端的现有媒体识别行为保持兼容。
 
@@ -417,11 +433,11 @@ APP 上传接口只接收本地网盘服务基础信息、登录凭据和来源�
 
 - [x] **影视扫描与刮削**：已完成路径选择、全量与增量扫描、电影与节目归组、NFO、TMDB、插件、手动匹配、清除匹配和媒体库浏览。
 - [x] **后台任务与定时执行**：已完成扫描和视频规格分析队列、定时任务、进度与时长、等待原因、暂停、终止、重试、删除及完成任务清理。
-- [x] **AI 模型目录文件清洗**：已完成 OpenAI Chat Completions 兼容模型配置、可用性测试、服务级选择、弱标题与 TMDB 首次未匹配补充、失败回退、任务快照和持久化缓存。
+- [x] **AI 模型目录文件清洗**：已完成 OpenAI Chat Completions 兼容模型配置、可用性测试、服务级选择、弱标题与 TMDB 首次未匹配补充、失败回退、任务配置记录和持久化缓存。
 - [x] **9 类 Provider 接入**：WebDAV、光鸭、阿里云盘、百度网盘、115网盘、123云盘、天翼云盘、移动云盘和夸克网盘均已接入目录浏览、扫描、文件定位、直连和按能力中转；115、123、天翼、移动和夸克支持直接扫码登录。
 - [x] **音乐三阶段扫描**：已完成目录与文件发现、音频标签和旁挂资料读取、在线元数据补全、阶段进度、问题明细与按阶段重试。
 - [x] **网盘音乐与 Navidrome**：9 类 Provider 均可作为音乐媒体库来源，并提供歌曲、专辑、艺术家、封面、歌词和 Navidrome/Subsonic 兼容访问。
-- [x] **服务与媒体库解耦**：网盘服务只保存基础信息与登录凭据，媒体库通过独立来源关系管理类型、扫描、元数据、通知和协议；当前限制一对一，数据结构保留多来源扩展能力。
+- [x] **服务与媒体库解耦**：网盘服务只保存基础信息与登录凭据，媒体库通过独立来源关系管理类型、扫描、元数据、通知和协议；保留旧单源媒体库，并支持云聚合视频库关联多个网盘来源。
 - [x] **Flymby 单向上传与协议接入**：鸿蒙 APP 可上传本地网盘服务和凭据，并把 Jellyfin、Emby、Navidrome 协议账号一次性添加为普通本地服务。
 - [x] **Jellyfin 常用协议兼容**：已完成账号登录、媒体库浏览、搜索、详情、季集、图片、播放定位、直连或中转播放及观看状态上报。
 - [x] **Emby 独立协议兼容**：已完成独立地址、账号、会话、收藏、续播、历史、下载、地区媒体库和直连或中转播放，不复用 Jellyfin 账号与观看数据。
@@ -444,18 +460,19 @@ APP 上传接口只接收本地网盘服务基础信息、登录凭据和来源�
 
 ## 数据与密钥
 
-本地开发数据保存在 `data/`，Docker 数据保存在 `flycloud_helper_data` 持久卷。未配置凭据主密钥时，服务首次启动会随机生成并保存到 `data/secrets/credential-master-key`；设置超级管理员时需要按页面提示备份该密钥。密钥丢失后，数据库中已有的网盘凭据将无法解密。
+本地开发数据保存在 `data/`。默认 Docker 部署保存在项目的 `flycloud_helper_data` 命名卷，群晖目录映射方案保存在 `/volume1/docker/flycloud-helper/data`。未配置凭据主密钥时，服务首次启动会随机生成并保存到 `data/secrets/credential-master-key`；设置超级管理员时需要按页面提示备份该密钥。密钥丢失后，数据库中已有的网盘凭据将无法解密。
 
 切换 SQLite、PostgreSQL 或 MySQL 不会自动迁移数据，需要自行执行导出、导入或数据库迁移。
 
-当前项目版本为 `0.1.15`，数据库 schema 版本为 `55`。升级现有数据库时服务会把网盘服务、媒体库来源、媒体配置和协议数据拆分到独立结构；使用不兼容的早期开发数据库时也可以删除并重新初始化，首次启动后重新设置超级管理员。
-旧版已软删除的服务及其专属媒体库数据会在升级时彻底清理。新版若有媒体库仍使用某个网盘服务，必须先删除相关媒体库，才能删除该服务。
-媒体库设置页会显示关联的网盘服务。当前一对一版本取消最后一个服务关联时会同时删除媒体库及其配置和扫描结果，网盘服务本身保留，不产生无来源的空媒体库。
+当前源码版本为 `0.2.4`，数据库 schema 版本为 `63`；Docker Hub 的 `latest` 以实际发布镜像为准。升级现有数据库时服务会把网盘服务、媒体库来源、媒体配置和协议数据拆分到独立结构；升级前应备份数据库和 `/data`，不要通过删除数据解决升级问题。
+历史协议账号、播放进度、播放历史、歌单和扫描计划会迁入原媒体库，保留密码校验及自定义协议地址。迁移步骤完成后逐步保存 schema 版本，启动中断后再次启动会继续迁移；旧记录全部迁入并核对后才删除对应旧表。遇到归属冲突或未知旧字段时会保留旧表并给出错误，不能用清空数据的方式绕过；低版本程序也不能直接启动已升级的新数据库。
+旧版已软删除的服务及其专属媒体库数据会在升级时彻底清理。新版若有媒体库仍关联某个网盘服务，删除按钮不可用；必须先取消全部关联或删除相关媒体库，才能删除服务。
+媒体库设置页显示关联的网盘来源。云聚合视频库可添加、移除多个来源，移除最后一个来源后保留空媒体库，之后可以重新添加来源；旧单源媒体库不支持单独移除来源，需要删除媒体库后再删除网盘服务。移除来源或删除媒体库不会删除网盘中的原始文件。
 
 ## 项目结构
 
 ```text
-api/       Fastify API、数据库、Provider、扫描 Worker 与刮削逻辑
+api/       Fastify API、数据库、Provider、内容源、扫描 Worker 与刮削逻辑
 web/       React 管理前端
 data/      本地数据库、密钥、插件和导出文件（不会提交到 Git）
 ```
