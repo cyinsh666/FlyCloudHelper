@@ -13,6 +13,7 @@ import { TmdbMetadataCache } from "./metadata/tmdb-cache.js";
 import { TmdbKeyPool } from "./metadata/tmdb.js";
 import { MetadataPluginManager } from "./plugin-manager.js";
 import { ContentSourceManager } from "./content-sources/manager.js";
+import { ContentMusicManager } from "./content-sources/music-manager.js";
 import { ContentSourceAutoSyncWorker } from "./content-sources/auto-sync.js";
 import { ContentSourceDiagnostics } from "./content-sources/diagnostics.js";
 import { ProviderRegistry } from "./providers/registry.js";
@@ -28,7 +29,7 @@ import { registerNavidromeRoutes } from "./routes/navidrome-routes.js";
 import { registerNotificationRoutes } from "./routes/notification-routes.js";
 import { registerScanScheduleRoutes } from "./routes/scan-schedule-routes.js";
 import { registerPluginRoutes } from "./routes/plugin-routes.js";
-import { registerContentSourceRoutes } from "./routes/content-source-routes.js";
+import { registerContentSourceRoutes, registerContentMusicRoutes } from "./routes/content-source-routes.js";
 import { PublicAccessService } from "./public-access.js";
 import { ServiceAccessService } from "./service-access.js";
 import { EmbyAccessService } from "./emby-access.js";
@@ -199,6 +200,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   const plugins = new MetadataPluginManager(database, config, vault);
   const contentSources = new ContentSourceManager(database, config, repository);
   await contentSources.initialize();
+  const contentMusic = new ContentMusicManager(database, config, repository);
   const contentSourceAutoSync = new ContentSourceAutoSyncWorker({ database, contentSources, logBusinessEvent: logger });
   await contentSourceAutoSync.initialize();
   const contentSourceDiagnostics = new ContentSourceDiagnostics({ database, config, contentSources, logBusinessEvent: logger });
@@ -250,6 +252,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     scanScheduleWorker,
     plugins,
     contentSources,
+    contentMusic,
     contentSourceAutoSync,
     contentSourceDiagnostics,
     aiModels,
@@ -273,6 +276,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     await contentSourceAutoSync.stop();
     await contentSourceDiagnostics.shutdown();
     await contentSources.shutdown();
+    await contentMusic.shutdown();
     await telegramNotifications.close();
     await scanScheduleWorker.stop();
     await worker.stop();
@@ -464,6 +468,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerAiModelRoutes(server, runtime);
   await registerPluginRoutes(server, runtime);
   await registerContentSourceRoutes(server, runtime);
+  await registerContentMusicRoutes(server, runtime);
 
   if (fs.existsSync(config.webDistDirectory)) {
     await server.register(fastifyStatic, {

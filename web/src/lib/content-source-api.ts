@@ -1,4 +1,4 @@
-import { requestJson } from "@/lib/api";
+import { ApiClientError, requestJson } from "@/lib/api";
 
 /** 一个可独立启停的内容源插件版本。 */
 export interface ContentSourcePlugin {
@@ -6,7 +6,7 @@ export interface ContentSourcePlugin {
   version: string;
   displayName: string;
   status: "enabled" | "disabled" | "imported" | "uninstalled";
-  adapter: string;
+  adapter: "cms_json" | "netease_http" | "python_spider";
   description: string;
 }
 
@@ -53,6 +53,22 @@ export interface ContentSourceLibraryState {
   configuration: { categoryIds: string[]; initialPageCount: number; categories?: ContentSourceCategory[] };
   sync: ContentSourceSync;
   plugin?: ContentSourcePlugin;
+}
+
+/** 音乐源使用专辑、歌单建立初始目录，播放模式独立于网盘设置。 */
+export interface ContentMusicConfiguration {
+  albumIds: string[];
+  playlistIds: string[];
+  playbackMode: ContentSourcePlaybackMode;
+}
+
+/** 独立在线音乐库的源配置和最近同步状态。 */
+export interface ContentMusicLibraryState {
+  libraryId: string;
+  source: ContentSourceInstance;
+  plugin: ContentSourcePlugin;
+  configuration: ContentMusicConfiguration;
+  sync: ContentSourceSync;
 }
 
 /** 在线源的播放方式；两种协议独立保存，缺省由服务端返回自动模式。 */
@@ -111,17 +127,30 @@ export interface ContentSourceDiagnosticsResult {
   } | null;
 }
 
-/** 创建时一次性返回的协议密码；后续管理页只提供修改密码。 */
+/** 影视库创建仅返回库和同步状态；音乐库保留原 Navidrome 初始账号结果。 */
 export interface ContentSourceLibraryCreateResult {
   libraryId: string;
   sync?: ContentSourceSync;
-  accessCredentials?: { account: { username: string }; password: string };
-  embyAccessCredentials?: { account: { username: string }; password: string };
+  navidromeAccessCredentials?: { account: { username: string }; password: string };
 }
 
 /** 读取可用插件；普通用户只会收到已启用的版本。 */
 export function listContentSourcePlugins(): Promise<{ items: ContentSourcePlugin[] }> {
   return requestJson("/api/v1/content-source-plugins");
+}
+
+/** 直接预览已启用插件的分类，读取时不创建源实例。 */
+export function listContentSourcePluginCategories(plugin: Pick<ContentSourcePlugin, "pluginId" | "version">): Promise<{ items: ContentSourceCategory[] }> {
+  return requestJson(`/api/v1/content-source-plugins/${encodeURIComponent(plugin.pluginId)}/${encodeURIComponent(plugin.version)}/categories`);
+}
+
+/** 从已安装插件创建媒体库，内部源关联交给服务端处理。 */
+export function createContentSourcePluginLibrary(plugin: Pick<ContentSourcePlugin, "pluginId" | "version">, input: {
+  displayName: string; categoryIds: string[]; initialPageCount?: number;
+} | { displayName: string; albumIds: string[]; playlistIds: string[] }): Promise<ContentSourceLibraryCreateResult> {
+  return requestJson(`/api/v1/content-source-plugins/${encodeURIComponent(plugin.pluginId)}/${encodeURIComponent(plugin.version)}/libraries`, {
+    method: "POST", body: JSON.stringify(input),
+  });
 }
 
 /** 启用或停用指定内容源插件，保留已有实例和媒体库目录。 */
@@ -137,6 +166,20 @@ export async function importContentSourcePlugin(file: File): Promise<ContentSour
   return (await requestJson<{ plugin: ContentSourcePlugin }>("/api/v1/admin/content-source-plugins/import", {
     method: "POST", body: JSON.stringify({ manifest }),
   })).plugin;
+}
+
+/** 上传独立 Python 源，使用浏览器生成的 multipart 边界，由服务端静态检查后登记。 */
+export async function importPythonContentSourcePlugin(file: File): Promise<ContentSourcePlugin> {
+  const form = new FormData();
+  form.set("file", file);
+  const response = await fetch("/api/v1/admin/content-source-plugins/import-python", {
+    method: "POST", body: form, credentials: "include", cache: "no-store",
+  });
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => ({}))) as { error?: { code?: string; message?: string } };
+    throw new ApiClientError(response.status, payload.error?.code ?? "request_failed", payload.error?.message ?? "Python 内容源导入失败");
+  }
+  return (await response.json() as { plugin: ContentSourcePlugin }).plugin;
 }
 
 /** 卸载源插件，已有媒体库和用户播放记录继续保留。 */
@@ -172,12 +215,31 @@ export function listContentSourceCategories(sourceId: string): Promise<{ items: 
   return requestJson(`/api/v1/content-sources/${encodeURIComponent(sourceId)}/categories`);
 }
 
-/** 创建在线影视库并开始首轮同步，每个源实例只关联一个库。 */
+/** 根据插件适配器创建影视或音乐库，每个源实例只关联一个库。 */
 export function createContentSourceLibrary(sourceId: string, input: {
-  displayName: string; categoryIds: string[]; initialPageCount: number;
-}): Promise<ContentSourceLibraryCreateResult> {
+  displayName: string; categoryIds: string[]; initialPageCount?: number;
+} | { displayName: string; albumIds: string[]; playlistIds: string[] }): Promise<ContentSourceLibraryCreateResult> {
   return requestJson(`/api/v1/content-sources/${encodeURIComponent(sourceId)}/libraries`, {
     method: "POST", body: JSON.stringify(input),
+  });
+}
+
+/** 读取音乐源配置，不访问网盘路径和扫描接口。 */
+export function getContentMusicLibrary(libraryId: string, admin = false): Promise<ContentMusicLibraryState> {
+  return requestJson(`${admin ? "/api/v1/admin" : "/api/v1"}/libraries/${encodeURIComponent(libraryId)}/content-music`);
+}
+
+/** 保存专辑、歌单及在线播放模式，同步由用户单独发起。 */
+export function updateContentMusicLibrary(libraryId: string, input: Partial<ContentMusicConfiguration>, admin = false): Promise<ContentMusicLibraryState> {
+  return requestJson(`${admin ? "/api/v1/admin" : "/api/v1"}/libraries/${encodeURIComponent(libraryId)}/content-music`, {
+    method: "PATCH", body: JSON.stringify(input),
+  });
+}
+
+/** 同步已配置的专辑和歌单，沿用音乐条目与用户记录。 */
+export function syncContentMusicLibrary(libraryId: string, admin = false): Promise<unknown> {
+  return requestJson(`${admin ? "/api/v1/admin" : "/api/v1"}/libraries/${encodeURIComponent(libraryId)}/content-music/sync`, {
+    method: "POST", body: "{}",
   });
 }
 

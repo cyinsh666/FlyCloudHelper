@@ -99,7 +99,7 @@ async function saveSchedule(
   operatorId: string,
   administrator: boolean,
 ) {
-  if (library.libraryKind === "content_source_video") {
+  if (library.libraryKind === "content_source_video" || library.libraryKind === "content_source_music") {
     throw new ApiError(409, "content_source_scan_schedule_unsupported", "在线内容库请使用内容源目录同步，首批不支持网盘定时扫描");
   }
   if (scanMode !== "full" && scanMode !== "incremental" && scanMode !== "media_probe") {

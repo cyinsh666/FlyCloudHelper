@@ -36,11 +36,12 @@ export class EmbyAccessService {
 
   /** 为历史服务补齐一个默认 Emby 免密码账号。 */
   public async ensureExistingLibraries(): Promise<number> {
-    const services = await this.database.query("media_libraries as l")
+    const libraries = await this.database.query("media_libraries as l")
       .leftJoin("library_emby_accounts as a", "a.library_id", "l.id")
-      .select("l.id")
-
+      .select("l.id", "l.library_kind", "l.emby_enabled")
       .whereNull("a.id");
+    // 关键变量：未开启 Emby 的在线影视库不在启动时生成账号，已有账号和其他库保持原流程。
+    const services = libraries.filter((library) => library.library_kind !== "content_source_video" || Number(library.emby_enabled) === 1);
     for (const service of services) await this.createForLibrary(String(service.id));
     return services.length;
   }

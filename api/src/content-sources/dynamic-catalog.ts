@@ -1,7 +1,7 @@
 import { ApiError, validationError } from "../errors.js";
 import { categoryMatches } from "./catalog.js";
 import type { CmsJsonAdapter } from "./cms-adapter.js";
-import type { CmsCatalogContentItem, ContentSourceBrowseOptions, ContentSourceBrowseResult, ContentSourceCategory, ContentSourceManifest, ContentSourceSearchOptions } from "./types.js";
+import type { CmsCatalogContentItem, ContentSourceBrowseOptions, ContentSourceBrowseResult, ContentSourceCategory, ContentSourceManifest, ContentSourceSearchOptions, VideoSourceAdapter } from "./types.js";
 
 /** 分类浏览与实时搜索使用独立窗口，源页请求始终保持原始顺序。 */
 export type DynamicCatalogQuery = { kind: "category"; categoryId: string }
@@ -19,7 +19,7 @@ export interface DynamicCatalogContext {
   identity: string;
   manifest: ContentSourceManifest;
   categories: ContentSourceCategory[];
-  adapter: CmsJsonAdapter;
+  adapter: VideoSourceAdapter;
 }
 
 interface CachedSourcePage {
@@ -221,7 +221,7 @@ export class DynamicContentCatalog {
       // 关键变量：源站搜索可能跨全站，必须用条目的真实分类精确筛选，而非仅信任 CMS 参数。
       const candidates = result.items.filter((content) => content.episodes.length > 0 && context.categoryIds.includes(content.categoryId)
         && !categoryMatches(content.categoryId, context.manifest.excludedCategoryIds ?? [], context.categories))
-        .map((content): CmsCatalogContentItem => ({ ...content, episodes: content.episodes.map(({ url: _url, ...episode }) => episode) }));
+        .map((content): CmsCatalogContentItem => ({ ...content, episodes: content.episodes.map(({ url: _url, playbackId: _playbackId, ...episode }) => episode) }));
       const sourcePage = { candidates, rawItemCount: result.rawItemCount, sourcePageCount: result.sourcePageCount };
       window.pages.set(page, sourcePage);
       while (window.pages.size > DynamicContentCatalog.MAX_CACHED_PAGES) window.pages.delete(window.pages.keys().next().value!);

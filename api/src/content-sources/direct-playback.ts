@@ -3,6 +3,7 @@ import type { IncomingMessage } from "node:http";
 import { ApiError } from "../errors.js";
 import { providerProbeStream } from "../providers/network.js";
 import type { ApiRuntime } from "../runtime.js";
+import type { ContentVideoContainer } from "./types.js";
 
 /** 直连判断只保存是否可用，不缓存或对外输出源站临时地址。 */
 interface DirectProbeCacheEntry {
@@ -40,7 +41,7 @@ function directRequestHeaders(userAgent: string): Record<string, string> {
 }
 
 /** 确认媒体资源有实际字节，拒绝 HTML/JSON 错误页；Range 被忽略时仍只读少量前缀。 */
-async function probeResource(runtime: ApiRuntime, url: string, userAgent: string, signal: AbortSignal): Promise<boolean> {
+async function probeResource(runtime: ApiRuntime, url: string, userAgent: string, signal: AbortSignal, inspectManifest = false): Promise<boolean> {
   const response = await providerProbeStream(url, { method: "GET", headers: { ...directRequestHeaders(userAgent), Range: "bytes=0-4095" } }, { allowInsecureHttp: runtime.config.allowInsecureProviderHttp }, signal);
   try {
     if (response.statusCode !== 200 && response.statusCode !== 206) return false;
@@ -49,7 +50,12 @@ async function probeResource(runtime: ApiRuntime, url: string, userAgent: string
     const prefix = await readProbeBody(response.body, 4096, false);
     if (prefix.length === 0) return false;
     const textPrefix = prefix.subarray(0, 80).toString("utf8").trimStart();
-    return !/^<(?:!doctype\s+html|html|head|body)\b/iu.test(textPrefix);
+    if (/^<(?:!doctype\s+html|html|head|body)\b/iu.test(textPrefix)) return false;
+    if (inspectManifest && (textPrefix.startsWith("#EXTM3U") || /mpegurl/iu.test(contentType) || /\.m3u8$/iu.test(response.finalUrl.pathname))) {
+      // 关键变量：无后缀地址实际返回 HLS 时，仍需检查子清单及分片，不能只凭根清单字节允许自动直连。
+      return probeHls(runtime, url, userAgent, signal);
+    }
+    return true;
   } finally {
     response.body.destroy();
   }
@@ -127,8 +133,8 @@ async function probeHls(runtime: ApiRuntime, url: string, userAgent: string, sig
   return true;
 }
 
-/** 实际播放时有界探测，自动模式失败后仍保留父请求以便继续中转。 */
-export async function canDirectContentPlayback(runtime: ApiRuntime, url: string, container: "hls" | "mp4", userAgent: string, parentSignal: AbortSignal): Promise<boolean> {
+/** 实际播放时有界探测；未知格式从媒体响应识别 HLS，其余只检查字节，不虚构 MP4。 */
+export async function canDirectContentPlayback(runtime: ApiRuntime, url: string, container: ContentVideoContainer, userAgent: string, parentSignal: AbortSignal): Promise<boolean> {
   parentSignal.throwIfAborted();
   // 关键变量：地址或播放器 UA 改变必须重新判断，不记录完整临时地址，也不跨客户端复用 UA 结果。
   const key = createHash("sha256").update(JSON.stringify([url, container, userAgent])).digest("hex");
@@ -146,7 +152,8 @@ export async function canDirectContentPlayback(runtime: ApiRuntime, url: string,
   });
   let available = false;
   try {
-    const probe = container === "hls" ? probeHls(runtime, url, userAgent, controller.signal) : probeResource(runtime, url, userAgent, controller.signal);
+    const probe = container === "hls" ? probeHls(runtime, url, userAgent, controller.signal)
+      : probeResource(runtime, url, userAgent, controller.signal, container === "unknown");
     available = await Promise.race([probe, interruptedProbe]);
     parentSignal.throwIfAborted();
   } catch {

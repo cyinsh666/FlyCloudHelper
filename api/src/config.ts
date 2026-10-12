@@ -42,6 +42,8 @@ export interface ApiConfig {
   ffprobeAnalyzeDurationUs: number;
   ffprobeProbeSizeBytes: number;
   pluginDirectory: string;
+  /** Python Spider 解释器路径；未配置时使用运行环境的 python3。 */
+  pythonPath?: string;
   exportDirectory: string;
   /** 音频内嵌封面的内容寻址缓存目录。 */
   musicArtworkDirectory: string;
@@ -354,6 +356,7 @@ export function loadApiConfig(): ApiConfig {
     ffprobeAnalyzeDurationUs: readPositiveInteger("FLYCLOUDHELPER_FFPROBE_ANALYZE_DURATION_US", 10_000_000),
     ffprobeProbeSizeBytes: readPositiveInteger("FLYCLOUDHELPER_FFPROBE_PROBE_SIZE_BYTES", 10 * 1024 * 1024),
     pluginDirectory: resolveProjectPath(readEnvironmentValue("FLYCLOUDHELPER_PLUGIN_DIR"), "data/plugins"),
+    pythonPath: readEnvironmentValue("FLYCLOUDHELPER_PYTHON_PATH") || "python3",
     exportDirectory: resolveProjectPath(readEnvironmentValue("FLYCLOUDHELPER_EXPORT_DIR"), "data/exports"),
     musicArtworkDirectory: resolveProjectPath(
       readEnvironmentValue("FLYCLOUDHELPER_MUSIC_ARTWORK_DIR"),

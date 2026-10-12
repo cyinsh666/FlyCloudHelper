@@ -48,6 +48,7 @@ ENV NODE_ENV=production \
     FLYCLOUDHELPER_HUAWEI_BINDING_PROOF_SECRET= \
     FLYCLOUDHELPER_GENERATED_CREDENTIAL_KEY_PATH=/data/secrets/credential-master-key \
     FLYCLOUDHELPER_PLUGIN_DIR=/data/plugins \
+    FLYCLOUDHELPER_PYTHON_PATH=python3 \
     FLYCLOUDHELPER_EXPORT_DIR=/data/exports \
     FLYCLOUDHELPER_MIGRATION_DIR=/data/migrations \
     FLYCLOUDHELPER_MUSIC_ARTWORK_DIR=/data/music-artwork \
@@ -69,12 +70,13 @@ COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # 当前网络环境无法稳定访问 deb.debian.org，切换到阿里云 HTTP Debian 镜像保证构建阶段可获取 ffmpeg。
 # Debian 的 ffmpeg 软件包提供原生 ffprobe；gosu 用于修复 NAS 挂载权限后降权启动服务。
+# Python Spider 使用系统 Python 和共用 HTTP、HTML、加密依赖，源插件不重复打包运行环境。
 RUN sed -i \
         -e 's|http://deb.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g' \
         -e 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g' \
         /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg gosu \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg gosu python3 python3-requests python3-bs4 python3-pycryptodome \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /data/database /data/secrets /data/plugins /data/exports /data/migrations /data/music-artwork \
     && chown -R node:node /data

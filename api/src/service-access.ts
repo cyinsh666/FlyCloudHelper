@@ -56,9 +56,11 @@ export class ServiceAccessService {
 
   /** 为升级前已经存在的服务补齐默认免密码账号。 */
   public async ensureExistingLibraries(): Promise<number> {
-    const services = await this.database.query("media_libraries as l")
+    const libraries = await this.database.query("media_libraries as l")
       .leftJoin("library_access_accounts as a", "a.library_id", "l.id")
-      .select("l.id").whereNull("a.id");
+      .select("l.id", "l.library_kind", "l.jellyfin_enabled").whereNull("a.id");
+    // 关键变量：未开启协议的在线影视库保持无账号，重启不能替用户提前完成协议配置。
+    const services = libraries.filter((library) => library.library_kind !== "content_source_video" || Number(library.jellyfin_enabled) === 1);
     for (const service of services) await this.createForLibrary(String(service.id));
     // 关键变量：免密码历史账号的真实密码可确定为空，直接补齐摘要认证所需的加密值。
     const passwordlessAccounts = await this.database.query("library_access_accounts")
@@ -71,6 +73,20 @@ export class ServiceAccessService {
       });
     }
     return services.length;
+  }
+
+  /** 用户主动开启协议时补齐默认免密码账号；并发调用复用已经创建的账号。 */
+  public async ensureForLibrary(libraryId: string): Promise<LibraryAccessAccountRecord> {
+    const existing = (await this.listByLibrary(libraryId))[0];
+    if (existing) return existing;
+    try {
+      return (await this.createForLibrary(libraryId)).account;
+    } catch (error) {
+      // 关键变量：默认用户名受唯一约束保护，并发创建失败后只复用同一库内的实际账号。
+      const createdByAnotherRequest = (await this.listByLibrary(libraryId))[0];
+      if (createdByAnotherRequest) return createdByAnotherRequest;
+      throw error;
+    }
   }
 
   /** 为新服务创建稳定的默认免密码账号。 */

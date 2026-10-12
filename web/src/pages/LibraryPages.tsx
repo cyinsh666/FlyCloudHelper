@@ -6,7 +6,10 @@ import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/Console
 import { Panel, StatusPill } from "@/components/ui-kit";
 import { ServicePathPicker, toProviderDirectory } from "@/components/ServicePathPicker";
 import { ContentSourceLibraryPanel } from "@/components/ContentSourceLibraryPanel";
+import { ContentSourceLibraryNameEditor } from "@/components/ContentSourceLibraryNameEditor";
 import { ContentSourcePlaybackModeSettings } from "@/components/ContentSourcePlaybackModeSettings";
+import { ContentMusicLibraryPanel } from "@/components/ContentMusicLibraryPanel";
+import { ContentMusicPlaybackModeSettings } from "@/components/ContentMusicPlaybackModeSettings";
 import { CloudAggregateSourcesPanel } from "@/components/CloudAggregateSourcesPanel";
 import { CloudAggregateScanPathsPanel } from "@/components/CloudAggregateScanPathsPanel";
 import { AiCleaningSettingsFields, type AiCleaningSettingsValue } from "@/components/AiCleaningSettingsFields";
@@ -179,7 +182,8 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   const scanProfile = resource.data?.scanProfile ?? {};
   const metadataProfile = resource.data?.metadataProfile ?? {};
   const isCloudAggregate = service?.libraryKind === "cloud_aggregate_video";
-  const isContentSource = service?.libraryKind === "content_source_video";
+  const isMusicContentSource = service?.libraryKind === "content_source_music";
+  const isContentSource = service?.libraryKind === "content_source_video" || isMusicContentSource;
   // 关键变量：聚合扫描只计入状态正常且已配置当前模式路径的来源。
   const readyAggregateSources = service?.sources.filter(isReadyAggregateSource) ?? [];
   const fullAggregateScanSources = readyAggregateSources.filter((source) => hasAggregateSourceRoots(source, "full"));
@@ -497,22 +501,24 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   const libraryProtocolEnabled = settings.navidromeSupported
     ? settings.navidromeEnabled
     : settings.jellyfinEnabled;
+  const headerActions = <div className="flex flex-wrap gap-2">
+    <Link to={librariesPath}><SecondaryButton>返回媒体库</SecondaryButton></Link>
+    {!isContentSource && <Link to={schedulePath} params={{ serviceId }}><SecondaryButton><CalendarClock className="size-4" /> 定时任务</SecondaryButton></Link>}
+    {!isContentSource && service.dataType === "video" && <Link to={filesPath} params={{ serviceId }}><SecondaryButton><FolderOpen className="size-4" /> 文件浏览</SecondaryButton></Link>}
+    <Link to={catalogPath} params={{ serviceId }}><PrimaryButton><Images className="size-4" /> 海报墙</PrimaryButton></Link>
+  </div>;
 
   return (
     <>
-      <PageHeader
+      {isContentSource ? <div className="mb-6 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
+        <ContentSourceLibraryNameEditor key={`${serviceId}:${admin}`} state={{ libraryId: serviceId, displayName: service.displayName, admin, loading: resource.loading, onSaved: resource.refresh }} />
+        <div className="flex flex-wrap gap-2 sm:justify-end">{headerActions}</div>
+      </div> : <PageHeader
         title={`${service.displayName} · 媒体库设置`}
-        actions={(
-          <div className="flex flex-wrap gap-2">
-            <Link to={librariesPath}><SecondaryButton>返回媒体库</SecondaryButton></Link>
-            {!isContentSource && <Link to={schedulePath} params={{ serviceId }}><SecondaryButton><CalendarClock className="size-4" /> 定时任务</SecondaryButton></Link>}
-            {!isContentSource && service.dataType === "video" && <Link to={filesPath} params={{ serviceId }}><SecondaryButton><FolderOpen className="size-4" /> 文件浏览</SecondaryButton></Link>}
-            <Link to={catalogPath} params={{ serviceId }}><PrimaryButton><Images className="size-4" /> 海报墙</PrimaryButton></Link>
-          </div>
-        )}
-      />
+        actions={headerActions}
+      />}
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
-      {isContentSource ? <ContentSourceLibraryPanel key={`${serviceId}:${admin}`} libraryId={serviceId} admin={admin} onChanged={resource.refresh} /> : isCloudAggregate ? <><CloudAggregateSourcesPanel library={service} admin={admin} onChanged={resource.refresh} onMessage={setMessage} /><CloudAggregateScanPathsPanel library={service} admin={admin} onChanged={resource.refresh} onMessage={setMessage} /></> : <Panel title="关联服务" description="当前媒体库使用这个网盘服务的登录凭据读取和扫描文件。" className="mb-4">
+      {isMusicContentSource ? <ContentMusicLibraryPanel key={`${serviceId}:${admin}`} state={{ libraryId: serviceId, admin, onChanged: resource.refresh }} /> : isContentSource ? <ContentSourceLibraryPanel key={`${serviceId}:${admin}`} libraryId={serviceId} admin={admin} onChanged={resource.refresh} /> : isCloudAggregate ? <><CloudAggregateSourcesPanel library={service} admin={admin} onChanged={resource.refresh} onMessage={setMessage} /><CloudAggregateScanPathsPanel library={service} admin={admin} onChanged={resource.refresh} onMessage={setMessage} /></> : <Panel title="关联服务" description="当前媒体库使用这个网盘服务的登录凭据读取和扫描文件。" className="mb-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0">
             <p className="truncate text-sm font-medium">{service.sourceServiceName}</p>
@@ -636,7 +642,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
               <div className="mt-3 flex flex-col gap-3 border-t border-border pt-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="min-w-0">
                   <p className="break-all font-mono text-xs">{settings.navidromeUrl ?? `云助手 API 地址${settings.navidromePath}`}</p>
-                  <p className="mt-1 text-xs text-muted-foreground">账号：<span className="font-mono text-foreground">{settings.account.username}</span> · 原音频透传，不转码</p>
+                  <p className="mt-1 text-xs text-muted-foreground">账号：<span className="font-mono text-foreground">{settings.account?.username ?? "尚未创建"}</span> · 原音频透传，不转码</p>
                 </div>
                 <div className="flex shrink-0 flex-wrap gap-2">
                   <SecondaryButton type="button" onClick={() => void copyLibraryText(settings.navidromeUrl ?? settings.navidromePath).then(() => setMessage(settings.navidromeUrl ? "Navidrome 服务地址已复制" : "Navidrome 服务路径已复制"))}><Copy className="size-4" /> 复制</SecondaryButton>
@@ -688,6 +694,7 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
   const pendingAccountActionRef = useRef<string | null>(null);
   const service = resource.data?.service;
   const isContentSource = service?.libraryKind === "content_source_video";
+  const isMusicContentSource = service?.libraryKind === "content_source_music";
   const settings = resource.data?.settings;
   const settingsPath = admin ? "/admin/libraries/$serviceId/settings" : "/app/libraries/$serviceId/settings";
 
@@ -956,8 +963,8 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
     return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取协议访问配置…"}</div></Panel>;
   }
   const jellyfinAddress = settings.jellyfinUrl ?? `云助手 API 地址${settings.jellyfinPath}`;
-  // 关键变量：旧服务响应没有 accounts 时仍把历史单账号作为列表中的第一个账号显示。
-  const accessAccounts = settings.accounts?.length > 0 ? settings.accounts : [settings.account];
+  // 关键变量：旧服务继续展示历史单账号，新在线视频库尚无账号时保留真实的空列表。
+  const accessAccounts = settings.accounts?.length > 0 ? settings.accounts : settings.account ? [settings.account] : [];
   const activeAccountCount = accessAccounts.filter((account) => account.status === "active").length;
   return (
     <>
@@ -994,7 +1001,7 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
       </Panel>}
       {settings.navidromeSupported && (
         <Panel title="播放设置" description="控制 Navidrome 音乐播放和下载的传输方式，不转码。" className="mb-4">
-          <div className="flex items-center justify-between gap-4 rounded-xl border border-border bg-secondary/35 p-4">
+          {isMusicContentSource ? <ContentMusicPlaybackModeSettings key={`${serviceId}:${admin}:navidrome`} state={{ libraryId: serviceId, admin }} /> : <div className="flex items-center justify-between gap-4 rounded-xl border border-border bg-secondary/35 p-4">
             <div>
               <p className="text-sm font-medium">Navidrome 中转播放</p>
               <p className="mt-1 text-xs text-muted-foreground">开启后由云助手转发音频；关闭后优先直连网盘，需认证请求头或无法生成直链时回退中转。客户端直连后若无法播放，可重新开启中转。</p>
@@ -1002,7 +1009,7 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
             <button type="button" role="switch" aria-checked={settings.navidromeRelayPlaybackEnabled ?? true} aria-label="启用 Navidrome 中转播放" disabled={updatingPlayback} onClick={() => void toggleNavidromeRelayPlayback()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${(settings.navidromeRelayPlaybackEnabled ?? true) ? "border-foreground bg-foreground" : "border-border bg-secondary"}`}>
               <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-background shadow-sm transition-transform ${(settings.navidromeRelayPlaybackEnabled ?? true) ? "translate-x-5" : "translate-x-0"}`} />
             </button>
-          </div>
+          </div>}
         </Panel>
       )}
       {settings.navidromeSupported && (
@@ -1032,6 +1039,7 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
         className="mt-4"
         action={<SecondaryButton type="button" disabled={pendingAccountAction !== null} onClick={() => setShowCreateAccount((value) => !value)}><Plus className="size-4" /> 添加账号</SecondaryButton>}
       >
+        {accessAccounts.length === 0 && !showCreateAccount && <p className="py-3 text-sm text-muted-foreground">{isContentSource ? "尚未创建 Jellyfin 账号，启用协议时会创建初始账号，也可以在这里添加账号。" : "尚未创建访问账号，可以添加账号后使用。"}</p>}
         {showCreateAccount && (
           <form onSubmit={(event) => void createAccessAccount(event)} className="mb-3 grid gap-2 rounded-lg border border-border bg-secondary/35 p-3 md:grid-cols-2">
             <label><span className="text-xs text-muted-foreground">新账号用户名</span><input value={newAccountUsername} required minLength={4} maxLength={255} onChange={(event) => setNewAccountUsername(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label>

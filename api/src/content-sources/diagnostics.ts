@@ -2,7 +2,6 @@ import type { ApiConfig } from "../config.js";
 import type { FlyCloudHelperDatabase } from "../database.js";
 import { parseJsonObject } from "../domain.js";
 import { ApiError } from "../errors.js";
-import { CmsJsonAdapter, validateContentManifest } from "./cms-adapter.js";
 import { probeContentLine, summarizeContentError } from "./diagnostic-probe.js";
 import type { ContentSourceManager } from "./manager.js";
 import type { ContentSourcePlaybackProtocol } from "./types.js";
@@ -20,7 +19,7 @@ interface LineDiagnostic {
   title: string;
   lineName: string;
   episodeName: string;
-  container: "hls" | "mp4";
+  container: "hls" | "mp4" | "unknown";
   status: "ok" | "failed";
   elapsedMs: number;
   runTimeTicks: number;
@@ -181,11 +180,12 @@ export class ContentSourceDiagnostics {
           .join("media_libraries as l", "l.id", "b.library_id")
           .join("library_sources as ls", "ls.id", "b.library_source_id")
           .join("content_source_plugins as p", function pinnedPlugin() { this.on("p.plugin_id", "=", "i.plugin_id").andOn("p.version", "=", "i.plugin_version"); })
-          .select("p.manifest_json", "p.status as plugin_status", "i.status as source_status", "l.status as library_status", "ls.status as binding_status")
+          .select("b.instance_id", "p.manifest_json", "p.status as plugin_status", "i.status as source_status", "l.status as library_status", "ls.status as binding_status")
           .where({ "b.library_id": libraryId, "b.user_id": ownerUserId, "l.user_id": ownerUserId, "i.user_id": ownerUserId, "ls.user_id": ownerUserId }).first();
         if (!binding) throw new ApiError(404, "content_library_not_found", "内容源媒体库不存在");
         if (binding.plugin_status !== "enabled" || binding.source_status !== "active" || binding.library_status !== "active" || binding.binding_status !== "active") throw new ApiError(409, "content_source_disabled", "内容源已停用");
-        const adapter = new CmsJsonAdapter(validateContentManifest(parseJsonObject(binding.manifest_json)), this.options.config.allowInsecureProviderHttp);
+        const source = await this.options.contentSources.adapterForInstance(String(binding.instance_id), ownerUserId);
+        const adapter = source.adapter;
         const categories = await adapter.categories(controller.signal);
         result.catalog = { status: "ok", categoryCount: categories.length, elapsedMs: Date.now() - started, error: null };
       } finally {
@@ -229,7 +229,7 @@ export class ContentSourceDiagnostics {
     const started = Date.now();
     const result: LineDiagnostic = {
       sourceId: String(row.id), itemId: String(row.item_id), title: String(row.title),
-      lineName: String(row.line_name), episodeName: String(row.name), container: row.container === "hls" ? "hls" : "mp4",
+      lineName: String(row.line_name), episodeName: String(row.name), container: row.container === "hls" ? "hls" : row.container === "mp4" ? "mp4" : "unknown",
       status: "failed", elapsedMs: 0, runTimeTicks: 0, error: null,
     };
     const controller = new AbortController();

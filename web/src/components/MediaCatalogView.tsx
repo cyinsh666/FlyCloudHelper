@@ -272,7 +272,7 @@ function MediaDetailDialog({
   const metadata = getDisplayMetadata(item.metadata);
   const externalIds = Object.entries(item.externalIds).filter(([, value]) => Boolean(value));
   const mediaProbeSummary = item.mediaProbeSummary;
-  const isContentSource = item.libraryKind === "content_source_video";
+  const isContentSource = item.libraryKind === "content_source_video" || item.libraryKind === "content_source_music";
   const canMatchVideo = !isContentSource && item.mediaType === "video" && (item.itemType === "video.movie" || item.itemType === "video.series");
   const aggregateSourceNames = item.libraryKind === "cloud_aggregate_video" && Array.isArray(item.sourceNames) ? item.sourceNames : [];
   // 关键变量：只有节目详情使用季集位置展示子项，电影及其他媒体保持原展示。
@@ -355,7 +355,7 @@ function MediaDetailDialog({
                 <div className="mt-3 flex flex-wrap gap-2">{externalIds.map(([key, value]) => <StatusPill key={key}>{key.toLocaleUpperCase("zh-CN")}：{value}</StatusPill>)}</div>
               </div>
             )}
-            {isContentSource ? <div className="rounded-xl border border-border bg-secondary/30 p-4"><p className="text-xs text-muted-foreground">内容和分集来自在线源，通过该媒体库的 Jellyfin、Emby 服务地址播放。</p></div> : <div>
+            {isContentSource ? <div className="rounded-xl border border-border bg-secondary/30 p-4"><p className="text-xs text-muted-foreground">{item.libraryKind === "content_source_music" ? "歌曲来自在线音乐源，通过该媒体库的 Navidrome 服务地址播放。" : "内容和分集来自在线源，通过该媒体库的 Jellyfin、Emby 服务地址播放。"}</p></div> : <div>
               <h3 className="flex items-center gap-2 text-sm font-semibold"><FolderOpen className="size-4" /> 文件路径</h3>
               {loading ? <p className="mt-3 text-sm text-muted-foreground">正在读取路径…</p> : paths.length > 0 ? (
                 <ul className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
@@ -549,7 +549,7 @@ export function MediaCatalogView({
         getMediaItem(item, admin),
         listMediaItemChildren(item, admin),
         item.itemType === "music.album" ? listMediaItemArtists(item, admin) : Promise.resolve([]),
-        item.libraryKind === "content_source_video" ? Promise.resolve([]) : listMediaItemPaths(item, admin),
+        item.libraryKind === "content_source_video" || item.libraryKind === "content_source_music" ? Promise.resolve([]) : listMediaItemPaths(item, admin),
       ]);
       setSelectedItem(detail);
       setSelectedChildren(children);

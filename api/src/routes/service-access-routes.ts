@@ -30,7 +30,7 @@ function librarySupportsRelayPlayback(
   runtime: ApiRuntime,
   library: Awaited<ReturnType<ApiRuntime["repository"]["getLibrary"]>>,
 ): boolean {
-  if (library.libraryKind === "content_source_video") return true;
+  if (library.libraryKind === "content_source_video" || library.libraryKind === "content_source_music") return true;
   if (library.libraryKind !== "cloud_aggregate_video") return supportsRelayPlayback(runtime, library.providerType);
   return library.sources.length > 0
     && library.sources.every((source) => supportsRelayPlayback(runtime, source.providerType));
@@ -46,8 +46,9 @@ function supportsNavidrome(runtime: ApiRuntime, providerType: string, dataType: 
 async function buildLibraryAccessSettings(runtime: ApiRuntime, libraryId: string) {
   const libraryRecord = await runtime.repository.getLibrary(libraryId);
   const accounts = await runtime.serviceAccess.listByLibrary(libraryId);
-  const account = accounts[0];
-  if (!account) throw new ApiError(404, "service_access_account_not_found", "协议访问账号不存在");
+  // 关键变量：新在线视频库在用户启用协议前没有账号，设置读取不能因此阻断协议开关。
+  const account = accounts[0] ?? null;
+  if (!account && libraryRecord.libraryKind !== "content_source_video") throw new ApiError(404, "service_access_account_not_found", "协议访问账号不存在");
   const library = await runtime.database.query("media_libraries")
     .select(
       "jellyfin_enabled",
@@ -70,8 +71,9 @@ async function buildLibraryAccessSettings(runtime: ApiRuntime, libraryId: string
   const jellyfinPathSuffix = String(library.jellyfin_path_suffix ?? "").trim() || libraryId;
   const navidromePathSuffix = String(library.navidrome_path_suffix ?? "").trim() || libraryId;
   const embyPathSuffix = String(library.emby_path_suffix ?? "").trim() || libraryId;
-  const navidromeSupported = libraryRecord.libraryKind !== "cloud_aggregate_video"
-    && supportsNavidrome(runtime, libraryRecord.providerType, libraryRecord.dataType);
+  const navidromeSupported = libraryRecord.libraryKind === "content_source_music"
+    || (libraryRecord.libraryKind !== "cloud_aggregate_video"
+      && supportsNavidrome(runtime, libraryRecord.providerType, libraryRecord.dataType));
   const embyAccounts = await runtime.embyAccess.listByLibrary(libraryId);
   return {
     relayPlaybackSupported: librarySupportsRelayPlayback(runtime, libraryRecord),
@@ -225,6 +227,7 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
 
     server.patch<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(`${prefix}/:libraryId/jellyfin-settings`, async (request) => {
       const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
+      if (library.libraryKind === "content_source_music" && request.body.jellyfinEnabled === true) throw new ApiError(422, "content_music_navidrome_only", "在线音乐源请使用 Navidrome 协议");
       const changesJellyfinEnabled = request.body.jellyfinEnabled !== undefined;
       const changesPathSuffix = request.body.jellyfinPathSuffix !== undefined;
       const changesRegionLibraries = request.body.jellyfinRegionLibrariesEnabled !== undefined;
@@ -277,6 +280,8 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
         if (pathSuffix && duplicateSuffix) throw new ApiError(409, "jellyfin_path_suffix_conflict", "该 Jellyfin 地址后缀已被使用，请更换后缀");
         throw error;
       }
+      // 首次启用才补齐默认账号；已有账号继续沿用原用户名、密码及个人数据。
+      if (changesJellyfinEnabled && request.body.jellyfinEnabled === true) await runtime.serviceAccess.ensureForLibrary(library.id);
       const disabledJellyfin = changesJellyfinEnabled && request.body.jellyfinEnabled === false;
       const revokedCount = disabledJellyfin ? await runtime.serviceAccess.revokeSessions(library.id, "jellyfin") : 0;
       const jellyfinSettingsEvent = pathSuffix
@@ -307,6 +312,7 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
     /** 保存独立 Emby 协议开关、地址、下载和地区虚拟媒体库设置。 */
     server.patch<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(`${prefix}/:libraryId/emby-settings`, async (request) => {
       const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
+      if (library.libraryKind === "content_source_music" && request.body.embyEnabled === true) throw new ApiError(422, "content_music_navidrome_only", "在线音乐源请使用 Navidrome 协议");
       const changesEnabled = request.body.embyEnabled !== undefined;
       const changesPathSuffix = request.body.embyPathSuffix !== undefined;
       const changesDownload = request.body.embyDownloadEnabled !== undefined;
@@ -411,7 +417,7 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
 
     server.patch<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(`${prefix}/:libraryId/navidrome-settings`, async (request) => {
       const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
-      if (!supportsNavidrome(runtime, service.providerType, library.dataType)) {
+      if (library.libraryKind !== "content_source_music" && !supportsNavidrome(runtime, service.providerType, library.dataType)) {
         throw new ApiError(422, "navidrome_music_service_required", "只有音乐类型服务可以启用 Navidrome 协议");
       }
       const changesEnabled = request.body.navidromeEnabled !== undefined;

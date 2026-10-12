@@ -186,16 +186,26 @@ async function sendResource(
     reply.raw.removeListener("close", abort);
   };
   try {
-    const upstream = await providerStream(ticket.url, {
+    let upstream = await providerStream(ticket.url, {
       // 清单 HEAD 仍先获取并改写正文，使返回的长度与实际 GET 一致。
       method: ticket.manifest ? "GET" : request.method,
       headers: buildContentUpstreamHeaders(request, ticket.headers, ticket.manifest),
     }, { allowInsecureHttp: runtime.config.allowInsecureProviderHttp }, controller.signal);
     body = upstream.body;
-    const rawContentType = String(upstream.headers["content-type"] ?? "");
-    const isManifest = ticket.manifest || /mpegurl/iu.test(rawContentType) || /\.m3u8$/iu.test(upstream.finalUrl.pathname);
+    let rawContentType = String(upstream.headers["content-type"] ?? "");
+    let isManifest = ticket.manifest || /mpegurl/iu.test(rawContentType) || /\.m3u8$/iu.test(upstream.finalUrl.pathname);
+    if (isManifest && !ticket.manifest && (request.method === "HEAD" || upstream.statusCode === 206)) {
+      // 关键变量：未知地址可能最终返回 HLS，HEAD 或 Range 响应不足以改写完整清单。
+      body.destroy();
+      upstream = await providerStream(ticket.url, {
+        method: "GET", headers: buildContentUpstreamHeaders(request, ticket.headers, true),
+      }, { allowInsecureHttp: runtime.config.allowInsecureProviderHttp }, controller.signal);
+      body = upstream.body;
+      rawContentType = String(upstream.headers["content-type"] ?? "");
+      isManifest = /mpegurl/iu.test(rawContentType) || /\.m3u8$/iu.test(upstream.finalUrl.pathname);
+    }
     if (!isManifest) {
-      // MP4 可能持续数小时；只限制空闲等待，不能按总播放时间截断整条字节流。
+      // 普通媒体可能持续数小时；只限制空闲等待，不能按总播放时间截断整条字节流。
       clearTimeout(timeout);
       body.setTimeout(120_000, abort);
     }
@@ -217,6 +227,7 @@ async function sendResource(
       const value = upstream.headers[name];
       if (value !== undefined) reply.header(name, value);
     }
+    if (!rawContentType) reply.type("application/octet-stream");
     reply.status(upstream.statusCode);
     if (request.method === "HEAD") {
       body.destroy();
@@ -253,7 +264,7 @@ async function sendResource(
   }
 }
 
-/** 即时解析指定来源，按协议播放模式跳转直连或中转原始 HLS、MP4。 */
+/** 即时解析指定来源，按实际容器中转 HLS 或普通媒体字节，未知格式沿用上游类型。 */
 export async function sendContentPlayback(
   runtime: ApiRuntime,
   context: ContentRelayContext,
@@ -304,6 +315,7 @@ export async function sendContentPlayback(
       protocol: options.protocol,
       ownerUserId: context.ownerUserId, libraryId: context.libraryId, accountId: context.accountId,
       itemId, sourceId: source.id, url: resolved.url, headers: resolved.headers,
+      // 关键变量：解析后的格式决定中转分支，不能使用数据库中的未知定位格式代替实际结果。
       manifest: resolved.container === "hls", measureDuration: true,
     });
   } catch (error) {

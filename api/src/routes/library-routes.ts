@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
-import type { LibraryScanJobRecord, LibrarySourceRecord, MediaType } from "../domain.js";
+import { parseJsonObject, type LibraryScanJobRecord, type LibrarySourceRecord, type MediaType } from "../domain.js";
 import { ApiError, toSafeErrorMessage, validationError } from "../errors.js";
 import {
   readPagination,
@@ -109,7 +109,7 @@ function readExpectedRevision(value: unknown): number | undefined {
 
 /** 在线内容由源插件同步目录，不能进入网盘路径、刮削和文件规格任务。 */
 export function requireDriveLibrary(libraryKind: string): void {
-  if (libraryKind === "content_source_video") {
+  if (libraryKind === "content_source_video" || libraryKind === "content_source_music") {
     throw new ApiError(409, "content_source_requires_catalog_sync", "在线内容库请在内容源设置中同步目录");
   }
 }
@@ -536,7 +536,49 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
       patch.notificationEnabled = request.body.notificationEnabled;
     }
     if (Object.keys(patch).length === 0) throw validationError("library", "没有可更新的媒体库字段");
-    return { library: await runtime.repository.updateLibrary(request.params.libraryId, user.id, patch) };
+    // 关键变量：先沿用仓储的同步任务与停用校验，成功提交 disabled 后再释放 Python 宿主。
+    const library = await runtime.repository.updateLibrary(request.params.libraryId, user.id, patch);
+    if (patch.status === "disabled" && library.libraryKind === "content_source_video") {
+      // 关键变量：按库所属用户和实例绑定版本判断 Python 源，停用插件也能完成宿主清理。
+      const binding = await runtime.database.query("content_source_libraries as b")
+        .join("content_source_instances as i", "i.id", "b.instance_id")
+        .join("content_source_plugins as p", /** 只读取实例绑定的固定插件版本。 */ function joinLibraryPluginVersion() {
+          this.on("p.plugin_id", "=", "i.plugin_id").andOn("p.version", "=", "i.plugin_version");
+        })
+        .select("p.manifest_json")
+        .where({ "b.library_id": library.id, "b.user_id": user.id, "i.user_id": user.id }).first();
+      if (parseJsonObject(binding?.manifest_json).adapter === "python_spider") {
+        // 关键变量：复用目录生命周期取消旧动态请求、失效缓存并停止该实例宿主。
+        await runtime.contentSources.withLibraryCatalogChange(library.id, async () => undefined);
+      }
+    }
+    return { library };
+  });
+
+  /** 管理员仅修改独立在线库名称，沿用所属用户的媒体库更新入口和管理审计。 */
+  server.patch<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/admin/libraries/:libraryId/name", async (request) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    const displayName = requireString(request.body, "displayName", "媒体库名称", 100);
+    if (Object.keys(request.body).some((field) => field !== "displayName")) {
+      throw validationError("library", "此接口只支持修改媒体库名称");
+    }
+    // 关键变量：管理员读取库的真实归属，再按所属用户调用更新，不扩展其他编辑权限。
+    const library = await runtime.repository.getLibrary(request.params.libraryId);
+    if (library.libraryKind !== "content_source_video" && library.libraryKind !== "content_source_music") {
+      throw new ApiError(409, "content_library_name_only", "此接口仅支持修改在线媒体库名称");
+    }
+    const updated = await runtime.repository.updateLibrary(library.id, library.userId, { displayName });
+    await runtime.database.addAudit({
+      id: randomUUID(),
+      operatorUserId: operator.id,
+      operatorUsername: operator.username,
+      operationType: "update_library_name",
+      targetType: "library",
+      targetId: library.id,
+      result: "success",
+      detail: { 原媒体库名称: library.displayName, 媒体库名称: updated.displayName, 目标用户ID: library.userId },
+    });
+    return { library: updated };
   });
 
   server.put<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/libraries/:libraryId/scan-profile", async (request) => {
@@ -834,6 +876,8 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     // 关键变量：在线库清空前暂停动态入库并清理窗口，避免旧分页缓存或正在写入的内容回填。
     const cleared = library.libraryKind === "content_source_video"
       ? await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, user.id))
+      : library.libraryKind === "content_source_music"
+        ? await runtime.contentMusic.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, user.id))
       : await runtime.repository.clearLibraryCatalog(library.id, user.id);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-media-library-catalog-clear",
@@ -854,6 +898,8 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     // 管理员清空在线库也等待该库动态写入收尾，再沿用原目录清空流程。
     const cleared = library.libraryKind === "content_source_video"
       ? await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, library.userId))
+      : library.libraryKind === "content_source_music"
+        ? await runtime.contentMusic.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, library.userId))
       : await runtime.repository.clearLibraryCatalog(library.id, library.userId);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-media-library-catalog-clear",
@@ -874,6 +920,8 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     // 删除在线库前暂停新分页并等待已有动态请求，避免删除后继续使用旧库写入。
     if (library.libraryKind === "content_source_video") {
       await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id, user.id));
+    } else if (library.libraryKind === "content_source_music") {
+      await runtime.contentMusic.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id, user.id));
     } else {
       await runtime.repository.deleteLibrary(library.id, user.id);
     }
@@ -894,6 +942,8 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     // 管理员删除在线库与个人入口使用相同的动态浏览生命周期。
     if (library.libraryKind === "content_source_video") {
       await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id));
+    } else if (library.libraryKind === "content_source_music") {
+      await runtime.contentMusic.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id));
     } else {
       await runtime.repository.deleteLibrary(library.id);
     }

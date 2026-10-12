@@ -1,18 +1,27 @@
-/** 内容源插件只描述固定 CMS JSON 协议，不包含可执行脚本。 */
+/** 内容源清单声明 CMS、Python Spider 或网易音乐能力，各源独立固定版本。 */
 export interface ContentSourceManifest {
   protocolVersion: 1;
   pluginId: string;
   version: string;
   displayName: string;
   description: string;
-  adapter: "cms_json";
+  adapter: "cms_json" | "python_spider" | "netease_http";
   endpoint: string;
   headers?: Record<string, string>;
   /** 指定电影父分类；其他已选分类按节目分集。 */
   movieCategoryIds: string[];
   /** 可选的专用音乐、小说等非视频父分类，不允许同步到首期视频库。 */
   excludedCategoryIds?: string[];
+  /** Python 源由导入入口保存的相对脚本路径，不接受远程执行地址。 */
+  scriptFile?: string;
+  /** 固定源版本的脚本摘要，防止文件内容与安装版本不一致。 */
+  scriptHash?: string;
+  /** Spider 初始化参数及缺少 limit 时使用的明确分页尺寸。 */
+  pythonConfig?: { extend?: string; pageSize?: number };
 }
+
+/** 尚未即时取址的 Spider 分集不猜测媒体格式。 */
+export type ContentVideoContainer = "hls" | "mp4" | "unknown";
 
 /** 安装及启停后的插件公开摘要。 */
 export interface ContentSourcePluginRecord {
@@ -20,7 +29,7 @@ export interface ContentSourcePluginRecord {
   version: string;
   displayName: string;
   description: string;
-  adapter: "cms_json";
+  adapter: ContentSourceManifest["adapter"];
   status: "enabled" | "disabled" | "imported" | "uninstalled";
 }
 
@@ -72,8 +81,10 @@ export interface CmsPlaybackEpisode {
   name: string;
   episodeNumber: number;
   seasonNumber: number;
-  url: string;
-  container: "hls" | "mp4";
+  url?: string;
+  /** Spider 原始分集标识只在取址期间传给 playerContent，不保存到目录缓存。 */
+  playbackId?: string;
+  container: ContentVideoContainer;
 }
 
 /** 从 CMS JSON 读取的电影或节目详情。 */
@@ -98,7 +109,7 @@ export interface CmsContentItem {
 
 /** 目录持久化与浏览缓存只需要播放身份和格式，实际 URL 仍由即时详情解析。 */
 export type CmsCatalogContentItem = Omit<CmsContentItem, "episodes"> & {
-  episodes: Array<Omit<CmsPlaybackEpisode, "url">>;
+  episodes: Array<Omit<CmsPlaybackEpisode, "url" | "playbackId">>;
 };
 
 /** 源页原始窗口与过滤后的候选分开，空候选不能被误认为源站末页。 */
@@ -144,7 +155,7 @@ export interface ContentPlaybackSource {
   name: string;
   lineName: string;
   episodeKey: string;
-  container: "hls" | "mp4";
+  container: ContentVideoContainer;
   runTimeTicks: number;
   sourceName: string;
 }
@@ -172,4 +183,13 @@ export interface ContentSourceSyncState {
   lastError: string | null;
   /** 仅成功完成 next 才清除；刷新目录、失败、停用和重启均保留。 */
   pendingBatch?: ContentSourcePendingBatch;
+}
+
+/** 视频源统一业务接口，协议和目录不直接调用 Python 或 CMS 特有字段。 */
+export interface VideoSourceAdapter {
+  categories(signal?: AbortSignal): Promise<ContentSourceCategory[]>;
+  page(categoryId: string, page: number, signal?: AbortSignal): Promise<CmsContentPage>;
+  search(searchTerm: string, page: number, categoryId?: string, signal?: AbortSignal): Promise<CmsContentPage>;
+  detail(remoteItemId: string, signal?: AbortSignal): Promise<CmsContentItem>;
+  resolveEpisode(episode: CmsPlaybackEpisode, signal?: AbortSignal): Promise<{ url: string; headers: Record<string, string>; container: ContentVideoContainer }>;
 }

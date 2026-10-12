@@ -8,7 +8,7 @@ export type JobStatus = "queued" | "running" | "retry_waiting" | "paused" | "com
 export type BackgroundJobType = "scan" | "media_probe";
 export type JobStage = "queued" | "enumerating" | "classifying" | "scraping" | "persisting" | "probing" | "completed";
 export type MediaType = "video" | "music" | "audiobook";
-export type MediaLibraryKind = "legacy_single_source" | "cloud_aggregate_video" | "content_source_video";
+export type MediaLibraryKind = "legacy_single_source" | "cloud_aggregate_video" | "content_source_video" | "content_source_music";
 /** 文件浏览启动的精确视频扫描范围，跟随任务快照持久化并用于重试。 */
 export interface TargetedVideoScanScope {
   kind: "folder" | "video";

@@ -2,6 +2,7 @@ import type { IncomingMessage } from "node:http";
 import { ApiError } from "../errors.js";
 import { providerProbeStream } from "../providers/network.js";
 import { readHlsRunTimeTicks } from "./hls-relay.js";
+import type { ContentVideoContainer } from "./types.js";
 
 /** 将业务错误转换为诊断摘要，不返回源地址、签名参数或请求头。 */
 export function summarizeContentError(error: unknown): { message: string; upstreamStatus: number | null } {
@@ -64,13 +65,13 @@ async function probeResource(url: string, headers: Record<string, string>, allow
   }
 }
 
-/** 只检查一个视频变体及首尾分片、必要 KEY/MAP；不下载完整影片。 */
+/** HLS 检查一个视频变体及必要资源；其他格式只读字节，不把未知格式伪装为 MP4。 */
 export async function probeContentLine(input: {
-  url: string; headers: Record<string, string>; container: "hls" | "mp4";
+  url: string; headers: Record<string, string>; container: ContentVideoContainer;
   allowInsecureHttp: boolean; signal: AbortSignal;
 }): Promise<number> {
   const headers = { ...input.headers, Accept: "*/*", "Accept-Encoding": "identity" };
-  if (input.container === "mp4") {
+  if (input.container !== "hls") {
     await probeResource(input.url, headers, input.allowInsecureHttp, input.signal);
     return 0;
   }

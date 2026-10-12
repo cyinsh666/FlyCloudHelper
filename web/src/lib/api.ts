@@ -143,7 +143,7 @@ export async function requestJson<T>(path: string, init?: RequestInit): Promise<
 }
 
 export type MediaType = "video" | "music" | "audiobook";
-export type MediaLibraryKind = "legacy_single_source" | "cloud_aggregate_video" | "content_source_video";
+export type MediaLibraryKind = "legacy_single_source" | "cloud_aggregate_video" | "content_source_video" | "content_source_music";
 export type CatalogSort = "created_desc" | "year_desc" | "premiere_date_desc" | "title_asc";
 export type MatchState = "matched" | "needs_review" | "unmatched" | "processing";
 export type ServiceStatus = "active" | "scanning" | "disabled" | "reauthorization_required";
@@ -441,8 +441,8 @@ export interface ServiceAccessSettings {
   navidromePath: string;
   /** 固定 /n/ 前缀之后的单层可编辑地址后缀。 */
   navidromePathSuffix: string;
-  /** 历史最早账号，保留给旧版客户端读取。 */
-  account: ServiceAccessAccount;
+  /** 历史最早账号；尚未启用协议的新在线视频库没有账号。 */
+  account: ServiceAccessAccount | null;
   /** 同一个 Jellyfin 地址下按创建时间排列的全部账号。 */
   accounts: ServiceAccessAccount[];
 }
@@ -996,6 +996,16 @@ export function listLibraries(admin = false, filters: ServiceListFilters = {}): 
 /** 读取单个媒体库及其当前配置。 */
 export function getLibrary(libraryId: string, admin = false): Promise<LibraryDetailResult> {
   return requestJson(admin ? `/api/v1/admin/libraries/${libraryId}` : `/api/v1/libraries/${libraryId}`);
+}
+
+/** 修改在线媒体库名称，管理员使用仅允许改名的专属接口。 */
+export async function updateContentLibraryName(libraryId: string, displayName: string, admin = false): Promise<MediaLibrary> {
+  const encodedId = encodeURIComponent(libraryId);
+  const result = await requestJson<{ library: MediaLibrary }>(
+    admin ? `/api/v1/admin/libraries/${encodedId}/name` : `/api/v1/libraries/${encodedId}`,
+    { method: "PATCH", body: JSON.stringify({ displayName: displayName.trim() }) },
+  );
+  return result.library;
 }
 
 /** 从一个尚未关联的网盘服务创建媒体库。 */

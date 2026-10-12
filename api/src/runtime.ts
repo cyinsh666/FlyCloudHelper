@@ -17,6 +17,7 @@ import type { MediaProbeWorker } from "./media-probe-worker.js";
 import type { ScanScheduleStore, ScanScheduleWorker } from "./scan-schedule-service.js";
 import type { TelegramNotificationService } from "./telegram-notification-service.js";
 import type { ContentSourceManager } from "./content-sources/manager.js";
+import type { ContentMusicManager } from "./content-sources/music-manager.js";
 import type { ContentSourceAutoSyncWorker } from "./content-sources/auto-sync.js";
 import type { ContentSourceDiagnostics } from "./content-sources/diagnostics.js";
 
@@ -37,6 +38,8 @@ export interface ApiRuntime {
   plugins: MetadataPluginManager;
   /** 独立内容源插件、配置实例、在线目录与即时播放取址。 */
   contentSources: ContentSourceManager;
+  /** 独立音乐源目录和播放定位，与网盘服务及文件扫描分开。 */
+  contentMusic: ContentMusicManager;
   /** 用户主动开启的内容源更新计划，不与网盘定时扫描混用。 */
   contentSourceAutoSync: ContentSourceAutoSyncWorker;
   /** 内容源目录、线路抽查与最近播放失败的持久摘要。 */

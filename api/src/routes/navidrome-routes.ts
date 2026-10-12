@@ -1,5 +1,7 @@
 import { resolveNavidromeDirectPlayback } from "../music/navidrome-playback.js";
 import { openMusicFileStream } from "../music/file-stream.js";
+import { streamContentSourceSong } from "../music/content-source-stream.js";
+import { isContentMusicPlaylistId } from "../content-sources/music-discovery.js";
 import type { IncomingMessage } from "node:http";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -23,7 +25,8 @@ interface NavidromeContext {
   libraryName: string;
   accountId: string;
   accountUsername: string;
-  relayLibrary: RelayLibraryRow;
+  libraryKind: string;
+  relayLibrary: RelayLibraryRow | null;
 }
 
 /** 从任意查询值读取第一个字符串。 */
@@ -48,7 +51,9 @@ function readQueryBoolean(value: unknown, fallback: boolean): boolean {
 
 /** 读取并限制 Subsonic 整数参数。 */
 function readQueryInteger(query: Record<string, unknown>, key: string, fallback: number, maximum: number): number {
-  const value = Number(readQueryString(query[key]));
+  const text = readQueryString(query[key]);
+  if (!text.trim()) return fallback;
+  const value = Number(text);
   return Number.isInteger(value) && value >= 0 ? Math.min(maximum, value) : fallback;
 }
 
@@ -112,9 +117,15 @@ function sendSubsonicResponse(
 
 /** 把内部错误转换为 Subsonic 错误编号，不暴露 Provider 和数据库细节。 */
 function sendSubsonicError(reply: FastifyReply, query: Record<string, unknown>, error: unknown): FastifyReply {
+  // 关键变量：音频或封面输出前失败时，不能把二进制长度和 Range 头留在 XML 错误信封中。
+  for (const header of ["content-length", "content-range", "accept-ranges", "content-encoding", "content-disposition", "etag", "last-modified", "expires"]) {
+    reply.removeHeader(header);
+  }
+  reply.code(200);
   const apiError = error instanceof ApiError ? error : null;
   const code = apiError?.statusCode === 401 ? 40 : apiError?.statusCode === 404 ? 70 : apiError?.statusCode === 403 ? 50 : 0;
-  const message = code === 40 ? "用户名或密码错误" : code === 70 ? "请求的音乐内容不存在" : code === 50 ? "当前账号无权访问" : "Navidrome 协议请求失败";
+  const message = apiError?.code === "content_music_playlist_readonly" ? "网易推荐歌单与排行榜是只读播放列表"
+    : code === 40 ? "用户名或密码错误" : code === 70 ? "请求的音乐内容不存在" : code === 50 ? "当前账号无权访问" : "Navidrome 协议请求失败";
   return sendSubsonicResponse(reply, query, { error: { code, message } }, "failed");
 }
 
@@ -124,6 +135,31 @@ async function authenticateRequest(
   pathSuffix: string,
   query: Record<string, unknown>,
 ): Promise<NavidromeContext> {
+  // 关键变量：在线音乐库不绑定 cloud_services，先按独立媒体库入口验证协议账号。
+  const onlineLibrary = await runtime.database.query("media_libraries")
+    .select("id", "user_id", "display_name", "status", "navidrome_enabled", "library_kind")
+    .where({ navidrome_path_suffix_lookup: pathSuffix.toLowerCase(), data_type: "music", library_kind: "content_source_music" })
+    .first();
+  if (onlineLibrary) {
+    if (Number(onlineLibrary.navidrome_enabled) !== 1 || onlineLibrary.status !== "active") {
+      throw new ApiError(404, "navidrome_service_disabled", "Navidrome 音乐服务未启用");
+    }
+    const libraryId = String(onlineLibrary.id);
+    const ownerUserId = String(onlineLibrary.user_id);
+    await runtime.contentMusic.assertAvailable(libraryId, ownerUserId);
+    const account = await runtime.serviceAccess.authenticateSubsonic(libraryId, {
+      username: readQueryString(query.u),
+      password: query.p === undefined ? undefined : readQueryString(query.p),
+      token: query.t === undefined ? undefined : readQueryString(query.t),
+      salt: query.s === undefined ? undefined : readQueryString(query.s),
+    });
+    return {
+      serviceId: "", ownerUserId, libraryId,
+      libraryName: String(onlineLibrary.display_name),
+      accountId: account.id, accountUsername: account.username,
+      libraryKind: "content_source_music", relayLibrary: null,
+    };
+  }
   const service = await runtime.database.query("cloud_services as s")
     .join("library_sources as ls", "ls.service_id", "s.id").join("media_libraries as l", "l.id", "ls.library_id")
     .select(
@@ -152,6 +188,7 @@ async function authenticateRequest(
     libraryName: String(service.display_name),
     accountId: account.id,
     accountUsername: account.username,
+    libraryKind: "cloud_music",
     relayLibrary: {
       id: String(service.library_id),
       service_id: serviceId,
@@ -219,7 +256,7 @@ function mapArtist(item: MediaItemRecord, albumCount = 0): Record<string, unknow
     id: item.id,
     isDir: true,
     name: item.title,
-    albumCount,
+    albumCount: albumCount || Number(item.metadata.albumCount ?? 0),
     coverArt: item.posterUrl ? item.id : undefined,
     artistImageUrl: item.posterUrl ?? undefined,
   };
@@ -238,8 +275,8 @@ function mapAlbum(item: MediaItemRecord, artistId = "", songCount = 0, duration 
     artist: String(item.metadata.albumArtist ?? item.subtitle ?? ""),
     artistId: artistId || undefined,
     coverArt: item.posterUrl ? item.id : undefined,
-    songCount,
-    duration,
+    songCount: songCount || Number(item.metadata.songCount ?? 0),
+    duration: duration || Math.max(0, Math.round(Number(item.metadata.albumDurationMs ?? 0) / 1000)),
     created: item.createdAt,
     year: item.year ?? undefined,
     genre: genres[0] || undefined,
@@ -260,7 +297,8 @@ function mapSong(
   file?: Record<string, unknown>,
   accountState?: { starredAt: string | null; rating: number; playCount: number; lastPlayedAt: string | null },
 ): Record<string, unknown> {
-  const extension = String(file?.name ?? "").split(".").pop()?.toLocaleLowerCase("en-US") ?? String(item.metadata.audioContainer ?? "").toLocaleLowerCase("en-US");
+  const fileName = String(file?.name ?? "");
+  const extension = (fileName ? fileName.split(".").pop() ?? "" : String(item.metadata.audioContainer ?? "")).toLocaleLowerCase("en-US");
   const durationMs = Number(item.metadata.durationMs ?? 0);
   const genres = Array.isArray(item.metadata.genres) ? item.metadata.genres.map(String).filter(Boolean) : [];
   return {
@@ -277,7 +315,7 @@ function mapSong(
     year: item.year ?? undefined,
     genre: genres[0] || undefined,
     coverArt: coverArtId || undefined,
-    size: Number(file?.size ?? 0) || undefined,
+    size: Number(file?.size ?? item.metadata.audioSize ?? 0) || undefined,
     contentType: readAudioContentType(extension),
     suffix: extension || undefined,
     duration: durationMs > 0 ? Math.round(durationMs / 1000) : undefined,
@@ -371,7 +409,7 @@ async function mapSongs(runtime: ApiRuntime, context: NavidromeContext, songs: M
   const albumCoverIds = new Set(albumCoverRows.map((row) => String(row.id)));
   let albumCoverFallbackCount = 0;
   const mappedSongs = await Promise.all(songs.map(async (song) => {
-    const files = await runtime.repository.listItemFiles(song.id, context.ownerUserId);
+    const files = context.libraryKind === "content_source_music" ? [] : await runtime.repository.listItemFiles(song.id, context.ownerUserId);
     const file = files.find((candidate) => String(candidate.itemId) === song.id);
     const albumId = albumIds.get(song.id) ?? "";
     const coverArtId = song.posterUrl ? song.id : albumCoverIds.has(albumId) ? albumId : "";
@@ -568,6 +606,22 @@ async function requireMusicItem(runtime: ApiRuntime, context: NavidromeContext, 
   return item;
 }
 
+/** 在线音乐详情先补齐源目录，再沿用已有音乐 DTO 和账号状态映射。 */
+async function hydrateMusicItem(runtime: ApiRuntime, context: NavidromeContext, itemId: string): Promise<MediaItemRecord> {
+  const item = await requireMusicItem(runtime, context, itemId);
+  if (context.libraryKind !== "content_source_music") return item;
+  await runtime.contentMusic.hydrateItem(context.libraryId, context.ownerUserId, item.id);
+  return requireMusicItem(runtime, context, item.id);
+}
+
+/** 读取在线源歌词或已有网盘歌词，始终按当前音乐库限制条目归属。 */
+async function readMusicLyrics(runtime: ApiRuntime, context: NavidromeContext, song: MediaItemRecord): Promise<string> {
+  if (context.libraryKind === "content_source_music") {
+    return runtime.contentMusic.lyrics(context.libraryId, context.ownerUserId, song.id);
+  }
+  return readStoredLyrics(song);
+}
+
 /** 按当前账号保存或取消收藏，其他协议账号的数据不受影响。 */
 async function updateStarredItems(runtime: ApiRuntime, context: NavidromeContext, itemIds: string[], starred: boolean): Promise<void> {
   const items = await Promise.all(itemIds.map((itemId) => requireMusicItem(runtime, context, itemId)));
@@ -761,6 +815,13 @@ async function requirePlaylist(runtime: ApiRuntime, context: NavidromeContext, p
   return playlist;
 }
 
+/** 网易推荐歌单与排行榜只供读取，不能通过账号播放列表写接口覆盖。 */
+function requireEditablePlaylist(context: NavidromeContext, playlistId: string): void {
+  if (context.libraryKind === "content_source_music" && isContentMusicPlaylistId(playlistId)) {
+    throw new ApiError(403, "content_music_playlist_readonly", "网易推荐歌单与排行榜是只读播放列表");
+  }
+}
+
 /** 按播放列表顺序读取当前音乐库中的歌曲。 */
 async function listPlaylistSongs(runtime: ApiRuntime, context: NavidromeContext, playlistId: string): Promise<MediaItemRecord[]> {
   const rows = await runtime.database.query("library_music_playlist_items")
@@ -780,6 +841,7 @@ function mapPlaylist(playlist: Record<string, unknown>, songs: MediaItemRecord[]
     comment: playlist.comment ? String(playlist.comment) : undefined,
     owner: username,
     public: Number(playlist.is_public ?? 0) === 1,
+    readonly: false,
     songCount: songs.length,
     duration,
     created: String(playlist.created_at),
@@ -858,9 +920,14 @@ async function updatePlaylist(
 }
 
 /** 发送 Navidrome 原音频流，不提供转码。 */
-async function streamSong(runtime: ApiRuntime, context: NavidromeContext, itemId: string, request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
+async function streamSong(runtime: ApiRuntime, context: NavidromeContext, itemId: string, query: Record<string, unknown>, request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
   const item = await runtime.repository.getCatalogItem(itemId, context.ownerUserId);
   if (item.libraryId !== context.libraryId || item.itemType !== "music.track") throw new ApiError(404, "navidrome_song_not_found", "歌曲不存在");
+  if (context.libraryKind === "content_source_music") {
+    return streamContentSourceSong(runtime, context.libraryId, context.ownerUserId, item, query, request, reply);
+  }
+  const relayLibrary = context.relayLibrary;
+  if (!relayLibrary) throw new ApiError(404, "navidrome_song_file_not_found", "歌曲文件不存在");
   const files = await runtime.repository.listItemFiles(item.id, context.ownerUserId);
   const file = files.find((candidate) => String(candidate.itemId) === item.id);
   if (!file) throw new ApiError(404, "navidrome_song_file_not_found", "歌曲文件不存在");
@@ -871,11 +938,11 @@ async function streamSong(runtime: ApiRuntime, context: NavidromeContext, itemId
   let upstreamBody: IncomingMessage | null = null;
   try {
     const locator = file.playbackLocator && typeof file.playbackLocator === "object" ? file.playbackLocator as Record<string, unknown> : {};
-    if (Number(context.relayLibrary.relay_playback_enabled) !== 1) {
-      const direct = await resolveNavidromeDirectPlayback(runtime, context.relayLibrary, context.ownerUserId, locator, request, controller.signal);
+    if (Number(relayLibrary.relay_playback_enabled) !== 1) {
+      const direct = await resolveNavidromeDirectPlayback(runtime, relayLibrary, context.ownerUserId, locator, request, controller.signal);
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-flycloud-navidrome-playback", 事件: "选择音乐传输方式",
-        服务ID: context.serviceId, 歌曲ID: item.id, 网盘类型: context.relayLibrary.provider_type,
+        服务ID: context.serviceId, 歌曲ID: item.id, 网盘类型: relayLibrary.provider_type,
         实际方式: direct.url ? "直连" : "回退中转", 回退原因: direct.fallbackReason,
         请求方法: request.method, 是否Range请求: Boolean(request.headers.range),
       });
@@ -888,7 +955,7 @@ async function streamSong(runtime: ApiRuntime, context: NavidromeContext, itemId
       }
     }
     const upstream = await openMusicFileStream(
-      () => resolveRelayAccess(runtime, context.relayLibrary, context.ownerUserId, locator, controller.signal),
+      () => resolveRelayAccess(runtime, relayLibrary, context.ownerUserId, locator, controller.signal),
       { method: request.method === "HEAD" ? "HEAD" : "GET", headers: buildUpstreamHeaders(request, {}) },
       { allowInsecureHttp: runtime.config.allowInsecureProviderHttp, logConnectionFailure: (fields) => runtime.logBusinessEvent("warn", fields) }, controller.signal);
     upstreamBody = upstream.body;
@@ -904,7 +971,7 @@ async function streamSong(runtime: ApiRuntime, context: NavidromeContext, itemId
       日志关键字: "codex-flycloud-helper-navidrome",
       事件: "Navidrome歌曲流连接建立",
       播放日志关键字: "codex-flycloud-navidrome-playback",
-      配置方式: Number(context.relayLibrary.relay_playback_enabled) === 1 ? "中转" : "直连优先",
+      配置方式: Number(relayLibrary.relay_playback_enabled) === 1 ? "中转" : "直连优先",
       实际方式: "中转",
       服务ID: context.serviceId,
       服务访问账号ID: context.accountId,
@@ -948,8 +1015,8 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
       const method = requestedMethod.replace(/\.(?:view|json)$/iu, "");
       // 关键变量：部分客户端使用 .json 后缀代替 f=json，服务端应返回同样的 JSON 信封。
       if (/\.json$/iu.test(requestedMethod) && query.f === undefined) query.f = "json";
-      // getAvatar 成功直接返回图片；失败按标准返回 XML，不受 f 或 .json 后缀影响。
-      if (method === "getAvatar") query.f = "xml";
+      // 二进制协议方法失败时必须返回 XML，不受 f=json 或 .json 后缀影响。
+      if (["getAvatar", "getCoverArt", "stream", "download"].includes(method)) query.f = "xml";
       try {
         const context = await authenticateRequest(runtime, request.params.pathSuffix, query);
         if (method === "getAvatar") {
@@ -970,18 +1037,22 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
         if (method === "stream" || method === "download") {
           const itemId = readQueryString(query.id);
           if (!itemId) throw new ApiError(422, "navidrome_song_id_required", "缺少歌曲 ID");
-          return await streamSong(runtime, context, itemId, request, reply);
+          return await streamSong(runtime, context, itemId, query, request, reply);
         }
         if (method === "getCoverArt") {
           const itemId = readQueryString(query.id);
+          if (context.libraryKind === "content_source_music" && isContentMusicPlaylistId(itemId)) {
+            const imageUrl = await runtime.contentMusic.getDiscoveryPlaylistCover(context.libraryId, context.ownerUserId, itemId);
+            return await sendRemoteMusicCover(runtime, imageUrl, itemId, request, reply);
+          }
           const item = await runtime.repository.getCatalogItem(itemId, context.ownerUserId);
           if (item.libraryId !== context.libraryId || !item.posterUrl) throw new ApiError(404, "navidrome_cover_not_found", "封面不存在");
-          return sendNavidromeCoverArt(runtime, item, request, reply);
+          return await sendNavidromeCoverArt(runtime, item, request, reply);
         }
         if (method === "getLyricsBySongId") {
           const song = await requireMusicItem(runtime, context, readQueryString(query.id));
           if (song.itemType !== "music.track") throw new ApiError(404, "navidrome_song_not_found", "歌曲不存在");
-          const storedLyrics = readStoredLyrics(song);
+          const storedLyrics = await readMusicLyrics(runtime, context, song);
           const parsedLyrics = parseStoredLyrics(storedLyrics);
           runtime.logBusinessEvent("info", {
             日志关键字: "codex-flycloud-helper-navidrome-lyrics",
@@ -1009,15 +1080,17 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
         if (method === "getLyrics") {
           const title = readQueryString(query.title).trim();
           const artist = readQueryString(query.artist).trim();
-          const candidates = title
-            ? await listMusicItems(runtime, context, "music.track", { search: title, limit: 100 })
-            : [];
+          const candidates = !title ? [] : context.libraryKind === "content_source_music"
+            ? (await runtime.contentMusic.search(context.libraryId, context.ownerUserId, title, {
+              artistCount: 0, artistOffset: 0, albumCount: 0, albumOffset: 0, songCount: 30, songOffset: 0,
+            })).songs
+            : await listMusicItems(runtime, context, "music.track", { search: title, limit: 100 });
           // 关键变量：旧版接口没有歌曲 ID，优先使用标题和艺术家同时精确命中的条目。
           const exactSong = candidates.find((candidate) => candidate.title.trim().toLocaleLowerCase("en-US") === title.toLocaleLowerCase("en-US")
             && (!artist || String(candidate.metadata.artist ?? candidate.subtitle ?? "").trim().toLocaleLowerCase("en-US") === artist.toLocaleLowerCase("en-US")));
           const song = exactSong ?? candidates.find((candidate) => candidate.title.trim().toLocaleLowerCase("en-US") === title.toLocaleLowerCase("en-US"))
             ?? candidates[0];
-          const storedLyrics = song ? readStoredLyrics(song) : "";
+          const storedLyrics = song ? await readMusicLyrics(runtime, context, song) : "";
           runtime.logBusinessEvent("info", {
             日志关键字: "codex-flycloud-helper-navidrome-lyrics",
             事件: "返回Subsonic旧版歌词",
@@ -1043,6 +1116,9 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
           return sendSubsonicResponse(reply, query, { musicFolders: { musicFolder: [{ id: context.libraryId, name: context.libraryName }] } });
         }
         if (method === "getArtists" || method === "getIndexes") {
+          if (context.libraryKind === "content_source_music") {
+            await runtime.contentMusic.ensureDiscoveryCatalog(context.libraryId, context.ownerUserId);
+          }
           const artists = await listMusicItems(runtime, context, "music.artist");
           const albumCounts = await loadRelationCounts(runtime, context, artists.map((artist) => artist.id), "artist_album");
           const preferences = await loadItemPreferences(runtime, context, artists.map((artist) => artist.id));
@@ -1058,7 +1134,7 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
           return sendSubsonicResponse(reply, query, method === "getArtists" ? { artists: container } : { indexes: { ...container, lastModified: Date.now() } });
         }
         if (method === "getArtist") {
-          const artist = await runtime.repository.getCatalogItem(readQueryString(query.id), context.ownerUserId);
+          const artist = await hydrateMusicItem(runtime, context, readQueryString(query.id));
           if (artist.libraryId !== context.libraryId || artist.itemType !== "music.artist") throw new ApiError(404, "navidrome_artist_not_found", "艺术家不存在");
           const children = await runtime.repository.listCatalogChildren(artist.id, context.ownerUserId);
           const albums = children.filter((item) => item.itemType === "music.album");
@@ -1072,7 +1148,7 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
           });
         }
         if (method === "getAlbum") {
-          const album = await runtime.repository.getCatalogItem(readQueryString(query.id), context.ownerUserId);
+          const album = await hydrateMusicItem(runtime, context, readQueryString(query.id));
           if (album.libraryId !== context.libraryId || album.itemType !== "music.album") throw new ApiError(404, "navidrome_album_not_found", "专辑不存在");
           const songs = (await runtime.repository.listCatalogChildren(album.id, context.ownerUserId)).filter((item) => item.itemType === "music.track");
           const artistIds = await loadArtistIds(runtime, context, [album.id]);
@@ -1082,7 +1158,16 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
           return sendSubsonicResponse(reply, query, { album: { ...attachPreference(mapAlbum(album, artistIds.get(album.id), songs.length, duration), preference), song: mappedSongs } });
         }
         if (method === "getMusicDirectory") {
-          const item = await runtime.repository.getCatalogItem(readQueryString(query.id), context.ownerUserId);
+          const directoryId = readQueryString(query.id);
+          if (context.libraryKind === "content_source_music" && directoryId === context.libraryId) {
+            await runtime.contentMusic.ensureDiscoveryCatalog(context.libraryId, context.ownerUserId);
+            const artists = await listMusicItems(runtime, context, "music.artist");
+            const counts = await loadRelationCounts(runtime, context, artists.map((artist) => artist.id), "artist_album");
+            return sendSubsonicResponse(reply, query, {
+              directory: { id: context.libraryId, name: context.libraryName, child: artists.map((artist) => mapArtist(artist, counts.get(artist.id) ?? 0)) },
+            });
+          }
+          const item = await hydrateMusicItem(runtime, context, directoryId);
           if (item.libraryId !== context.libraryId || !["music.artist", "music.album"].includes(item.itemType)) {
             throw new ApiError(404, "navidrome_directory_not_found", "音乐目录不存在");
           }
@@ -1101,25 +1186,33 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
           });
         }
         if (method === "getSong") {
-          const song = await runtime.repository.getCatalogItem(readQueryString(query.id), context.ownerUserId);
+          const song = await hydrateMusicItem(runtime, context, readQueryString(query.id));
           if (song.libraryId !== context.libraryId || song.itemType !== "music.track") throw new ApiError(404, "navidrome_song_not_found", "歌曲不存在");
           return sendSubsonicResponse(reply, query, { song: (await mapSongs(runtime, context, [song]))[0] });
         }
         if (method === "getAlbumList2" || method === "getAlbumList") {
-          const type = readQueryString(query.type);
+          const type = readQueryString(query.type) || (context.libraryKind === "content_source_music" ? "newest" : "");
           const sort = ["alphabeticalByName", "alphabeticalByArtist"].includes(type) ? "title_asc" : type === "recent" ? "updated_desc" : "created_desc";
           const size = readQueryInteger(query, "size", 10, 500);
           const offset = readQueryInteger(query, "offset", 0, 100_000);
           const filtersLocally = ["random", "byGenre", "byYear"].includes(type);
-          let albums = type === "recent"
-            ? await listRecentlyPlayedAlbums(runtime, context, offset, size)
-            : ["frequent", "starred", "highest"].includes(type)
-              ? await listAccountSelectedAlbums(runtime, context, type as "frequent" | "starred" | "highest", offset, size)
-              : await listMusicItems(runtime, context, "music.album", {
-              sort,
-              limit: filtersLocally ? 5000 : size,
-              offset: filtersLocally ? 0 : offset,
-              });
+          // 关键变量：最新专辑按源站 offset/size 获取，其余目录只补初始发现页，账号列表保留原语义。
+          const sourceNewest = context.libraryKind === "content_source_music" && type === "newest";
+          if (context.libraryKind === "content_source_music" && !sourceNewest && !["frequent", "recent", "starred", "highest"].includes(type)) {
+            await runtime.contentMusic.ensureDiscoveryCatalog(context.libraryId, context.ownerUserId);
+          }
+          let albums: MediaItemRecord[];
+          if (sourceNewest) {
+            albums = size === 0 ? [] : await runtime.contentMusic.listDiscoveryAlbums(context.libraryId, context.ownerUserId, size, offset);
+          } else if (type === "recent") {
+            albums = await listRecentlyPlayedAlbums(runtime, context, offset, size);
+          } else if (["frequent", "starred", "highest"].includes(type)) {
+            albums = await listAccountSelectedAlbums(runtime, context, type as "frequent" | "starred" | "highest", offset, size);
+          } else {
+            albums = await listMusicItems(runtime, context, "music.album", {
+              sort, limit: filtersLocally ? 5000 : size, offset: filtersLocally ? 0 : offset,
+            });
+          }
           if (type === "byGenre") {
             const genre = readQueryString(query.genre);
             albums = albums.filter((album) => Array.isArray(album.metadata.genres) && album.metadata.genres.map(String).includes(genre));
@@ -1142,18 +1235,24 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
           return sendSubsonicResponse(reply, query, { [key]: { album: albums.map((album) => attachPreference(mapAlbum(album, artistIds.get(album.id), counts.get(album.id) ?? 0), preferences.get(album.id))) } });
         }
         if (method === "search3" || method === "search2") {
-          const search = readQueryString(query.query).slice(0, 200);
+          const search = readQueryString(query.query).slice(0, 200).trim();
           const artistCount = readQueryInteger(query, "artistCount", 20, 200);
           const albumCount = readQueryInteger(query, "albumCount", 20, 200);
           const songCount = readQueryInteger(query, "songCount", 20, 500);
           const artistOffset = readQueryInteger(query, "artistOffset", 0, 100_000);
           const albumOffset = readQueryInteger(query, "albumOffset", 0, 100_000);
           const songOffset = readQueryInteger(query, "songOffset", 0, 100_000);
-          const [artists, albums, songs] = await Promise.all([
-            listMusicItems(runtime, context, "music.artist", { search, limit: artistCount, offset: artistOffset }),
-            listMusicItems(runtime, context, "music.album", { search, limit: albumCount, offset: albumOffset }),
-            listMusicItems(runtime, context, "music.track", { search, limit: songCount, offset: songOffset }),
-          ]);
+          // 关键变量：三类实时结果分别使用源站 offset/count，保持原顺序，不再本地截页。
+          const results = context.libraryKind === "content_source_music" && search
+            ? await runtime.contentMusic.search(context.libraryId, context.ownerUserId, search, {
+              artistCount, artistOffset, albumCount, albumOffset, songCount, songOffset,
+            })
+            : await Promise.all([
+              artistCount === 0 ? [] : listMusicItems(runtime, context, "music.artist", { search, limit: artistCount, offset: artistOffset }),
+              albumCount === 0 ? [] : listMusicItems(runtime, context, "music.album", { search, limit: albumCount, offset: albumOffset }),
+              songCount === 0 ? [] : listMusicItems(runtime, context, "music.track", { search, limit: songCount, offset: songOffset }),
+            ]).then(([artists, albums, songs]) => ({ artists, albums, songs }));
+          const { artists, albums, songs } = results;
           const albumArtistIds = await loadArtistIds(runtime, context, albums.map((album) => album.id));
           const preferences = await loadItemPreferences(runtime, context, [...artists.map((artist) => artist.id), ...albums.map((album) => album.id)]);
           const mappedSongs = await mapSongs(runtime, context, songs);
@@ -1190,7 +1289,7 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
           return sendSubsonicResponse(reply, query, { songsByGenre: { song: await mapSongs(runtime, context, songs) } });
         }
         if (["getArtistInfo", "getArtistInfo2"].includes(method)) {
-          const artist = await runtime.repository.getCatalogItem(readQueryString(query.id), context.ownerUserId);
+          const artist = await hydrateMusicItem(runtime, context, readQueryString(query.id));
           if (artist.libraryId !== context.libraryId || artist.itemType !== "music.artist") throw new ApiError(404, "navidrome_artist_not_found", "艺术家不存在");
           const artistInfo = {
             biography: String(artist.overview ?? ""),
@@ -1203,7 +1302,7 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
           return sendSubsonicResponse(reply, query, { [method === "getArtistInfo2" ? "artistInfo2" : "artistInfo"]: artistInfo });
         }
         if (["getAlbumInfo", "getAlbumInfo2"].includes(method)) {
-          const album = await runtime.repository.getCatalogItem(readQueryString(query.id), context.ownerUserId);
+          const album = await hydrateMusicItem(runtime, context, readQueryString(query.id));
           if (album.libraryId !== context.libraryId || album.itemType !== "music.album") throw new ApiError(404, "navidrome_album_not_found", "专辑不存在");
           const albumInfo = {
             notes: String(album.overview ?? ""),
@@ -1272,10 +1371,21 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
             await listPlaylistSongs(runtime, context, String(playlist.id)),
             context.accountUsername,
           )));
-          return sendSubsonicResponse(reply, query, { playlists: { playlist: mapped } });
+          const discovered = context.libraryKind === "content_source_music"
+            ? await runtime.contentMusic.listDiscoveryPlaylists(context.libraryId, context.ownerUserId)
+            : [];
+          return sendSubsonicResponse(reply, query, { playlists: { playlist: [...discovered, ...mapped] } });
         }
         if (method === "getPlaylist") {
-          const playlist = await requirePlaylist(runtime, context, readQueryString(query.id));
+          const playlistId = readQueryString(query.id);
+          if (context.libraryKind === "content_source_music" && isContentMusicPlaylistId(playlistId)) {
+            const discovered = await runtime.contentMusic.getDiscoveryPlaylist(context.libraryId, context.ownerUserId, playlistId);
+            return sendSubsonicResponse(reply, query, { playlist: {
+              ...discovered.playlist,
+              entry: await mapSongs(runtime, context, discovered.songs),
+            } });
+          }
+          const playlist = await requirePlaylist(runtime, context, playlistId);
           const songs = await listPlaylistSongs(runtime, context, String(playlist.id));
           return sendSubsonicResponse(reply, query, { playlist: {
             ...mapPlaylist(playlist, songs, context.accountUsername),
@@ -1283,6 +1393,7 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
           } });
         }
         if (method === "createPlaylist") {
+          requireEditablePlaylist(context, readQueryString(query.playlistId));
           const playlist = await createPlaylist(runtime, context, query.name, readQueryStrings(query.songId, 5000));
           runtime.logBusinessEvent("info", {
             日志关键字: "codex-flycloud-helper-navidrome", 事件: "创建Navidrome账号播放列表",
@@ -1291,6 +1402,7 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
           return sendSubsonicResponse(reply, query, { playlist });
         }
         if (method === "updatePlaylist") {
+          requireEditablePlaylist(context, readQueryString(query.playlistId));
           const removeIndexes = readQueryStrings(query.songIndexToRemove, 5000)
             .map(Number)
             .filter((value) => Number.isInteger(value) && value >= 0);
@@ -1308,6 +1420,7 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
           return sendSubsonicResponse(reply, query, {});
         }
         if (method === "deletePlaylist") {
+          requireEditablePlaylist(context, readQueryString(query.id));
           const playlist = await requirePlaylist(runtime, context, readQueryString(query.id));
           await runtime.database.query("library_music_playlists").where({ id: playlist.id }).delete();
           runtime.logBusinessEvent("info", {

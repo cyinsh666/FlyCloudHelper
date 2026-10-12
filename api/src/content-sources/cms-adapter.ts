@@ -201,11 +201,11 @@ export class CmsJsonAdapter {
   }
 }
 
-/** 校验导入清单，首期只接受固定 CMS JSON 地址和公开请求头。 */
+/** 校验声明式插件，网易音乐使用固定原站接口，视频保留已有 CMS 规则。 */
 export function validateContentManifest(value: unknown): ContentSourceManifest {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw validationError("manifest", "插件清单必须是 JSON 对象");
   const raw = value as Record<string, unknown>;
-  if (raw.protocolVersion !== 1 || raw.adapter !== "cms_json") throw validationError("manifest", "首期只支持 protocolVersion 1 的 cms_json 内容源插件");
+  if (raw.protocolVersion !== 1 || !["cms_json", "python_spider", "netease_http"].includes(String(raw.adapter))) throw validationError("manifest", "只支持 protocolVersion 1 的 CMS、Python Spider 或网易音乐内容源插件");
   const readText = (field: string, maximum: number): string => {
     const text = typeof raw[field] === "string" ? String(raw[field]).trim() : "";
     if (!text || text.length > maximum) throw validationError(field, `${field} 不能为空且不能超过 ${maximum} 个字符`);
@@ -214,10 +214,28 @@ export function validateContentManifest(value: unknown): ContentSourceManifest {
   const pluginId = readText("pluginId", 128);
   const version = readText("version", 64);
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/u.test(pluginId) || !/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/u.test(version)) throw validationError("manifest", "插件 ID 或版本格式无效");
+  if (raw.adapter === "python_spider") {
+    const scriptFile = readText("scriptFile", 200);
+    const scriptHash = readText("scriptHash", 64);
+    if (!/^[a-f0-9]{64}$/u.test(scriptHash) || scriptFile !== `python-sources/${scriptHash}/source.py`) throw validationError("scriptFile", "Python 源必须使用导入时保存的固定脚本路径和摘要");
+    const configuration = raw.pythonConfig;
+    if (configuration !== undefined && (!configuration || typeof configuration !== "object" || Array.isArray(configuration))) throw validationError("pythonConfig", "Python 初始化配置必须是对象");
+    const config = (configuration ?? {}) as Record<string, unknown>;
+    if (config.extend !== undefined && (typeof config.extend !== "string" || config.extend.length > 10000)) throw validationError("extend", "Python 初始化参数必须是文本且不超过 10000 字符");
+    const pageSize = Number(config.pageSize ?? 20);
+    if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 200) throw validationError("pageSize", "Python 源每页条数必须为 1 至 200");
+    return { protocolVersion: 1, pluginId, version, displayName: readText("displayName", 100), description: String(raw.description ?? "").slice(0, 2000), adapter: "python_spider", endpoint: "", headers: {}, scriptFile, scriptHash,
+      movieCategoryIds: Array.isArray(raw.movieCategoryIds) ? raw.movieCategoryIds.map(String) : [], excludedCategoryIds: Array.isArray(raw.excludedCategoryIds) ? raw.excludedCategoryIds.map(String) : [],
+      pythonConfig: { extend: String(config.extend ?? ""), pageSize } };
+  }
   const endpoint = readText("endpoint", 2000);
   let url: URL;
   try { url = new URL(endpoint); } catch { throw validationError("endpoint", "CMS 接口地址无效"); }
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.hash || url.search) throw validationError("endpoint", "首期 CMS 地址只允许不含查询参数的 HTTP(S) 地址，不能内嵌账号或锚点");
+  if (raw.adapter === "netease_http") {
+    if (url.href !== "https://music.163.com/") throw validationError("endpoint", "网易音乐适配器使用 https://music.163.com/ 原站接口");
+    return { protocolVersion: 1, pluginId, version, displayName: readText("displayName", 100), description: String(raw.description ?? "").slice(0, 2000), adapter: "netease_http", endpoint: url.href, movieCategoryIds: [], excludedCategoryIds: [], headers: {} };
+  }
   const movieCategoryIds = Array.isArray(raw.movieCategoryIds) ? raw.movieCategoryIds.map(String) : [];
   if (!movieCategoryIds.length || movieCategoryIds.some((id) => !id || id.length > 128)) throw validationError("movieCategoryIds", "请指定电影分类 ID");
   const headers: Record<string, string> = {};
