@@ -14,7 +14,7 @@ function encryptNeteaseWebText(text: string, key: string): string {
   return Buffer.concat([cipher.update(text, "utf8"), cipher.final()]).toString("base64");
 }
 
-/** 生成仅供本次公开网页请求使用的 16 位随机 AES 密钥，不建立用户会话。 */
+/** 生成仅供本次网页请求使用的 16 位随机 AES 密钥，不保存临时请求密钥。 */
 function createNeteaseWebSecretKey(): string {
   let key = "";
   for (let index = 0; index < 16; index += 1) {
@@ -32,8 +32,8 @@ function encryptNeteaseWebSecretKey(secretKey: string): string {
   return publicEncrypt({ key: NETEASE_WEB_PUBLIC_KEY, padding: constants.RSA_NO_PADDING }, keyBlock).toString("hex");
 }
 
-/** 构建正常匿名 WEAPI 表单，不读取、生成或保存账号 Cookie 和登录凭据。 */
-export function createNeteaseWebBody(parameters: Record<string, string>): URLSearchParams {
+/** 构建 WEAPI 表单，登录会话的 CSRF 由调用方传入，Cookie 不进入本函数。 */
+export function createNeteaseWebBody(parameters: Record<string, unknown>): URLSearchParams {
   const secretKey = createNeteaseWebSecretKey();
   const requestText = JSON.stringify({ csrf_token: "", ...parameters });
   const firstLayer = encryptNeteaseWebText(requestText, NETEASE_WEB_PRESET_KEY);

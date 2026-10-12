@@ -316,7 +316,9 @@ export class ContentSourceManager {
 
   /** 读取内容库及持久化同步进度，停用后的历史状态仍可查看。 */
   public async getLibrary(libraryId: string, userId: string): Promise<{ source: ContentSourceInstance; configuration: ContentLibraryConfiguration; sync: ContentSourceSyncState }> {
-    const row = await this.database.query("content_source_libraries").where({ library_id: libraryId, user_id: userId }).first();
+    const row = await this.database.query("content_source_libraries as b")
+      .join("media_libraries as l", "l.id", "b.library_id")
+      .select("b.*").where({ "b.library_id": libraryId, "b.user_id": userId, "l.user_id": userId, "l.library_kind": "content_source_video" }).first();
     if (!row) throw new ApiError(404, "content_library_not_found", "内容源媒体库不存在");
     return { source: await this.instance(String(row.instance_id), userId, false), configuration: parseJsonObject(row.configuration_json) as unknown as ContentLibraryConfiguration, sync: { ...emptySync(), ...parseJsonObject(row.sync_json) } as ContentSourceSyncState };
   }

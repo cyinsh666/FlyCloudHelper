@@ -124,7 +124,8 @@ function sendSubsonicError(reply: FastifyReply, query: Record<string, unknown>, 
   reply.code(200);
   const apiError = error instanceof ApiError ? error : null;
   const code = apiError?.statusCode === 401 ? 40 : apiError?.statusCode === 404 ? 70 : apiError?.statusCode === 403 ? 50 : 0;
-  const message = apiError?.code === "content_music_playlist_readonly" ? "网易推荐歌单与排行榜是只读播放列表"
+  const message = apiError?.code === "content_music_playlist_readonly" ? "网易歌单是只读播放列表，请在网易云音乐中修改"
+    : apiError?.code === "content_music_liked_song_readonly" ? "网易喜欢的歌曲为只读收藏，请在网易云音乐中取消喜欢"
     : code === 40 ? "用户名或密码错误" : code === 70 ? "请求的音乐内容不存在" : code === 50 ? "当前账号无权访问" : "Navidrome 协议请求失败";
   return sendSubsonicResponse(reply, query, { error: { code, message } }, "failed");
 }
@@ -333,14 +334,14 @@ function mapSong(
   };
 }
 
-/** 批量读取当前协议账号的歌曲收藏、评分和播放次数。 */
+/** 批量读取当前协议账号状态，网易喜欢标记只合并到返回结果，不写入本地偏好。 */
 async function loadSongAccountStates(
   runtime: ApiRuntime,
   context: NavidromeContext,
   songIds: string[],
 ): Promise<Map<string, { starredAt: string | null; rating: number; playCount: number; lastPlayedAt: string | null }>> {
   if (songIds.length === 0) return new Map();
-  const [preferences, progressRows] = await Promise.all([
+  const [preferences, progressRows, neteaseLikes] = await Promise.all([
     runtime.database.query("library_item_preferences")
       .select("item_id", "starred_at", "rating")
       .where({ library_id: context.libraryId, account_id: context.accountId })
@@ -349,13 +350,20 @@ async function loadSongAccountStates(
       .select("item_id", "play_count", "last_played_at")
       .where({ library_id: context.libraryId, account_id: context.accountId })
       .whereIn("item_id", songIds),
+    context.libraryKind === "content_source_music"
+      ? runtime.contentMusic.readNeteaseLikedSongState(context.libraryId, context.ownerUserId)
+      : Promise.resolve(null),
   ]);
   const result = new Map<string, { starredAt: string | null; rating: number; playCount: number; lastPlayedAt: string | null }>();
-  songIds.forEach((songId) => result.set(songId, { starredAt: null, rating: 0, playCount: 0, lastPlayedAt: null }));
+  // 关键变量：网易未提供逐曲喜欢时间时使用宿主的快照日期，本地收藏日期始终优先。
+  songIds.forEach((songId) => result.set(songId, {
+    starredAt: neteaseLikes?.songIds.has(songId) ? neteaseLikes.likedAt : null,
+    rating: 0, playCount: 0, lastPlayedAt: null,
+  }));
   preferences.forEach((row) => {
     const itemId = String(row.item_id);
     const current = result.get(itemId);
-    if (current) result.set(itemId, { ...current, starredAt: row.starred_at ? String(row.starred_at) : null, rating: Number(row.rating ?? 0) });
+    if (current) result.set(itemId, { ...current, starredAt: row.starred_at ? String(row.starred_at) : current.starredAt, rating: Number(row.rating ?? 0) });
   });
   progressRows.forEach((row) => {
     const itemId = String(row.item_id);
@@ -622,9 +630,16 @@ async function readMusicLyrics(runtime: ApiRuntime, context: NavidromeContext, s
   return readStoredLyrics(song);
 }
 
-/** 按当前账号保存或取消收藏，其他协议账号的数据不受影响。 */
+/** 按当前账号保存或取消本地收藏，网易源喜欢列表仅展示，不向源站执行修改。 */
 async function updateStarredItems(runtime: ApiRuntime, context: NavidromeContext, itemIds: string[], starred: boolean): Promise<void> {
   const items = await Promise.all(itemIds.map((itemId) => requireMusicItem(runtime, context, itemId)));
+  if (!starred && context.libraryKind === "content_source_music" && items.some((item) => item.itemType === "music.track")) {
+    // 关键变量：整批取消前先检查源收藏，拒绝时任何条目的本地偏好都尚未写入。
+    const neteaseLikes = await runtime.contentMusic.readNeteaseLikedSongIds(context.libraryId, context.ownerUserId);
+    if (items.some((item) => item.itemType === "music.track" && neteaseLikes.has(item.id))) {
+      throw new ApiError(403, "content_music_liked_song_readonly", "网易喜欢的歌曲为只读收藏，请在网易云音乐中取消喜欢");
+    }
+  }
   const now = new Date().toISOString();
   await runtime.database.query.transaction(async (transaction) => {
     for (const item of items) {
@@ -733,6 +748,19 @@ async function listStarredItems(runtime: ApiRuntime, context: NavidromeContext):
     starredAt: String(row.starred_at),
   })));
   return items.filter(({ item }) => item.libraryId === context.libraryId);
+}
+
+/** 收藏页合并网易喜欢歌曲与当前协议账号的收藏，重复歌曲保留本地收藏日期。 */
+async function listVisibleStarredItems(runtime: ApiRuntime, context: NavidromeContext): Promise<Array<{ item: MediaItemRecord; starredAt: string }>> {
+  const localItems = await listStarredItems(runtime, context);
+  if (context.libraryKind !== "content_source_music") return localItems;
+  const neteaseLikes = await runtime.contentMusic.listNeteaseLikedSongs(context.libraryId, context.ownerUserId);
+  // 关键变量：合并仅影响协议响应，网易收藏不会变成任一 Navidrome 账号的本地偏好记录。
+  const localIds = new Set(localItems.map(({ item }) => item.id));
+  const sourceItems = neteaseLikes.songs
+    .filter((item) => item.libraryId === context.libraryId && item.itemType === "music.track" && !localIds.has(item.id))
+    .map((item) => ({ item, starredAt: neteaseLikes.likedAt }));
+  return [...localItems, ...sourceItems];
 }
 
 /** 按当前账号最近播放的歌曲反查专辑，避免不同账号共享“最近播放”。 */
@@ -1347,7 +1375,7 @@ export async function registerNavidromeRoutes(server: FastifyInstance, runtime: 
         if (method === "getBookmarks") return sendSubsonicResponse(reply, query, { bookmarks: { bookmark: [] } });
         if (method === "getShares") return sendSubsonicResponse(reply, query, { shares: { share: [] } });
         if (method === "getStarred" || method === "getStarred2") {
-          const starredItems = await listStarredItems(runtime, context);
+          const starredItems = await listVisibleStarredItems(runtime, context);
           const artists = starredItems.filter(({ item }) => item.itemType === "music.artist");
           const albums = starredItems.filter(({ item }) => item.itemType === "music.album");
           const songs = starredItems.filter(({ item }) => item.itemType === "music.track");

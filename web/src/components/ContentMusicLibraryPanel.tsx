@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { ContentSourceSettingsDialog } from "@/components/ContentSourceSettingsDialog";
+import { NeteaseAccountSettings } from "@/components/NeteaseAccountSettings";
 import { Panel, StatusPill } from "@/components/ui-kit";
 import {
   getContentMusicLibrary,
@@ -131,6 +132,7 @@ export function ContentMusicLibraryPanel({ state }: { state: {
         <div className="min-w-0 sm:col-span-2 sm:row-start-2 lg:col-span-1 lg:col-start-2 lg:row-start-1"><div className="flex flex-wrap items-center gap-3"><span className="break-all text-xs text-muted-foreground">{data.source.pluginId} · {data.source.pluginVersion}</span><StatusPill>{enabled ? "配置已启用" : "内容源已停用"}</StatusPill></div></div>
         <div className="flex justify-end sm:col-start-2 sm:row-start-1 lg:col-start-3"><SecondaryButton disabled={busy || running || dialog !== null} onClick={() => void toggleSource()}>{busy ? "正在处理…" : data.source.status === "active" ? "停用此配置" : "启用此配置"}</SecondaryButton></div>
       </div>
+      {data.plugin.adapter === "netease_http" && <NeteaseAccountSettings key={`${admin ? "admin" : "user"}:${libraryId}`} state={{ libraryId, admin, onChanged }} />}
       <div className="grid min-h-12 min-w-0 grid-cols-1 items-center gap-x-4 gap-y-2 py-1 sm:grid-cols-[minmax(0,1fr)_auto] lg:grid-cols-[8rem_minmax(0,1fr)_auto]">
         <p className="text-sm">目录与播放</p>
         <div className="min-w-0 text-xs text-muted-foreground sm:col-span-2 sm:row-start-2 lg:col-span-1 lg:col-start-2 lg:row-start-1"><p>自动发现推荐歌单、排行榜和新专辑 · {playbackModeLabels[data.configuration.playbackMode]}播放</p>{(data.configuration.albumIds.length > 0 || data.configuration.playlistIds.length > 0) && <p className="mt-1">补充目录：{data.configuration.albumIds.length} 个专辑 · {data.configuration.playlistIds.length} 个歌单</p>}</div>

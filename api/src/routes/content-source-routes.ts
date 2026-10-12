@@ -235,6 +235,29 @@ export async function registerContentMusicRoutes(server: FastifyInstance, runtim
         ...(body.playbackMode !== undefined ? { playbackMode: body.playbackMode as ContentSourcePlaybackMode } : {}),
       });
     });
+    // 网易账号独立于 Navidrome 协议账号，所有操作继续使用当前媒体库归属检查。
+    const accountBase = `${base}/account`;
+    server.get<{ Params: { libraryId: string } }>(accountBase, async (request) => {
+      return runtime.contentMusic.getNeteaseAccount(request.params.libraryId, await ownerId(request.params.libraryId, request));
+    });
+    server.post<{ Params: { libraryId: string } }>(`${accountBase}/qr`, async (request, reply) => {
+      const session = await runtime.contentMusic.startNeteaseQr(request.params.libraryId, await ownerId(request.params.libraryId, request));
+      reply.code(201);
+      return session;
+    });
+    server.post<{ Params: { libraryId: string; sessionId: string } }>(`${accountBase}/qr/:sessionId/check`, async (request) => {
+      return runtime.contentMusic.checkNeteaseQr(request.params.libraryId, await ownerId(request.params.libraryId, request), request.params.sessionId);
+    });
+    server.post<{ Params: { libraryId: string } }>(`${accountBase}/check`, async (request) => {
+      return runtime.contentMusic.checkNeteaseAccount(request.params.libraryId, await ownerId(request.params.libraryId, request));
+    });
+    server.post<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(`${accountBase}/session`, async (request) => {
+      return runtime.contentMusic.importNeteaseSession(request.params.libraryId, await ownerId(request.params.libraryId, request),
+        requireString(request.body ?? {}, "cookie", "网易网页登录凭据", 32 * 1024));
+    });
+    server.delete<{ Params: { libraryId: string } }>(accountBase, async (request) => {
+      return runtime.contentMusic.logoutNeteaseAccount(request.params.libraryId, await ownerId(request.params.libraryId, request));
+    });
     server.post<{ Params: { libraryId: string } }>(`${base}/sync`, async (request, reply) => {
       const sync = await runtime.contentMusic.syncLibrary(request.params.libraryId, await ownerId(request.params.libraryId, request));
       reply.code(202);

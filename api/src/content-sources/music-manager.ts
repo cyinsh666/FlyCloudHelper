@@ -1,13 +1,15 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { ApiConfig } from "../config.js";
 import type { FlyCloudHelperDatabase } from "../database.js";
 import { parseJsonObject, type MediaItemRecord } from "../domain.js";
 import { ApiError, validationError } from "../errors.js";
 import type { ServiceRepository } from "../service-repository.js";
+import { CredentialVault } from "../secrets.js";
 import { validateContentManifest } from "./cms-adapter.js";
-import { persistContentMusic, type ContentMusicRemoteKind } from "./music-catalog.js";
+import { contentMusicItemId, persistContentMusic, type ContentMusicRemoteKind } from "./music-catalog.js";
 import { contentMusicPlaylistRemoteId, mapContentMusicPlaylist, type ContentMusicPlaylist } from "./music-discovery.js";
 import { NeteaseMusicAdapter, neteaseRemoteId, type NeteasePlayback, type NeteasePlaylist } from "./netease-adapter.js";
+import { NeteaseLoginClient, validateNeteaseCookie, type NeteaseAccountProfile } from "./netease-login.js";
 import type { ContentSourceInstance, ContentSourceManifest, ContentSourcePlaybackMode, ContentSourcePluginRecord, ContentSourceSyncState } from "./types.js";
 
 /** 在线音乐库只保存初始目录入口与播放模式，不保存网易账号或临时 URL。 */
@@ -39,7 +41,36 @@ interface MusicRuntimeContext {
   source: ContentSourceInstance;
   manifest: ContentSourceManifest;
   configuration: ContentMusicConfiguration;
+  storedConfiguration: Record<string, unknown>;
+  account: StoredNeteaseAccount | null;
   adapter: NeteaseMusicAdapter;
+}
+
+/** 设置页仅展示账号摘要，网易会话不会返回给浏览器或协议客户端。 */
+export interface ContentMusicAccountState {
+  status: "anonymous" | "logged_in" | "expired";
+  profile: NeteaseAccountProfile | null;
+  checkedAt: string | null;
+}
+
+/** 网易 Cookie 与账号摘要一起使用现有凭据主密钥加密保存。 */
+interface StoredNeteaseAccount {
+  cookie: string;
+  profile: NeteaseAccountProfile;
+  status: "logged_in" | "expired";
+  checkedAt: string;
+}
+
+/** 二维码只在当前服务内存保存，并限定媒体库、所有者和本次尝试。 */
+interface NeteaseQrSession {
+  libraryId: string;
+  userId: string;
+  key: string;
+  cookie: string;
+  expiresAt: number;
+  nextPollAt: number;
+  status: "waiting" | "scanned" | "verification_required" | "expired" | "authorized";
+  verificationUrl?: string;
 }
 
 // 关键变量：摘要和专辑页在当前进程缓存 15 分钟，歌单曲目缓存 5 分钟；不保存临时播放地址。
@@ -48,12 +79,14 @@ const PLAYLIST_DETAIL_CACHE_MS = 5 * 60_000;
 const DISCOVERY_ALBUM_PAGE_SIZE = 50;
 
 interface DiscoveryPlaylistCache {
+  accountKey: string;
   expiresAt: number;
   fetchedAt: string;
   playlists: NeteasePlaylist[];
 }
 
 interface DiscoveryPlaylistDetailCache {
+  accountKey: string;
   expiresAt: number;
   fetchedAt: string;
   playlist: NeteasePlaylist;
@@ -64,6 +97,20 @@ interface DiscoveryAlbumPageCache {
   expiresAt: number;
   albumIds: string[];
   hasMore: boolean;
+}
+
+/** 喜欢集合仅缓存源站真实 ID，不把账号喜欢写入本地协议账号偏好表。 */
+interface NeteaseLikedSongCache {
+  accountKey: string;
+  expiresAt: number;
+  likedAt: string;
+  remoteSongIds: string[];
+}
+
+/** 协议星标使用当前音乐库的稳定条目 ID，并共用同一次源站喜欢快照。 */
+export interface NeteaseLikedSongState {
+  songIds: ReadonlySet<string>;
+  likedAt: string;
 }
 
 /** 创建与视频相同格式的同步摘要，音乐数量代表本轮处理的目录摘要或歌曲。 */
@@ -112,10 +159,44 @@ export class ContentMusicManager {
   private readonly discoveryPlaylists = new Map<string, DiscoveryPlaylistCache>();
   private readonly discoveryPlaylistDetails = new Map<string, DiscoveryPlaylistDetailCache>();
   private readonly discoveryAlbumPages = new Map<string, DiscoveryAlbumPageCache>();
+  private readonly neteaseLikedSongs = new Map<string, NeteaseLikedSongCache>();
+  private readonly neteaseQrSessions = new Map<string, NeteaseQrSession>();
+  private readonly vault: CredentialVault;
+  private readonly neteaseLogin: NeteaseLoginClient;
   private closing = false;
 
   /** 使用已有表和仓储，不执行初始化、建表或数据库迁移。 */
-  public constructor(private readonly database: FlyCloudHelperDatabase, private readonly config: ApiConfig, private readonly repository: ServiceRepository) {}
+  public constructor(private readonly database: FlyCloudHelperDatabase, private readonly config: ApiConfig, private readonly repository: ServiceRepository) {
+    this.vault = new CredentialVault(config.credentialMasterKey);
+    this.neteaseLogin = new NeteaseLoginClient(config.allowInsecureProviderHttp);
+  }
+
+  /** 只在宿主内部解密当前音乐库会话，旧配置没有会话时继续匿名访问。 */
+  private readNeteaseAccount(configuration: Record<string, unknown>): StoredNeteaseAccount | null {
+    const encrypted = configuration.neteaseSessionEncrypted;
+    if (typeof encrypted !== "string" || !encrypted) return null;
+    const value = this.vault.decrypt(encrypted);
+    const profile = value.profile as NeteaseAccountProfile | undefined;
+    if (typeof value.cookie !== "string" || !value.cookie || !profile || typeof profile.userId !== "string"
+      || typeof profile.nickname !== "string" || typeof value.checkedAt !== "string"
+      || (value.status !== "logged_in" && value.status !== "expired")) {
+      throw new ApiError(503, "content_music_account_invalid", "网易云登录记录无法读取，请退出后重新扫码登录");
+    }
+    return { cookie: value.cookie, profile, status: value.status, checkedAt: value.checkedAt };
+  }
+
+  /** 返回公开登录状态，不包含会话 Cookie、密文或二维码请求参数。 */
+  private accountState(account: StoredNeteaseAccount | null): ContentMusicAccountState {
+    return account ? { status: account.status, profile: account.profile, checkedAt: account.checkedAt }
+      : { status: "anonymous", profile: null, checkedAt: null };
+  }
+
+  /** 丢弃当前库未完成的扫码，防止切换账号或删除目录后提交旧结果。 */
+  private clearNeteaseQrSessions(libraryId: string): void {
+    for (const [id, session] of this.neteaseQrSessions) {
+      if (session.libraryId === libraryId || session.expiresAt < Date.now()) this.neteaseQrSessions.delete(id);
+    }
+  }
 
   /** 查询固定版本实例，创建音乐库前确认源属于当前用户。 */
   private async instance(instanceId: string, userId: string): Promise<{ source: ContentSourceInstance; manifest: ContentSourceManifest }> {
@@ -153,7 +234,11 @@ export class ContentMusicManager {
     if (row.plugin_status !== "enabled") throw new ApiError(409, "content_plugin_disabled", "内容源插件当前未启用");
     const manifest = validateContentManifest(parseJsonObject(row.manifest_json));
     if (manifest.adapter !== "netease_http") throw new ApiError(422, "content_music_adapter_invalid", "音乐库绑定的适配器不支持在线音乐");
-    return { libraryId, userId, source: sourceFromRow(row), manifest, configuration: readConfiguration(row.configuration_json), adapter: new NeteaseMusicAdapter(manifest, this.config.allowInsecureProviderHttp) };
+    const storedConfiguration = parseJsonObject(row.configuration_json);
+    const account = this.readNeteaseAccount(storedConfiguration);
+    return { libraryId, userId, source: sourceFromRow(row), manifest, storedConfiguration, account,
+      configuration: readConfiguration(row.configuration_json),
+      adapter: new NeteaseMusicAdapter(manifest, this.config.allowInsecureProviderHttp, account?.status === "logged_in" ? account.cookie : "") };
   }
 
   /** 标准协议鉴权通过后仍核对插件和源实例可用性。 */
@@ -209,6 +294,7 @@ export class ContentMusicManager {
     try {
       for (const controller of this.controllers.get(libraryId) ?? []) controller.abort();
       await this.tails.get(libraryId);
+      this.clearNeteaseQrSessions(libraryId);
       this.clearDiscoveryCache(libraryId);
       return await operation();
     } finally { this.pausedLibraries.delete(libraryId); }
@@ -223,11 +309,14 @@ export class ContentMusicManager {
     this.discoveryPlaylists.clear();
     this.discoveryPlaylistDetails.clear();
     this.discoveryAlbumPages.clear();
+    this.neteaseLikedSongs.clear();
+    this.neteaseQrSessions.clear();
   }
 
   /** 清空或删除目录时同时丢弃该库发现缓存，后续主动浏览才重新取源。 */
   private clearDiscoveryCache(libraryId: string): void {
     this.discoveryPlaylists.delete(libraryId);
+    this.neteaseLikedSongs.delete(libraryId);
     const prefix = `${libraryId}:`;
     for (const key of this.discoveryPlaylistDetails.keys()) if (key.startsWith(prefix)) this.discoveryPlaylistDetails.delete(key);
     for (const key of this.discoveryAlbumPages.keys()) if (key.startsWith(prefix)) this.discoveryAlbumPages.delete(key);
@@ -260,7 +349,7 @@ export class ContentMusicManager {
     return this.enqueue(libraryId, async (signal, generation) => {
       const runtime = await this.context(libraryId, userId);
       if (patch.playbackMode !== undefined && !["auto", "direct", "relay"].includes(patch.playbackMode)) throw validationError("playbackMode", "播放模式只支持自动、直连或中转");
-      const configuration = { ...runtime.configuration,
+      const configuration = { ...runtime.storedConfiguration, ...runtime.configuration,
         ...(patch.albumIds === undefined ? {} : { albumIds: configuredIds(patch.albumIds, "albumIds") }),
         ...(patch.playlistIds === undefined ? {} : { playlistIds: configuredIds(patch.playlistIds, "playlistIds") }),
         ...(patch.playbackMode === undefined ? {} : { playbackMode: patch.playbackMode }),
@@ -268,6 +357,125 @@ export class ContentMusicManager {
       this.checkOperation(libraryId, generation, signal);
       await this.database.query("content_source_libraries").where({ library_id: libraryId, user_id: userId }).update({ configuration_json: JSON.stringify(configuration), updated_at: new Date().toISOString() });
       return this.getLibrary(libraryId, userId);
+    });
+  }
+
+  /** 读取当前库的登录摘要，不发起网易请求，也不改变已有媒体目录。 */
+  public async getNeteaseAccount(libraryId: string, userId: string): Promise<ContentMusicAccountState> {
+    const row = await this.binding(libraryId, userId);
+    return this.accountState(this.readNeteaseAccount(parseJsonObject(row.configuration_json)));
+  }
+
+  /** 只改绑定配置中的加密会话，保留目录、播放模式、库 ID 与协议账号。 */
+  private async saveNeteaseAccount(libraryId: string, userId: string, account: StoredNeteaseAccount | null, signal: AbortSignal, generation: number): Promise<ContentMusicAccountState> {
+    const row = await this.binding(libraryId, userId);
+    const configuration = parseJsonObject(row.configuration_json);
+    if (account) configuration.neteaseSessionEncrypted = this.vault.encrypt({ ...account });
+    else delete configuration.neteaseSessionEncrypted;
+    this.checkOperation(libraryId, generation, signal);
+    await this.database.query("content_source_libraries").where({ library_id: libraryId, user_id: userId })
+      .update({ configuration_json: JSON.stringify(configuration), updated_at: new Date().toISOString() });
+    this.clearDiscoveryCache(libraryId);
+    return this.accountState(account);
+  }
+
+  /** 创建网易 App 扫码入口；重新扫码保留原账号，确认后才替换会话。 */
+  public async startNeteaseQr(libraryId: string, userId: string) {
+    return this.enqueue(libraryId, async (signal, generation) => {
+      await this.context(libraryId, userId);
+      if (!this.vault.isConfigured()) throw new ApiError(503, "credential_key_missing", "服务凭据主密钥尚未配置");
+      this.clearNeteaseQrSessions(libraryId);
+      const qr = await this.neteaseLogin.createQr(signal);
+      await this.assertAvailable(libraryId, userId);
+      this.checkOperation(libraryId, generation, signal);
+      const sessionId = randomUUID();
+      // 关键变量：短期二维码最多保留三分钟，原站提前过期时立即显示过期状态。
+      const expiresAt = Date.now() + 180_000;
+      this.neteaseQrSessions.set(sessionId, { libraryId, userId, key: qr.key, cookie: qr.cookie, expiresAt, nextPollAt: 0, status: "waiting" });
+      return { sessionId, qrCodeContent: qr.qrCodeContent, expiresAt: new Date(expiresAt).toISOString(), pollIntervalSeconds: 3 };
+    });
+  }
+
+  /** 校验扫码尝试归属后查询原站，确认账号身份再加密保存，不新建插件或媒体库。 */
+  public async checkNeteaseQr(libraryId: string, userId: string, sessionId: string): Promise<{ status: NeteaseQrSession["status"]; account?: ContentMusicAccountState; verificationUrl?: string }> {
+    return this.enqueue(libraryId, async (signal, generation) => {
+      await this.context(libraryId, userId);
+      const session = this.neteaseQrSessions.get(sessionId);
+      if (!session || session.libraryId !== libraryId || session.userId !== userId) {
+        throw new ApiError(404, "content_music_qr_missing", "网易云二维码已失效，请重新获取");
+      }
+      if (session.status === "authorized") return { status: "authorized", account: await this.getNeteaseAccount(libraryId, userId) };
+      if (session.status === "expired" || Date.now() >= session.expiresAt) {
+        session.status = "expired";
+        session.key = "";
+        session.cookie = "";
+        delete session.verificationUrl;
+        return { status: "expired" };
+      }
+      if (Date.now() < session.nextPollAt) return { status: session.status,
+        ...(session.status === "verification_required" ? { verificationUrl: session.verificationUrl } : {}) };
+      session.nextPollAt = Date.now() + 3_000;
+      const result = await this.neteaseLogin.checkQr(session.key, signal, session.cookie);
+      this.checkOperation(libraryId, generation, signal);
+      // 关键变量：临时设备 Cookie 随同一次扫码更新，只存在内存且不返回浏览器。
+      if (result.cookie !== undefined) session.cookie = result.cookie;
+      if (result.status !== "authorized") {
+        session.status = result.status;
+        if (result.status === "verification_required") session.verificationUrl = result.verificationUrl;
+        else delete session.verificationUrl;
+        if (result.status === "expired") { session.key = ""; session.cookie = ""; }
+        // 验证入口只交给当前扫码会话的所属用户，不写入音乐目录或账号记录。
+        return { status: session.status, ...(session.status === "verification_required" ? { verificationUrl: session.verificationUrl } : {}) };
+      }
+      const profile = result.cookie ? await this.neteaseLogin.account(result.cookie, signal) : null;
+      if (!profile || !result.cookie) throw new ApiError(502, "content_music_login_incomplete", "网易云未返回完整登录会话，请重新扫码");
+      await this.assertAvailable(libraryId, userId);
+      this.checkOperation(libraryId, generation, signal);
+      if (this.neteaseQrSessions.get(sessionId) !== session || Date.now() >= session.expiresAt) {
+        throw new ApiError(409, "content_music_qr_changed", "网易云二维码已更新，请使用当前二维码登录");
+      }
+      const account = await this.saveNeteaseAccount(libraryId, userId, { cookie: result.cookie, profile, status: "logged_in", checkedAt: new Date().toISOString() }, signal, generation);
+      session.status = "authorized";
+      session.key = "";
+      session.cookie = "";
+      delete session.verificationUrl;
+      return { status: "authorized", account };
+    });
+  }
+
+  /** 主动检查网易登录是否仍有效，网络故障不会删除已保存的会话。 */
+  public async checkNeteaseAccount(libraryId: string, userId: string): Promise<ContentMusicAccountState> {
+    return this.enqueue(libraryId, async (signal, generation) => {
+      const runtime = await this.context(libraryId, userId);
+      if (!runtime.account) return this.accountState(null);
+      const profile = await this.neteaseLogin.account(runtime.account.cookie, signal);
+      await this.assertAvailable(libraryId, userId);
+      return this.saveNeteaseAccount(libraryId, userId, { ...runtime.account, ...(profile ? { profile } : {}),
+        status: profile ? "logged_in" : "expired", checkedAt: new Date().toISOString() }, signal, generation);
+    });
+  }
+
+  /** 退出只移除当前音乐库的网易会话，媒体目录和 Navidrome 登录资料继续保留。 */
+  public async logoutNeteaseAccount(libraryId: string, userId: string): Promise<ContentMusicAccountState> {
+    return this.enqueue(libraryId, async (signal, generation) => {
+      await this.binding(libraryId, userId);
+      this.clearNeteaseQrSessions(libraryId);
+      return this.saveNeteaseAccount(libraryId, userId, null, signal, generation);
+    });
+  }
+
+  /** 校验用户自己的网页登录会话，原站确认账号后才保存到当前音乐库。 */
+  public async importNeteaseSession(libraryId: string, userId: string, cookie: string): Promise<ContentMusicAccountState> {
+    const checkedCookie = validateNeteaseCookie(cookie);
+    if (!/(?:^|;\s*)MUSIC_U=[^;]+/u.test(checkedCookie)) throw validationError("cookie", "请填写网易网页登录凭据 MUSIC_U");
+    return this.enqueue(libraryId, async (signal, generation) => {
+      await this.context(libraryId, userId);
+      const profile = await this.neteaseLogin.account(checkedCookie, signal);
+      if (!profile) throw new ApiError(401, "content_music_session_invalid", "网易网页登录会话无效或已失效，请重新登录网易官网并复制 MUSIC_U");
+      await this.assertAvailable(libraryId, userId);
+      // 关键变量：账号校验成功才取消当前二维码，失败时仍可继续扫码。
+      this.clearNeteaseQrSessions(libraryId);
+      return this.saveNeteaseAccount(libraryId, userId, { cookie: checkedCookie, profile, status: "logged_in", checkedAt: new Date().toISOString() }, signal, generation);
     });
   }
 
@@ -383,20 +591,55 @@ export class ContentMusicManager {
     return ids.flatMap((id) => { const record = recordsById.get(id); return record ? [record] : []; });
   }
 
-  /** 推荐和排行榜只加载摘要，不在列表请求中串行获取每个歌单的全部曲目。 */
+  /** 缓存按当前库、实例、网易 UID 和会话摘要隔离，Cookie 原文不会进入缓存键或目录。 */
+  private neteaseAccountKey(runtime: MusicRuntimeContext): string {
+    if (!runtime.account || runtime.account.status !== "logged_in") return `${runtime.source.id}:anonymous`;
+    const cookieHash = createHash("sha256").update(runtime.account.cookie, "utf8").digest("hex");
+    return `${runtime.source.id}:${runtime.account.profile.userId}:${cookieHash}`;
+  }
+
+  /** 喜欢 ID 使用五分钟内存快照，获取失败继续抛错，不缓存失败产生的空列表。 */
+  private async readNeteaseLikedSongs(runtime: MusicRuntimeContext, signal: AbortSignal, generation: number): Promise<NeteaseLikedSongCache> {
+    this.checkOperation(runtime.libraryId, generation, signal);
+    const accountKey = this.neteaseAccountKey(runtime);
+    if (!runtime.account || runtime.account.status !== "logged_in") {
+      return { accountKey, expiresAt: 0, likedAt: new Date().toISOString(), remoteSongIds: [] };
+    }
+    const cached = this.neteaseLikedSongs.get(runtime.libraryId);
+    if (cached && cached.accountKey === accountKey && cached.expiresAt > Date.now()) return cached;
+    const remoteSongIds = await runtime.adapter.likedSongIds(runtime.account.profile.userId, signal);
+    this.checkOperation(runtime.libraryId, generation, signal);
+    // 关键变量：源站没有返回喜欢时间，使用本次成功读取的观测时间作为协议星标时间；缓存期间保持稳定。
+    const value = { accountKey, expiresAt: Date.now() + PLAYLIST_DETAIL_CACHE_MS, likedAt: new Date().toISOString(), remoteSongIds };
+    this.neteaseLikedSongs.set(runtime.libraryId, value);
+    return value;
+  }
+
+  /** 推荐、排行榜与账号歌单只加载摘要，不在列表请求中读取全部曲目。 */
   private async readDiscoveryPlaylists(runtime: MusicRuntimeContext, signal: AbortSignal, generation: number, force = false): Promise<DiscoveryPlaylistCache> {
     this.checkOperation(runtime.libraryId, generation, signal);
+    const accountKey = this.neteaseAccountKey(runtime);
     const cached = this.discoveryPlaylists.get(runtime.libraryId);
-    if (!force && cached && cached.expiresAt > Date.now()) return cached;
-    const results = await Promise.allSettled([runtime.adapter.recommendedPlaylists(30, signal), runtime.adapter.charts(signal)]);
+    if (!force && cached && cached.accountKey === accountKey && cached.expiresAt > Date.now()) return cached;
+    const results = await Promise.allSettled([
+      runtime.adapter.recommendedPlaylists(30, signal), runtime.adapter.charts(signal),
+      runtime.account?.status === "logged_in" ? runtime.adapter.userPlaylists(runtime.account.profile.userId, signal) : Promise.resolve([] as NeteasePlaylist[]),
+    ]);
     for (const result of results) if (result.status === "rejected") throw result.reason;
     const recommendations = results[0]?.status === "fulfilled" ? results[0].value : [];
     const charts = results[1]?.status === "fulfilled" ? results[1].value : [];
-    // 排行榜在重叠身份中优先保留自己的分类；列表顺序仍先推荐、再排行榜。
+    const accountPlaylists = results[2]?.status === "fulfilled" ? results[2].value : [];
+    // 关键变量：账号歌单优先展示并按真实远端 ID 去重，避免同一收藏同时出现在推荐列表。
+    const accountPlaylistIds = new Set(accountPlaylists.map((playlist) => playlist.id));
     const chartIds = new Set(charts.map((playlist) => playlist.id));
-    const playlists = [...recommendations.filter((playlist) => !chartIds.has(playlist.id)), ...charts];
+    const playlists = [
+      ...accountPlaylists.filter((playlist) => playlist.category === "liked"),
+      ...accountPlaylists.filter((playlist) => playlist.category !== "liked"),
+      ...recommendations.filter((playlist) => !chartIds.has(playlist.id) && !accountPlaylistIds.has(playlist.id)),
+      ...charts.filter((playlist) => !accountPlaylistIds.has(playlist.id)),
+    ];
     this.checkOperation(runtime.libraryId, generation, signal);
-    const value = { expiresAt: Date.now() + DISCOVERY_CACHE_MS, fetchedAt: new Date().toISOString(), playlists };
+    const value = { accountKey, expiresAt: Date.now() + DISCOVERY_CACHE_MS, fetchedAt: new Date().toISOString(), playlists };
     this.discoveryPlaylists.set(runtime.libraryId, value);
     return value;
   }
@@ -445,12 +688,52 @@ export class ContentMusicManager {
     return this.enqueue(libraryId, async (signal, generation) => this.readDiscoveryAlbums(await this.context(libraryId, userId), count, offset, signal, generation));
   }
 
-  /** 公开推荐和排行榜作为标准只读歌单，不写入账号自建歌单表。 */
+  /** 网易账号歌单、公开推荐和排行榜作为标准只读歌单，不写入协议账号自建歌单表。 */
   public async listDiscoveryPlaylists(libraryId: string, userId: string): Promise<ContentMusicPlaylist[]> {
     return this.enqueue(libraryId, async (signal, generation) => {
       const runtime = await this.context(libraryId, userId);
       const cached = await this.readDiscoveryPlaylists(runtime, signal, generation);
       return cached.playlists.map((playlist) => mapContentMusicPlaylist(playlist, libraryId, runtime.source.id, runtime.source.createdAt, cached.fetchedAt));
+    });
+  }
+
+  /** 批量读取当前库的网易喜欢标记，不请求歌曲详情，供所有协议列表复用。 */
+  public async readNeteaseLikedSongState(libraryId: string, userId: string): Promise<NeteaseLikedSongState> {
+    return this.enqueue(libraryId, async (signal, generation) => {
+      const runtime = await this.context(libraryId, userId);
+      const cached = await this.readNeteaseLikedSongs(runtime, signal, generation);
+      return { songIds: new Set(cached.remoteSongIds.map((remoteId) => contentMusicItemId(libraryId, runtime.source.id, "song", remoteId))), likedAt: cached.likedAt };
+    });
+  }
+
+  /** 返回协议条目 ID 集合，源喜欢的取消操作可以在任何本地偏好写入前整批预检。 */
+  public async readNeteaseLikedSongIds(libraryId: string, userId: string): Promise<ReadonlySet<string>> {
+    return (await this.readNeteaseLikedSongState(libraryId, userId)).songIds;
+  }
+
+  /** 收藏页按需补齐喜欢歌曲的真实目录，已有评分、播放历史和本地收藏不参与写入。 */
+  public async listNeteaseLikedSongs(libraryId: string, userId: string): Promise<{ songs: MediaItemRecord[]; likedAt: string }> {
+    return this.enqueue(libraryId, async (signal, generation) => {
+      const runtime = await this.context(libraryId, userId);
+      const cached = await this.readNeteaseLikedSongs(runtime, signal, generation);
+      const itemIds = cached.remoteSongIds.map((remoteId) => contentMusicItemId(libraryId, runtime.source.id, "song", remoteId));
+      const previousItems = await this.orderedCatalogItems(runtime, itemIds);
+      const previousById = new Map(previousItems.map((item) => [item.id, item]));
+      const missingRemoteIds = cached.remoteSongIds.filter((remoteId, index) => {
+        const item = previousById.get(itemIds[index] ?? "");
+        const source = item?.metadata.contentSource;
+        return !item || !source || typeof source !== "object" || (source as Record<string, unknown>).detailsLoaded !== true;
+      });
+      if (missingRemoteIds.length) {
+        const songs = await runtime.adapter.songs(missingRemoteIds, signal);
+        const returnedIds = new Set(songs.map((song) => song.id));
+        const missingCount = missingRemoteIds.filter((remoteId) => !returnedIds.has(remoteId)).length;
+        if (missingCount) throw new ApiError(502, "content_music_liked_songs_incomplete", `网易云未返回 ${missingCount} 首喜欢歌曲的完整详情，请稍后重试`);
+        await persistContentMusic({ database: this.database, repository: this.repository, userId, libraryId, instanceId: runtime.source.id, songs,
+          beforeWrite: this.beforeWrite(runtime, signal, generation) });
+      }
+      this.checkOperation(libraryId, generation, signal);
+      return { songs: await this.orderedCatalogItems(runtime, itemIds), likedAt: cached.likedAt };
     });
   }
 
@@ -465,19 +748,27 @@ export class ContentMusicManager {
   public async getDiscoveryPlaylist(libraryId: string, userId: string, playlistId: string): Promise<{ playlist: ContentMusicPlaylist; songs: MediaItemRecord[] }> {
     return this.enqueue(libraryId, async (signal, generation) => {
       const runtime = await this.context(libraryId, userId);
+      const accountKey = this.neteaseAccountKey(runtime);
       const remoteId = this.playlistRemoteId(runtime, playlistId);
       const key = `${libraryId}:${remoteId}`;
       let cached = this.discoveryPlaylistDetails.get(key);
-      let songs = cached && cached.expiresAt > Date.now() ? await this.orderedCatalogItems(runtime, cached.songIds) : null;
-      if (!cached || cached.expiresAt <= Date.now() || !songs || songs.length !== cached.songIds.length) {
+      let songs = cached && cached.accountKey === accountKey && cached.expiresAt > Date.now() ? await this.orderedCatalogItems(runtime, cached.songIds) : null;
+      if (!cached || cached.accountKey !== accountKey || cached.expiresAt <= Date.now() || !songs || songs.length !== cached.songIds.length) {
+        const discoveryCache = this.discoveryPlaylists.get(libraryId);
+        let summary = discoveryCache?.accountKey === accountKey ? discoveryCache.playlists.find((playlist) => playlist.id === remoteId) : undefined;
+        if (!summary && runtime.account?.status === "logged_in") {
+          const discovery = await this.readDiscoveryPlaylists(runtime, signal, generation);
+          summary = discovery.playlists.find((playlist) => playlist.id === remoteId);
+        }
         const detail = await runtime.adapter.playlistDetail(remoteId, signal);
         const ids = await persistContentMusic({ database: this.database, repository: this.repository, userId, libraryId,
           instanceId: runtime.source.id, songs: detail.songs, beforeWrite: this.beforeWrite(runtime, signal, generation) });
-        const summary = this.discoveryPlaylists.get(libraryId)?.playlists.find((playlist) => playlist.id === remoteId);
         const description = detail.missingSongIds.length ? `${detail.playlist.description}\n源站未提供 ${detail.missingSongIds.length} 首歌曲的详情。`.trim() : detail.playlist.description;
-        const playlist = { ...detail.playlist, category: summary?.category ?? detail.playlist.category, description, songCount: detail.songs.length };
+        const playlist = { ...detail.playlist, category: summary?.category ?? detail.playlist.category, description, songCount: detail.songs.length,
+          ...(summary?.ownerId ? { ownerId: summary.ownerId } : {}), ...(summary?.ownerName ? { ownerName: summary.ownerName } : {}),
+          ...(summary?.public === undefined ? {} : { public: summary.public }) };
         this.checkOperation(libraryId, generation, signal);
-        cached = { expiresAt: Date.now() + PLAYLIST_DETAIL_CACHE_MS, fetchedAt: new Date().toISOString(), playlist, songIds: ids.songIds };
+        cached = { accountKey, expiresAt: Date.now() + PLAYLIST_DETAIL_CACHE_MS, fetchedAt: new Date().toISOString(), playlist, songIds: ids.songIds };
         this.discoveryPlaylistDetails.set(key, cached);
         songs = await this.orderedCatalogItems(runtime, ids.songIds);
       }
@@ -489,10 +780,13 @@ export class ContentMusicManager {
   public async getDiscoveryPlaylistCover(libraryId: string, userId: string, playlistId: string): Promise<string> {
     return this.enqueue(libraryId, async (signal, generation) => {
       const runtime = await this.context(libraryId, userId);
+      const accountKey = this.neteaseAccountKey(runtime);
       const remoteId = this.playlistRemoteId(runtime, playlistId);
       const detail = this.discoveryPlaylistDetails.get(`${libraryId}:${remoteId}`);
-      const summary = this.discoveryPlaylists.get(libraryId)?.playlists.find((playlist) => playlist.id === remoteId);
-      const cachedArtwork = summary?.artwork ?? detail?.playlist.artwork;
+      const discoveryCache = this.discoveryPlaylists.get(libraryId);
+      const summary = discoveryCache?.accountKey === accountKey && discoveryCache.expiresAt > Date.now()
+        ? discoveryCache.playlists.find((playlist) => playlist.id === remoteId) : undefined;
+      const cachedArtwork = summary?.artwork ?? (detail?.accountKey === accountKey && detail.expiresAt > Date.now() ? detail.playlist.artwork : null);
       if (cachedArtwork) return cachedArtwork;
       const discovery = await this.readDiscoveryPlaylists(runtime, signal, generation);
       const playlist = discovery.playlists.find((playlist) => playlist.id === remoteId);
@@ -539,7 +833,17 @@ export class ContentMusicManager {
       const runtime = await this.context(libraryId, userId);
       const item = await this.item(libraryId, userId, itemId, runtime.source.id);
       if (item.kind !== "song") throw new ApiError(404, "content_music_song_missing", "此条目不是可播放歌曲");
-      const playback = await runtime.adapter.resolveSong(item.remoteId, maxBitRate, signal);
+      if (runtime.account?.status === "expired") throw new ApiError(403, "content_music_netease_login_expired", "网易云登录已失效，请在云助手重新扫码登录");
+      let playback: NeteasePlayback;
+      try {
+        playback = await runtime.adapter.resolveSong(item.remoteId, maxBitRate, signal);
+      } catch (error) {
+        // 仅原站明确报告登录失效时更新状态，歌曲受限或网络失败保留原登录。
+        if (error instanceof ApiError && error.code === "content_music_netease_login_expired" && runtime.account) {
+          await this.saveNeteaseAccount(libraryId, userId, { ...runtime.account, status: "expired", checkedAt: new Date().toISOString() }, signal, generation);
+        }
+        throw error;
+      }
       const beforeWrite = this.beforeWrite(runtime, signal, generation);
       await beforeWrite();
       const metadata = { ...item.record.metadata, audioContainer: playback.suffix, audioBitRate: Math.round(playback.bitRate * 1000), audioSize: playback.size };

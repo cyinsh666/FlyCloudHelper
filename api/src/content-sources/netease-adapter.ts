@@ -1,6 +1,7 @@
 import { ApiError, validationError } from "../errors.js";
 import { providerFetch } from "../providers/network.js";
 import { createNeteaseWebBody } from "./netease-web-request.js";
+import { readNeteaseCsrf, validateNeteaseCookie } from "./netease-login.js";
 import type { ContentSourceManifest } from "./types.js";
 
 /** 网易目录里的艺术家身份，不使用姓名合并不同的艺术家。 */
@@ -31,7 +32,11 @@ export interface NeteasePlaylist {
   artwork: string | null;
   description: string;
   songCount: number;
-  category: "recommended" | "chart" | "playlist";
+  category: "recommended" | "chart" | "playlist" | "liked" | "created" | "collected";
+  /** 账号歌单保留源站创建者资料与可见性，不冒充协议账号自建歌单。 */
+  ownerId?: string;
+  ownerName?: string;
+  public?: boolean;
   updateFrequency?: string;
   createdAt: string | null;
   updatedAt: string | null;
@@ -169,23 +174,29 @@ function readSong(value: unknown, album?: NeteaseAlbum, detailsLoaded = false): 
   } catch { return null; }
 }
 
-/** 固定网易原站 HTTP 适配器，不执行导入文件里的脚本，也不持有网易登录凭据。 */
+/** 固定网易原站 HTTP 适配器，仅在本次操作内使用宿主解密的网易会话。 */
 export class NeteaseMusicAdapter {
+  // 关键变量：会话只用于网易目录和取址接口，不放入播放结果或音频 CDN 请求头。
+  private readonly cookie: string;
+
   /** 保存声明式清单，源站端点由导入校验限制为网易 HTTPS 原站。 */
-  public constructor(private readonly manifest: ContentSourceManifest, private readonly allowInsecureHttp: boolean) {
+  public constructor(private readonly manifest: ContentSourceManifest, private readonly allowInsecureHttp: boolean, cookie = "") {
     if (manifest.adapter !== "netease_http" || manifest.endpoint !== "https://music.163.com/") throw validationError("adapter", "此音乐源需要网易原站适配器");
+    this.cookie = validateNeteaseCookie(cookie);
   }
 
   /** 发起公开目录或取址请求；专辑及发现目录使用正常网页 POST 协议，其他接口沿用原请求方式。 */
   private async request(path: string, parameters: Record<string, string> = {}, signal?: AbortSignal, useWebProtocol = false): Promise<Record<string, unknown>> {
     const url = new URL(path, this.manifest.endpoint);
     const headers: Record<string, string> = { Accept: "application/json", "User-Agent": "Mozilla/5.0", Referer: this.manifest.endpoint };
-    // 关键变量：网页接口将参数封装在表单中，不创建网易登录会话或保存临时请求密钥。
+    if (this.cookie) headers.Cookie = this.cookie;
+    // 关键变量：已登录会话使用对应 CSRF，匿名请求仍使用原来的空值。
+    const csrf = this.cookie ? readNeteaseCsrf(this.cookie) : "";
     let body: URLSearchParams | undefined;
     if (useWebProtocol) {
-      url.searchParams.set("csrf_token", "");
+      url.searchParams.set("csrf_token", csrf);
       headers["Content-Type"] = "application/x-www-form-urlencoded";
-      body = createNeteaseWebBody(parameters);
+      body = createNeteaseWebBody({ ...parameters, csrf_token: csrf });
     } else {
       for (const [key, value] of Object.entries(parameters)) url.searchParams.set(key, value);
     }
@@ -193,10 +204,14 @@ export class NeteaseMusicAdapter {
     try {
       response = await providerFetch(url, { method: useWebProtocol ? "POST" : "GET", headers, body }, { allowInsecureHttp: this.allowInsecureHttp }, signal);
     } catch (error) {
+      if (this.cookie && error instanceof ApiError && error.code === "provider_authentication_failed") {
+        throw new ApiError(403, "content_music_netease_login_expired", "网易云登录已失效，请在云助手重新扫码登录");
+      }
       if (error instanceof ApiError && error.code.startsWith("provider_")) throw new ApiError(error.statusCode, error.code, error.message.replace(/网盘/gu, "音乐源").replace(/Provider/gu, "音乐源"));
       throw error;
     }
     signal?.throwIfAborted();
+    if (this.cookie && response.status === 401) throw new ApiError(403, "content_music_netease_login_expired", "网易云登录已失效，请在云助手重新扫码登录");
     if (!response.ok) throw new ApiError(502, "content_music_http_failed", `网易音乐接口返回 HTTP ${response.status}`);
     const text = await response.text();
     if (Buffer.byteLength(text) > 4 * 1024 * 1024) throw new ApiError(413, "content_music_response_too_large", "网易音乐单次响应超过 4 MB");
@@ -204,6 +219,7 @@ export class NeteaseMusicAdapter {
     try { payload = object(JSON.parse(text)); }
     catch { throw new ApiError(502, "content_music_json_invalid", "网易音乐源未返回有效 JSON"); }
     const sourceCode = Number(payload.code);
+    if (this.cookie && sourceCode === 301) throw new ApiError(403, "content_music_netease_login_expired", "网易云登录已失效，请在云助手重新扫码登录");
     if (sourceCode !== 200) {
       // 仅展示业务错误码，不把源站正文、播放地址或请求密文写入提示。
       const message = sourceCode === -462
@@ -252,6 +268,54 @@ export class NeteaseMusicAdapter {
     const payload = await this.request("/weapi/personalized/playlist", { limit: String(count), total: "true", n: "1000" }, signal, true);
     if (!Array.isArray(payload.result)) throw new ApiError(502, "content_music_recommendations_missing", "网易音乐源未返回推荐歌单");
     return payload.result.slice(0, count).flatMap((value) => { const playlist = readPlaylist(value, "recommended"); return playlist ? [playlist] : []; });
+  }
+
+  /** 按登录账号 UID 分页读取自建、我喜欢与收藏的歌单，源站错误不冒充空列表。 */
+  public async userPlaylists(userId: string, signal?: AbortSignal): Promise<NeteasePlaylist[]> {
+    const remoteUserId = neteaseRemoteId(userId);
+    if (!this.cookie) throw new ApiError(403, "content_music_account_required", "请先登录网易云账号后查看账号歌单");
+    const playlists = new Map<string, NeteasePlaylist>();
+    // 关键变量：源站按实际返回条数推进 offset，最多读取与现有歌单详情相同的 10000 条范围。
+    const limit = 100;
+    let offset = 0;
+    while (true) {
+      const payload = await this.request("/weapi/user/playlist", { uid: remoteUserId, limit: String(limit), offset: String(offset), includeVideo: "true" }, signal, true);
+      if (!Array.isArray(payload.playlist)) throw new ApiError(502, "content_music_user_playlists_missing", "网易云未返回有效账号歌单列表");
+      const page = payload.playlist;
+      if (offset + page.length > 10000) throw new ApiError(422, "content_music_user_playlists_large", "此账号歌单超过本次可加载的 10000 条范围");
+      const previousCount = playlists.size;
+      for (const value of page) {
+        const raw = object(value);
+        const creator = object(raw.creator);
+        const ownerId = creator.userId ?? raw.userId;
+        const isOwner = String(ownerId) === remoteUserId;
+        const category: NeteasePlaylist["category"] = isOwner && Number(raw.specialType) === 5 ? "liked" : isOwner ? "created" : "collected";
+        const playlist = readPlaylist(raw, category);
+        if (!playlist) throw new ApiError(502, "content_music_user_playlist_invalid", "网易云账号歌单资料不完整，请稍后重试");
+        playlists.set(playlist.id, {
+          ...playlist,
+          ...(typeof ownerId === "string" || typeof ownerId === "number" ? { ownerId: neteaseRemoteId(ownerId) } : {}),
+          ...(typeof creator.nickname === "string" && creator.nickname.trim() ? { ownerName: creator.nickname.trim() } : {}),
+          ...(raw.privacy === undefined ? {} : { public: Number(raw.privacy) === 0 }),
+        });
+      }
+      offset += page.length;
+      const hasMore = typeof payload.more === "boolean" ? payload.more : page.length === limit;
+      if (!hasMore) break;
+      if (!page.length || playlists.size === previousCount) throw new ApiError(502, "content_music_user_playlists_incomplete", "网易云账号歌单分页没有继续返回内容，请稍后重试");
+      if (offset >= 10000) throw new ApiError(422, "content_music_user_playlists_large", "此账号歌单超过本次可加载的 10000 条范围");
+    }
+    return [...playlists.values()];
+  }
+
+  /** 读取登录账号喜欢的真实歌曲 ID；此接口不向网易写入喜欢或取消喜欢操作。 */
+  public async likedSongIds(userId: string, signal?: AbortSignal): Promise<string[]> {
+    const remoteUserId = neteaseRemoteId(userId);
+    if (!this.cookie) throw new ApiError(403, "content_music_account_required", "请先登录网易云账号后查看喜欢的歌曲");
+    const payload = await this.request("/weapi/song/like/get", { uid: remoteUserId }, signal, true);
+    if (!Array.isArray(payload.ids)) throw new ApiError(502, "content_music_liked_songs_missing", "网易云未返回有效喜欢歌曲列表");
+    if (payload.ids.length > 10000) throw new ApiError(422, "content_music_liked_songs_large", "此账号喜欢歌曲超过本次可加载的 10000 首范围");
+    return [...new Set(payload.ids.map(neteaseRemoteId))];
   }
 
   /** 读取网易所有公开排行榜摘要，排名歌曲在打开榜单时再读取详情。 */
@@ -377,10 +441,12 @@ export class NeteaseMusicAdapter {
     const remoteId = neteaseRemoteId(id);
     if (!Number.isFinite(maxBitRate) || maxBitRate < 0) throw validationError("maxBitRate", "音频码率上限必须为非负数");
     const requestedBitRate = maxBitRate > 0 ? Math.round(Math.min(320, maxBitRate) * 1000) : 128000;
-    const payload = await this.request("/api/song/enhance/player/url", { ids: JSON.stringify([Number(remoteId)]), br: String(requestedBitRate) }, signal);
+    const payload = await this.request(this.cookie ? "/weapi/song/enhance/player/url" : "/api/song/enhance/player/url",
+      { ids: JSON.stringify([Number(remoteId)]), br: String(requestedBitRate) }, signal, Boolean(this.cookie));
     const value = Array.isArray(payload.data) ? payload.data.find((entry) => String(object(entry).id) === remoteId) : null;
     const raw = object(value);
-    if (Number(raw.code) !== 200 || typeof raw.url !== "string" || !raw.url) throw new ApiError(403, "content_music_song_unavailable", "网易音乐源没有提供此歌曲的可用播放地址");
+    if (Number(raw.code) !== 200 || typeof raw.url !== "string" || !raw.url) throw new ApiError(403, "content_music_song_unavailable",
+      this.cookie ? "当前网易云账号没有此歌曲的完整播放权限" : "网易音乐源未提供匿名播放地址，可在云助手登录有播放权限的网易云账号");
     if (raw.freeTrialInfo !== null && raw.freeTrialInfo !== undefined) throw new ApiError(403, "content_music_song_trial", "此歌曲仅提供试听，当前插件不播放试听音频");
     let url: URL;
     try { url = new URL(raw.url); } catch { throw new ApiError(502, "content_music_playback_url_invalid", "网易音乐源返回的播放地址无效"); }
