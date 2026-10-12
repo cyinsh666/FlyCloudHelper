@@ -31,7 +31,18 @@ async function savePythonSource(absolutePath: string, bytes: Buffer, scriptHash:
   }
 }
 
-/** 上传时仅进行 UTF-8 和 AST 静态检查，创建独立待启用插件，不导入或执行脚本。 */
+/** 只把文件不存在视为可修复缺失，现有脚本和权限错误都不进入补写流程。 */
+async function pythonSourceMissing(absolutePath: string): Promise<boolean> {
+  try {
+    await fs.lstat(absolutePath);
+    return false;
+  } catch (error) {
+    if (error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw error;
+  }
+}
+
+/** 上传仅做 UTF-8 和 AST 检查；新源登记待启用插件，已有源缺失时只补回脚本。 */
 export async function importPythonSource(runtime: ApiRuntime, filename: string, bytes: Buffer): Promise<ContentSourcePluginRecord> {
   if (!filename.toLowerCase().endsWith(".py")) throw new ApiError(415, "python_source_file_type_invalid", "请选择 .py 内容源文件");
   if (bytes.length === 0) throw new ApiError(400, "python_source_empty", "Python 源文件不能为空");
@@ -46,14 +57,19 @@ export async function importPythonSource(runtime: ApiRuntime, filename: string, 
   const scriptHash = createHash("sha256").update(bytes).digest("hex");
   const pluginId = `py.${scriptHash.slice(0, 24)}`;
   const version = "1.0.0";
-  // 关键变量：按脚本内容身份检查已安装插件，重命名上传仍视为同一插件。
+  // 关键变量：按脚本内容身份复用原记录，文件改名不会产生第二份插件。
   const previous = (await runtime.contentSources.listPlugins(true)).find((plugin) => plugin.pluginId === pluginId && plugin.version === version);
-  if (previous && previous.status !== "uninstalled") {
-    throw new ApiError(409, "content_plugin_already_exists", "已添加插件，不要重复导入");
-  }
   const scriptFile = path.posix.join("python-sources", scriptHash, "source.py");
   const absolutePath = path.resolve(runtime.config.pluginDirectory, scriptFile);
+  // 关键变量：仍安装的插件只允许补回缺失文件，原有名称、状态和关联不变。
+  const repairingInstalledPlugin = previous !== undefined && previous.status !== "uninstalled";
+  if (repairingInstalledPlugin && !await pythonSourceMissing(absolutePath)) {
+    throw new ApiError(409, "content_plugin_already_exists", "已添加插件，不要重复导入");
+  }
   const createdFile = await savePythonSource(absolutePath, bytes, scriptHash);
+  if (repairingInstalledPlugin && !createdFile) {
+    throw new ApiError(409, "content_plugin_already_exists", "脚本已补回，不要重复导入");
+  }
   let inspection: { name: string; methods: string[] };
   try {
     // 关键变量：inspect 使用 AST 识别 Spider 和基础方法，导入管理端不运行源的初始化逻辑。
@@ -65,6 +81,12 @@ export async function importPythonSource(runtime: ApiRuntime, filename: string, 
 
   // 关键变量：重新安装已卸载脚本时保留原清单，避免上传名改变已绑定的源信息。
   if (previous) {
+    if (repairingInstalledPlugin) {
+      // 关键变量：补写只恢复文件，返回最新记录以保留期间发生的启停或卸载操作。
+      const current = (await runtime.contentSources.listPlugins(true)).find((plugin) => plugin.pluginId === pluginId && plugin.version === version);
+      if (!current) throw new ApiError(404, "content_plugin_not_found", "内容源插件版本不存在");
+      return current;
+    }
     return runtime.contentSources.setPluginStatus(pluginId, version, "imported");
   }
   const manifest: ContentSourceManifest = {

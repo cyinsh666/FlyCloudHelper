@@ -62,11 +62,11 @@ export function AdminPluginsPanel() {
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   // 关键变量：导入、启停和卸载共用操作锁，避免同一版本状态互相覆盖。
   const pendingRef = useRef(false);
-  // 关键变量：合并展示但保留接口来源，详情始终读取刷新后的记录。
+  // 关键变量：合并展示但保留接口来源，过滤已卸载记录后列表和详情共用可见插件。
   const entries: PluginEntry[] = [
     ...(sources.data?.items ?? []).map((plugin): PluginEntry => ({ kind: "source", plugin })),
     ...(metadata.data?.items ?? []).map((plugin): PluginEntry => ({ kind: "metadata", plugin })),
-  ];
+  ].filter((entry) => entry.plugin.status !== "uninstalled");
   entries.sort((left, right) => left.plugin.displayName.localeCompare(right.plugin.displayName, "zh-CN"));
   const selectedEntry = entries.find((entry) => getPluginKey(entry) === selectedKey);
   const loading = sources.loading || metadata.loading;
@@ -139,7 +139,7 @@ export function AdminPluginsPanel() {
     }
   }
 
-  /** 根据记录来源调用原来的启停接口，恢复卸载内容源仍走原启用流程。 */
+  /** 根据记录来源调用原来的启停接口。 */
   async function togglePlugin(entry: PluginEntry): Promise<void> {
     if (pendingRef.current) return;
     pendingRef.current = true;
@@ -194,9 +194,9 @@ export function AdminPluginsPanel() {
       {entries.map((entry) => <article key={getPluginKey(entry)} className="surface p-4">
         <header className="flex items-center justify-between gap-3"><h2 className="min-w-0 truncate text-sm font-medium" title={entry.plugin.displayName}>{entry.plugin.displayName}</h2><StatusPill tone={entry.plugin.status === "enabled" ? "success" : "neutral"}>{pluginStatusLabels[entry.plugin.status]}</StatusPill></header>
         <footer className="mt-4 flex flex-wrap gap-2">
-          <SecondaryButton disabled={pending !== null} onClick={() => void togglePlugin(entry)}>{pending === getPluginKey(entry) ? "正在处理…" : entry.plugin.status === "enabled" ? "停用" : entry.plugin.status === "uninstalled" ? "重新安装并启用" : "启用"}</SecondaryButton>
+          <SecondaryButton disabled={pending !== null} onClick={() => void togglePlugin(entry)}>{pending === getPluginKey(entry) ? "正在处理…" : entry.plugin.status === "enabled" ? "停用" : "启用"}</SecondaryButton>
           <SecondaryButton onClick={() => setSelectedKey(getPluginKey(entry))}>详情</SecondaryButton>
-          {entry.kind === "source" && entry.plugin.status !== "uninstalled" && <SecondaryButton disabled={pending !== null} onClick={() => void uninstallPlugin(entry)}>卸载</SecondaryButton>}
+          {entry.kind === "source" && <SecondaryButton disabled={pending !== null} onClick={() => void uninstallPlugin(entry)}>卸载</SecondaryButton>}
         </footer>
       </article>)}
     </div>
@@ -210,7 +210,7 @@ export function AdminPluginsPanel() {
       <PluginDetailField label="能力" value={selectedEntry.kind === "source" ? describeSourceCapabilities(selectedEntry.plugin.adapter) : describeMetadataCapabilities(selectedEntry.plugin)} />
       {selectedEntry.kind === "source" ? <>
         <PluginDetailField label="适配器" value={selectedEntry.plugin.adapter === "python_spider" ? "Python Spider" : selectedEntry.plugin.adapter} />
-        <p className="text-xs text-muted-foreground">停用和卸载不会自动删除媒体库。恢复启用后可继续使用原目录和播放记录。</p>
+        <p className="text-xs text-muted-foreground">停用和卸载不会自动删除媒体库。停用后可重新启用；卸载后可重新导入原插件，继续使用原目录和播放记录。</p>
       </> : <>
         <PluginDetailField label="配置修订" value={`r${selectedEntry.plugin.configurationRevision}`} />
         <PluginDetailField label="SHA256" value={selectedEntry.plugin.sha256} />

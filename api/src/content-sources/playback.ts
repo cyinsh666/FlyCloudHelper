@@ -1,7 +1,7 @@
 import type { FastifyRequest } from "fastify";
 import { ApiError } from "../errors.js";
 import type { ApiRuntime } from "../runtime.js";
-import { probeHlsRunTimeTicks } from "./hls-relay.js";
+import { probeContentMediaInfo } from "./hls-relay.js";
 import type { ContentPlaybackSource, ContentVideoContainer } from "./types.js";
 
 /** 同一次取址同时返回实际格式和时长，不缓存源站临时地址。 */
@@ -106,8 +106,10 @@ async function refreshContentDuration(runtime: ApiRuntime, source: ContentPlayba
     try {
       const access = await runtime.contentSources.resolvePlayback(source.id, ownerUserId, libraryId, controller.signal);
       result.container = access.container;
-      if (access.container !== "hls" || !shouldProbeDuration) return result;
-      const ticks = await probeHlsRunTimeTicks(runtime, access.url, access.headers, controller.signal);
+      if (access.container !== "unknown" && (access.container !== "hls" || !shouldProbeDuration)) return result;
+      const media = await probeContentMediaInfo(runtime, access.url, access.headers, shouldProbeDuration, controller.signal);
+      result.container = media.container === "unknown" ? access.container : media.container;
+      const ticks = media.runTimeTicks;
       if (ticks > 0) {
         await runtime.contentSources.updatePlaybackDuration(source.id, ownerUserId, ticks);
         result.runTimeTicks = ticks;
