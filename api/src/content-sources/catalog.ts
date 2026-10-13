@@ -4,7 +4,7 @@ import type { ServiceRepository } from "../service-repository.js";
 import { createStableId } from "../media/filename.js";
 import { contentKey } from "./cms-adapter.js";
 import { persistCmsEpisodeRelations, persistCmsEpisodes } from "./catalog-batch.js";
-import { completePythonContentMetadata, persistPythonContentCard, refreshManuallyMatchedSourceMetadata } from "./catalog-card.js";
+import { completeContentMetadata, persistContentCard, refreshManuallyMatchedSourceMetadata } from "./catalog-card.js";
 import type { CmsCatalogContentItem, ContentSourceCategory, ContentSourceManifest } from "./types.js";
 
 /** 检查分类及其祖先是否匹配清单中指定的父分类。 */
@@ -45,12 +45,15 @@ export async function persistCmsContent(input: {
   // 关键变量：分类身份供协议入口筛选，电影/节目/单集共用，不参与稳定媒体 ID。
   const category = categories.find((item) => item.id === content.categoryId);
   const contentSource: Record<string, unknown> = { instanceId, remoteItemId: content.id, categoryId: content.categoryId, categoryName: content.categoryName || category?.name || "", parentCategoryId: content.parentCategoryId ?? category?.parentId ?? null };
-  if (manifest.adapter === "python_spider" && content.detailState === "card") {
-    return persistPythonContentCard({ database, repository, userId, libraryId, identityKey, generationId, movie, content, contentSource });
+  const supportsCards = manifest.adapter === "python_spider" || manifest.adapter === "cms_json";
+  if (supportsCards && content.detailState === "card") {
+    const countries = originCountries(content.area); // 摘要和完整详情沿用同一份明确地区转换。
+    return persistContentCard({ database, repository, userId, libraryId, identityKey, generationId, movie, content, contentSource,
+      metadata: { originCountries: countries, productionCountries: countries } });
   }
   // 空详情不创建虚构分集，也不能把尚未补齐的卡片标记为完成。
   if (content.episodes.length === 0) return [];
-  if (manifest.adapter === "python_spider") {
+  if (supportsCards) {
     // 完成标记在末尾统一提交；本轮中途失败时，下一次详情仍需重新补齐。
     contentSource.detailState = "card";
   }
@@ -148,8 +151,8 @@ export async function persistCmsContent(input: {
     await database.query("media_items").where({ user_id: userId, library_id: libraryId }).whereIn("id", deletedIds).update({ deleted_at: now, updated_at: now });
     await database.query("media_relations").where({ user_id: userId, library_id: libraryId }).whereIn("child_item_id", deletedIds).delete();
   }
-  if (manifest.adapter === "python_spider") {
-    const completedIds = await completePythonContentMetadata({ database, userId, libraryId,
+  if (supportsCards) {
+    const completedIds = await completeContentMetadata({ database, userId, libraryId,
       itemIds: [parent.itemId, ...episodeItems.values()], contentSource });
     for (const itemId of completedIds) changedIds.add(itemId);
   }

@@ -63,13 +63,33 @@ export function parseCmsPlaybackEpisodes(raw: Record<string, unknown>): CmsPlayb
   return result;
 }
 
-/** 把固定 CMS 字段转换为内容目录，不执行源文件中的脚本或解析器。 */
-function readContentItem(value: unknown, manifest: ContentSourceManifest): CmsContentItem | null {
+/** 列表只确认至少一个有效直连媒体，不创建全部分集对象或计算播放身份。 */
+function hasCmsPlaybackMedia(raw: Record<string, unknown>): boolean {
+  const lineNames = String(raw.vod_play_from ?? "").split("$$$");
+  const lineGroups = String(raw.vod_play_url ?? "").split("$$$");
+  for (const [lineIndex, group] of lineGroups.entries()) {
+    if (!lineNames[lineIndex]?.trim()) continue;
+    // 关键变量：找到首个有名称和有效媒体地址的分集即可，重复身份留到单片详情严格检查。
+    for (const entry of group.split("#")) {
+      const separator = entry.indexOf("$");
+      if (separator <= 0 || !plainText(entry.slice(0, separator))) continue;
+      let url: URL;
+      try { url = new URL(entry.slice(separator + 1).trim()); } catch { continue; }
+      if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) continue;
+      if (/\.(?:m3u8|mp4)$/iu.test(url.pathname)) return true;
+    }
+  }
+  return false;
+}
+
+/** 把固定 CMS 字段转换为卡片或详情；仅详情解析完整播放身份，不执行网页脚本。 */
+function readContentItem(value: unknown, manifest: ContentSourceManifest, detailState: "card" | "complete"): CmsContentItem | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
   const id = String(raw.vod_id ?? "").trim();
   const title = plainText(raw.vod_name);
   if (!id || id.length > 128 || !title) return null;
+  if (detailState === "card" && !hasCmsPlaybackMedia(raw)) return null;
   const parsedYear = Number(raw.vod_year);
   // 关键变量：优先使用源站的豆瓣评分，缺失时读取源站评分；零分和越界值不能冒充真实评分。
   const rating = [raw.vod_douban_score, raw.vod_score].map(Number)
@@ -86,7 +106,8 @@ function readContentItem(value: unknown, manifest: ContentSourceManifest): CmsCo
     tags: [...new Set(plainText(raw.vod_tag).split(/[|,，/]/u).map((tag) => tag.trim()).filter(Boolean))],
     actors: plainText(raw.vod_actor).split(/[,，/]/u).filter(Boolean),
     directors: plainText(raw.vod_director).split(/[,，/]/u).filter(Boolean),
-    episodes: parseCmsPlaybackEpisodes(raw),
+    detailState,
+    episodes: detailState === "card" ? [] : parseCmsPlaybackEpisodes(raw),
   };
 }
 
@@ -142,10 +163,10 @@ export class CmsJsonAdapter {
     });
   }
 
-  /** 读取分类详细列表，避免为列表中的每个条目额外请求一次详情。 */
+  /** 一次读取保留海报和分类的源页，仅返回卡片，线路分集留到单片详情处理。 */
   public async page(categoryId: string, page: number, signal?: AbortSignal): Promise<CmsContentPage> {
     const payload = await this.request({ ac: "detail", t: categoryId, pg: String(page) }, signal);
-    return this.readPage(payload, page, categoryId);
+    return this.readPage(payload, page);
   }
 
   /** 单分类搜索携带 t 减少源扫描；实际范围仍由宿主按返回分类精确过滤。 */
@@ -153,29 +174,17 @@ export class CmsJsonAdapter {
     const payload = await this.request({ ac: "detail", wd: searchTerm, pg: String(page), ...(categoryId === undefined ? {} : { t: categoryId }) }, signal);
     // 关键变量：已接入的 CMS 源成功码为 1，明确失败即使附带空列表也不能伪装成没有匹配项。
     if (payload.code !== undefined && payload.code !== 1 && payload.code !== "1") throw new ApiError(502, "content_source_search_failed", "内容源搜索未成功，请稍后重试");
-    return this.readPage(payload, page, categoryId, true);
+    return this.readPage(payload, page);
   }
 
-  /** 分类和搜索共用详情页契约；原始条数决定源尾，过滤后空候选不代表末页。 */
-  private readPage(payload: Record<string, unknown>, page: number, categoryId?: string, isSearchPage = false): CmsContentPage {
+  /** 分类和搜索共用摘要契约；原始条数决定源尾，过滤后空候选不代表末页。 */
+  private readPage(payload: Record<string, unknown>, page: number): CmsContentPage {
     if (!Array.isArray(payload.list)) throw new ApiError(502, "content_source_list_missing", "内容源没有返回目录列表");
     if (payload.list.length > 200) throw new ApiError(422, "content_source_page_too_large", "内容源单页超过 200 个条目，请调整源站分页后再同步");
     const items: CmsContentItem[] = [];
     for (const value of payload.list) {
-      try {
-        const item = readContentItem(value, this.manifest);
-        if (item) items.push(item);
-      } catch (error) {
-        // 关键变量：单条播放身份不明确不能阻断整页；详情仍拒绝该条目，不猜测同名视频的版本。
-        if (!(error instanceof ApiError) || error.code !== "content_episode_ambiguous") throw error;
-        const raw = value as Record<string, unknown>;
-        console.warn(JSON.stringify({
-          日志关键字: "codex-content-source-item-invalid", 事件: "跳过播放身份重复的源条目",
-          插件ID: this.manifest.pluginId, 分类ID: categoryId ?? null, 页码: page,
-          // 搜索页仅记录身份，避免标题间接带出用户搜索词。
-          源条目ID: String(raw.vod_id ?? ""), ...(isSearchPage ? {} : { 标题: plainText(raw.vod_name) }),
-        }));
-      }
+      const item = readContentItem(value, this.manifest, "card");
+      if (item) items.push(item);
     }
     const pageCount = Number(payload.pagecount);
     const sourcePageCount = Number.isInteger(pageCount) && pageCount > 0 ? pageCount : null;
@@ -195,7 +204,7 @@ export class CmsJsonAdapter {
       if (malformedList) throw new ApiError(502, "content_source_detail_invalid", "内容源详情列表格式异常");
       throw new ApiError(404, "content_source_item_missing", "内容源中的条目已经不可用");
     }
-    const item = readContentItem(rawItem, this.manifest);
+    const item = readContentItem(rawItem, this.manifest, "complete");
     if (!item) throw new ApiError(502, "content_source_detail_invalid", "内容源返回的条目详情格式异常");
     return item;
   }

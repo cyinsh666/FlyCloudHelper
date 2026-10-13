@@ -1,7 +1,7 @@
 import type { FlyCloudHelperDatabase } from "../database.js";
 import { parseJsonObject } from "../domain.js";
 import { createStableId } from "../media/filename.js";
-import type { ServiceRepository } from "../service-repository.js";
+import { readVideoRegionGroup, type ServiceRepository } from "../service-repository.js";
 import type { CmsCatalogContentItem } from "./types.js";
 
 /** 人工匹配保留展示元数据，但源定位及详情状态仍需独立补齐。 */
@@ -27,7 +27,7 @@ function readContentSource(metadata: Record<string, unknown>): Record<string, un
 }
 
 /** 完整分集、关系及播放定位全部成功后，统一提交完成标记，失败不能留下新鲜的半成品详情。 */
-export async function completePythonContentMetadata(input: {
+export async function completeContentMetadata(input: {
   database: FlyCloudHelperDatabase;
   userId: string;
   libraryId: string;
@@ -68,8 +68,32 @@ export async function completePythonContentMetadata(input: {
   });
 }
 
-/** Python 列表卡片仅建立影片身份与基础展示，已有分集、线路及用户数据完全沿用。 */
-export async function persistPythonContentCard(input: {
+/** 摘要只保存源明确提供的风格、评分、标签和人物，空值不能清掉已知资料。 */
+function cardDisplayMetadata(content: CmsCatalogContentItem): Record<string, unknown> {
+  const genres = [...new Set([...content.genres, ...(content.categoryName.includes("动漫") ? ["动画"] : [])])];
+  const people = [...content.actors.map((name) => ({ name, type: "cast" })), ...content.directors.map((name) => ({ name, type: "director" }))];
+  const metadata: Record<string, unknown> = {};
+  if (genres.length) metadata.genres = genres;
+  if (typeof content.rating === "number" && content.rating > 0 && content.rating <= 10) metadata.rating = content.rating;
+  if (content.tags?.length) metadata.tags = content.tags;
+  if (people.length) metadata.people = people;
+  return metadata;
+}
+
+/** 完整详情的已有字段优先；仍为摘要时仅合并本次实际提供的非空资料。 */
+function mergeCardDisplayMetadata(previous: Record<string, unknown>, card: Record<string, unknown>, preserveCompleteFields: boolean): Record<string, unknown> {
+  const metadata = { ...previous };
+  for (const [field, value] of Object.entries(card)) {
+    const previousValue = previous[field];
+    const missing = previousValue === undefined || previousValue === null || previousValue === "" || previousValue === 0
+      || Array.isArray(previousValue) && previousValue.length === 0;
+    if (!preserveCompleteFields || missing) metadata[field] = value;
+  }
+  return metadata;
+}
+
+/** CMS JSON 和 Python 列表卡片仅建立影片身份与摘要，已有分集、线路及用户数据完全沿用。 */
+export async function persistContentCard(input: {
   database: FlyCloudHelperDatabase;
   repository: ServiceRepository;
   userId: string;
@@ -79,8 +103,15 @@ export async function persistPythonContentCard(input: {
   movie: boolean;
   content: CmsCatalogContentItem;
   contentSource: Record<string, unknown>;
+  /** 沿用完整目录的源地区字段，不从分类或标题猜测国家。 */
+  metadata?: Record<string, unknown>;
 }): Promise<string[]> {
   const { database, repository, userId, libraryId, identityKey, generationId, movie, content } = input;
+  const cardMetadata = cardDisplayMetadata(content);
+  for (const field of ["originCountries", "productionCountries"]) {
+    const value = input.metadata?.[field];
+    if (Array.isArray(value) && value.length) cardMetadata[field] = value;
+  }
   const existing = await database.query.transaction(async (transaction) => {
     const query = transaction("media_items").where({ user_id: userId, library_id: libraryId, identity_key: identityKey });
     if (database.databaseType !== "sqlite") query.forUpdate();
@@ -103,14 +134,18 @@ export async function persistPythonContentCard(input: {
     const previousYear = previous.year == null ? null : Number(previous.year);
     const previousPoster = previous.poster_url ? String(previous.poster_url) : null;
     const title = preserveCompleteFields && previous.title ? String(previous.title) : content.title;
-    const payload: Record<string, unknown> = {
-      metadata_json: JSON.stringify({ ...previousMetadata, contentSource }),
-    };
+    const displayMetadata = hasManualMatch ? previousMetadata : mergeCardDisplayMetadata(previousMetadata, cardMetadata, preserveCompleteFields);
+    const payload: Record<string, unknown> = { metadata_json: JSON.stringify({ ...displayMetadata, contentSource }) };
     if (!hasManualMatch) {
       payload.title = title;
       payload.sort_title = preserveCompleteFields && previous.sort_title ? String(previous.sort_title) : title;
       payload.year = preserveCompleteFields && previousYear !== null ? previousYear : content.year ?? previousYear;
       payload.poster_url = preserveCompleteFields && previousPoster ? previousPoster : content.posterUrl || previousPoster;
+      if (content.overview) payload.overview = preserveCompleteFields && previous.overview ? String(previous.overview) : content.overview;
+      if (JSON.stringify(displayMetadata.originCountries ?? []) !== JSON.stringify(previousMetadata.originCountries ?? [])) {
+        // 摘要更新或补齐地区时复用原仓储派生；完整已知地区和人工分组继续保留。
+        payload.region_group = readVideoRegionGroup(String(previous.item_type), displayMetadata);
+      }
     }
     // 关键变量：只列出真正变化的父卡片字段，相同列表不写 metadata、时间戳或目录增量。
     const changes: Record<string, unknown> = {};
@@ -134,9 +169,9 @@ export async function persistPythonContentCard(input: {
   const result = await repository.upsertMediaItem({
     id: createStableId("itm", libraryId, identityKey), userId, serviceId: null, libraryId, identityKey,
     mediaType: "video", itemType: movie ? "video.movie" : "video.series",
-    title: content.title, sortTitle: content.title, subtitle: "", year: content.year, overview: "",
+    title: content.title, sortTitle: content.title, subtitle: "", year: content.year, overview: content.overview,
     posterUrl: content.posterUrl, backdropUrl: null, matchState: "matched", externalIds: {},
-    metadata: { contentSource: { ...input.contentSource, detailState: "card" } }, generationId,
+    metadata: { ...cardMetadata, contentSource: { ...input.contentSource, detailState: "card" } }, generationId,
   });
   if (!result.changed) return [];
   await repository.publishContentSourceCatalogChanges(userId, libraryId, [result.itemId]);

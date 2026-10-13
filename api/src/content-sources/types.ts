@@ -87,7 +87,7 @@ export interface CmsPlaybackEpisode {
   container: ContentVideoContainer;
 }
 
-/** 从内容源读取的电影或节目；Python 列表卡片允许在访问详情时再补齐分集。 */
+/** 从内容源读取的电影或节目；CMS JSON 和 Python 摘要允许在访问详情时再补齐分集。 */
 export interface CmsContentItem {
   id: string;
   title: string;
@@ -104,7 +104,7 @@ export interface CmsContentItem {
   tags?: string[];
   actors: string[];
   directors: string[];
-  /** 仅 Python 源显式标记未查详情的卡片；旧源和缓存不凭空推断可播放状态。 */
+  /** 内容源显式标记未查详情的摘要；旧源和缓存不凭空推断可播放状态。 */
   detailState?: "card" | "complete";
   episodes: CmsPlaybackEpisode[];
 }

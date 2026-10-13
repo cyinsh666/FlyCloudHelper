@@ -218,10 +218,11 @@ export class DynamicContentCatalog {
       const result = context.query.kind === "search"
         ? await context.adapter.search(context.query.searchTerm, page, context.query.categoryId, signal)
         : await context.adapter.page(context.query.categoryId, page, signal);
-      // 关键变量：仅 Python 明确标记的卡片允许尚无分集；CMS 仍要求完整播放目录。
+      // 关键变量：CMS JSON 和 Python 明确标记的摘要允许尚无分集，详情入口才验证完整播放目录。
       // 搜索可能跨全站，必须继续用真实分类精确筛选，不能把卡片挂到当前查询类别。
+      const supportsCards = context.manifest.adapter === "cms_json" || context.manifest.adapter === "python_spider";
       const candidates = result.items.filter((content) => (content.episodes.length > 0
-        || context.manifest.adapter === "python_spider" && content.detailState === "card") && context.categoryIds.includes(content.categoryId)
+        || (supportsCards && content.detailState === "card")) && context.categoryIds.includes(content.categoryId)
         && !categoryMatches(content.categoryId, context.manifest.excludedCategoryIds ?? [], context.categories))
         .map((content): CmsCatalogContentItem => ({ ...content, episodes: content.episodes.map(({ url: _url, playbackId: _playbackId, ...episode }) => episode) }));
       const sourcePage = { candidates, rawItemCount: result.rawItemCount, sourcePageCount: result.sourcePageCount };

@@ -536,10 +536,10 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
       patch.notificationEnabled = request.body.notificationEnabled;
     }
     if (Object.keys(patch).length === 0) throw validationError("library", "没有可更新的媒体库字段");
-    // 关键变量：先沿用仓储的同步任务与停用校验，成功提交 disabled 后再释放 Python 宿主。
+    // 关键变量：先沿用仓储的同步任务与停用校验，成功提交 disabled 后再停止在线视频请求。
     const library = await runtime.repository.updateLibrary(request.params.libraryId, user.id, patch);
     if (patch.status === "disabled" && library.libraryKind === "content_source_video") {
-      // 关键变量：按库所属用户和实例绑定版本判断 Python 源，停用插件也能完成宿主清理。
+      // 关键变量：按库所属用户和绑定版本判断视频源，停用插件也能完成详情及目录清理。
       const binding = await runtime.database.query("content_source_libraries as b")
         .join("content_source_instances as i", "i.id", "b.instance_id")
         .join("content_source_plugins as p", /** 只读取实例绑定的固定插件版本。 */ function joinLibraryPluginVersion() {
@@ -547,8 +547,9 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
         })
         .select("p.manifest_json")
         .where({ "b.library_id": library.id, "b.user_id": user.id, "i.user_id": user.id }).first();
-      if (parseJsonObject(binding?.manifest_json).adapter === "python_spider") {
-        // 关键变量：复用目录生命周期取消旧动态请求、失效缓存并停止该实例宿主。
+      const adapterType = parseJsonObject(binding?.manifest_json).adapter;
+      if (adapterType === "python_spider" || adapterType === "cms_json") {
+        // 关键变量：取消 CMS／Python 详情及动态请求、失效窗口，并按需释放 Python 宿主。
         await runtime.contentSources.withLibraryCatalogChange(library.id, async () => undefined);
       }
     }

@@ -88,7 +88,7 @@ function readStringArray(value: unknown): string[] {
 }
 
 /** 根据节目 TMDB origin_country 计算稳定地区分组；电影和缺失数据统一归入 other。 */
-function readVideoRegionGroup(itemType: string, metadata: Record<string, unknown>): VideoRegionGroup {
+export function readVideoRegionGroup(itemType: string, metadata: Record<string, unknown>): VideoRegionGroup {
   if (itemType !== "video.series") return "other";
   const countries = Array.isArray(metadata.originCountries)
     ? metadata.originCountries.map((country) => String(country).trim().toUpperCase()).filter(Boolean)
