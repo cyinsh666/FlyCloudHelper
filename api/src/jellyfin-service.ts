@@ -933,7 +933,9 @@ export class JellyfinCompatibilityService {
       this.toInternalItemId(protocolItemId),
       context.ownerUserId,
     );
-    const item = await hydrateRealtimeVideoDetails(this.runtime, sourceItem);
+    // 单条详情先校验服务所属媒体库，再补齐 Python 卡片，避免跨库请求触发源站查询。
+    const detailedItem = await this.readContentItemDetail(context, sourceItem);
+    const item = await hydrateRealtimeVideoDetails(this.runtime, detailedItem);
     const parentRelation = item.itemType === "video.episode"
       ? await this.runtime.database.query("media_relations").where({ child_item_id: item.id }).first()
       : null;
@@ -941,6 +943,15 @@ export class JellyfinCompatibilityService {
       ? await this.runtime.repository.getCatalogItem(String(parentRelation.parent_item_id), context.ownerUserId)
       : undefined;
     return await this.mapItem(context, item, parent) as Record<string, unknown>;
+  }
+
+  /** 仅在详情或选集入口补齐在线卡片，普通网盘和列表装配保持原有行为。 */
+  private async readContentItemDetail(context: JellyfinContext, item: MediaItemRecord): Promise<MediaItemRecord> {
+    if (item.libraryId !== context.libraryId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
+    if (!isContentSourceLibrary(context.libraryKind)) return item;
+    await this.runtime.contentSources.ensureItemDetail(context.libraryId, context.ownerUserId, item.id);
+    // 关键变量：补详情会更新元数据并创建分集，后续协议映射必须使用最新条目。
+    return this.runtime.repository.getCatalogItem(item.id, context.ownerUserId);
   }
 
   /** 返回条目的 Jellyfin 面包屑。 */
@@ -985,8 +996,8 @@ export class JellyfinCompatibilityService {
       const virtualSeason = this.parseSeasonReference(parentId);
       if (virtualSeason) return this.listEpisodes(context, virtualSeason.seriesId, { ...query, SeasonId: parentId });
       const internalParentId = decodeProtocolItemId(parentId);
-      const parent = await this.runtime.repository.getCatalogItem(internalParentId, context.ownerUserId);
-      if (parent.libraryId !== context.libraryId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
+      const sourceParent = await this.runtime.repository.getCatalogItem(internalParentId, context.ownerUserId);
+      const parent = await this.readContentItemDetail(context, sourceParent);
       const children = (await this.runtime.repository.listCatalogChildren(internalParentId, context.ownerUserId))
         .filter((item) => matchesProtocolItemIdentity(identityFilter, item.id, item.externalIds));
       const ordered = await this.sortChildRecords(context, query, children, (item) => item.id);
@@ -1261,8 +1272,8 @@ export class JellyfinCompatibilityService {
   /** 获取节目季列表，季使用可逆虚拟 ID，不新增重复媒体实体。 */
   public async listSeasons(context: JellyfinContext, seriesId: string) {
     const internalSeriesId = decodeProtocolItemId(seriesId);
-    const series = await this.runtime.repository.getCatalogItem(internalSeriesId, context.ownerUserId);
-    if (series.libraryId !== context.libraryId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
+    const sourceSeries = await this.runtime.repository.getCatalogItem(internalSeriesId, context.ownerUserId);
+    const series = await this.readContentItemDetail(context, sourceSeries);
     const children = await this.runtime.repository.listCatalogChildren(internalSeriesId, context.ownerUserId);
     const seasons = [...new Set(children.map((item) => readVideoSeason(item.metadata.seasonNumber)))].sort((left, right) => left - right);
     const primaryImageTag = series.posterUrl ? String(Date.parse(series.updatedAt) || 1) : "";
@@ -1298,8 +1309,8 @@ export class JellyfinCompatibilityService {
     const explicitSeasonNumber = Number(query.Season ?? query.SeasonNumber);
     const seasonNumber = pathSeason?.seasonNumber ?? querySeason?.seasonNumber
       ?? (Number.isFinite(explicitSeasonNumber) ? explicitSeasonNumber : null);
-    const series = await this.runtime.repository.getCatalogItem(actualSeriesId, context.ownerUserId);
-    if (series.libraryId !== context.libraryId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
+    const sourceSeries = await this.runtime.repository.getCatalogItem(actualSeriesId, context.ownerUserId);
+    const series = await this.readContentItemDetail(context, sourceSeries);
     const children = (await this.runtime.repository.listCatalogChildren(actualSeriesId, context.ownerUserId))
       .filter((item) => matchesProtocolItemIdentity(identityFilter, item.id, item.externalIds))
       .filter((item) => seasonNumber === null || Number(item.metadata.seasonNumber ?? 0) === seasonNumber)
@@ -1689,15 +1700,17 @@ export class JellyfinCompatibilityService {
     const requestedSeriesId = String(this.readQueryValue(query, "SeriesId") ?? "");
     if (!requestedSeriesId) return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
     const seriesId = decodeProtocolItemId(requestedSeriesId);
-    const series = await this.runtime.repository.getCatalogItem(seriesId, context.ownerUserId);
-    if (series.libraryId !== context.libraryId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
+    const sourceSeries = await this.runtime.repository.getCatalogItem(seriesId, context.ownerUserId);
+    if (sourceSeries.libraryId !== context.libraryId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
     const parentFilters = await this.readOnlineParentFilters(context, query);
     if (isContentSourceLibrary(context.libraryKind)
-      && (!matchesJellyfinSourceCategory(series.metadata, parentFilters.sourceCategoryId)
-        || (parentFilters.parentId !== undefined && parentFilters.parentId !== series.id)
-        || (parentFilters.itemTypes !== undefined && !parentFilters.itemTypes.includes(series.itemType)))) {
+      && (!matchesJellyfinSourceCategory(sourceSeries.metadata, parentFilters.sourceCategoryId)
+        || (parentFilters.parentId !== undefined && parentFilters.parentId !== sourceSeries.id)
+        || (parentFilters.itemTypes !== undefined && !parentFilters.itemTypes.includes(sourceSeries.itemType)))) {
       return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
     }
+    // 明确节目后的下一集入口也允许首次选集，范围校验完成后才向源站读取详情。
+    const series = await this.readContentItemDetail(context, sourceSeries);
     const children = (await this.runtime.repository.listCatalogChildren(seriesId, context.ownerUserId))
       .filter((item) => !isContentSourceLibrary(context.libraryKind) || (matchesJellyfinSourceCategory(item.metadata, parentFilters.sourceCategoryId)
         && (parentFilters.seasonNumber === undefined || readVideoSeason(item.metadata.seasonNumber) === parentFilters.seasonNumber)))

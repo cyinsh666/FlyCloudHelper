@@ -65,7 +65,7 @@ function readEpisodes(raw: Record<string, unknown>): CmsPlaybackEpisode[] {
   return episodes;
 }
 
-/** 常驻 Spider 实例承接分类、卡片补详情、搜索与异步取址，不依赖网盘文件。 */
+/** 常驻 Spider 实例承接分类、轻量卡片、按需详情、搜索与异步取址，不依赖网盘文件。 */
 export class PythonVideoSourceAdapter implements VideoSourceAdapter {
   private readonly scriptPath: string;
   private scriptReady: Promise<void> | null = null;
@@ -161,8 +161,8 @@ export class PythonVideoSourceAdapter implements VideoSourceAdapter {
     return this.readPage(result, page, categoryId, signal);
   }
 
-  /** Spider 常只返回卡片，按需补齐详情之后才交给现有目录逻辑。 */
-  private async readPage(result: Record<string, unknown>, page: number, categoryId?: string, signal?: AbortSignal): Promise<CmsContentPage> {
+  /** 列表只转换源站已返回的字段，未含分集的卡片留到详情入口补齐。 */
+  private readPage(result: Record<string, unknown>, page: number, categoryId?: string, signal?: AbortSignal): CmsContentPage {
     if (!Array.isArray(result.list) || result.list.length > 200) throw new ApiError(502, "python_source_list_invalid", "Python 源目录列表无效或单页超过 200 条");
     const items: CmsContentItem[] = [];
     for (const value of result.list) {
@@ -174,8 +174,10 @@ export class PythonVideoSourceAdapter implements VideoSourceAdapter {
       const actualCategory = String(raw.type_id ?? categoryId ?? "");
       if (actualCategory) this.categoryHints.set(id, actualCategory);
       try {
-        const item = raw.vod_play_url ? this.readItem(raw, actualCategory) : await this.detail(id, signal);
-        if (item.episodes.length) items.push(item);
+        // 关键变量：没有播放字段只表示尚未查详情，不能据此把影片丢弃或伪造分集。
+        const detailState = String(raw.vod_play_url ?? "").trim() ? "complete" : "card";
+        const item = this.readItem(raw, actualCategory, detailState);
+        if (item.detailState === "card" || item.episodes.length > 0) items.push(item);
       } catch (error) {
         if (!(error instanceof ApiError) || !["content_episode_ambiguous", "content_source_item_missing"].includes(error.code)) throw error;
         console.warn(JSON.stringify({ 日志关键字: "codex-python-source", 事件: "跳过源条目", 插件ID: this.manifest.pluginId, 错误码: error.code }));
@@ -197,11 +199,11 @@ export class PythonVideoSourceAdapter implements VideoSourceAdapter {
     if (!Array.isArray(result.list)) throw new ApiError(502, "python_source_detail_invalid", "Python 源没有返回详情列表");
     const raw = result.list.find((value) => value && typeof value === "object" && String((value as Record<string, unknown>).vod_id ?? "") === remoteItemId);
     if (!raw) throw new ApiError(404, "content_source_item_missing", "Python 源中的条目已经不可用或需要更新源");
-    return this.readItem(raw as Record<string, unknown>, this.categoryHints.get(remoteItemId) ?? "");
+    return this.readItem(raw as Record<string, unknown>, this.categoryHints.get(remoteItemId) ?? "", "complete");
   }
 
   /** 固定 Spider 字段转换为现有视频目录模型，不保存取址会话或临时地址。 */
-  private readItem(raw: Record<string, unknown>, categoryHint: string): CmsContentItem {
+  private readItem(raw: Record<string, unknown>, categoryHint: string, detailState: "card" | "complete"): CmsContentItem {
     const id = String(raw.vod_id ?? "");
     const title = text(raw.vod_name);
     const categoryId = String(raw.type_id ?? categoryHint);
@@ -215,7 +217,8 @@ export class PythonVideoSourceAdapter implements VideoSourceAdapter {
       overview: text(raw.vod_content), posterUrl: /^https?:\/\//iu.test(String(raw.vod_pic ?? "")) ? String(raw.vod_pic) : null,
       area: text(raw.vod_area), genres: text(raw.vod_class || raw.type_name).split(/[,，/]/u).filter(Boolean),
       actors: text(raw.vod_actor).split(/[,，/]/u).filter(Boolean), directors: text(raw.vod_director).split(/[,，/]/u).filter(Boolean),
-      rating: Number.isFinite(rating) && rating > 0 && rating <= 10 ? rating : null, tags: text(raw.vod_tag).split(/[|,，/]/u).filter(Boolean), episodes: readEpisodes(raw) };
+      rating: Number.isFinite(rating) && rating > 0 && rating <= 10 ? rating : null, tags: text(raw.vod_tag).split(/[|,，/]/u).filter(Boolean),
+      detailState, episodes: detailState === "card" ? [] : readEpisodes(raw) };
   }
 
   /** 播放时调用 Spider，解析输入与最终 HTTP 地址分开，不把网页解析交给客户端。 */

@@ -125,13 +125,17 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
     const user = await requireRequestUser(request, runtime.database);
     await requireLibrary(runtime, request.params.libraryId, user.id);
     const item = await requireLibraryItem(runtime, user.id, request.params.libraryId, request.params.itemId);
-    return { item: await hydrateRealtimeVideoDetails(runtime, item) };
+    // 网页单条详情与标准协议共用 Python 补齐，权限检查完成后才请求源站。
+    await runtime.contentSources.ensureItemDetail(request.params.libraryId, user.id, item.id);
+    const detailed = await requireLibraryItem(runtime, user.id, request.params.libraryId, item.id);
+    return { item: await hydrateRealtimeVideoDetails(runtime, detailed) };
   });
 
   server.get<{ Params: { libraryId: string; itemId: string } }>("/api/v1/libraries/:libraryId/items/:itemId/children", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     await requireLibrary(runtime, request.params.libraryId, user.id);
     await requireLibraryItem(runtime, user.id, request.params.libraryId, request.params.itemId);
+    await runtime.contentSources.ensureItemDetail(request.params.libraryId, user.id, request.params.itemId);
     return { items: await runtime.repository.listCatalogChildren(request.params.itemId, user.id) };
   });
 

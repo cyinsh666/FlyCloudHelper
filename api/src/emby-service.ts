@@ -423,7 +423,7 @@ export class EmbyCompatibilityService {
 
   /** 返回节目季，季仅为协议虚拟项。 */
   public async listSeasons(context: EmbyContext, seriesId: string) {
-    const series = await this.requireItem(context, decodeItemId(seriesId));
+    const series = await this.requireItemDetail(context, decodeItemId(seriesId));
     const children = await this.runtime.repository.listCatalogChildren(series.id, context.ownerUserId);
     const tag = series.posterUrl ? String(Date.parse(series.updatedAt) || 1) : "";
     const seasons = [...new Set(children.map((item) => readVideoSeason(item.metadata.seasonNumber))).values()].sort((a, b) => a - b).map((number) => ({ Name: videoSeasonTitle(number), Id: encodeSeasonId(series.id, number), ServerId: context.libraryId, Type: "Season", IsFolder: true, SeriesId: encodeItemId(series.id), SeriesName: series.title, IndexNumber: number, ParentId: encodeItemId(series.id), ImageTags: tag ? { Primary: tag } : {}, PrimaryImageTag: tag || undefined, PrimaryImageItemId: tag ? encodeItemId(series.id) : undefined, UserData: this.emptyUserData() }));
@@ -436,7 +436,7 @@ export class EmbyCompatibilityService {
     const identityFilter = readProtocolItemIdentityFilter(query, decodeItemId);
     const seasonRef = decodeSeasonId(seriesId) ?? decodeSeasonId(this.queryString(query, "SeasonId"));
     const rawSeriesId = this.queryString(query, "SeriesId") || seasonRef?.seriesId || decodeItemId(seriesId);
-    const series = await this.requireItem(context, decodeItemId(rawSeriesId));
+    const series = await this.requireItemDetail(context, decodeItemId(rawSeriesId));
     // 关键变量：未传季筛选时必须保留全部单集，不能把 Number("") 得到的 0 当作特辑季。
     const rawSeason = this.queryString(query, "Season") || this.queryString(query, "SeasonNumber");
     const requestedSeason = seasonRef?.seasonNumber ?? (rawSeason ? Number(rawSeason) : undefined);
@@ -448,9 +448,11 @@ export class EmbyCompatibilityService {
     return isContentSourceLibrary(context.libraryKind) ? this.filterAndPaginate(items, query, context) : this.paginate(items, query);
   }
 
-  /** 返回单条详情；路由可直接把该 DTO 返回给 /Users/{id}/Items/{id}。 */
-  public async getItem(context: EmbyContext, itemId: string) {
-    const item = await this.requireItem(context, decodeItemId(itemId));
+  /** 单条详情补齐在线卡片；收藏、历史与续播装配显式关闭详情预读。 */
+  public async getItem(context: EmbyContext, itemId: string, options: { loadDetail?: boolean } = {}) {
+    const item = options.loadDetail === false
+      ? await this.requireItem(context, decodeItemId(itemId))
+      : await this.requireItemDetail(context, decodeItemId(itemId));
     const parent = item.itemType === "video.episode" ? await this.findParent(item.id, context.ownerUserId) : undefined;
     return this.mapItem(context, item, parent);
   }
@@ -477,7 +479,7 @@ export class EmbyCompatibilityService {
     const scopedRows = (await rowsQuery).filter((row) => !allowedIds || allowedIds.has(String(row.item_id)));
     const rows = onlineLibrary ? scopedRows : scopedRows.slice(0, 500);
     const media: Record<string, unknown>[] = [];
-    for (const row of rows) { try { media.push(await this.getItem(context, encodeItemId(String(row.item_id)))); } catch { /* 目录变更后忽略已删除条目。 */ } }
+    for (const row of rows) { try { media.push(await this.getItem(context, encodeItemId(String(row.item_id)), { loadDetail: false })); } catch { /* 目录变更后忽略已删除条目。 */ } }
     const include = this.queryString(query, "IncludeItemTypes");
     if (!include || include.split(",").includes("Person")) {
       const personRows = await this.runtime.database.query("library_emby_virtual_preferences").select("protocol_item_id").where({ library_id: context.libraryId, account_id: context.accountId, item_type: "Person" }).orderBy("starred_at", "desc").limit(500);
@@ -506,7 +508,7 @@ export class EmbyCompatibilityService {
     if (!allowedIds) rowsQuery.limit(500);
     const rows = (await rowsQuery).filter((row) => !allowedIds || allowedIds.has(String(row.id))).slice(0, 500);
     const items: Record<string, unknown>[] = [];
-    for (const row of rows) { try { items.push(await this.getItem(context, encodeItemId(String(row.id)))); } catch { /* 扫描移除后跳过。 */ } }
+    for (const row of rows) { try { items.push(await this.getItem(context, encodeItemId(String(row.id)), { loadDetail: false })); } catch { /* 扫描移除后跳过。 */ } }
     return this.filterAndPaginate(await this.filterOnlineParentItems(context, items, query), query, context);
   }
 
@@ -523,7 +525,7 @@ export class EmbyCompatibilityService {
     const items: Record<string, unknown>[] = [];
     for (const row of rows) {
       try {
-        const item = await this.getItem(context, encodeItemId(String(row.id)));
+        const item = await this.getItem(context, encodeItemId(String(row.id)), { loadDetail: false });
         if (!isContentSourceLibrary(context.libraryKind) || (Array.isArray(item.MediaSources) && item.MediaSources.length > 0)) items.push(item);
       } catch { /* 删除条目不返回。 */ }
     }
@@ -537,7 +539,7 @@ export class EmbyCompatibilityService {
     if (!allowedIds) rowsQuery.limit(500);
     const rows = (await rowsQuery).filter((row) => !allowedIds || allowedIds.has(String(row.id))).slice(0, 500);
     const seen = new Set<string>(); const items: Record<string, unknown>[] = [];
-    for (const row of rows) { const id = String(row.id); if (seen.has(id)) continue; seen.add(id); try { items.push(await this.getItem(context, encodeItemId(id))); } catch { /* 删除条目不返回。 */ } }
+    for (const row of rows) { const id = String(row.id); if (seen.has(id)) continue; seen.add(id); try { items.push(await this.getItem(context, encodeItemId(id), { loadDetail: false })); } catch { /* 删除条目不返回。 */ } }
     return this.paginate(await this.filterOnlineParentItems(context, items, query), query);
   }
 
@@ -629,15 +631,19 @@ export class EmbyCompatibilityService {
   public async listNextUp(context: EmbyContext, query: Record<string, unknown>) {
     const requestedSeriesId = this.queryString(query, "SeriesId");
     if (!requestedSeriesId) return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
-    const series = await this.requireItem(context, decodeItemId(requestedSeriesId));
-    const allowedIds = await this.readOnlineParentItemIds(context, query);
+    const sourceSeries = await this.requireItem(context, decodeItemId(requestedSeriesId));
+    const initialAllowedIds = await this.readOnlineParentItemIds(context, query);
     const requestedParentId = this.queryString(query, "ParentId");
     const parentSeason = decodeSeasonId(requestedParentId);
     const libraryParent = this.findLibraryDefinition(context, requestedParentId);
-    if (allowedIds && (libraryParent ? !allowedIds.has(series.id)
-      : (parentSeason?.seriesId ?? decodeItemId(requestedParentId)) !== series.id)) {
+    if (initialAllowedIds && (libraryParent ? !initialAllowedIds.has(sourceSeries.id)
+      : (parentSeason?.seriesId ?? decodeItemId(requestedParentId)) !== sourceSeries.id)) {
       return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
     }
+    const series = await this.requireItemDetail(context, sourceSeries.id);
+    // 关键变量：首次详情会创建分集，父级身份集合必须重读，不能沿用原卡片的空子集。
+    const allowedIds = isContentSourceLibrary(context.libraryKind)
+      ? await this.readOnlineParentItemIds(context, query) : initialAllowedIds;
     const children = (await this.runtime.repository.listCatalogChildren(series.id, context.ownerUserId))
       .filter((item) => item.itemType === "video.episode" && (!allowedIds || allowedIds.has(item.id)))
       .sort((left, right) => Number(left.metadata.seasonNumber ?? 0) - Number(right.metadata.seasonNumber ?? 0)
@@ -1086,6 +1092,15 @@ export class EmbyCompatibilityService {
   }
   private personId(person: Record<string, unknown>): string { const source = String(person.id ?? "").trim(); const name = String(person.name ?? "").trim(); return protocolUuid("person", source ? `source:${source}` : `name:${name}`).toLowerCase(); }
   private async requireItem(context: EmbyLibraryContext, itemId: string): Promise<MediaItemRecord> { const item = await this.runtime.repository.getCatalogItem(itemId, context.ownerUserId); if (item.libraryId !== context.libraryId) throw new ApiError(404, "emby_item_not_found", "媒体条目不存在"); return item; }
+
+  /** 详情和选集入口先验证账号所属媒体库，再按需补齐 Python 节目或电影。 */
+  private async requireItemDetail(context: EmbyContext, itemId: string): Promise<MediaItemRecord> {
+    const item = await this.requireItem(context, itemId);
+    if (!isContentSourceLibrary(context.libraryKind)) return item;
+    await this.runtime.contentSources.ensureItemDetail(context.libraryId, context.ownerUserId, item.id);
+    // 关键变量：详情写入后的元数据与子集关系不能继续使用原列表卡片。
+    return this.requireItem(context, item.id);
+  }
   private async findParent(itemId: string, userId: string) { const relation = await this.runtime.database.query("media_relations").where({ child_item_id: itemId }).first(); return relation ? this.runtime.repository.getCatalogItem(String(relation.parent_item_id), userId) : undefined; }
   /** 根据当前有效单集计算节目整体观看状态，不能永久沿用历史父记录。 */
   private buildSeriesProgress(

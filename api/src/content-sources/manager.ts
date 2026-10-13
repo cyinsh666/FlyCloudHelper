@@ -10,6 +10,7 @@ import { contentKey, validateContentManifest } from "./cms-adapter.js";
 import { CmsVideoSourceAdapter } from "./video-adapter.js";
 import { PythonVideoSourceAdapter } from "./python-adapter.js";
 import { PythonSpiderRuntime } from "./python-runtime.js";
+import { PythonItemDetailLoader, type PythonItemDetailContext } from "./python-detail-loader.js";
 import { DynamicContentCatalog, type DynamicCatalogContext, type DynamicCatalogQuery } from "./dynamic-catalog.js";
 import { initializeContentSourceSchema } from "./schema.js";
 import { mergeCategoryCatalog, SourceCategoryLibraryReader } from "./source-category-library.js";
@@ -84,6 +85,7 @@ export class ContentSourceManager {
   private readonly jobs = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   private readonly categoryLibraryReader: SourceCategoryLibraryReader;
   private readonly dynamicCatalog: DynamicContentCatalog;
+  private readonly itemDetails: PythonItemDetailLoader;
   // 关键变量：同步与浏览共用每条源内容的写入队列，避免两次 generation 互相淘汰播放线路。
   private readonly contentWrites = new Map<string, Promise<void>>();
   private closing = false;
@@ -97,6 +99,9 @@ export class ContentSourceManager {
       (context, content, itemTypes, signal) => this.persistDynamicContent(context, content, itemTypes, signal),
       (context, itemIds, itemTypes) => this.validateDynamicIndex(context, itemIds, itemTypes),
     );
+    this.itemDetails = new PythonItemDetailLoader(database, repository,
+      (libraryId, userId, itemId) => this.pythonItemDetailContext(libraryId, userId, itemId),
+      (context, operation, signal) => this.withContentWrite(context.libraryId, context.instanceId, context.remoteItemId, operation, signal));
   }
 
   /** 创建内容表，不自动安装插件；保留已有插件记录并处理重启中断的同步。 */
@@ -115,7 +120,7 @@ export class ContentSourceManager {
     this.closing = true;
     for (const adapter of this.pythonAdapters.values()) adapter.invalidate();
     for (const job of this.jobs.values()) job.controller.abort();
-    await Promise.allSettled([this.dynamicCatalog.shutdown(), ...[...this.jobs.values()].map((job) => job.promise)]);
+    await Promise.allSettled([this.dynamicCatalog.shutdown(), this.itemDetails.close(), ...[...this.jobs.values()].map((job) => job.promise)]);
     await this.pythonRuntime.close();
     this.pythonAdapters.clear();
   }
@@ -125,6 +130,17 @@ export class ContentSourceManager {
     const query = this.database.query("content_source_plugins").orderBy("plugin_id", "asc").orderBy("created_at", "desc");
     if (!includeDisabled) query.where({ status: "enabled" });
     return (await query).map(mapPlugin);
+  }
+
+  /** 脚本显式升级后仍复用原插件身份；重传新版按当前摘要匹配原记录。 */
+  public async findPythonPluginByScriptHash(scriptHash: string): Promise<ContentSourcePluginRecord | null> {
+    const rows = await this.database.query("content_source_plugins").select("*").orderBy("created_at", "asc");
+    const matches = rows.filter((row) => {
+      const manifest = parseJsonObject(row.manifest_json);
+      return manifest.adapter === "python_spider" && manifest.scriptHash === scriptHash;
+    });
+    const row = matches.find((entry) => entry.status !== "uninstalled") ?? matches[0];
+    return row ? mapPlugin(row) : null;
   }
 
   /** 导入声明式清单；同一 ID/版本不可静默替换已经安装的源地址和规则。 */
@@ -260,6 +276,7 @@ export class ContentSourceManager {
 
   /** 先阻止旧请求启动进程，再删除缓存并结束宿主，重新启用使用全新适配器。 */
   private async stopPythonAdapter(instanceId: string): Promise<void> {
+    await this.itemDetails.stopInstance(instanceId);
     this.pythonAdapters.get(instanceId)?.invalidate();
     this.pythonAdapters.delete(instanceId);
     await this.pythonRuntime.stopInstance(instanceId);
@@ -348,11 +365,51 @@ export class ContentSourceManager {
 
   /** 清空或删除在线库时先停止动态回填，实际同步检查和目录事务继续交给既有仓储。 */
   public async withLibraryCatalogChange<T>(libraryId: string, operation: () => Promise<T>): Promise<T> {
-    return this.dynamicCatalog.withLibraryCatalogChange(libraryId, async () => {
+    return this.itemDetails.withLibraryChange(libraryId, () => this.dynamicCatalog.withLibraryCatalogChange(libraryId, async () => {
       const binding = await this.database.query("content_source_libraries").select("instance_id").where({ library_id: libraryId }).first();
       if (binding) await this.stopPythonAdapter(String(binding.instance_id));
       return operation();
-    });
+    }));
+  }
+
+  /** 详情、选集与播放共用按需补齐；普通列表和播放来源枚举不触发源查询。 */
+  public async ensureItemDetail(libraryId: string, userId: string, itemId: string, signal?: AbortSignal): Promise<void> {
+    await this.itemDetails.ensure(libraryId, userId, itemId, signal);
+  }
+
+  /** 从已存在的媒体身份恢复 Python 定位，用户或跨库请求不能指定远端影片。 */
+  private async pythonItemDetailContext(libraryId: string, userId: string, itemId: string): Promise<PythonItemDetailContext | null> {
+    const library = await this.database.query("media_libraries").select("library_kind", "status")
+      .where({ id: libraryId, user_id: userId }).first();
+    if (!library || library.library_kind !== "content_source_video") return null;
+    // 关键变量：先识别固定版本的源类型，停用的 JSON 源仍沿用原本地详情行为。
+    const sourceType = await this.database.query("content_source_libraries as b")
+      .join("content_source_instances as i", "i.id", "b.instance_id")
+      .join("content_source_plugins as p", function joinDetailPlugin() { this.on("p.plugin_id", "=", "i.plugin_id").andOn("p.version", "=", "i.plugin_version"); })
+      .select("p.manifest_json", "b.library_source_id").where({ "b.library_id": libraryId, "b.user_id": userId, "i.user_id": userId }).first();
+    if (!sourceType || parseJsonObject(sourceType.manifest_json).adapter !== "python_spider") return null;
+    if (library.status !== "active") throw new ApiError(409, "content_library_disabled", "媒体库已停用");
+    const binding = await this.getLibrary(libraryId, userId);
+    const sourceStatus = await this.database.query("library_sources").select("status")
+      .where({ id: String(sourceType.library_source_id), library_id: libraryId, user_id: userId, source_mode: "content_source" }).first();
+    if (!sourceStatus || sourceStatus.status !== "active") throw new ApiError(409, "content_source_disabled", "内容源实例已停用");
+    const runtime = await this.adapter(binding.source.id, userId);
+    if (!(runtime.adapter instanceof PythonVideoSourceAdapter)) return null;
+    const item = await this.repository.getCatalogItem(itemId, userId);
+    if (item.libraryId !== libraryId) throw new ApiError(404, "content_item_not_found", "媒体条目不存在");
+    const source = item.metadata.contentSource;
+    if (!source || typeof source !== "object" || Array.isArray(source)) {
+      throw new ApiError(409, "content_source_locator_missing", "Python 源条目缺少定位，请刷新目录");
+    }
+    const locator = source as Record<string, unknown>;
+    if (locator.instanceId !== binding.source.id || typeof locator.remoteItemId !== "string" || !locator.remoteItemId) {
+      throw new ApiError(409, "content_source_locator_missing", "Python 源条目定位已变化，请刷新目录");
+    }
+    const categories = mergeCategoryCatalog(binding.configuration, []);
+    runtime.adapter.useCategoryCatalog(categories);
+    if (typeof locator.categoryId === "string") runtime.adapter.useItemCategory(locator.remoteItemId, locator.categoryId);
+    return { libraryId, userId, itemId, instanceId: binding.source.id, remoteItemId: locator.remoteItemId,
+      manifest: runtime.manifest, categories, adapter: runtime.adapter };
   }
 
   /** 每次取页或入库都核对归属、库启用状态、固定插件版本和当前所选分类。 */
@@ -427,18 +484,23 @@ export class ContentSourceManager {
   private async validateDynamicIndex(context: DynamicCatalogContext, itemIds: string[], itemTypes: string[]): Promise<boolean> {
     for (let offset = 0; offset < itemIds.length; offset += 100) {
       const batch = itemIds.slice(offset, offset + 100);
-      const rows = await this.database.query("media_items as m").select("m.id", "m.metadata_json")
-        .where({ "m.library_id": context.libraryId, "m.user_id": context.userId }).whereIn("m.id", batch).whereIn("m.item_type", itemTypes).whereNull("m.deleted_at")
-        .where((builder) => builder.where((movies) => movies.where("m.item_type", "video.movie")
+      const query = this.database.query("media_items as m").select("m.id", "m.metadata_json")
+        .where({ "m.library_id": context.libraryId, "m.user_id": context.userId }).whereIn("m.id", batch).whereIn("m.item_type", itemTypes).whereNull("m.deleted_at");
+      if (context.manifest.adapter !== "python_spider") query.where((builder) => builder.where((movies) => movies.where("m.item_type", "video.movie")
           .whereExists(this.database.query("content_playback_sources as p").select("p.id")
             .whereRaw("?? = ??", ["p.item_id", "m.id"]).where({ "p.library_id": context.libraryId, "p.user_id": context.userId, "p.instance_id": context.instanceId, "p.status": "active" })))
           .orWhere((series) => series.where("m.item_type", "video.series")
             .whereExists(this.database.query("media_relations as r").join("media_items as child", "child.id", "r.child_item_id").join("content_playback_sources as p", "p.item_id", "child.id").select("p.id")
               .whereRaw("?? = ??", ["r.parent_item_id", "m.id"]).where({ "r.library_id": context.libraryId, "r.user_id": context.userId, "r.relation_type": "series_episode", "child.item_type": "video.episode", "child.library_id": context.libraryId, "child.user_id": context.userId, "p.library_id": context.libraryId, "p.user_id": context.userId, "p.instance_id": context.instanceId, "p.status": "active" }).whereNull("child.deleted_at"))));
+      // Python 卡片的可浏览性由稳定父身份判断；实际线路在详情和播放时校验。
+      const rows = await query;
       if (rows.length !== batch.length) return false;
       if (rows.some((row) => {
         const source = parseJsonObject(row.metadata_json).contentSource;
-        return !source || typeof source !== "object" || Array.isArray(source) || !context.categoryIds.includes(String((source as Record<string, unknown>).categoryId ?? ""));
+        if (!source || typeof source !== "object" || Array.isArray(source)) return true;
+        const locator = source as Record<string, unknown>;
+        return (context.manifest.adapter === "python_spider" && locator.instanceId !== context.instanceId)
+          || !context.categoryIds.includes(String(locator.categoryId ?? ""));
       })) return false;
     }
     return true;
@@ -619,7 +681,8 @@ export class ContentSourceManager {
       /** 单条成功入库后同时保存处理数量和样本检查点，重试不能重置剩余额度。 */
       const persist = async (content: Awaited<ReturnType<VideoSourceAdapter["detail"]>>, sampleCategoryId?: string) => {
         signal.throwIfAborted();
-        if (content.episodes.length === 0) {
+        const card = runtime.manifest.adapter === "python_spider" && content.detailState === "card";
+        if (content.episodes.length === 0 && !card) {
           await this.withContentWrite(libraryId, detail.source.id, content.id,
             () => this.markRemoteUnavailable(libraryId, userId, detail.source.id, content.id), signal);
           return;
@@ -691,7 +754,9 @@ export class ContentSourceManager {
             const page = await runtime.adapter.page(categoryId, currentPage, signal);
             if (page.items.length === 0) break;
             const sampledIds = batch.sampledItemIdsByCategory?.[categoryId] ?? [];
-            const playableItems = page.items.filter((content) => content.episodes.length > 0 && (!batch.sample || !sampledIds.includes(content.id)));
+            const playableItems = page.items.filter((content) => (content.episodes.length > 0
+              || (runtime.manifest.adapter === "python_spider" && content.detailState === "card"))
+              && (!batch.sample || !sampledIds.includes(content.id)));
             const items = batch.sample ? playableItems.slice(0, batch.remainingSampleCountByCategory[categoryId]) : playableItems;
             for (const content of items) await persist(content, batch.sample ? categoryId : undefined);
             // 首次样例只导入少量条目，保留当前页以便下一批补齐剩余内容。

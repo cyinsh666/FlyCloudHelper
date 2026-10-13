@@ -378,9 +378,6 @@ export async function sendContentPlayback(
 ) {
   const item = await runtime.repository.getCatalogItem(itemId, context.ownerUserId);
   if (item.libraryId !== context.libraryId) throw new ApiError(404, "content_item_not_found", "媒体条目不存在");
-  const sources = await runtime.contentSources.listPlaybackSources(itemId, context.ownerUserId);
-  const source = sourceId && sourceId !== itemId ? sources.find((candidate) => candidate.id === sourceId) : sources[0];
-  if (!source) throw new ApiError(404, "content_playback_source_not_found", "指定在线播放来源不存在");
   const controller = new AbortController();
   const abort = () => controller.abort();
   const timeout = setTimeout(abort, 30_000);
@@ -388,7 +385,14 @@ export async function sendContentPlayback(
   reply.raw.once("close", abort);
   if (request.raw.aborted) abort();
   let resolving = true; // 关键变量：即时取址失败与中转资源失败分别记录，不把中转错误重复记成取址失败。
+  let selectedSourceId = ""; // 关键变量：仅已选中的真实来源才登记取址失败，详情尚未加载时不伪造来源 ID。
   try {
+    // 直接取流也可能绕过 PlaybackInfo，详情加载沿用本次请求的取消和超时信号。
+    await runtime.contentSources.ensureItemDetail(context.libraryId, context.ownerUserId, itemId, controller.signal);
+    const sources = await runtime.contentSources.listPlaybackSources(itemId, context.ownerUserId);
+    const source = sourceId && sourceId !== itemId ? sources.find((candidate) => candidate.id === sourceId) : sources[0];
+    if (!source) throw new ApiError(404, "content_playback_source_not_found", "指定在线播放来源不存在");
+    selectedSourceId = source.id;
     const resolved = await runtime.contentSources.resolvePlayback(source.id, context.ownerUserId, context.libraryId, controller.signal);
     resolving = false;
     if (controller.signal.aborted) throw new ApiError(504, "content_playback_resolve_cancelled", "在线播放取址已取消或超时");
@@ -424,8 +428,8 @@ export async function sendContentPlayback(
       directResources, segmentExtension: "ts",
     });
   } catch (error) {
-    if (resolving && !request.raw.aborted && !reply.raw.destroyed) await runtime.contentSourceDiagnostics.recordPlaybackFailure({
-      libraryId: context.libraryId, ownerUserId: context.ownerUserId, itemId, sourceId: source.id,
+    if (resolving && selectedSourceId && !request.raw.aborted && !reply.raw.destroyed) await runtime.contentSourceDiagnostics.recordPlaybackFailure({
+      libraryId: context.libraryId, ownerUserId: context.ownerUserId, itemId, sourceId: selectedSourceId,
       protocol: options.protocol, stage: "resolve", error,
     });
     throw error;

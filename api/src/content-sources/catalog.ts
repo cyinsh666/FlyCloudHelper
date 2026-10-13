@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { FlyCloudHelperDatabase } from "../database.js";
 import type { ServiceRepository } from "../service-repository.js";
-import { parseJsonObject } from "../domain.js";
 import { createStableId } from "../media/filename.js";
 import { contentKey } from "./cms-adapter.js";
 import { persistCmsEpisodeRelations, persistCmsEpisodes } from "./catalog-batch.js";
+import { completePythonContentMetadata, persistPythonContentCard, refreshManuallyMatchedSourceMetadata } from "./catalog-card.js";
 import type { CmsCatalogContentItem, ContentSourceCategory, ContentSourceManifest } from "./types.js";
 
 /** 检查分类及其祖先是否匹配清单中指定的父分类。 */
@@ -25,23 +25,6 @@ function originCountries(area: string): string[] {
   return area.split(/[,，/]/u).flatMap((name) => mappings[name.trim()] ? [mappings[name.trim()]!] : []);
 }
 
-/** 人工匹配保留展示元数据，但源分类属于定位信息，需要独立补齐且不能覆盖人工字段。 */
-async function refreshManuallyMatchedSourceMetadata(database: FlyCloudHelperDatabase, userId: string, libraryId: string, itemId: string, contentSource: Record<string, unknown>): Promise<boolean> {
-  return database.query.transaction(async (transaction) => {
-    const query = transaction("media_items").where({ id: itemId, user_id: userId, library_id: libraryId });
-    if (database.databaseType !== "sqlite") query.forUpdate();
-    const item = await query.first();
-    if (!item) return false;
-    const previousMetadata = parseJsonObject(item.metadata_json);
-    const previousSource = previousMetadata.contentSource && typeof previousMetadata.contentSource === "object" && !Array.isArray(previousMetadata.contentSource)
-      ? previousMetadata.contentSource as Record<string, unknown> : {};
-    const metadataJson = JSON.stringify({ ...previousMetadata, contentSource: { ...previousSource, ...contentSource } });
-    if (metadataJson === item.metadata_json) return false;
-    await transaction("media_items").where({ id: itemId, user_id: userId, library_id: libraryId }).update({ metadata_json: metadataJson, updated_at: new Date().toISOString() });
-    return true;
-  });
-}
-
 /** 持久化单条内容及其精确播放定位，不创建不存在的网盘文件记录。 */
 export async function persistCmsContent(input: {
   database: FlyCloudHelperDatabase;
@@ -54,16 +37,24 @@ export async function persistCmsContent(input: {
   content: CmsCatalogContentItem;
 }): Promise<string[]> {
   const { database, repository, userId, libraryId, instanceId, content, categories, manifest } = input;
-  if (content.episodes.length === 0) return [];
   if (categoryMatches(content.categoryId, manifest.excludedCategoryIds ?? [], categories)) return [];
   const movie = categoryMatches(content.categoryId, manifest.movieCategoryIds, categories)
     || Boolean(content.parentCategoryId && manifest.movieCategoryIds.includes(content.parentCategoryId));
   const identityKey = `content:${instanceId}:${contentKey(content.id)}`;
-  const generationId = randomUUID(); // 关键变量：仅淘汰这一个已成功读取详情的条目的过期播放线路。
-  const genres = [...new Set([...content.genres, ...(content.categoryName.includes("动漫") ? ["动画"] : [])])];
+  const generationId = randomUUID(); // 关键变量：刷新单条身份；仅完整详情路径用它淘汰该条目的过期播放线路。
   // 关键变量：分类身份供协议入口筛选，电影/节目/单集共用，不参与稳定媒体 ID。
   const category = categories.find((item) => item.id === content.categoryId);
-  const contentSource = { instanceId, remoteItemId: content.id, categoryId: content.categoryId, categoryName: content.categoryName || category?.name || "", parentCategoryId: content.parentCategoryId ?? category?.parentId ?? null };
+  const contentSource: Record<string, unknown> = { instanceId, remoteItemId: content.id, categoryId: content.categoryId, categoryName: content.categoryName || category?.name || "", parentCategoryId: content.parentCategoryId ?? category?.parentId ?? null };
+  if (manifest.adapter === "python_spider" && content.detailState === "card") {
+    return persistPythonContentCard({ database, repository, userId, libraryId, identityKey, generationId, movie, content, contentSource });
+  }
+  // 空详情不创建虚构分集，也不能把尚未补齐的卡片标记为完成。
+  if (content.episodes.length === 0) return [];
+  if (manifest.adapter === "python_spider") {
+    // 完成标记在末尾统一提交；本轮中途失败时，下一次详情仍需重新补齐。
+    contentSource.detailState = "card";
+  }
+  const genres = [...new Set([...content.genres, ...(content.categoryName.includes("动漫") ? ["动画"] : [])])];
   const metadata: Record<string, unknown> = {
     contentSource,
     genres, originCountries: originCountries(content.area), productionCountries: originCountries(content.area),
@@ -156,6 +147,11 @@ export async function persistCmsContent(input: {
     const now = new Date().toISOString();
     await database.query("media_items").where({ user_id: userId, library_id: libraryId }).whereIn("id", deletedIds).update({ deleted_at: now, updated_at: now });
     await database.query("media_relations").where({ user_id: userId, library_id: libraryId }).whereIn("child_item_id", deletedIds).delete();
+  }
+  if (manifest.adapter === "python_spider") {
+    const completedIds = await completePythonContentMetadata({ database, userId, libraryId,
+      itemIds: [parent.itemId, ...episodeItems.values()], contentSource });
+    for (const itemId of completedIds) changedIds.add(itemId);
   }
   if (changedIds.size > 0) {
     changedIds.add(parent.itemId);

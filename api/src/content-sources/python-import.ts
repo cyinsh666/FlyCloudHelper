@@ -55,14 +55,20 @@ export async function importPythonSource(runtime: ApiRuntime, filename: string, 
 
   // 关键变量：文件身份由完整原始字节确定，上传名和脚本声明都不能影响存储路径。
   const scriptHash = createHash("sha256").update(bytes).digest("hex");
-  const pluginId = `py.${scriptHash.slice(0, 24)}`;
-  const version = "1.0.0";
-  // 关键变量：按脚本内容身份复用原记录，文件改名不会产生第二份插件。
-  const previous = (await runtime.contentSources.listPlugins(true)).find((plugin) => plugin.pluginId === pluginId && plugin.version === version);
+  const derivedPluginId = `py.${scriptHash.slice(0, 24)}`;
+  // 关键变量：已升级脚本可以沿用旧插件 ID，必须先按当前清单的实际摘要复用记录。
+  const previous = await runtime.contentSources.findPythonPluginByScriptHash(scriptHash);
+  const pluginId = previous?.pluginId ?? derivedPluginId;
+  const version = previous?.version ?? "1.0.0";
+  if (!previous) {
+    const previousIdentity = (await runtime.contentSources.listPlugins(true)).find((plugin) => plugin.pluginId === derivedPluginId && plugin.version === version);
+    // 关键变量：原身份已升级到新字节时拒绝旧文件，不覆盖新版，也不创建重复记录。
+    if (previousIdentity) throw new ApiError(409, "python_source_version_outdated", "此 Python 源已经更新，请导入最新脚本，不能使用旧文件覆盖");
+  }
   const scriptFile = path.posix.join("python-sources", scriptHash, "source.py");
   const absolutePath = path.resolve(runtime.config.pluginDirectory, scriptFile);
   // 关键变量：仍安装的插件只允许补回缺失文件，原有名称、状态和关联不变。
-  const repairingInstalledPlugin = previous !== undefined && previous.status !== "uninstalled";
+  const repairingInstalledPlugin = previous !== null && previous.status !== "uninstalled";
   if (repairingInstalledPlugin && !await pythonSourceMissing(absolutePath)) {
     throw new ApiError(409, "content_plugin_already_exists", "已添加插件，不要重复导入");
   }

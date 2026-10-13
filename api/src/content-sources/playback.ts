@@ -131,6 +131,10 @@ export async function prepareContentPlaybackSources(
   requestedSourceId: string,
   recentSourceId: string,
 ): Promise<ContentPlaybackSource[]> {
+  const item = await runtime.repository.getCatalogItem(itemId, ownerUserId);
+  if (item.libraryId !== libraryId) throw new ApiError(404, "content_item_not_found", "媒体条目不存在");
+  // PlaybackInfo 可以从列表直接调用，必须先补当前条目的线路，不能要求先访问详情页。
+  await runtime.contentSources.ensureItemDetail(libraryId, ownerUserId, itemId);
   const sources = prioritizeContentSources(await runtime.contentSources.listPlaybackSources(itemId, ownerUserId), recentSourceId);
   const selected = requestedSourceId && requestedSourceId !== itemId ? sources.filter((source) => source.id === requestedSourceId) : sources;
   if (selected.length === 0) throw new ApiError(404, "content_playback_source_not_found", requestedSourceId ? "指定在线播放来源不存在" : "媒体条目没有可播放的在线来源");
