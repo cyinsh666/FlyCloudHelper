@@ -317,17 +317,18 @@ export class ContentSourceManager {
     return selectableVideoCategories(categories, runtime.manifest);
   }
 
-  /** 创建每实例独立视频库并安排小量首次同步，协议由用户创建完成后在库设置中启用。 */
+  /** 创建每实例独立视频库并导入各已选分类第一页摘要，协议在库设置中启用。 */
   public async createLibrary(instanceId: string, userId: string, input: { displayName: string; categoryIds: string[]; initialPageCount?: number }) {
     const runtime = await this.adapter(instanceId, userId);
     const categories = await runtime.adapter.categories();
     const available = selectableVideoCategories(categories, runtime.manifest);
     const selected = selectedVideoCategories(input.categoryIds, available);
-    const initialPageCount = pageCount(input.initialPageCount, 3);
+    // 关键变量：首次导入固定每分类一整页，取消电影三部、节目一部的样本额度。
+    const initialPageCount = 1;
     const configuration: ContentLibraryConfiguration = { ...selected, categoryCatalog: categories, initialPageCount };
     const libraryId = randomUUID();
     const created = await this.repository.createContentSourceVideoLibrary({ libraryId, sourceId: randomUUID(), instanceId, userId, displayName: input.displayName, sourceName: runtime.source.displayName, providerType: runtime.manifest.adapter === "python_spider" ? "python_spider" : "cms_json", configuration: configuration as unknown as Record<string, unknown>, syncState: emptySync() as unknown as Record<string, unknown> });
-    const sync = await this.startLibrarySync(libraryId, userId, { pageCount: initialPageCount, sample: true });
+    const sync = await this.startLibrarySync(libraryId, userId, { pageCount: initialPageCount });
     return { libraryId, library: created.library, sync };
   }
 
@@ -747,7 +748,7 @@ export class ContentSourceManager {
           let currentPage = sync.nextPageByCategory[categoryId] ?? 1;
           const endPageExclusive = batch.endPageExclusiveByCategory[categoryId];
           if (endPageExclusive === undefined) throw new ApiError(500, "content_sync_batch_missing", "目录同步缺少分类批次范围，请重新发起同步");
-          // 关键变量：首次样例额度属于整个分类，跨页或重试都不能重新获得额度。
+          // 关键变量：兼容升级前尚未完成的样本批次，跨页或重试都不能重新获得额度。
           if (batch.sample && batch.remainingSampleCountByCategory[categoryId] === undefined) {
             batch.remainingSampleCountByCategory[categoryId] = categoryMatches(categoryId, runtime.manifest.movieCategoryIds, categories) ? 3 : 1;
             await this.saveSync(libraryId, sync);
@@ -761,7 +762,7 @@ export class ContentSourceManager {
               && (!batch.sample || !sampledIds.includes(content.id)));
             const items = batch.sample ? playableItems.slice(0, batch.remainingSampleCountByCategory[categoryId]) : playableItems;
             for (const content of items) await persist(content, batch.sample ? categoryId : undefined);
-            // 首次样例只导入少量条目，保留当前页以便下一批补齐剩余内容。
+            // 旧样本批次只导入剩余额度内的条目，保留当前页供下一批补齐。
             if (batch.sample && items.length < playableItems.length) break;
             currentPage += 1;
             sync.nextPageByCategory[categoryId] = currentPage;

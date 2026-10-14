@@ -9,7 +9,17 @@ WORKDIR /app
 COPY package.json package-lock.json tsconfig.json ./
 COPY api/package.json api/tsconfig.json api/tsconfig.build.json ./api/
 COPY web/package.json web/tsconfig.json ./web/
-RUN npm ci
+# 原生依赖的 GitHub 预编译包不可访问时，安装编译工具并使用镜像自带的 Node 头文件重试。
+# 编译工具只存在于构建阶段，不进入最终运行镜像。
+RUN npm ci || ( \
+    sed -i \
+        -e 's|http://deb.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g' \
+        -e 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends python3 make g++ \
+    && npm_config_nodedir=/usr/local npm ci \
+    )
 
 COPY api ./api
 COPY web ./web
@@ -23,7 +33,15 @@ WORKDIR /app
 COPY package.json package-lock.json tsconfig.json ./
 COPY api/package.json api/tsconfig.json api/tsconfig.build.json ./api/
 COPY web/package.json web/tsconfig.json ./web/
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev || ( \
+    sed -i \
+        -e 's|http://deb.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g' \
+        -e 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends python3 make g++ \
+    && npm_config_nodedir=/usr/local npm ci --omit=dev \
+    )
 
 FROM node:20-bookworm-slim AS runtime
 

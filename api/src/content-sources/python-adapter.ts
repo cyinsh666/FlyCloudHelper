@@ -161,7 +161,7 @@ export class PythonVideoSourceAdapter implements VideoSourceAdapter {
     return this.readPage(result, page, categoryId, signal);
   }
 
-  /** 列表只转换源站已返回的字段，未含分集的卡片留到详情入口补齐。 */
+  /** 分类及搜索列表统一转换摘要，源站自带播放字段也留到详情入口补齐。 */
   private readPage(result: Record<string, unknown>, page: number, categoryId?: string, signal?: AbortSignal): CmsContentPage {
     if (!Array.isArray(result.list) || result.list.length > 200) throw new ApiError(502, "python_source_list_invalid", "Python 源目录列表无效或单页超过 200 条");
     const items: CmsContentItem[] = [];
@@ -174,10 +174,9 @@ export class PythonVideoSourceAdapter implements VideoSourceAdapter {
       const actualCategory = String(raw.type_id ?? categoryId ?? "");
       if (actualCategory) this.categoryHints.set(id, actualCategory);
       try {
-        // 关键变量：没有播放字段只表示尚未查详情，不能据此把影片丢弃或伪造分集。
-        const detailState = String(raw.vod_play_url ?? "").trim() ? "complete" : "card";
-        const item = this.readItem(raw, actualCategory, detailState);
-        if (item.detailState === "card" || item.episodes.length > 0) items.push(item);
+        // 关键变量：列表一律保存卡片，不因源站自带播放字段而解析分集或改写已有线路。
+        const item = this.readItem(raw, actualCategory, "card");
+        items.push(item);
       } catch (error) {
         if (!(error instanceof ApiError) || !["content_episode_ambiguous", "content_source_item_missing"].includes(error.code)) throw error;
         console.warn(JSON.stringify({ 日志关键字: "codex-python-source", 事件: "跳过源条目", 插件ID: this.manifest.pluginId, 错误码: error.code }));

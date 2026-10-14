@@ -11,10 +11,10 @@ function readCategoryIds(value: unknown): string[] {
   return value as string[];
 }
 
-/** 读取同步模式，连续导入和刷新已有目录保持独立语义。 */
-function readSyncOptions(body: Record<string, unknown> | undefined): { pageCount?: number; mode?: "next" | "refresh" } {
-  if (body?.mode !== undefined && body.mode !== "next" && body.mode !== "refresh") throw validationError("mode", "同步模式只支持 next 或 refresh");
-  return { ...(body?.pageCount !== undefined ? { pageCount: Number(body.pageCount) } : {}), ...(body?.mode ? { mode: body.mode as "next" | "refresh" } : {}) };
+/** 读取同步模式；最新摘要只补各分类首页，不推进连续导入游标或补整库详情。 */
+function readSyncOptions(body: Record<string, unknown> | undefined): { pageCount?: number; mode?: "next" | "refresh" | "latest" } {
+  if (body?.mode !== undefined && body.mode !== "next" && body.mode !== "refresh" && body.mode !== "latest") throw validationError("mode", "同步模式只支持 next、refresh 或 latest");
+  return { ...(body?.pageCount !== undefined ? { pageCount: Number(body.pageCount) } : {}), ...(body?.mode ? { mode: body.mode as "next" | "refresh" | "latest" } : {}) };
 }
 
 /** 严格校验协议和三种播放模式，避免未知值写入在线库配置。 */
