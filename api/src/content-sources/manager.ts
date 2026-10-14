@@ -24,6 +24,11 @@ const CMS_REMOTE_SEARCH_PLUGIN_IDS = new Set([
   "cms.modu-resources",
   "cms.maoyan-resources",
   "cms.guangsu-resources",
+  "cms.liangzi-resources",
+  "cms.zuida-resources",
+  "cms.xinlang-resources",
+  "cms.weishi-resources",
+  "cms.piaoling-resources",
 ]);
 
 interface ContentLibraryConfiguration {

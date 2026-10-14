@@ -5,6 +5,7 @@ import { sendProtocolUserImage } from "../media/protocol-user-image.js";
 import { readProtocolContentFilters } from "../media/protocol-content-filters.js";
 import { buildEmbyPath } from "../emby-path.js";
 import { EmbyCompatibilityService, type EmbyContext, type EmbyLibraryContext } from "../emby-service.js";
+import { hasRequiredEmbyPlaybackHeaders, supportsEmbyPlaybackUserAgent } from "../emby-playback.js";
 import { providerFetch, providerStream } from "../providers/network.js";
 import type { ProviderConnectionContext, ProviderFileAccess } from "../providers/types.js";
 import type { ApiRuntime } from "../runtime.js";
@@ -58,12 +59,16 @@ async function getStreamService(runtime: ApiRuntime, serviceId: string): Promise
 }
 
 /** 解析网盘临时访问地址，并在 Provider 刷新授权时持久化新的连接配置。 */
-async function resolveFileAccess(runtime: ApiRuntime, file: Record<string, unknown>, ownerUserId: string, locator: Record<string, unknown>, signal: AbortSignal): Promise<ProviderFileAccess | null> {
+async function resolveFileAccess(runtime: ApiRuntime, file: Record<string, unknown>, ownerUserId: string, locator: Record<string, unknown>, signal: AbortSignal, playbackRequest?: FastifyRequest): Promise<ProviderFileAccess | null> {
   const sourceRuntime = await runtime.repository.getLibrarySourceRuntimeConfiguration(String(file.librarySourceId), ownerUserId);
-  const adapter = runtime.providers.get(sourceRuntime.providerType);
+  const providerType = sourceRuntime.providerType; // 关键变量：UA 适配只作用于本次 Emby 取流，不改变网盘常规请求。
+  const adapter = runtime.providers.get(providerType);
   if (!adapter.resolveFileAccess) return null;
   const connection = runtime.vault.decrypt(sourceRuntime.encryptedConnection);
   const providerContext: ProviderConnectionContext = {
+    playbackUserAgent: supportsEmbyPlaybackUserAgent(providerType) && playbackRequest
+      ? playbackRequest.headers["user-agent"] || undefined
+      : undefined,
     persistConnection: async (nextConnection) => runtime.repository.refreshLibrarySourceEncryptedConnection({
       librarySourceId: sourceRuntime.source.id, userId: ownerUserId,
       credentialRevision: sourceRuntime.credentialRevision, encryptedConnection: runtime.vault.encrypt(nextConnection),
@@ -154,8 +159,11 @@ async function sendMediaStream(runtime: ApiRuntime, compatibility: EmbyCompatibi
     for (const candidate of candidates) {
       const locator = candidate.playbackLocator && typeof candidate.playbackLocator === "object" ? candidate.playbackLocator as Record<string, unknown> : {};
       try {
-        const originAccess = effectiveRoute === "origin" ? await resolveFileAccess(runtime, candidate, context.ownerUserId, locator, controller.signal) : null;
-        if (effectiveRoute === "origin" && originAccess && Object.keys(originAccess.headers).length === 0) {
+        const originAccess = effectiveRoute === "origin" ? await resolveFileAccess(runtime, candidate, context.ownerUserId, locator, controller.signal, request) : null;
+        const requiresExtraHeaders = originAccess
+          ? hasRequiredEmbyPlaybackHeaders(originAccess, request, String(candidate.providerType ?? ""))
+          : false;
+        if (effectiveRoute === "origin" && originAccess && !requiresExtraHeaders) {
           reply.header("Cache-Control", "private, no-store");
           return reply.redirect(originAccess.url, 307);
         }
@@ -226,17 +234,11 @@ export async function registerEmbyRoutes(server: FastifyInstance, runtime: ApiRu
       const context = await authenticated(request);
       requireEmbyUser(context, String((request.params as { userId: string }).userId));
       const query = readQuery(request);
-      // 关键变量：在线库保留显式 false、camelCase 和组合条件，不能用字符串包含判断用户状态。
-      const contentFilters = isContentSourceLibrary(context.libraryKind) ? readProtocolContentFilters(query) : undefined;
-      const favorite = contentFilters ? contentFilters.favorite === true
-        : String(query.IsFavorite ?? query.Filters ?? "").includes("true") || String(query.Filters ?? "").includes("IsFavorite");
-      const played = contentFilters ? contentFilters.played === true
-        : String(query.IsPlayed ?? query.Filters ?? "").includes("true") || String(query.Filters ?? "").includes("IsPlayed");
-      const sortFields = String(query.SortBy ?? query.sortBy ?? "").split(",").map((field) => field.trim().toLowerCase());
-      // 关键变量：内容源排序不改成历史筛选；未知字段也不能因包含 DatePlayed 字样进入空历史列表。
-      const historyRequested = context.libraryKind !== "content_source_video" && sortFields[0] === "dateplayed";
-      return favorite ? compatibility.listFavoriteItems(context, query) : played ? compatibility.listPlayedItems(context, query)
-        : historyRequested ? compatibility.listHistory(context, query) : compatibility.listItems(context, query);
+      // 关键变量：两类影视库都保留显式 false 与组合筛选，播放日期仅决定排序，不隐式切换历史集合。
+      const filters = readProtocolContentFilters(query);
+      if (filters.favorite === true) return compatibility.listFavoriteItems(context, query);
+      if (filters.played === true) return compatibility.listPlayedItems(context, query);
+      return compatibility.listItems(context, query);
     });
     server.get(`${prefix}/Items`, async (request) => compatibility.listItems(await authenticated(request), readQuery(request)));
     server.get(`${prefix}/Items/:itemId`, async (request) => compatibility.getItemDetail(await authenticated(request), String((request.params as { itemId: string }).itemId)));
@@ -258,7 +260,7 @@ export async function registerEmbyRoutes(server: FastifyInstance, runtime: ApiRu
     server.post(`${prefix}/Library/Media/Updated`, async (request, reply) => { const context = await authenticated(request); await enqueueProtocolScan(runtime, context, "emby", "Library/Media/Updated"); return reply.status(200).send(); });
     server.post(`${prefix}/Library/Refresh`, async (request, reply) => { const context = await authenticated(request); await enqueueProtocolScan(runtime, context, "emby", "Library/Refresh"); return reply.status(200).send(); });
     server.post(`${prefix}/Items/:itemId/Refresh`, async (request, reply) => { const context = await authenticated(request); const itemId = String((request.params as { itemId: string }).itemId); const libraries = await compatibility.listLibraries(context); const isLibrary = libraries.Items.some((item) => String(item.Id) === itemId); if (!isLibrary) await compatibility.getItemDetail(context, itemId); await enqueueProtocolScan(runtime, context, "emby", "Items/{ItemId}/Refresh", itemId); return reply.status(200).send(); });
-    server.get(`${prefix}/Shows/:seriesId/Seasons`, async (request) => compatibility.listSeasons(await authenticated(request), String((request.params as { seriesId: string }).seriesId)));
+    server.get(`${prefix}/Shows/:seriesId/Seasons`, async (request) => compatibility.listSeasons(await authenticated(request), String((request.params as { seriesId: string }).seriesId), readQuery(request)));
     server.get(`${prefix}/Shows/:seriesId/Episodes`, async (request) => compatibility.listEpisodes(await authenticated(request), String((request.params as { seriesId: string }).seriesId), readQuery(request)));
     server.get(`${prefix}/Shows/NextUp`, async (request) => compatibility.listNextUp(await authenticated(request), readQuery(request)));
     server.route({ method: ["GET", "POST"], url: `${prefix}/Items/:itemId/PlaybackInfo`, handler: async (request) => { const context = await authenticated(request); const body = request.body && typeof request.body === "object" ? request.body as Record<string, unknown> : {}; return compatibility.buildPlaybackInfo(context, String((request.params as { itemId: string }).itemId), { mediaSourceId: readMediaSourceId(request) || undefined, playSessionId: String(readQuery(request).PlaySessionId ?? readQuery(request).playSessionId ?? body.CurrentPlaySessionId ?? "") || undefined, route: readPlaybackRoute(request), serverRoot: contentPlaybackServerRoot(request) }); } });

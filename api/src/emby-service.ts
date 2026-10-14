@@ -3,7 +3,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { FastifyRequest } from "fastify";
 import type { Knex } from "knex";
 import { hashSessionToken } from "./auth.js";
-import { parseJsonObject, type CatalogSort, type MediaItemRecord, type VideoRegionGroup } from "./domain.js";
+import { parseJsonObject, type MediaItemRecord, type VideoRegionGroup } from "./domain.js";
 import { ApiError } from "./errors.js";
 import type { ApiRuntime } from "./runtime.js";
 import { hydrateRealtimeVideoDetails } from "./media/realtime-video-details.js";
@@ -13,9 +13,10 @@ import { contentPlaybackServerRoot, isContentSourceLibrary, mapContentMediaSourc
 import { readProtocolItemIdentityFilter, matchesProtocolItemIdentity, resolveProtocolItemIdentityIds } from "./media/protocol-item-identity-filter.js";
 import { matchesContentFilterDto, readContentFilterNames, readProtocolContentFilters } from "./media/protocol-content-filters.js";
 import { parseCompletedMediaProbeResult, readJellyfinRunTimeTicks, type MediaProbeResult } from "./media/media-probe.js";
-import { JellyfinCatalogSort, type JellyfinSortFilters, type JellyfinSortPlan } from "./jellyfin-catalog-sort.js";
+import { JellyfinCatalogSort, type JellyfinSortEntry, type JellyfinSortFilters, type JellyfinSortPlan } from "./jellyfin-catalog-sort.js";
 import type { ContentSourceCategoryDefinition } from "./content-sources/types.js";
-import { matchesJellyfinSourceCategory, readJellyfinSourceCategoryId } from "./jellyfin-source-category.js";
+import { readJellyfinSourceCategoryId } from "./jellyfin-source-category.js";
+import { readEmbyPlaybackRequiredHeaders, toEmbyMediaSourceId } from "./emby-playback.js";
 
 /** Emby 媒体库读取使用的服务范围；与 Jellyfin 的账号和用户状态完全隔离。 */
 export interface EmbyLibraryContext {
@@ -334,21 +335,17 @@ export class EmbyCompatibilityService {
 
   /** 源分类与普通搜索按源窗口分页；用户状态、复杂筛选和最新内容保留本地目录。 */
   public async listItems(context: EmbyContext, query: Record<string, unknown>, options: { localOnly?: boolean } = {}) {
-    // 在线高级筛选先校验，Ids、人物、空类型及动态旁路均不能绕过非法条件。
-    if (isContentSourceLibrary(context.libraryKind)) readProtocolContentFilters(query);
+    // 两类影视库先校验筛选，Ids、人物、空类型及动态旁路均不能绕过非法条件。
+    readProtocolContentFilters(query);
     const include = this.queryString(query, "IncludeItemTypes").split(",").map((value) => value.trim()).filter(Boolean);
-    const requestedTypes = include.map((type) => type === "Movie" ? "video.movie" : type === "Series" ? "video.series" : type === "Episode" ? "video.episode" : "").filter(Boolean);
+    const requestedTypes: string[] = include.map((type) => type === "Movie" ? "video.movie" : type === "Series" ? "video.series" : type === "Episode" ? "video.episode" : "").filter(Boolean);
     // APP 的人物作品页直接通过 PersonIds 查询，必须先按人物索引限定条目。
     const personIds = this.queryString(query, "PersonIds").split(",").map((value) => value.trim()).filter(Boolean);
     if (personIds.length > 0) return this.listItemsByPerson(context, personIds, query);
     // APP 会使用 Ids 批量回查条目；保持请求顺序并忽略已经删除的条目。
     const explicitIds = this.queryString(query, "Ids").split(",").map((value) => value.trim()).filter(Boolean);
     if (explicitIds.length > 0) {
-      const records: MediaItemRecord[] = [];
-      for (const protocolItemId of explicitIds) {
-        try { records.push(await this.requireItem(context, decodeItemId(protocolItemId))); } catch { /* 已删除条目不阻断整批返回。 */ }
-      }
-      return this.filterAndPaginate(await this.filterOnlineParentItems(context, await this.mapItems(context, records), query), query, context);
+      return this.listCatalogPage(context, query, { itemIds: explicitIds.map(decodeItemId) }, true);
     }
     const parentId = this.queryString(query, "ParentId");
     const library = this.findLibraryDefinition(context, parentId);
@@ -356,7 +353,7 @@ export class EmbyCompatibilityService {
     if (season) return this.listEpisodes(context, encodeItemId(season.seriesId), { ...query, Season: season.seasonNumber });
     // 关键变量：部分第三方 Emby 播放器会缓存或自行构造非 UUID 的媒体库 ParentId；不能因此返回空列表。
     // 只有可识别为条目 ID 的父级才按节目读取单集，其他父级退回当前媒体库根列表。
-    const parentSeriesId = parentId && !library && (parentId !== context.libraryId || !isContentSourceLibrary(context.libraryKind))
+    const parentSeriesId = parentId && !library && parentId !== context.libraryId
       && (UUID_PATTERN.test(parentId) || INTERNAL_ITEM_ID_PATTERN.test(parentId))
       ? decodeItemId(parentId)
       : "";
@@ -388,26 +385,11 @@ export class EmbyCompatibilityService {
       if (dynamicPage) return dynamicPage;
     }
     // 外部编号先限定真实条目，再按原有类型、地区和搜索条件排序，不能只匹配原列表前 500 项。
-    let records = isContentSourceLibrary(context.libraryKind)
-      ? await this.readOnlineCatalogRecords(context, query, {
-        itemTypes: types, itemIds: identityIds, sourceCategoryId: library?.sourceCategoryId,
-        regionGroup: library?.regionGroup, search: this.queryString(query, "SearchTerm") || undefined,
-      })
-      : (await Promise.all(types.map((itemType) => this.runtime.repository.listCatalogItems({ userId: context.ownerUserId, libraryId: context.libraryId, itemIds: identityIds, mediaType: "video", itemType, regionGroup: library?.regionGroup, search: this.queryString(query, "SearchTerm") || undefined, sort: this.readSort(query), limit: Math.max(500, identityIds?.length ?? 0), offset: 0, includeFileCounts: false })))).flatMap((result) => result.items);
-    // 关键变量：Genres 返回的是稳定协议 ID，Flymby 会把该 ID 原样传入 GenreIds。
-    const genreIds = new Set(this.queryString(query, "GenreIds").split(",").map((value) => value.trim().toLowerCase()).filter(Boolean));
-    if (genreIds.size > 0) {
-      records = records.filter((item) => Array.isArray(item.metadata.genres) && item.metadata.genres.some((genre) => genreIds.has(protocolUuid("genre", String(genre).trim()).toLowerCase())));
-    }
-    const genres = this.queryString(query, "Genres").split(/[|,]/u).map((value) => value.trim()).filter(Boolean);
-    if (isContentSourceLibrary(context.libraryKind) && genres.length > 0) {
-      records = records.filter((item) => Array.isArray(item.metadata.genres) && item.metadata.genres.some((genre) => genres.includes(String(genre).trim())));
-    }
-    if (this.queryString(query, "SortBy").split(",").some((value) => value.trim().toLowerCase() === "random")) {
-      records = records.map((item) => ({ item, order: Math.random() })).sort((left, right) => left.order - right.order).map((entry) => entry.item);
-    }
-    const mapped = await this.mapItems(context, records);
-    const result = this.filterAndPaginate(mapped, query, context);
+    // 关键变量：候选只读取排序键，所有筛选和排序完成后才装配当前页，普通网盘不再截断到 500 条。
+    const result = await this.listCatalogPage(context, query, {
+      itemTypes: types, itemIds: identityIds, sourceCategoryId: library?.sourceCategoryId,
+      regionGroup: library?.regionGroup, topLevel: identityFilter.itemIds === undefined,
+    });
     this.runtime.logBusinessEvent("info", {
       日志关键字: "codex-emby-route",
       事件: "返回Emby媒体列表",
@@ -422,18 +404,32 @@ export class EmbyCompatibilityService {
   }
 
   /** 返回节目季，季仅为协议虚拟项。 */
-  public async listSeasons(context: EmbyContext, seriesId: string) {
+  public async listSeasons(context: EmbyContext, seriesId: string, query: Record<string, unknown> = {}) {
     const series = await this.requireItemDetail(context, decodeItemId(seriesId));
     const children = await this.runtime.repository.listCatalogChildren(series.id, context.ownerUserId);
     const tag = series.posterUrl ? String(Date.parse(series.updatedAt) || 1) : "";
-    const seasons = [...new Set(children.map((item) => readVideoSeason(item.metadata.seasonNumber))).values()].sort((a, b) => a - b).map((number) => ({ Name: videoSeasonTitle(number), Id: encodeSeasonId(series.id, number), ServerId: context.libraryId, Type: "Season", IsFolder: true, SeriesId: encodeItemId(series.id), SeriesName: series.title, IndexNumber: number, ParentId: encodeItemId(series.id), ImageTags: tag ? { Primary: tag } : {}, PrimaryImageTag: tag || undefined, PrimaryImageItemId: tag ? encodeItemId(series.id) : undefined, UserData: this.emptyUserData() }));
-    return { Items: seasons, TotalRecordCount: seasons.length, StartIndex: 0 };
+    const seriesIdForClient = encodeItemId(series.id); // 关键变量：虚拟季继承图片时必须引用真实节目 ID。
+    const backdropTag = series.backdropUrl ? String(Date.parse(series.updatedAt) || 1) : "";
+    const logoTag = String(series.metadata.logoUrl ?? "").trim() ? imageTag(String(series.metadata.logoUrl)) : "";
+    const seasons = [...new Set(children.map((item) => readVideoSeason(item.metadata.seasonNumber))).values()].sort((a, b) => a - b).map((number) => ({
+      Name: videoSeasonTitle(number), Id: encodeSeasonId(series.id, number), ServerId: context.libraryId,
+      Type: "Season", IsFolder: true, SeriesId: seriesIdForClient, SeriesName: series.title,
+      IndexNumber: number, ParentId: seriesIdForClient,
+      ImageTags: { ...(tag ? { Primary: tag } : {}), ...(logoTag ? { Logo: logoTag } : {}) },
+      PrimaryImageTag: tag || undefined, PrimaryImageItemId: tag ? seriesIdForClient : undefined,
+      ParentPrimaryImageItemId: tag ? seriesIdForClient : undefined, ParentPrimaryImageTag: tag || undefined,
+      SeriesPrimaryImageTag: tag || undefined,
+      BackdropImageTags: backdropTag ? [backdropTag] : [], ParentBackdropItemId: backdropTag ? seriesIdForClient : undefined,
+      ParentBackdropImageTags: backdropTag ? [backdropTag] : [],
+      ParentLogoItemId: logoTag ? seriesIdForClient : undefined, ParentLogoImageTag: logoTag || undefined,
+      UserData: this.emptyUserData(),
+    }));
+    return this.filterAndPaginate(seasons, query, context);
   }
 
   /** 返回节目单集，并补全实时详情以保持单集简介一致。 */
   public async listEpisodes(context: EmbyContext, seriesId: string, query: Record<string, unknown>) {
-    if (isContentSourceLibrary(context.libraryKind)) readProtocolContentFilters(query);
-    const identityFilter = readProtocolItemIdentityFilter(query, decodeItemId);
+    readProtocolContentFilters(query);
     const seasonRef = decodeSeasonId(seriesId) ?? decodeSeasonId(this.queryString(query, "SeasonId"));
     const rawSeriesId = this.queryString(query, "SeriesId") || seasonRef?.seriesId || decodeItemId(seriesId);
     const series = await this.requireItemDetail(context, decodeItemId(rawSeriesId));
@@ -441,14 +437,21 @@ export class EmbyCompatibilityService {
     const rawSeason = this.queryString(query, "Season") || this.queryString(query, "SeasonNumber");
     const requestedSeason = seasonRef?.seasonNumber ?? (rawSeason ? Number(rawSeason) : undefined);
     const useSeason = requestedSeason !== undefined && Number.isFinite(requestedSeason);
-    const children = (await this.runtime.repository.listCatalogChildren(series.id, context.ownerUserId)).filter((item) => item.itemType === "video.episode" && (!useSeason || Number(item.metadata.seasonNumber ?? 0) === requestedSeason)).sort((a, b) => Number(a.metadata.seasonNumber ?? 0) - Number(b.metadata.seasonNumber ?? 0) || Number(a.metadata.episodeNumber ?? 0) - Number(b.metadata.episodeNumber ?? 0));
-    const matchedChildren = children.filter((item) => matchesProtocolItemIdentity(identityFilter, item.id, item.externalIds));
-    const hydrated = await Promise.all(matchedChildren.map((item) => hydrateRealtimeVideoDetails(this.runtime, item)));
+    // 关键变量：季集默认维持季号、集号顺序，显式排序则遵循同一目录查询规则。
+    const episodeScope = { ...query, SeriesId: encodeItemId(series.id) }; // 关键变量：路径中的节目身份同样参与随机分页缓存范围。
+    const episodeQuery = this.queryString(query, "SortBy") ? episodeScope
+      : { ...episodeScope, SortBy: "ParentIndexNumber,IndexNumber", SortOrder: "Ascending" };
+    const entries = await this.readCatalogEntries(context, episodeQuery, {
+      itemTypes: ["video.episode"], parentId: series.id, seasonNumber: useSeason ? requestedSeason : undefined,
+    });
+    const page = this.paginate(entries, query);
+    const records = await this.readCatalogRecords(context, page.Items.map((entry) => entry.id));
+    const hydrated = await Promise.all(records.map((item) => hydrateRealtimeVideoDetails(this.runtime, item)));
     const items = await this.mapItems(context, hydrated, new Map(hydrated.map((item) => [item.id, series])));
-    return isContentSourceLibrary(context.libraryKind) ? this.filterAndPaginate(items, query, context) : this.paginate(items, query);
+    return { Items: items, TotalRecordCount: page.TotalRecordCount, StartIndex: page.StartIndex };
   }
 
-  /** 单条详情补齐在线卡片；收藏、历史与续播装配显式关闭详情预读。 */
+  /** 单条详情补齐网盘 TMDB 信息或在线卡片；收藏、历史与续播显式关闭详情预读。 */
   public async getItem(context: EmbyContext, itemId: string, options: { loadDetail?: boolean } = {}) {
     const item = options.loadDetail === false
       ? await this.requireItem(context, decodeItemId(itemId))
@@ -471,65 +474,98 @@ export class EmbyCompatibilityService {
 
   /** 按当前 Emby 账户返回收藏媒体及演员虚拟项。 */
   public async listFavoriteItems(context: EmbyContext, query: Record<string, unknown>) {
-    const onlineLibrary = isContentSourceLibrary(context.libraryKind);
-    if (onlineLibrary) readProtocolContentFilters(query, { favorite: true });
-    const allowedIds = await this.readOnlineParentItemIds(context, query);
-    const rowsQuery = this.runtime.database.query("library_emby_item_preferences as pref").join("media_items as m", "m.id", "pref.item_id").select("pref.item_id").where({ "pref.library_id": context.libraryId, "pref.account_id": context.accountId }).whereNotNull("pref.starred_at").whereNull("m.deleted_at").orderBy("pref.starred_at", "desc");
-    if (!onlineLibrary && !allowedIds) rowsQuery.limit(500);
-    const scopedRows = (await rowsQuery).filter((row) => !allowedIds || allowedIds.has(String(row.item_id)));
-    const rows = onlineLibrary ? scopedRows : scopedRows.slice(0, 500);
-    const media: Record<string, unknown>[] = [];
-    for (const row of rows) { try { media.push(await this.getItem(context, encodeItemId(String(row.item_id)), { loadDetail: false })); } catch { /* 目录变更后忽略已删除条目。 */ } }
+    const contentFilters = readProtocolContentFilters(query, { favorite: true });
+    const entries = await this.readCatalogEntries(context, query, {
+      itemTypes: ["video.movie", "video.series", "video.episode"], contentFilters,
+    });
+    const people = new Map<string, Record<string, unknown>>(); // 关键变量：虚拟演员收藏不能被媒体目录候选吞掉。
     const include = this.queryString(query, "IncludeItemTypes");
-    if (!include || include.split(",").includes("Person")) {
-      const personRows = await this.runtime.database.query("library_emby_virtual_preferences").select("protocol_item_id").where({ library_id: context.libraryId, account_id: context.accountId, item_type: "Person" }).orderBy("starred_at", "desc").limit(500);
-      for (const row of personRows) { const person = await this.getPersonItem(context, String(row.protocol_item_id)); if (person) media.push(person); }
+    if (!contentFilters.impossible && (!include || include.split(",").map((type) => type.trim()).includes("Person"))) {
+      const allowedIds = await this.readOnlineParentItemIds(context, query);
+      const genreIds = await this.readGenreMatchingIds(context, query);
+      const genreMatches = genreIds ? new Set(genreIds) : undefined;
+      const requestedPeople = new Set(this.queryString(query, "PersonIds").split(",").map((id) => id.trim().toLowerCase()).filter(Boolean));
+      const cache = await this.loadPersonCache(context);
+      const identity = readProtocolItemIdentityFilter(query, decodeItemId);
+      const search = this.queryString(query, "SearchTerm").toLocaleLowerCase("zh-CN");
+      const personRows = await this.runtime.database.query("library_emby_virtual_preferences").select("protocol_item_id", "starred_at")
+        .where({ library_id: context.libraryId, account_id: context.accountId, item_type: "Person" }).orderBy("starred_at", "desc");
+      for (const row of personRows) {
+        const personId = String(row.protocol_item_id);
+        const personSummary = cache.peopleById.get(personId.toLowerCase());
+        if (!personSummary || (allowedIds && ![...personSummary.itemIds].some((id) => allowedIds.has(id)))
+          || (genreMatches && ![...personSummary.itemIds].some((id) => genreMatches.has(id)))
+          || (requestedPeople.size > 0 && !requestedPeople.has(personId.toLowerCase()))) continue;
+        const person = await this.getPersonItem(context, personId);
+        if (!person || (search && !String(person.Name).toLocaleLowerCase("zh-CN").includes(search))
+          || !matchesProtocolItemIdentity(identity, personId, (person.ProviderIds ?? {}) as Record<string, unknown>)
+          || !matchesContentFilterDto(contentFilters, person)) continue;
+        people.set(personId, person);
+        const entry = this.dtoSortEntry(person);
+        entry.values.starred = Number.isFinite(Date.parse(String(row.starred_at))) ? Date.parse(String(row.starred_at)) : null;
+        entries.push(entry);
+      }
     }
-    return this.filterAndPaginate(await this.filterOnlineParentItems(context, media, query), query, context, { favorite: true });
+    // 关键变量：没有显式排序时仍按实际收藏时间倒序；显式多字段排序对媒体和演员共同执行。
+    const plan = this.queryString(query, "SortBy") ? this.readOnlineSortPlan(context, query)
+      : { fields: [{ name: "starred", descending: true }], randomSeed: "" };
+    const page = this.paginate(this.catalogSort.sort(entries, plan), query);
+    const records = await this.readCatalogRecords(context, page.Items.filter((entry) => !people.has(entry.id)).map((entry) => entry.id));
+    const media = await this.mapItems(context, records);
+    const mapped = new Map(media.map((item) => [decodeItemId(String(item.Id)), item]));
+    return { Items: page.Items.map((entry) => people.get(entry.id) ?? mapped.get(entry.id))
+      .filter((item): item is Record<string, unknown> => Boolean(item)),
+      TotalRecordCount: page.TotalRecordCount, StartIndex: page.StartIndex };
   }
 
   /** 返回明确已观看的 Emby 条目。 */
   public async listPlayedItems(context: EmbyContext, query: Record<string, unknown>) {
-    const allowedIds = await this.readOnlineParentItemIds(context, query);
-    if (isContentSourceLibrary(context.libraryKind)) {
-      // 关键变量：在线节目必须使用当前有效单集汇总，不能先用历史父 played 截断候选。
-      const records = await this.readOnlineCatalogRecords(context, query, {
-        itemTypes: ["video.movie", "video.series", "video.episode"],
-        itemIds: allowedIds ? [...allowedIds] : undefined,
-        search: this.queryString(query, "SearchTerm") || undefined,
-        contentFilters: readProtocolContentFilters(query, { played: true }),
-      });
-      const items = await this.mapItems(context, records);
-      if (!this.queryString(query, "SortBy")) items.sort((left, right) =>
-        String(right.DatePlayed ?? "").localeCompare(String(left.DatePlayed ?? "")));
-      return this.filterAndPaginate(items, query, context, { played: true });
-    }
-    const rowsQuery = this.runtime.database.query("library_emby_playback_progress as p").join("media_items as m", "m.id", "p.item_id").select("m.id").where({ "p.library_id": context.libraryId, "p.account_id": context.accountId, "p.played": 1 }).whereNull("m.deleted_at").orderBy("p.last_played_at", "desc");
-    if (!allowedIds) rowsQuery.limit(500);
-    const rows = (await rowsQuery).filter((row) => !allowedIds || allowedIds.has(String(row.id))).slice(0, 500);
-    const items: Record<string, unknown>[] = [];
-    for (const row of rows) { try { items.push(await this.getItem(context, encodeItemId(String(row.id)), { loadDetail: false })); } catch { /* 扫描移除后跳过。 */ } }
-    return this.filterAndPaginate(await this.filterOnlineParentItems(context, items, query), query, context);
+    // 关键变量：整剧已观看按有效单集汇总；普通库与在线库都不能先截断历史父状态。
+    const sortedQuery = this.queryString(query, "SortBy") ? query
+      : { ...query, SortBy: "DatePlayed", SortOrder: "Descending" };
+    return this.listCatalogPage(context, sortedQuery, {
+      itemTypes: ["video.movie", "video.series", "video.episode"], played: true,
+    });
   }
 
   /** 继续观看返回已有进度和单集完播生成的待播入口，排除已看完或隐藏的条目。 */
   public async listResume(context: EmbyContext, query: Record<string, unknown>) {
+    const onlineLibrary = isContentSourceLibrary(context.libraryKind); // 关键变量：在线条目使用播放来源，网盘条目使用真实文件。
     const allowedIds = await this.readOnlineParentItemIds(context, query);
     const rowsQuery = this.runtime.database.query("library_emby_playback_progress as p")
-      .join("media_items as m", "m.id", "p.item_id").select("m.id")
+      .join("media_items as m", "m.id", "p.item_id");
+    if (onlineLibrary) {
+      rowsQuery.join("content_playback_sources as source", "source.item_id", "m.id")
+        .where("source.status", "active");
+    } else {
+      rowsQuery.join("file_links as fl", "fl.item_id", "m.id")
+        .join("source_files as f", "f.id", "fl.source_file_id").where("f.status", "active");
+    }
+    rowsQuery.distinct("m.id", "p.updated_at")
       .where({ "p.library_id": context.libraryId, "p.account_id": context.accountId, "p.played": 0, "p.hidden_from_resume": 0 })
+      // Emby 保留任意非零进度的续播习惯，下一集待播入口仍允许零进度。
       .where((builder) => builder.where("p.position_ticks", ">", 0).orWhere("p.resume_pending", 1))
-      .whereNull("m.deleted_at").orderBy("p.updated_at", "desc");
+      .whereNull("m.deleted_at").orderBy("p.updated_at", "desc").orderBy("m.id", "asc");
     if (!allowedIds) rowsQuery.limit(500);
     const rows = (await rowsQuery).filter((row) => !allowedIds || allowedIds.has(String(row.id))).slice(0, 500);
     const items: Record<string, unknown>[] = [];
+    const seenResumeGroups = new Set<string>(); // 关键变量：同一节目只保留最近仍可播放的单集。
+    // 关键变量：先应用客户端条件，再选同一节目最近一集，不让不匹配的单集占用节目续播入口。
+    const filteredEntries = await this.readCatalogEntries(context, query, { itemIds: rows.map((row) => String(row.id)) });
+    const matchingIds = new Set(filteredEntries.map((entry) => entry.id));
     for (const row of rows) {
+      if (!matchingIds.has(String(row.id))) continue;
       try {
         const item = await this.getItem(context, encodeItemId(String(row.id)), { loadDetail: false });
-        if (!isContentSourceLibrary(context.libraryKind) || (Array.isArray(item.MediaSources) && item.MediaSources.length > 0)) items.push(item);
+        if (!Array.isArray(item.MediaSources) || item.MediaSources.length === 0) continue;
+        const groupId = item.Type === "Episode" && item.SeriesId
+          ? `series:${String(item.SeriesId)}` : `item:${String(item.Id)}`;
+        if (seenResumeGroups.has(groupId)) continue;
+        seenResumeGroups.add(groupId);
+        items.push(item);
       } catch { /* 删除条目不返回。 */ }
     }
-    return this.paginate(await this.filterOnlineParentItems(context, items, query), query);
+    return this.filterAndPaginate(await this.filterOnlineParentItems(context, items, query), query, context);
   }
 
   /** 返回播放历史，避免把单纯进度数据误当作历史。 */
@@ -556,16 +592,14 @@ export class EmbyCompatibilityService {
     const search = this.queryString(query, "SearchTerm").toLocaleLowerCase("zh-CN");
     const cache = await this.loadPersonCache(context);
     const items = await Promise.all([...cache.peopleById.values()].filter((person) => !search || person.name.toLocaleLowerCase("zh-CN").includes(search)).sort((a, b) => a.name.localeCompare(b.name, "zh-CN")).map((person) => this.getPersonItem(context, person.id)));
-    return this.paginate(await this.filterOnlineParentItems(context, items.filter(Boolean) as Record<string, unknown>[], query), query);
+    return this.filterAndPaginate(await this.filterOnlineParentItems(context, items.filter(Boolean) as Record<string, unknown>[], query), query, context);
   }
 
   /** 返回演员关联的电影和节目。 */
   public async listItemsByPerson(context: EmbyContext, personIds: string[], query: Record<string, unknown>) {
     const cache = await this.loadPersonCache(context); const ids = new Set<string>();
     personIds.forEach((personId) => cache.peopleById.get(personId.toLowerCase())?.itemIds.forEach((itemId) => ids.add(itemId)));
-    const records: MediaItemRecord[] = [];
-    for (const id of ids) { try { const item = await this.requireItem(context, id); if (item.itemType !== "video.episode") records.push(item); } catch { /* 条目已删除。 */ } }
-    return this.filterAndPaginate(await this.filterOnlineParentItems(context, await this.mapItems(context, records), query), query, context);
+    return this.listCatalogPage(context, query, { itemIds: [...ids], itemTypes: ["video.movie", "video.series"] });
   }
 
   /** 按人物名称返回详情，名称不存在时返回 null。 */
@@ -609,6 +643,7 @@ export class EmbyCompatibilityService {
     const library = this.findLibraryDefinition(context, this.queryString(query, "ParentId"));
     if (isContentSourceLibrary(context.libraryKind) && library) {
       const entries = await this.catalogSort.load(context, {
+        stateProtocol: "emby",
         itemTypes: [current.itemType], sourceCategoryId: library.sourceCategoryId, regionGroup: library.regionGroup, genres,
       }, { fields: [{ name: "datemodified", descending: true }], randomSeed: "" });
       const ids = entries.filter((entry) => entry.id !== current.id).slice(0, requestedLimit).map((entry) => entry.id);
@@ -660,12 +695,26 @@ export class EmbyCompatibilityService {
   /** 返回分类名称，供 Emby 浏览页面使用。 */
   public async listGenres(context: EmbyContext, query: Record<string, unknown>) {
     const library = this.findLibraryDefinition(context, this.queryString(query, "ParentId"));
-    const rowsQuery = this.runtime.database.query("media_items").select("metadata_json").where({ user_id: context.ownerUserId, library_id: context.libraryId, media_type: "video" }).whereIn("item_type", library?.itemType ? [library.itemType] : ["video.movie", "video.series"]).whereNull("deleted_at");
-    if (library?.regionGroup) rowsQuery.where("region_group", library.regionGroup);
-    const rows = await rowsQuery;
+    // 关键变量：Genres 的 SearchTerm 搜索风格名称，影片候选仍要遵循其它元数据、父级和账号筛选。
+    const search = this.queryString(query, "SearchTerm").toLocaleLowerCase("zh-CN");
+    const entries = await this.readCatalogEntries(context, { ...query, SearchTerm: "", SortBy: "SortName" }, {
+      itemTypes: library?.itemType ? [library.itemType] : ["video.movie", "video.series"],
+      sourceCategoryId: library?.sourceCategoryId, regionGroup: library?.regionGroup,
+    });
     const counts = new Map<string, number>();
-    rows.forEach((row) => { try { const metadata = JSON.parse(String(row.metadata_json ?? "{}")) as Record<string, unknown>; if (isContentSourceLibrary(context.libraryKind) && !matchesJellyfinSourceCategory(metadata, library?.sourceCategoryId)) return; if (Array.isArray(metadata.genres)) metadata.genres.map((genre) => String(genre).trim()).filter(Boolean).forEach((name) => counts.set(name, (counts.get(name) ?? 0) + 1)); } catch { /* 无效旧元数据不阻断列表。 */ } });
-    const items = [...counts.entries()].sort(([a], [b]) => a.localeCompare(b, "zh-CN")).map(([name, count]) => ({ Name: name, Id: protocolUuid("genre", name), Type: "Genre", IsFolder: true, ChildCount: count, RecursiveItemCount: count, UserData: this.emptyUserData() }));
+    for (let offset = 0; offset < entries.length; offset += 300) {
+      const rows = await this.runtime.database.query("media_items").select("metadata_json")
+        .where({ user_id: context.ownerUserId, library_id: context.libraryId }).whereNull("deleted_at")
+        .whereIn("id", entries.slice(offset, offset + 300).map((entry) => entry.id));
+      for (const row of rows) {
+        for (const name of readContentFilterNames(parseJsonObject(row.metadata_json).genres)) {
+          if (!search || name.toLocaleLowerCase("zh-CN").includes(search)) counts.set(name, (counts.get(name) ?? 0) + 1);
+        }
+      }
+    }
+    const direction = this.queryString(query, "SortOrder").toLowerCase() === "descending" ? -1 : 1;
+    const items = [...counts.entries()].sort(([left], [right]) => direction * left.localeCompare(right, "zh-CN"))
+      .map(([name, count]) => ({ Name: name, Id: protocolUuid("genre", name), Type: "Genre", IsFolder: true, ChildCount: count, RecursiveItemCount: count, UserData: this.emptyUserData() }));
     return this.paginate(items, query);
   }
 
@@ -717,27 +766,30 @@ export class EmbyCompatibilityService {
       return { MediaSources: sources.map((source) => mapContentMediaSource(source, encodeItemId(item.id), context.accessToken, playSessionId, input.serverRoot, input.route)), PlaySessionId: playSessionId, ErrorCode: null };
     }
     const itemFiles = (await this.runtime.repository.listItemFiles(item.id, context.ownerUserId)).filter((file) => String(file.itemId) === item.id);
+    // 关键变量：主版本沿用原始文件顺序，不能因最近播放或指定版本被提前而改变历史别名。
+    const primaryFileId = String(itemFiles[0]?.fileId ?? "");
     const progress = await this.runtime.database.query("library_emby_playback_progress").select("media_source_id").where({ library_id: context.libraryId, account_id: context.accountId, item_id: item.id }).first();
     const recentSourceId = String(progress?.media_source_id ?? "");
     // 关键变量：Emby 未指定版本时优先返回该账号最近成功使用的版本，其后保持来源稳定顺序。
     const files = recentSourceId ? [...itemFiles].sort((left, right) => Number(String(right.fileId) === recentSourceId) - Number(String(left.fileId) === recentSourceId)) : itemFiles;
     if (files.length === 0) throw new ApiError(404, "emby_media_source_not_found", "媒体条目没有可播放文件");
     const requested = this.toInternalMediaSourceId(item.id, input.mediaSourceId ?? "");
-    const selectedFiles = requested ? files.filter((file, index) => String(file.fileId) === requested || (index === 0 && requested === item.id)) : files;
+    const selectedFiles = requested ? files.filter((file) => String(file.fileId) === requested
+      || (requested === item.id && String(file.fileId) === primaryFileId)) : files;
     if (requested && selectedFiles.length === 0) throw new ApiError(404, "emby_media_source_not_found", "指定媒体源不存在");
     const playSessionId = input.playSessionId || randomUUID(); const protocolId = encodeItemId(item.id);
     const probes = selectedFiles.map((file) => parseCompletedMediaProbeResult(file.mediaProbeStatus, file.mediaProbeResult)); const ready = probes.every(Boolean); const duration = ready ? readJellyfinRunTimeTicks(probes) : 0;
     const sources = selectedFiles.map((file, index) => {
-      // 关键变量：云聚合版本不能随来源排序改变 ID；旧单源库仍保留主版本等于条目 ID 的兼容行为。
-      const sourceId = String(service.library_kind) === "cloud_aggregate_video"
-        ? String(file.fileId)
-        : index === 0 ? protocolId : String(file.fileId);
+      const sourceId = toEmbyMediaSourceId(protocolId, String(file.fileId), primaryFileId,
+        String(service.library_kind) === "cloud_aggregate_video");
       const probe = probes[index]; const route = input.route ?? "auto";
+      const relayEnabled = Number(service.emby_relay_playback_enabled) === 1 || service.emby_relay_playback_enabled === true;
+      const originPlayback = route === "origin" || (route === "auto" && !relayEnabled);
       // 关键变量：部分播放器不会处理 AddApiKeyToDirectStreamUrl，直放地址必须自行携带当前 Emby 会话令牌。
       const query = new URLSearchParams({ static: "true", MediaSourceId: sourceId, PlaySessionId: playSessionId, FlyCloudPlaybackRoute: route, api_key: context.accessToken });
       // 关键变量：Emby 客户端会将相对 /Videos 地址拼接到当前服务器根路径；不能重复写入 /e/{路径}，否则部分播放器会产生双重路径并返回 404。
       const container = probe?.container || "mp4";
-      return { Protocol: "File", Id: sourceId, Path: String(file.name ?? "video.mp4"), Name: `${String(file.sourceName ?? "网盘来源")}（${String(file.providerType ?? "未知网盘")}） · ${String(file.name ?? "video.mp4")}`, Type: "Default", Container: probe?.container || undefined, Size: Number(file.size ?? 0) || undefined, Bitrate: probe?.bitRate || undefined, RunTimeTicks: probe?.runTimeTicks || duration || undefined, MediaStreams: probe?.mediaStreams ?? [], SupportsTranscoding: false, SupportsDirectStream: true, SupportsDirectPlay: true, IsRemote: false, DirectStreamUrl: `/Videos/${protocolId}/stream.${container}?${query.toString()}`, AddApiKeyToDirectStreamUrl: false, RequiredHttpHeaders: {} };
+      return { Protocol: "File", Id: sourceId, Path: String(file.name ?? "video.mp4"), Name: `${String(file.sourceName ?? "网盘来源")}（${String(file.providerType ?? "未知网盘")}） · ${String(file.name ?? "video.mp4")}`, Type: "Default", Container: probe?.container || undefined, Size: Number(file.size ?? 0) || undefined, Bitrate: probe?.bitRate || undefined, RunTimeTicks: probe?.runTimeTicks || duration || undefined, MediaStreams: probe?.mediaStreams ?? [], SupportsTranscoding: false, SupportsDirectStream: true, SupportsDirectPlay: true, IsRemote: false, DirectStreamUrl: `/Videos/${protocolId}/stream.${container}?${query.toString()}`, AddApiKeyToDirectStreamUrl: false, RequiredHttpHeaders: readEmbyPlaybackRequiredHeaders(String(file.providerType ?? ""), originPlayback) };
     });
     const now = new Date().toISOString(); const selectedId = this.toInternalMediaSourceId(item.id, String(sources[0]?.Id ?? ""));
     await this.runtime.database.query("library_emby_playback_sessions").insert({ id: playSessionId, library_id: context.libraryId, account_id: context.accountId, item_id: item.id, media_source_id: selectedId || null, status: "created", position_ticks: 0, paused: 0, started_at: now, updated_at: now, stopped_at: null }).onConflict("id").ignore();
@@ -755,14 +807,25 @@ export class EmbyCompatibilityService {
     let automaticallyMarkedPlayed = false;
     await this.runtime.database.query.transaction(async (transaction: Knex.Transaction) => {
       const existingSession = await transaction("library_emby_playback_sessions").where({ id: playSessionId, library_id: context.libraryId, account_id: context.accountId }).first();
+      // 关键变量：同一账号、媒体库和播放会话的停止重试只记一次播放次数及历史。
+      const existingHistory = kind === "stopped"
+        ? await transaction("library_emby_playback_history")
+          .where({ library_id: context.libraryId, account_id: context.accountId, play_session_id: playSessionId }).first()
+        : undefined;
       const sessionPatch = { item_id: item.id, media_source_id: mediaSourceId || null, status: kind === "stopped" ? "stopped" : kind, position_ticks: positionTicks, paused: body.IsPaused === true || body.isPaused === true ? 1 : 0, updated_at: now, stopped_at: kind === "stopped" ? now : null };
       if (existingSession) await transaction("library_emby_playback_sessions").where({ id: playSessionId }).update(sessionPatch); else await transaction("library_emby_playback_sessions").insert({ id: playSessionId, library_id: context.libraryId, account_id: context.accountId, ...sessionPatch, started_at: now });
       automaticallyMarkedPlayed = await this.upsertProgress(transaction, context, item.id,
-        mediaSourceId || null, positionTicks, kind === "stopped", completed, now);
+        mediaSourceId || null, positionTicks, kind === "stopped" && !existingHistory, completed, now);
       if (item.itemType === "video.episode" && automaticallyMarkedPlayed) {
         await prepareNextEpisodeResume(transaction, "library_emby_playback_progress", context, item.id, now);
       }
-      if (kind === "stopped") { const history = await transaction("library_emby_playback_history").where({ library_id: context.libraryId, account_id: context.accountId, play_session_id: playSessionId }).first(); if (!history) await transaction("library_emby_playback_history").insert({ id: randomUUID(), library_id: context.libraryId, account_id: context.accountId, item_id: item.id, play_session_id: playSessionId, position_ticks: positionTicks, completed: completed ? 1 : 0, started_at: existingSession?.started_at ?? now, stopped_at: now }); }
+      if (kind === "stopped" && !existingHistory) {
+        await transaction("library_emby_playback_history").insert({
+          id: randomUUID(), library_id: context.libraryId, account_id: context.accountId,
+          item_id: item.id, play_session_id: playSessionId, position_ticks: positionTicks,
+          completed: completed ? 1 : 0, started_at: existingSession?.started_at ?? now, stopped_at: now,
+        });
+      }
     });
     // 自动播放进度也属于单集状态变化，最后一集完播后应立即更新整剧完成标记。
     if (item.itemType === "video.episode" && automaticallyMarkedPlayed) {
@@ -951,6 +1014,7 @@ export class EmbyCompatibilityService {
         sort: "updated_desc", limit: 1, offset: 0, includeFileCounts: false });
     }
     const entries = await this.catalogSort.load({ ...context, accountId: "", accessToken: "" }, {
+      stateProtocol: "emby",
       itemTypes: library.itemType ? [library.itemType] : undefined, topLevel: true,
       sourceCategoryId: library.sourceCategoryId, regionGroup: library.regionGroup,
     }, { fields: [{ name: "datemodified", descending: true }], randomSeed: "" });
@@ -972,22 +1036,76 @@ export class EmbyCompatibilityService {
 
   /** 沿 Emby 现有本地排序支持范围生成目录字段排序，不读取 Jellyfin 账号状态。 */
   private readOnlineSortPlan(context: EmbyContext, query: Record<string, unknown>): JellyfinSortPlan {
-    if (this.queryString(query, "SortBy").split(",").some((name) => name.trim().toLowerCase() === "random")) {
-      return this.catalogSort.readPlan(context, { ...query, SortBy: "Random" });
-    }
-    const sort = this.readSort(query);
-    const field = sort.startsWith("title_") ? "sortname" : sort.startsWith("year_") ? "productionyear"
-      : sort.startsWith("premiere_date_") ? "premieredate" : "datecreated";
-    return { fields: [{ name: field, descending: sort.endsWith("_desc") }], randomSeed: "" };
+    return this.catalogSort.readPlan({ ...context, stateProtocol: "emby" }, query);
   }
 
-  /** 在线库按精确分类筛选后加载条目，防止先截断全库再筛分类造成空页。 */
-  private async readOnlineCatalogRecords(context: EmbyContext, query: Record<string, unknown>, filters: JellyfinSortFilters): Promise<MediaItemRecord[]> {
-    const contentFilters = filters.contentFilters ?? readProtocolContentFilters(query);
-    const entries = await this.catalogSort.load(context, { ...filters, contentFilters, stateProtocol: "emby" }, this.readOnlineSortPlan(context, query));
-    const records = await this.runtime.repository.listCatalogItemsByIds(entries.map((entry) => entry.id), context.ownerUserId);
+  /** 精确查询风格名称和稳定 GenreIds，两个条件同时出现时分别求交，不匹配 JSON 中的其它字段。 */
+  private async readGenreMatchingIds(context: EmbyLibraryContext, query: Record<string, unknown>): Promise<string[] | undefined> {
+    const genreIds = new Set(this.queryString(query, "GenreIds").split(",").map((id) => id.trim().toLowerCase()).filter(Boolean));
+    const genreNames = new Set(this.queryString(query, "Genres").split(/[|,]/u).map((name) => name.trim().toLocaleLowerCase("und")).filter(Boolean));
+    if (genreIds.size === 0 && genreNames.size === 0) return undefined;
+    const rows = await this.runtime.database.query("media_items").select("id", "metadata_json")
+      .where({ library_id: context.libraryId, user_id: context.ownerUserId, media_type: "video" }).whereNull("deleted_at");
+    return rows.filter((row) => {
+      const genres = readContentFilterNames(parseJsonObject(row.metadata_json).genres); // 关键变量：只使用条目真正的风格数组。
+      return (genreIds.size === 0 || genres.some((name) => genreIds.has(protocolUuid("genre", name).toLowerCase())))
+        && (genreNames.size === 0 || genres.some((name) => genreNames.has(name.toLocaleLowerCase("und"))));
+    }).map((row) => String(row.id));
+  }
+
+  /** 所有目录入口统一闭合身份、父级、人物、风格、真实元数据和 Emby 账号状态后再排序。 */
+  private async readCatalogEntries(context: EmbyContext, query: Record<string, unknown>, filters: JellyfinSortFilters): Promise<JellyfinSortEntry[]> {
+    const contentFilters = filters.contentFilters ?? readProtocolContentFilters(query, { favorite: filters.favorite, played: filters.played });
+    if (contentFilters.impossible) return [];
+    const include = this.queryString(query, "IncludeItemTypes").split(",").map((type) => type.trim()).filter(Boolean);
+    const requestedTypes: string[] = include.map((type) => type === "Movie" ? "video.movie" : type === "Series" ? "video.series" : type === "Episode" ? "video.episode" : "").filter(Boolean);
+    if (include.length > 0 && requestedTypes.length === 0) return [];
+    const itemTypes = filters.itemTypes && requestedTypes.length > 0
+      ? filters.itemTypes.filter((type) => requestedTypes.includes(type))
+      : requestedTypes.length > 0 ? requestedTypes : filters.itemTypes ?? ["video.movie", "video.series", "video.episode"];
+    if (itemTypes?.length === 0) return [];
+    let itemIds = filters.itemIds; // 关键变量：每个已指定 ID 范围都求交，空集合不能退回全库。
+    const intersect = (ids: string[] | undefined): void => {
+      if (ids === undefined) return;
+      const available = new Set(ids);
+      itemIds = itemIds === undefined ? [...available] : itemIds.filter((id) => available.has(id));
+    };
+    const identity = readProtocolItemIdentityFilter(query, decodeItemId);
+    intersect(await resolveProtocolItemIdentityIds(this.runtime, context, identity));
+    const allowedIds = await this.readOnlineParentItemIds(context, query);
+    intersect(allowedIds ? [...allowedIds] : undefined);
+    intersect(await this.readGenreMatchingIds(context, query));
+    const personIds = this.queryString(query, "PersonIds").split(",").map((id) => id.trim().toLowerCase()).filter(Boolean);
+    if (personIds.length > 0) {
+      const cache = await this.loadPersonCache(context);
+      intersect(personIds.flatMap((id) => [...(cache.peopleById.get(id)?.itemIds ?? [])]));
+    }
+    return this.catalogSort.load(context, {
+      ...filters, itemTypes, itemIds, contentFilters, stateProtocol: "emby",
+      search: this.queryString(query, "SearchTerm") || filters.search,
+    }, this.readOnlineSortPlan(context, query));
+  }
+
+  /** 只装配当前页的真实条目；分批回查避免较长剧集或收藏超出数据库参数数量限制。 */
+  private async readCatalogRecords(context: EmbyContext, itemIds: string[]): Promise<MediaItemRecord[]> {
+    const records: MediaItemRecord[] = [];
+    for (let offset = 0; offset < itemIds.length; offset += 300) {
+      records.push(...await this.runtime.repository.listCatalogItemsByIds(itemIds.slice(offset, offset + 300), context.ownerUserId));
+    }
     const byId = new Map(records.filter((item) => item.libraryId === context.libraryId).map((item) => [item.id, item]));
-    return entries.map((entry) => byId.get(entry.id)).filter((item): item is MediaItemRecord => Boolean(item));
+    return itemIds.map((id) => byId.get(id)).filter((item): item is MediaItemRecord => Boolean(item));
+  }
+
+  /** 候选筛选、稳定排序、分页和 DTO 装配顺序固定；未指定排序的 Ids 回查保留请求顺序。 */
+  private async listCatalogPage(context: EmbyContext, query: Record<string, unknown>, filters: JellyfinSortFilters, preserveIdsOrder = false) {
+    const entries = await this.readCatalogEntries(context, query, filters);
+    if (preserveIdsOrder && !this.queryString(query, "SortBy")) {
+      const order = new Map((filters.itemIds ?? []).map((id, index) => [id, index]));
+      entries.sort((left, right) => (order.get(left.id) ?? 0) - (order.get(right.id) ?? 0));
+    }
+    const page = this.paginate(entries, { ...query, Limit: this.queryString(query, "Limit") || 100 });
+    const records = await this.readCatalogRecords(context, page.Items.map((entry) => entry.id));
+    return { Items: await this.mapItems(context, records), TotalRecordCount: page.TotalRecordCount, StartIndex: page.StartIndex };
   }
 
   /** 有本地筛选的请求继续查目录，不能在动态页上忽略筛选或二次分页。 */
@@ -1029,9 +1147,8 @@ export class EmbyCompatibilityService {
     return { Items: items, TotalRecordCount: page.totalRecordCount, StartIndex: page.startIndex };
   }
 
-  /** 明确 ParentId 时读取本地身份集合；根与未知旧别名维持原全库查询行为。 */
+  /** 明确 ParentId 时读取所有 Emby 影视库的本地身份集合；根与未知旧别名维持原全库查询行为。 */
   private async readOnlineParentItemIds(context: EmbyContext, query: Record<string, unknown>): Promise<Set<string> | undefined> {
-    if (!isContentSourceLibrary(context.libraryKind)) return undefined;
     const parentId = this.queryString(query, "ParentId");
     if (!parentId || parentId === context.libraryId) return undefined;
     const library = this.findLibraryDefinition(context, parentId);
@@ -1042,7 +1159,7 @@ export class EmbyCompatibilityService {
     } : season ? { parentId: season.seriesId, seasonNumber: season.seasonNumber }
       : UUID_PATTERN.test(parentId) || INTERNAL_ITEM_ID_PATTERN.test(parentId) ? { parentId: decodeItemId(parentId) } : {};
     if (!library && !season && !filters.parentId) return undefined;
-    const entries = await this.catalogSort.load({ ...context, accountId: "", accessToken: "" }, filters,
+    const entries = await this.catalogSort.load({ ...context, accountId: "", accessToken: "" }, { ...filters, stateProtocol: "emby" },
       { fields: [{ name: "sortname", descending: false }], randomSeed: "" });
     return new Set(entries.map((entry) => entry.id));
   }
@@ -1059,21 +1176,115 @@ export class EmbyCompatibilityService {
 
   private async mapItems(context: EmbyContext, records: MediaItemRecord[], parents = new Map<string, MediaItemRecord | undefined>) { return Promise.all(records.map(async (item) => this.mapItem(context, item, parents.get(item.id) ?? (item.itemType === "video.episode" ? await this.findParent(item.id, context.ownerUserId) : undefined)))); }
 
+  /** 映射标准 Emby 影视 DTO，单集图片继承明确指向真实父节目。 */
   private async mapItem(context: EmbyContext, item: MediaItemRecord, parent?: MediaItemRecord): Promise<Record<string, unknown>> {
     if (item.libraryId !== context.libraryId) throw new ApiError(404, "emby_item_not_found", "媒体条目不存在");
     // 关键变量：在线库独立读取线路定位，不构造网盘文件。
     const onlineLibrary = isContentSourceLibrary(context.libraryKind);
     let files = onlineLibrary ? [] : (await this.runtime.repository.listItemFiles(item.id, context.ownerUserId)).filter((file) => String(file.itemId) === item.id);
+    const primaryFileId = String(files[0]?.fileId ?? ""); // 关键变量：首文件别名在调整最近使用版本前固定，和 PlaybackInfo、取流入口一致。
     const progress = await this.readProgress(context, item.id);
     const recentSourceId = String(progress?.media_source_id ?? "");
     const onlineSources = onlineLibrary ? prioritizeContentSources(await this.runtime.contentSources.listPlaybackSources(item.id, context.ownerUserId), recentSourceId) : [];
     // 详情沿用标准本地媒体入口，不读取源站地址；真正播放时执行该 Emby 库的三模式策略。
     if (recentSourceId) files = [...files].sort((left, right) => Number(String(right.fileId) === recentSourceId) - Number(String(left.fileId) === recentSourceId));
     const probes = files.map((file) => parseCompletedMediaProbeResult(file.mediaProbeStatus, file.mediaProbeResult)); const specsReady = files.length > 0 && probes.every(Boolean); const ticks = onlineLibrary ? readContentRunTimeTicks(onlineSources) : specsReady ? readJellyfinRunTimeTicks(probes) : 0;
-    const type = item.itemType === "video.series" ? "Series" : item.itemType === "video.episode" ? "Episode" : "Movie"; const primaryTag = item.posterUrl ? String(Date.parse(item.updatedAt) || 1) : type === "Episode" && parent?.posterUrl ? String(Date.parse(parent.updatedAt) || 1) : "";
-    const ownLogo = String(item.metadata.logoUrl ?? ""); const people = Array.isArray(item.metadata.people) ? item.metadata.people as Array<Record<string, unknown>> : []; const protocolId = encodeItemId(item.id);
-    const season = Number(item.metadata.seasonNumber ?? 0); const favorite = await this.isFavorite(context, item.id);
-    return { Name: item.title, OriginalTitle: String(item.metadata.originalTitle ?? ""), ServerId: context.libraryId, Id: protocolId, Etag: String(Date.parse(item.updatedAt) || 1), DateCreated: item.createdAt, SortName: item.sortTitle, PremiereDate: item.premiereDate ?? undefined, ProductionYear: item.year ?? undefined, Overview: item.overview, CommunityRating: Number(item.metadata.rating ?? 0) || undefined, Type: type, MediaType: "Video", IsFolder: type === "Series", LocationType: onlineLibrary ? "Remote" : "FileSystem", CanDownload: context.downloadEnabled && type !== "Series" && files.length > 0, ProviderIds: mapProviderIds(item.externalIds), ...(onlineLibrary ? { Tags: readContentFilterNames(item.metadata.tags), Studios: readContentFilterNames(item.metadata.studios).map((Name) => ({ Name })) } : {}), Genres: Array.isArray(item.metadata.genres) ? item.metadata.genres.map(String) : [], ImageTags: { ...(primaryTag ? { Primary: primaryTag } : {}), ...(ownLogo ? { Logo: imageTag(ownLogo) } : {}) }, PrimaryImageTag: primaryTag || undefined, PrimaryImageItemId: item.posterUrl ? protocolId : parent?.posterUrl ? encodeItemId(parent.id) : undefined, BackdropImageTags: item.backdropUrl ? [String(Date.parse(item.updatedAt) || 1)] : [], RunTimeTicks: ticks || undefined, Container: onlineSources[0]?.container ?? probes[0]?.container ?? undefined, Bitrate: probes[0]?.bitRate || undefined, MediaStreams: probes[0]?.mediaStreams ?? [], MediaSources: onlineLibrary ? onlineSources.map((source) => mapContentMediaSource(source, protocolId, context.accessToken, "", context.contentServerRoot)) : files.map((file, index) => ({ Protocol: "File", Id: context.libraryKind === "cloud_aggregate_video" || index > 0 ? String(file.fileId) : protocolId, Path: String(file.name ?? "video.mp4"), Name: `${String(file.sourceName ?? "网盘来源")}（${String(file.providerType ?? "未知网盘")}） · ${String(file.name ?? "video.mp4")}`, Type: "Default", Size: Number(file.size ?? 0) || undefined, Container: probes[index]?.container || undefined, SupportsTranscoding: false, SupportsDirectStream: true, SupportsDirectPlay: true })), SeriesId: type === "Episode" && parent ? encodeItemId(parent.id) : undefined, SeriesName: type === "Episode" ? parent?.title ?? item.subtitle : undefined, ParentIndexNumber: type === "Episode" ? season : undefined, IndexNumber: type === "Episode" ? Number(item.metadata.episodeNumber ?? 0) : undefined, SeasonId: type === "Episode" && parent ? encodeSeasonId(parent.id, season) : undefined, SeasonName: type === "Episode" ? videoSeasonTitle(season) : undefined, ParentId: type === "Episode" && parent ? encodeSeasonId(parent.id, season) : this.libraryForItem(context, item).id, People: people.map((person) => { const name = String(person.name ?? "").trim(); const profile = String(person.profileUrl ?? "").trim(); return { Name: name, Id: this.personId(person), Role: String(person.role ?? ""), Type: String(person.type ?? "").toLowerCase() === "cast" ? "Actor" : "Unknown", PrimaryImageTag: profile ? imageTag(profile) : undefined }; }), UserData: this.userData(progress, ticks, favorite, protocolId), DatePlayed: progress?.last_played_at ?? undefined };
+    const type = item.itemType === "video.series" ? "Series" : item.itemType === "video.episode" ? "Episode" : "Movie";
+    const protocolId = encodeItemId(item.id);
+    const protocolParentId = parent ? encodeItemId(parent.id) : undefined; // 关键变量：图片继承使用父节目 ID，不使用虚拟季 ID。
+    const ownPrimaryTag = item.posterUrl ? String(Date.parse(item.updatedAt) || 1) : "";
+    const parentPrimaryTag = parent?.posterUrl ? String(Date.parse(parent.updatedAt) || 1) : "";
+    const primaryTag = ownPrimaryTag || (type === "Episode" ? parentPrimaryTag : "");
+    const ownLogo = String(item.metadata.logoUrl ?? "");
+    const parentLogo = String(parent?.metadata.logoUrl ?? "");
+    const parentLogoTag = parentLogo ? imageTag(parentLogo) : "";
+    const parentBackdropTag = parent?.backdropUrl ? String(Date.parse(parent.updatedAt) || 1) : "";
+    const people = Array.isArray(item.metadata.people) ? item.metadata.people as Array<Record<string, unknown>> : [];
+    const genres = Array.isArray(item.metadata.genres)
+      ? [...new Set(item.metadata.genres.map((genre) => String(genre).trim()).filter(Boolean))] : [];
+    const rawCriticRating = item.metadata.criticRating; // 关键变量：缺失的专业评分保持省略，不能伪造为零分。
+    const criticRating = rawCriticRating === undefined || rawCriticRating === null || rawCriticRating === ""
+      ? undefined : Number.isFinite(Number(rawCriticRating)) ? Number(rawCriticRating) : undefined;
+    const season = Number(item.metadata.seasonNumber ?? 0);
+    const favorite = await this.isFavorite(context, item.id);
+    return {
+      Name: item.title,
+      OriginalTitle: String(item.metadata.originalTitle ?? ""),
+      ServerId: context.libraryId,
+      Id: protocolId,
+      Etag: String(Date.parse(item.updatedAt) || 1),
+      DateCreated: item.createdAt,
+      SortName: item.sortTitle,
+      PremiereDate: item.premiereDate ?? undefined,
+      ProductionYear: item.year ?? undefined,
+      Overview: item.overview,
+      CommunityRating: Number(item.metadata.rating ?? 0) || undefined,
+      OfficialRating: item.metadata.officialRating ? String(item.metadata.officialRating) : undefined,
+      CriticRating: criticRating,
+      Type: type,
+      MediaType: "Video",
+      IsFolder: type === "Series",
+      LocationType: onlineLibrary ? "Remote" : "FileSystem",
+      CanDownload: context.downloadEnabled && type !== "Series" && files.length > 0,
+      ProviderIds: mapProviderIds(item.externalIds),
+      Tags: readContentFilterNames(item.metadata.tags),
+      Studios: readContentFilterNames(item.metadata.studios).map((Name) => ({ Name })),
+      Genres: genres,
+      GenreItems: genres.map((Name) => ({ Name, Id: protocolUuid("genre", Name) })),
+      ImageTags: {
+        ...(primaryTag ? { Primary: primaryTag } : {}),
+        ...(ownLogo ? { Logo: imageTag(ownLogo) } : {}),
+      },
+      PrimaryImageTag: primaryTag || undefined,
+      PrimaryImageItemId: ownPrimaryTag ? protocolId : primaryTag ? protocolParentId : undefined,
+      BackdropImageTags: item.backdropUrl ? [String(Date.parse(item.updatedAt) || 1)] : [],
+      RunTimeTicks: ticks || undefined,
+      Container: onlineSources[0]?.container ?? probes[0]?.container ?? undefined,
+      Bitrate: probes[0]?.bitRate || undefined,
+      MediaStreams: probes[0]?.mediaStreams ?? [],
+      MediaSources: onlineLibrary
+        ? onlineSources.map((source) => mapContentMediaSource(source, protocolId, context.accessToken, "", context.contentServerRoot))
+        : files.map((file, index) => ({
+          Protocol: "File",
+          Id: toEmbyMediaSourceId(protocolId, String(file.fileId), primaryFileId,
+            context.libraryKind === "cloud_aggregate_video"),
+          Path: String(file.name ?? "video.mp4"),
+          Name: `${String(file.sourceName ?? "网盘来源")}（${String(file.providerType ?? "未知网盘")}） · ${String(file.name ?? "video.mp4")}`,
+          Type: "Default",
+          Size: Number(file.size ?? 0) || undefined,
+          Container: probes[index]?.container || undefined,
+          SupportsTranscoding: false,
+          SupportsDirectStream: true,
+          SupportsDirectPlay: true,
+        })),
+      SeriesId: type === "Episode" ? protocolParentId : undefined,
+      SeriesName: type === "Episode" ? parent?.title ?? item.subtitle : undefined,
+      ParentIndexNumber: type === "Episode" ? season : undefined,
+      IndexNumber: type === "Episode" ? Number(item.metadata.episodeNumber ?? 0) : undefined,
+      SeasonId: type === "Episode" && parent ? encodeSeasonId(parent.id, season) : undefined,
+      SeasonName: type === "Episode" ? videoSeasonTitle(season) : undefined,
+      ParentId: type === "Episode" && parent ? encodeSeasonId(parent.id, season) : this.libraryForItem(context, item).id,
+      ParentPrimaryImageItemId: type === "Episode" && parentPrimaryTag ? protocolParentId : undefined,
+      ParentPrimaryImageTag: type === "Episode" ? parentPrimaryTag || undefined : undefined,
+      SeriesPrimaryImageTag: type === "Episode" ? parentPrimaryTag || undefined : undefined,
+      ParentLogoItemId: type === "Episode" && parentLogoTag ? protocolParentId : undefined,
+      ParentLogoImageTag: type === "Episode" ? parentLogoTag || undefined : undefined,
+      ParentBackdropItemId: type === "Episode" && parentBackdropTag ? protocolParentId : undefined,
+      ParentBackdropImageTags: type === "Episode" && parentBackdropTag ? [parentBackdropTag] : [],
+      People: people.map((person) => {
+        const name = String(person.name ?? "").trim();
+        const profile = String(person.profileUrl ?? "").trim();
+        return {
+          Name: name,
+          Id: this.personId(person),
+          Role: String(person.role ?? ""),
+          Type: String(person.type ?? "").toLowerCase() === "cast" ? "Actor" : "Unknown",
+          PrimaryImageTag: profile ? imageTag(profile) : undefined,
+        };
+      }),
+      UserData: this.userData(progress, ticks, favorite, protocolId),
+      DatePlayed: progress?.last_played_at ?? undefined,
+    };
   }
 
   /** 顶层条目属于其原源分类，单集仍保持原节目和季关系。 */
@@ -1093,10 +1304,10 @@ export class EmbyCompatibilityService {
   private personId(person: Record<string, unknown>): string { const source = String(person.id ?? "").trim(); const name = String(person.name ?? "").trim(); return protocolUuid("person", source ? `source:${source}` : `name:${name}`).toLowerCase(); }
   private async requireItem(context: EmbyLibraryContext, itemId: string): Promise<MediaItemRecord> { const item = await this.runtime.repository.getCatalogItem(itemId, context.ownerUserId); if (item.libraryId !== context.libraryId) throw new ApiError(404, "emby_item_not_found", "媒体条目不存在"); return item; }
 
-  /** 详情和选集入口先验证账号所属媒体库，再按需补齐 Python 节目或电影。 */
+  /** 详情和选集先验证所属媒体库，再补齐网盘 TMDB 详情或在线节目、电影卡片。 */
   private async requireItemDetail(context: EmbyContext, itemId: string): Promise<MediaItemRecord> {
     const item = await this.requireItem(context, itemId);
-    if (!isContentSourceLibrary(context.libraryKind)) return item;
+    if (!isContentSourceLibrary(context.libraryKind)) return hydrateRealtimeVideoDetails(this.runtime, item);
     await this.runtime.contentSources.ensureItemDetail(context.libraryId, context.ownerUserId, item.id);
     // 关键变量：详情写入后的元数据与子集关系不能继续使用原列表卡片。
     return this.requireItem(context, item.id);
@@ -1295,54 +1506,61 @@ export class EmbyCompatibilityService {
     return next;
   }
   private queryString(query: Record<string, unknown>, key: string): string { const camel = `${key.charAt(0).toLowerCase()}${key.slice(1)}`; return String(query[key] ?? query[camel] ?? "").trim(); }
-  /** 保留支持的首个排序字段；显式未知排序统一回退标题升序，未指定时沿用默认顺序。 */
-  private readSort(query: Record<string, unknown>): CatalogSort {
-    const names = this.queryString(query, "SortBy").split(",").map((value) => value.trim().toLowerCase()).filter(Boolean);
-    if (names.length === 0) return "created_desc";
-    const supportedIndex = names.findIndex((name) => ["productionyear", "premieredate", "sortname", "name", "datecreated", "random"].includes(name));
-    if (supportedIndex < 0) return "title_asc";
-    const directions = this.queryString(query, "SortOrder").split(",").map((value) => value.trim().toLowerCase());
-    const desc = (directions[supportedIndex] ?? directions[0]) === "descending";
-    const name = names[supportedIndex];
-    if (name === "productionyear") return desc ? "year_desc" : "year_asc";
-    if (name === "premieredate") return desc ? "premiere_date_desc" : "premiere_date_asc";
-    if (name === "sortname" || name === "name") return desc ? "title_desc" : "title_asc";
-    return desc ? "created_desc" : "created_asc";
+  /** 虚拟演员和季的排序键来自真实 DTO；普通影片的完整排序键已经由目录查询读取。 */
+  private dtoSortEntry(item: Record<string, unknown>): JellyfinSortEntry {
+    const data = item.UserData as Record<string, unknown> | undefined;
+    const number = (value: unknown): number | null => value === undefined || value === null || value === ""
+      || !Number.isFinite(Number(value)) ? null : Number(value);
+    const date = (value: unknown): number | null => value && Number.isFinite(Date.parse(String(value))) ? Date.parse(String(value)) : null;
+    return { id: String(item.Id), itemType: String(item.Type), values: {
+      name: String(item.Name ?? ""), sortname: String(item.SortName ?? item.Name ?? ""),
+      datecreated: date(item.DateCreated), datemodified: date(item.DateLastSaved),
+      productionyear: number(item.ProductionYear), premieredate: date(item.PremiereDate),
+      communityrating: number(item.CommunityRating), criticrating: number(item.CriticRating),
+      dateplayed: date(data?.LastPlayedDate ?? item.DatePlayed), seriesdateplayed: date(data?.LastPlayedDate ?? item.DatePlayed),
+      playcount: number(data?.PlayCount), indexnumber: number(item.IndexNumber), parentindexnumber: number(item.ParentIndexNumber),
+    } };
   }
 
-  /** 在筛选后按标题完成排序回退，兼顾混合类型、人物作品和批量回查；不改变默认季集顺序。 */
-  private sortFallbackItems(items: Record<string, unknown>[], query: Record<string, unknown>): Record<string, unknown>[] {
-    if (!this.queryString(query, "SortBy") || items.length === 0) return items;
-    const sort = this.readSort(query);
-    if (this.queryString(query, "SortBy").split(",").some((name) => name.trim().toLowerCase() === "random")) return items;
-    const isTitleSort = sort === "title_asc" || sort === "title_desc";
-    const valueField = sort === "year_asc" || sort === "year_desc" ? "ProductionYear"
-      : sort === "premiere_date_asc" || sort === "premiere_date_desc" ? "PremiereDate" : "DateCreated";
-    const hasSortValues = items.some((item) => item[valueField] !== null && item[valueField] !== undefined && item[valueField] !== "");
-    if (!isTitleSort && hasSortValues) return items;
-    // 关键变量：缺值或未知字段固定标题升序，支持的标题降序仍保持客户端指定方向。
-    const direction = sort === "title_desc" ? -1 : 1;
-    const collator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
-    return items.sort((left, right) => direction * collator.compare(String(left.SortName ?? left.Name ?? ""), String(right.SortName ?? right.Name ?? ""))
-      || String(left.Id).localeCompare(String(right.Id)));
+  /** 分页参数仅影响当前页，候选集合和总数保持完整；非法数值不传播为 NaN。 */
+  private paginate<T>(items: T[], query: Record<string, unknown>) {
+    const requestedStart = Number(this.queryString(query, "StartIndex") || 0);
+    const requestedLimit = Number(this.queryString(query, "Limit") || items.length || 100);
+    const start = Number.isFinite(requestedStart) ? Math.max(0, Math.floor(requestedStart)) : 0;
+    const limit = Number.isFinite(requestedLimit) ? Math.min(500, Math.max(1, Math.floor(requestedLimit))) : 100;
+    return { Items: items.slice(start, start + limit), TotalRecordCount: items.length, StartIndex: start };
   }
-  private paginate<T>(items: T[], query: Record<string, unknown>) { const start = Math.max(0, Number(this.queryString(query, "StartIndex") || 0)); const limit = Math.min(500, Math.max(1, Number(this.queryString(query, "Limit") || items.length || 100))); return { Items: items.slice(start, start + limit), TotalRecordCount: items.length, StartIndex: start }; }
-  /** Ids、外部编号、条目类型和账号状态共同筛选完成后再分页。 */
-  private filterAndPaginate(items: Record<string, unknown>[], query: Record<string, unknown>, context?: EmbyContext, required: { favorite?: boolean; played?: boolean } = {}) {
-    const favorite = this.queryString(query, "IsFavorite") === "true" || this.queryString(query, "Filters").split(",").includes("IsFavorite");
-    const played = this.queryString(query, "IsPlayed") === "true" || this.queryString(query, "Filters").split(",").includes("IsPlayed");
+
+  /** 收藏、人物和季等旁路也先闭合真实目录筛选及多字段排序，最后才切分页。 */
+  private async filterAndPaginate(items: Record<string, unknown>[], query: Record<string, unknown>, context: EmbyContext, required: { favorite?: boolean; played?: boolean } = {}) {
     const include = this.queryString(query, "IncludeItemTypes").split(",").map((type) => type.trim()).filter(Boolean);
     const identityFilter = readProtocolItemIdentityFilter(query, decodeItemId);
-    const contentFilters = isContentSourceLibrary(context?.libraryKind) ? readProtocolContentFilters(query, required) : undefined;
+    const contentFilters = readProtocolContentFilters(query, required);
+    const search = this.queryString(query, "SearchTerm").toLocaleLowerCase("zh-CN");
+    const realItems = items.filter((item) => ["Movie", "Series", "Episode"].includes(String(item.Type)));
+    const realEntries = realItems.length > 0 ? await this.readCatalogEntries(context, query, {
+      itemIds: realItems.map((item) => decodeItemId(String(item.Id))), contentFilters,
+    }) : [];
+    const entriesById = new Map(realEntries.map((entry) => [entry.id, entry])); // 关键变量：目录筛选结果决定实际影片是否保留。
     const matchedItems = items.filter((item) => {
       if (include.length > 0 && !include.includes(String(item.Type))) return false;
       if (!matchesProtocolItemIdentity(identityFilter, decodeItemId(String(item.Id)),
         (item.ProviderIds ?? {}) as Record<string, unknown>)) return false;
-      const userData = item.UserData as Record<string, unknown> | undefined;
-      if (contentFilters) return matchesContentFilterDto(contentFilters, item);
-      return (!favorite || Boolean(userData?.IsFavorite)) && (!played || Boolean(userData?.Played));
+      if (["Movie", "Series", "Episode"].includes(String(item.Type))) return entriesById.has(decodeItemId(String(item.Id)));
+      if (search && !String(item.Name ?? "").toLocaleLowerCase("zh-CN").includes(search)) return false;
+      return matchesContentFilterDto(contentFilters, item);
     });
-    return this.paginate(this.sortFallbackItems(matchedItems, query), query);
+    if (this.queryString(query, "SortBy")) {
+      const sortEntries = matchedItems.map((item) => {
+        const entry = entriesById.get(decodeItemId(String(item.Id)));
+        return entry ? { ...entry, id: String(item.Id), values: { ...entry.values } } : this.dtoSortEntry(item);
+      });
+      const sorted = this.catalogSort.sort(sortEntries, this.readOnlineSortPlan(context, query));
+      const byId = new Map(matchedItems.map((item) => [String(item.Id), item]));
+      return this.paginate(sorted.map((entry) => byId.get(entry.id)!).filter(Boolean), query);
+    }
+    // 无显式排序时保留调用方的收藏时间顺序或季号顺序。
+    return this.paginate(matchedItems, query);
   }
   private requireLoginAllowed(key: string) { const value = this.loginFailures.get(key); if (value && value.blockedUntil > Date.now()) throw new ApiError(429, "emby_login_rate_limited", "登录失败次数过多，请稍后再试"); }
   private recordLoginFailure(key: string) { const now = Date.now(); const old = this.loginFailures.get(key); const next = !old || now - old.firstFailedAt > 10 * 60 * 1000 ? { count: 1, firstFailedAt: now, blockedUntil: 0 } : { ...old, count: old.count + 1 }; if (next.count >= 8) next.blockedUntil = now + 15 * 60 * 1000; this.loginFailures.set(key, next); return next.blockedUntil; }

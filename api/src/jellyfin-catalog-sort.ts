@@ -15,6 +15,8 @@ export interface JellyfinSortContext {
   libraryKind?: string;
   accountId: string;
   accessToken: string;
+  /** Emby 显式声明排序会话范围；未指定时保持 Jellyfin 既有缓存身份。 */
+  stateProtocol?: "jellyfin" | "emby";
 }
 
 type SortValue = string | number | null;
@@ -113,9 +115,14 @@ export class JellyfinCatalogSort {
     if (fields.length === 0) fields.push({ name: names.length === 0 ? "datecreated" : "sortname", descending: names.length === 0 });
     let randomSeed = "";
     if (fields.some((field) => field.name === "random")) {
-      const scope = [context.libraryId, context.accountId, context.accessToken,
+      const scope = [...(context.stateProtocol === "emby" ? ["emby"] : []), context.libraryId, context.accountId, context.accessToken,
         ...["ParentId", "IncludeItemTypes", "SearchTerm", "Filters", "IsFavorite", "IsPlayed", "PersonIds", "GenreIds", "SortBy", "SortOrder"]
-          .map((key) => String(readJellyfinSortQuery(query, key) ?? ""))];
+          .map((key) => String(readJellyfinSortQuery(query, key) ?? "")),
+        // Emby 扩展筛选各自保留随机顺序，未指定协议时不改变 Jellyfin 原缓存键。
+        ...(context.stateProtocol === "emby" ? ["Genres", "Years", "Tags", "Studios", "IsUnplayed", "IsResumable", "IsFolder",
+          "SeriesId", "SeasonId", "Season", "SeasonNumber",
+          "HasOverview", "HasImdbId", "HasTmdbId", "HasTvdbId", "MinCommunityRating", "Ids", "AnyProviderIdEquals"]
+          .map((key) => String(readJellyfinSortQuery(query, key) ?? "")) : [])];
       // 关键变量：缓存键只保留摘要，绝不记录令牌或原始认证数据。
       const key = createHash("sha256").update(JSON.stringify(scope)).digest("hex");
       randomSeed = this.randomSeeds.get(key) ?? "";
@@ -157,7 +164,9 @@ export class JellyfinCatalogSort {
     const query = this.runtime.database.query("media_items as m").where("m.library_id", context.libraryId);
     // 关键变量：在线库条目没有 service_id，不能经过网盘内连接；其他库继续保留原服务存在及未删除条件。
     const onlineLibrary = context.libraryKind === "content_source_video";
-    const contentFilters = onlineLibrary ? filters.contentFilters : undefined;
+    // 关键变量：只有显式 Emby 调用扩展到普通影视库；Jellyfin 仍沿用原在线库筛选范围。
+    const embyQuery = filters.stateProtocol === "emby";
+    const contentFilters = onlineLibrary || embyQuery ? filters.contentFilters : undefined;
     if (contentFilters?.impossible) return [];
     if (onlineLibrary) query.whereNull("m.service_id");
     else query.join("cloud_services as s", "s.id", "m.service_id").whereNull("s.deleted_at");
@@ -169,9 +178,10 @@ export class JellyfinCatalogSort {
     else if (filters.topLevel) query.whereIn(typeColumn, ["video.movie", "video.series"]);
     if (filters.regionGroup) this.applyRegion(query, context, filters.regionGroup);
     if (filters.search?.trim()) query.where((builder) => builder.whereLike("m.title", `%${filters.search!.trim()}%`).orWhereLike("m.subtitle", `%${filters.search!.trim()}%`));
-    if (filters.genres?.length && !onlineLibrary) query.where((builder) => filters.genres!.forEach((genre) => builder.orWhereLike("m.metadata_json", `%${genre}%`)));
+    if (filters.genres?.length && !onlineLibrary && !embyQuery) query.where((builder) => filters.genres!.forEach((genre) => builder.orWhereLike("m.metadata_json", `%${genre}%`)));
     // 关键变量：在线分类和风格读取独立字段，在全局排序、分页前精确筛选，兼容三种数据库。
-    const exactSourceMetadata = onlineLibrary && (filters.sourceCategoryId !== undefined || Boolean(filters.genres?.length) || Boolean(contentFilters?.active));
+    const exactSourceMetadata = (onlineLibrary && filters.sourceCategoryId !== undefined)
+      || (onlineLibrary || embyQuery) && (Boolean(filters.genres?.length) || Boolean(contentFilters?.active));
     if (exactSourceMetadata) query.select("m.metadata_json as source_metadata_json");
     if (contentFilters?.active) query.select("m.overview", "m.external_ids_json");
     if (filters.parentId) {
@@ -187,7 +197,10 @@ export class JellyfinCatalogSort {
     if (names.has("indexnumber")) metadataFields.push(["episodeNumber", "episode_number"]);
     metadataFields.forEach(([key, alias]) => query.select(this.metadataColumn(key, alias)));
     if ((filters.favorite || filters.played) && !contentFilters?.active) {
-      const stateTable = filters.favorite ? "library_item_preferences" : "library_playback_progress";
+      // 关键变量：固定协议枚举决定表名，绝不从请求参数拼接状态表。
+      const stateTable = filters.favorite
+        ? embyQuery ? "library_emby_item_preferences" : "library_item_preferences"
+        : embyQuery ? "library_emby_playback_progress" : "library_playback_progress";
       const state = this.runtime.database.query(`${stateTable} as state`).select("state.id")
         .whereRaw("?? = ??", ["state.item_id", idColumn])
         .where("state.library_id", context.libraryId).where("state.account_id", context.accountId);
@@ -207,7 +220,7 @@ export class JellyfinCatalogSort {
       if (filters.seasonNumber !== undefined && Number(row.season_number ?? 0) !== filters.seasonNumber) return false;
       if (!exactSourceMetadata) return true;
       const metadata = parseJsonObject(row.source_metadata_json);
-      if (!matchesJellyfinSourceCategory(metadata, filters.sourceCategoryId)) return false;
+      if (onlineLibrary && !matchesJellyfinSourceCategory(metadata, filters.sourceCategoryId)) return false;
       const genres = readJellyfinSourceGenres(metadata);
       if (filters.genres?.length && !filters.genres.some((genre) => genres.includes(genre))) return false;
       return !contentFilters || matchesContentFilterMetadata(contentFilters, {
@@ -235,7 +248,9 @@ export class JellyfinCatalogSort {
     }));
     if (entries.length === 0) return entries;
     if (names.has("datelastcontentadded") || names.has("lastcontentpremieredate")) await this.loadChildDates(context, entries);
-    if (names.has("dateplayed") || names.has("seriesdateplayed") || names.has("playcount")) await this.loadPlaybackDates(context, entries);
+    if (names.has("dateplayed") || names.has("seriesdateplayed") || names.has("playcount")) {
+      await this.loadPlaybackDates(context, entries, filters.stateProtocol ?? "jellyfin");
+    }
     return this.sort(entries, plan);
   }
 
@@ -261,9 +276,10 @@ export class JellyfinCatalogSort {
     });
   }
 
-  /** 播放排序使用当前 Jellyfin 账号的实际播放时间，绝不读取更新进度记录的时间。 */
-  private async loadPlaybackDates(context: JellyfinSortContext, entries: JellyfinSortEntry[]): Promise<void> {
-    const query = this.runtime.database.query("library_playback_progress as progress")
+  /** 播放排序使用当前协议账号的实际播放时间，未指定协议时保持 Jellyfin 既有行为。 */
+  private async loadPlaybackDates(context: JellyfinSortContext, entries: JellyfinSortEntry[], protocol: "jellyfin" | "emby"): Promise<void> {
+    const progressTable = protocol === "emby" ? "library_emby_playback_progress" : "library_playback_progress"; // 关键变量：播放日期和次数必须读取自己的协议表。
+    const query = this.runtime.database.query(`${progressTable} as progress`)
       .where("progress.library_id", context.libraryId).where("progress.account_id", context.accountId);
     query.join("media_items as item", "item.id", "progress.item_id").whereNull("item.deleted_at")
       .leftJoin("media_relations as relation", "relation.child_item_id", "item.id").select("relation.parent_item_id as parent_id");
