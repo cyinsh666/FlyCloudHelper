@@ -20,6 +20,12 @@ export default defineConfig({
     host: "0.0.0.0",
     port: 9935,
     proxy: {
+      "/abs/": {
+        target: "http://127.0.0.1:9934",
+        // ABS HTTP 与 Socket.IO 使用同一根路径，开发入口支持升级 WebSocket。
+        changeOrigin: false,
+        ws: true,
+      },
       "/api": {
         target: "http://127.0.0.1:9934",
         // 保留浏览器访问时的 Host，供后台进行同源 CSRF 校验。

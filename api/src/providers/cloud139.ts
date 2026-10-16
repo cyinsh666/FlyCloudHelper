@@ -12,7 +12,7 @@ export class Cloud139Provider extends CloudDriveProviderBase {
   private readonly routes = new Map<string, Promise<string>>(); // 账号凭据版本隔离路由查询。
   public readonly descriptor: ProviderDescriptor = {
     type: "cloud139", displayName: "移动云盘", adapterVersion: "1.0.0", credentialSchemaVersion: 1,
-    supportedDataTypes: ["video", "music"], capabilities: ["list", "stableResourceId", "playbackLocator", "directDownload", "relay"],
+    supportedDataTypes: ["video", "music", "audiobook"], capabilities: ["list", "stableResourceId", "playbackLocator", "directDownload", "relay"],
     recommendedScanSettings: createProviderRecommendedScanSettings({ scanDirectoryConcurrency: { default: 4 } }),
     authenticationMode: "authorization_session", authMethods: [{ type: "qr", displayName: "移动云盘 App 扫码登录", interaction: "qr", recommended: true }], connectionFields: [],
   };

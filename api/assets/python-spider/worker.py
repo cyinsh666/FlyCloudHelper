@@ -177,7 +177,11 @@ def inspect_script(script_path):
                     name = names.get(value.attr, "")
                 if name:
                     break
-    return {"name": name,
+    # 关键变量：类型只读取静态类属性，不为识别有声书执行第三方脚本。
+    media_type = names.get("cloud_helper_media_type", "video")
+    if media_type not in ("video", "audiobook"):
+        raise WorkerFailure("python_source_result_invalid")
+    return {"name": name, "mediaType": media_type,
             "methods": sorted({node.name for node in functions if not node.name.startswith("_")})}
 
 

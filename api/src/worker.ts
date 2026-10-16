@@ -1,4 +1,6 @@
 import { refreshMusicJobCredential } from "./music/credentials.js";
+import { AUDIOBOOK_RECOGNITION_REVISION } from "./audiobooks/filename.js";
+import { applyAudiobookAudioTags, readAudiobookBookMetadata } from "./audiobooks/metadata.js";
 import { WEBDAV_UNKNOWN_SEASON } from "./media/flymby-consecutive-episode-helper.js";
 import path from "node:path";
 import { musicFileNameHints } from "./music/name-hints.js";
@@ -302,7 +304,7 @@ function createScanRootKey(root: ScanRoot): string {
   return createStableId("scan-root", root.resourceId || root.displayPath || "/");
 }
 
-/** 使用 Flymby APP 的刮削任务键；影视按作品聚合，音乐按单个源文件统计曲目处理进度。 */
+/** 影视与有声书按作品聚合任务，音乐按单个源文件统计曲目进度。 */
 function readBusinessTaskKey(descriptor: MediaDescriptor): string {
   if (descriptor.mediaType === "music" && descriptor.itemType === "music.track") {
     return descriptor.identityKey;
@@ -339,6 +341,10 @@ function resolveCatalogIdentityKey(
   parent: boolean,
   unmatchedSourceNamespace?: string,
 ): string {
+  // 有声书作品与章节保留自己的身份空间，不能进入后面的影视父项分组分支。
+  if (descriptor.mediaType === "audiobook") {
+    return parent ? descriptor.parent?.identityKey || descriptor.identityKey : descriptor.identityKey;
+  }
   const metadataIdentity = readMetadataIdentity(metadata);
   const businessTaskKey = readBusinessTaskKey(descriptor);
   // 关键变量：云聚合未取得可靠外部 ID 时必须保留来源边界，标题和文件名不能触发跨源自动合并。
@@ -405,10 +411,10 @@ function getHandledBusinessTaskCount(progress: BusinessTaskProgress): number {
   return progress.processedKeys.size + progress.failedKeys.size;
 }
 
-/** 解析扫描配置中的媒体范围；音乐服务与影视服务保持单类型边界。 */
+/** 解析扫描配置中的媒体范围，保持影视、音乐与有声书的单类型边界。 */
 function readMediaTypes(profile: Record<string, unknown>): MediaType[] {
   const values = Array.isArray(profile.mediaTypes) ? profile.mediaTypes : [];
-  const types = values.filter((item): item is MediaType => item === "video" || item === "music");
+  const types = values.filter((item): item is MediaType => item === "video" || item === "music" || item === "audiobook");
   return types.length > 0 ? types : ["video"];
 }
 
@@ -1565,7 +1571,7 @@ export class ScanWorker {
     // 关键变量：旧服务没有 syncDetails 字段时默认关闭，使扫描匹配方式与 Flymby APP 一致。
     const synchronizeVideoDetails = videoMetadataProfile.syncDetails === true;
     // 关键变量：规格分析只收集源文件，真正的 ffprobe 在扫描完成后由独立 Worker 执行。
-    const analyzeMediaSpecs = videoMetadataProfile.analyzeMediaSpecs === true;
+    const analyzeMediaSpecs = defaultMediaTypes.includes("video") && videoMetadataProfile.analyzeMediaSpecs === true;
     const mediaProbeSourceFiles = new Map<string, SourceFileRecord>();
     const tmdbStatusAtStart = this.tmdb.getStatus();
     // 没有配置 Key 或全部 Key 已永久禁用时不可恢复；冷却中的 Key 在建立检查点后进入延迟恢复。
@@ -1657,7 +1663,7 @@ export class ScanWorker {
     const videoRecognitionRevision = buildAiRecognitionRevision(metadataProfileRevision, aiModelSnapshot);
     const recognitionRevision = defaultMediaTypes.includes("music")
       ? `${videoRecognitionRevision}-${MUSIC_SCRAPE_RECOGNITION_REVISION}-sources-r${musicSourceSettings.configurationRevision}`
-      : videoRecognitionRevision;
+      : defaultMediaTypes.includes("audiobook") ? `${AUDIOBOOK_RECOGNITION_REVISION}-r${metadataProfileRevision}` : videoRecognitionRevision;
     if (defaultMediaTypes.includes("music")) {
       this.logger.info({
         日志关键字: "codex-flycloud-helper-music-source-config",
@@ -1803,10 +1809,10 @@ export class ScanWorker {
     });
     this.logger.info({
       日志关键字: "codex-flycloud-helper-scrape-flow",
-      事件: "影视扫描元数据流程已确定",
+      事件: job.dataType === "audiobook" ? "有声书本地标签与章节读取流程已确定" : "影视扫描元数据流程已确定",
       任务ID: job.id,
       本地NFO优先: useLocalVideoNfo,
-      元数据来源: videoMetadataProviderId || "builtin.tmdb",
+      元数据来源: job.dataType === "audiobook" ? "local" : videoMetadataProviderId || "builtin.tmdb",
       同步刮削详情: synchronizeVideoDetails,
       扫描模式: job.scanMode,
     });
@@ -1828,9 +1834,10 @@ export class ScanWorker {
       扫描会话ID: checkpoint.scanSessionId,
       扫描代次ID: generationId,
       Provider游标序号: restoredCheckpointSequence,
-      恢复扫描视频数量: scannedMediaCount,
-      页面保留扫描视频数量: visibleScannedMediaHighWater,
-      恢复处理影片数量: getHandledBusinessTaskCount(businessProgress),
+      媒体类型: job.dataType,
+      恢复扫描媒体文件数量: scannedMediaCount,
+      页面保留扫描媒体文件数量: visibleScannedMediaHighWater,
+      恢复处理作品数量: getHandledBusinessTaskCount(businessProgress),
     });
 
     /** 记录并合并并发刮削任务返回的 TMDB 临时错误，优先使用最早恢复时间。 */
@@ -1926,7 +1933,8 @@ export class ScanWorker {
                 errorCode,
                 error: new Error(mediaResult.providerUnavailable
                   ? "当前没有可用的元数据来源"
-                  : descriptor.mediaType === "music" ? "没有匹配到音乐元数据" : "没有匹配到影视元数据"),
+                  : descriptor.mediaType === "audiobook" ? "音频时长或标签暂未读取完整，作品已保留，可重新扫描补全"
+                    : descriptor.mediaType === "music" ? "没有匹配到音乐元数据" : "没有匹配到影视元数据"),
                 recovered: false,
                 mediaPath: candidate.entry.path,
                 resourceId: candidate.entry.resourceId,
@@ -1939,7 +1947,7 @@ export class ScanWorker {
                     ? JSON.stringify(descriptor.metadata.tmdbRecognitionDecision) : null,
                   判型说明: typeof descriptor.metadata.recognitionDetail === "string"
                     ? descriptor.metadata.recognitionDetail : null,
-                  使用元数据Provider: descriptor.mediaType === "music"
+                  使用元数据Provider: descriptor.mediaType === "audiobook" ? "local" : descriptor.mediaType === "music"
                     ? musicMetadataProviderId
                     : readMetadataProviderId(videoMetadataProfile) || "builtin.tmdb",
                 },
@@ -2036,7 +2044,7 @@ export class ScanWorker {
       return mediaTask;
     };
 
-    /** 为当前目录需要处理的音乐读取或复用标签，并将结果合并进音乐描述。 */
+    /** 为当前目录的音乐和有声书读取真实时长、标签、音频规格及内嵌章节。 */
     const applyDirectoryAudioTags = async (
       descriptors: Map<string, MediaDescriptor>,
       directoryItems: PendingDirectoryMedia[],
@@ -2045,7 +2053,7 @@ export class ScanWorker {
       const musicCandidates = directoryItems.filter((candidate) => (
         candidate.shouldProcess
         && candidate.sourceFile !== null
-        && descriptors.get(candidate.entry.resourceId)?.mediaType === "music"
+        && ["music", "audiobook"].includes(descriptors.get(candidate.entry.resourceId)?.mediaType ?? "")
       ));
       if (musicCandidates.length === 0) return;
       let nextCandidateIndex = 0;
@@ -2074,6 +2082,7 @@ export class ScanWorker {
                 readFailureCount += 1;
                 descriptors.set(candidate.entry.resourceId, {
                   ...descriptor,
+                  ...(descriptor.mediaType === "audiobook" ? { matchState: "needs_review" as const } : {}),
                   metadata: { ...descriptor.metadata, tagStatus: "failed", tagErrorCode: "provider_stream_unsupported" },
                 });
                 continue;
@@ -2113,6 +2122,7 @@ export class ScanWorker {
               readFailureCount += 1;
               descriptors.set(candidate.entry.resourceId, {
                 ...descriptor,
+                ...(descriptor.mediaType === "audiobook" ? { matchState: "needs_review" as const } : {}),
                 metadata: {
                   ...descriptor.metadata,
                   tagStatus: "failed",
@@ -2128,11 +2138,15 @@ export class ScanWorker {
             }
             if (tagResult.status === "empty") emptyTagCount += 1;
             else readSuccessCount += 1;
-            descriptors.set(candidate.entry.resourceId, applyAudioTagsToDescriptor(descriptor, tagResult));
+            const audioDescriptor = descriptor.mediaType === "audiobook"
+              ? applyAudiobookAudioTags(descriptor, tagResult, readMetadataProfile(effectiveMetadataProfile, "audiobook"))
+              : applyAudioTagsToDescriptor(descriptor, tagResult);
+            descriptors.set(candidate.entry.resourceId, audioDescriptor);
           } catch (error) {
             readFailureCount += 1;
             descriptors.set(candidate.entry.resourceId, {
               ...descriptor,
+              ...(descriptor.mediaType === "audiobook" ? { matchState: "needs_review" as const } : {}),
               metadata: {
                 ...descriptor.metadata,
                 tagStatus: "failed",
@@ -2141,7 +2155,7 @@ export class ScanWorker {
             });
             this.logger.warn({
               日志关键字: "codex-flycloud-helper-music-scan",
-              事件: "音乐标签读取降级",
+              事件: descriptor.mediaType === "audiobook" ? "有声书标签读取降级并保留目录资料" : "音乐标签读取降级",
               任务ID: job.id,
               服务ID: job.serviceId,
               源文件ID: candidate.sourceFile.id,
@@ -2155,11 +2169,11 @@ export class ScanWorker {
       await Promise.all(Array.from({ length: workerCount }, () => readNextCandidate()));
       this.logger.info({
         日志关键字: "codex-flycloud-helper-music-scan",
-        事件: "目录音乐标签处理完成",
+        事件: job.dataType === "audiobook" ? "目录有声书标签与内嵌章节处理完成" : "目录音乐标签处理完成",
         任务ID: job.id,
         服务ID: job.serviceId,
         目录标识: directoryKey,
-        音乐文件数量: musicCandidates.length,
+      音频文件数量: musicCandidates.length,
         标签缓存命中数量: cacheHitCount,
         标签读取成功数量: readSuccessCount,
         无标签数量: emptyTagCount,
@@ -2271,7 +2285,7 @@ export class ScanWorker {
                     const reusedTaskKey = readBusinessTaskKey(reusedDescriptor);
                     recordBusinessTaskSuccess(businessProgress, reusedTaskKey, true);
                     if (reusedDescriptor.itemType === "video.movie") movieTaskKeys.add(reusedTaskKey);
-                    else seriesTaskKeys.add(reusedTaskKey);
+                    else if (reusedDescriptor.mediaType === "video") seriesTaskKeys.add(reusedTaskKey);
                   }
                 }
               }
@@ -2618,7 +2632,7 @@ export class ScanWorker {
       const matchingRoot = findMatchingScanRoot(entry.path, roots);
       const effectiveRoot = matchingRoot ?? roots[0];
       const rootTypes = Array.isArray(matchingRoot?.mediaTypes)
-        ? matchingRoot.mediaTypes.filter((item): item is MediaType => item === "video" || item === "music")
+        ? matchingRoot.mediaTypes.filter((item): item is MediaType => item === "video" || item === "music" || item === "audiobook")
         : defaultMediaTypes;
       const rootPath = matchingRoot?.displayPath || matchingRoot?.resourceId || "/";
       const persistenceRoot = targetedScope
@@ -2927,6 +2941,9 @@ export class ScanWorker {
       targeted: targetedScope !== null,
       changedItemIds: [...changedItemIds],
     });
+    if (defaultMediaTypes.includes("audiobook")) {
+      await this.repository.refreshAudiobookBookSummaries(job.userId, job.libraryId);
+    }
     this.logger.info({
       日志关键字: "codex-flycloud-scan-reconcile",
       事件: "扫描成功后媒体目录与Provider对账完成",
@@ -2969,7 +2986,9 @@ export class ScanWorker {
       this.readScanCreatedMediaCounts(job),
     ]);
     // 关键变量：影视与音乐使用不同业务单位，只有本次任务确实有新内容入库时才投递 Telegram。
-    const createdContentCount = createdMediaCounts.videoContentCount;
+    const createdContentCount = job.dataType === "audiobook"
+      ? (createdMediaCounts.bookCount ?? 0) + (createdMediaCounts.chapterCount ?? 0)
+      : createdMediaCounts.videoContentCount;
     const deliverScanNotificationExternally = notificationEnabled && createdContentCount > 0;
     const completionMessage = buildScanCompletionMessage(job, createdMediaCounts);
     if (!belongsToAggregateParent) {
@@ -3146,11 +3165,11 @@ export class ScanWorker {
         input.generationId,
       );
       let parentPromise = input.metadataCache.parentItems.get(parentCacheKey);
-      if (!parentPromise || input.descriptor.mediaType === "music") {
+      if (!parentPromise || input.descriptor.mediaType === "music" || input.descriptor.mediaType === "audiobook") {
         // 同一专辑串行更新，在线阶段可以补上文件阶段缺失的资料。
         const previousParent = parentPromise;
         parentPromise = (async () => {
-          if (input.descriptor.mediaType === "music" && previousParent) await previousParent.catch(() => undefined);
+          if (previousParent) await previousParent.catch(() => undefined);
           input.signal.throwIfAborted();
           return this.repository.upsertMediaItem({
           id: createStableId("itm", input.job.userId, input.job.libraryId, parentIdentityKey),
@@ -3237,7 +3256,9 @@ export class ScanWorker {
         parentItemId,
         childItemId: itemResult.itemId,
         relationType: input.descriptor.parent.relationType,
-        sortOrder: input.descriptor.mediaType === "music"
+        sortOrder: input.descriptor.mediaType === "audiobook"
+          ? input.descriptor.parent.sortOrder
+          : input.descriptor.mediaType === "music"
           ? Math.max(0, Number(metadata.metadata.discNumber) || 0) * 100_000 + Math.max(0, Number(metadata.metadata.trackNumber) || 0)
           : input.descriptor.parent.sortOrder,
         parentItemType: parentItemState.itemType,
@@ -3394,6 +3415,8 @@ export class ScanWorker {
     jobId: string,
     signal: AbortSignal,
   ): Promise<EnrichedMetadata> {
+    // 有声书首期完全使用本地目录、音频标签和内嵌章节，不参与 TMDB 或音乐平台匹配。
+    if (descriptor.mediaType === "audiobook") return this.createLocalMetadata(descriptor);
     const profile = readMetadataProfile(metadataProfiles, descriptor.mediaType);
     const providerId = readMetadataProviderId(profile);
     // 关键变量：旧配置未包含 useNfo 时保持原有的 NFO 优先行为。
@@ -3880,14 +3903,15 @@ export class ScanWorker {
       && fieldSources.title === "embedded_tag"
       && fieldSources.artist === "embedded_tag"
       && fieldSources.album === "embedded_tag";
-    const embeddedArtworkUrl = isMusic && typeof descriptor.metadata.embeddedArtworkUrl === "string"
+    const isAudio = isMusic || descriptor.mediaType === "audiobook";
+    const embeddedArtworkUrl = isAudio && typeof descriptor.metadata.embeddedArtworkUrl === "string"
       ? descriptor.metadata.embeddedArtworkUrl
-      : isMusic && typeof descriptor.metadata.sidecarArtworkUrl === "string" ? descriptor.metadata.sidecarArtworkUrl : null;
+      : isAudio && typeof descriptor.metadata.sidecarArtworkUrl === "string" ? descriptor.metadata.sidecarArtworkUrl : null;
     const localMetadata: EnrichedMetadata = {
       title: descriptor.title,
       subtitle: descriptor.subtitle,
       year: descriptor.year,
-      overview: "",
+      overview: descriptor.mediaType === "audiobook" ? String(descriptor.metadata.description || "") : "",
       posterUrl: embeddedArtworkUrl,
       backdropUrl: null,
       matchState: hasReadableMusicTags ? "matched" : descriptor.matchState,
@@ -3902,7 +3926,7 @@ export class ScanWorker {
         title: descriptor.parent.title,
         subtitle: descriptor.parent.subtitle,
         year: descriptor.parent.year,
-        overview: "",
+        overview: descriptor.mediaType === "audiobook" ? String(descriptor.metadata.description || "") : "",
         posterUrl: embeddedArtworkUrl,
         backdropUrl: null,
         matchState: hasReadableMusicTags ? "matched" : descriptor.matchState,
@@ -3914,7 +3938,7 @@ export class ScanWorker {
           albumArtist: descriptor.metadata.albumArtist ?? descriptor.metadata.artist ?? descriptor.parent.subtitle,
           genres: descriptor.metadata.genres,
           artistIds: descriptor.metadata.musicBrainzArtistIds,
-        } : {},
+        } : descriptor.mediaType === "audiobook" ? readAudiobookBookMetadata(descriptor) : {},
       };
     }
     return localMetadata;

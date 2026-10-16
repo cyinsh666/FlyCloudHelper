@@ -215,6 +215,9 @@ export function validateContentManifest(value: unknown): ContentSourceManifest {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw validationError("manifest", "插件清单必须是 JSON 对象");
   const raw = value as Record<string, unknown>;
   if (raw.protocolVersion !== 1 || !["cms_json", "python_spider", "netease_http"].includes(String(raw.adapter))) throw validationError("manifest", "只支持 protocolVersion 1 的 CMS、Python Spider 或网易音乐内容源插件");
+  if (raw.mediaType !== undefined && !["video", "music", "audiobook"].includes(String(raw.mediaType))) throw validationError("mediaType", "内容源类型无效");
+  if (raw.mediaType === "audiobook" && raw.adapter !== "python_spider") throw validationError("mediaType", "当前有声书内容源需要 Python Spider 适配器");
+  if (raw.adapter === "python_spider" && raw.mediaType === "music") throw validationError("mediaType", "Python 内容源当前只支持视频和有声书");
   const readText = (field: string, maximum: number): string => {
     const text = typeof raw[field] === "string" ? String(raw[field]).trim() : "";
     if (!text || text.length > maximum) throw validationError(field, `${field} 不能为空且不能超过 ${maximum} 个字符`);
@@ -233,7 +236,7 @@ export function validateContentManifest(value: unknown): ContentSourceManifest {
     if (config.extend !== undefined && (typeof config.extend !== "string" || config.extend.length > 10000)) throw validationError("extend", "Python 初始化参数必须是文本且不超过 10000 字符");
     const pageSize = Number(config.pageSize ?? 20);
     if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 200) throw validationError("pageSize", "Python 源每页条数必须为 1 至 200");
-    return { protocolVersion: 1, pluginId, version, displayName: readText("displayName", 100), description: String(raw.description ?? "").slice(0, 2000), adapter: "python_spider", endpoint: "", headers: {}, scriptFile, scriptHash,
+    return { protocolVersion: 1, pluginId, version, displayName: readText("displayName", 100), description: String(raw.description ?? "").slice(0, 2000), adapter: "python_spider", ...(raw.mediaType === "audiobook" ? { mediaType: "audiobook" as const } : {}), endpoint: "", headers: {}, scriptFile, scriptHash,
       movieCategoryIds: Array.isArray(raw.movieCategoryIds) ? raw.movieCategoryIds.map(String) : [], excludedCategoryIds: Array.isArray(raw.excludedCategoryIds) ? raw.excludedCategoryIds.map(String) : [],
       pythonConfig: { extend: String(config.extend ?? ""), pageSize } };
   }

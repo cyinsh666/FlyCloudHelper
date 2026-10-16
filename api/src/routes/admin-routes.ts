@@ -1,6 +1,7 @@
 import { listMusicStageTasks } from "../music/task-query.js";
 import { retryMusicScan } from "../music/retry.js";
 import { randomUUID } from "node:crypto";
+import { ensureContentAudiobookDetail } from "../audiobooks/content-source-detail.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { FastifyInstance } from "fastify";
@@ -800,11 +801,11 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     );
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-metadata-profile",
-      事件: library.dataType === "music" ? "管理员更新音乐元数据配置" : "管理员更新影视元数据配置",
+      事件: library.dataType === "audiobook" ? "管理员更新有声书元数据配置" : library.dataType === "music" ? "管理员更新音乐元数据配置" : "管理员更新影视元数据配置",
       管理员ID: operator.id,
       媒体库ID: library.id,
       服务ID: library.sourceServiceId,
-      ...(library.dataType === "music"
+      ...(library.dataType === "audiobook" ? {} : library.dataType === "music"
         ? readMusicMetadataLogFields(profile)
         : readVideoMetadataLogFields(profile)),
     });
@@ -1317,31 +1318,41 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       throw validationError("userId", "全局海报墙必须指定用户、服务或媒体库范围");
     }
     const sortValue = request.query.sort;
+    const scopedLibrary = libraryId ? await runtime.repository.getLibrary(libraryId, userId) : null;
+    const searchTerm = typeof request.query.search === "string" ? request.query.search : "";
+    const pagination = readPagination(request.query);
+    const remoteIds = scopedLibrary?.libraryKind === "content_source_audiobook" && searchTerm.trim()
+      ? await runtime.contentAudiobooks.search(scopedLibrary.id, scopedLibrary.userId, searchTerm, Math.min(200, pagination.offset + pagination.limit))
+      : undefined;
+    // 远程没有命中时直接返回空列表，避免空 ID 筛选被目录查询忽略。
+    if (remoteIds?.length === 0) return { items: [], total: 0 };
     return runtime.repository.listCatalogItems({
       userId,
       serviceId,
       libraryId,
+      itemIds: remoteIds,
       mediaType: typeof request.query.mediaType === "string" ? request.query.mediaType as MediaType : undefined,
       itemType: typeof request.query.itemType === "string" ? request.query.itemType : undefined,
       matchState: typeof request.query.matchState === "string" ? request.query.matchState as MatchState : undefined,
-      search: typeof request.query.search === "string" ? request.query.search : undefined,
+      search: remoteIds === undefined ? searchTerm || undefined : undefined,
       sort: sortValue === "title_asc"
         || sortValue === "year_desc"
         || sortValue === "premiere_date_desc"
         ? sortValue
         : "created_desc",
-      ...readPagination(request.query),
+      ...pagination,
     });
   });
 
   server.get<{ Params: { itemId: string } }>("/api/v1/admin/catalog/items/:itemId", async (request) => {
     await requireSuperAdmin(request, runtime.database);
-    const item = await runtime.repository.getCatalogItem(request.params.itemId);
+    const item = await ensureContentAudiobookDetail(runtime, await runtime.repository.getCatalogItem(request.params.itemId));
     return { item: await hydrateRealtimeVideoDetails(runtime, item) };
   });
 
   server.get<{ Params: { itemId: string } }>("/api/v1/admin/catalog/items/:itemId/children", async (request) => {
     await requireSuperAdmin(request, runtime.database);
+    await ensureContentAudiobookDetail(runtime, await runtime.repository.getCatalogItem(request.params.itemId));
     return { items: await runtime.repository.listCatalogChildren(request.params.itemId) };
   });
 

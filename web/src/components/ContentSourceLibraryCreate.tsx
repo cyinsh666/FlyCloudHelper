@@ -7,16 +7,23 @@ import {
   listContentSourcePluginCategories,
   listContentSourcePlugins,
   type ContentSourceCategory,
+  type ContentSourcePlugin,
 } from "@/lib/content-source-api";
 import { useApiResource } from "@/lib/use-api-resource";
 import { readContentMusicIds } from "@/lib/content-music-input";
+
+/** 新建库的默认名称跟随清单媒体类型，未声明类型的旧插件保持原行为。 */
+function initialLibraryName(plugin: ContentSourcePlugin): string {
+  if (plugin.mediaType === "audiobook") return "在线听书库";
+  return plugin.adapter === "netease_http" ? "网易云音乐库" : "在线影视库";
+}
 
 /** 选择已启用插件、分类和名称创建在线库，分类预览不新增内容源记录。 */
 export function ContentSourceLibraryCreate() {
   const navigate = useNavigate();
   const resource = useApiResource(async () => {
     const plugins = await listContentSourcePlugins();
-    // 关键变量：Python 源与 CMS 共用影视库创建入口，网易音乐继续使用音乐库流程。
+    // 关键变量：Python 源由清单区分影视与听书，复用插件选择和分类预览入口。
     return plugins.items.filter((plugin) => plugin.status === "enabled"
       && (plugin.adapter === "cms_json" || plugin.adapter === "python_spider" || plugin.adapter === "netease_http"));
   }, []);
@@ -40,6 +47,7 @@ export function ContentSourceLibraryCreate() {
   const plugin = plugins.find((entry) => `${entry.pluginId}@${entry.version}` === pluginKey);
   // 关键变量：音乐源使用自动发现目录，不经过视频分类接口。
   const isMusicSource = plugin?.adapter === "netease_http";
+  const isAudiobookSource = plugin?.mediaType === "audiobook";
   // 关键变量：只展示叶分类，避免选择一个父分类后导入全部内容。
   const leafCategories = categories.filter((entry) => !categories.some((child) => child.parentId === entry.id));
 
@@ -47,7 +55,7 @@ export function ContentSourceLibraryCreate() {
     if (plugins.length > 0 && !pluginKey) {
       const first = plugins[0]!;
       setPluginKey(`${first.pluginId}@${first.version}`);
-      setDisplayName(first.adapter === "netease_http" ? "网易云音乐库" : "在线影视库");
+      setDisplayName(initialLibraryName(first));
     }
   }, [pluginKey, plugins]);
 
@@ -60,10 +68,10 @@ export function ContentSourceLibraryCreate() {
     setShowMusicConfiguration(false);
     setMessage(null);
     const selectedPlugin = plugins.find((entry) => `${entry.pluginId}@${entry.version}` === key);
-    setDisplayName(selectedPlugin?.adapter === "netease_http" ? "网易云音乐库" : "在线影视库");
+    setDisplayName(selectedPlugin ? initialLibraryName(selectedPlugin) : "在线影视库");
   }
 
-  /** 仅预览当前影视插件的分类，不在读取或取消时新增源记录。 */
+  /** 预览当前影视或听书插件的分类，不在读取或取消时新增源记录。 */
   async function readCategories(): Promise<void> {
     if (!plugin || isMusicSource || busyRef.current) return;
     busyRef.current = true;
@@ -73,7 +81,7 @@ export function ContentSourceLibraryCreate() {
       const result = await listContentSourcePluginCategories(plugin);
       setCategories(result.items);
       setCategoryIds([]);
-      setMessage(result.items.length > 0 ? "请选择要导入的分类，首轮仅同步少量内容。" : "当前源没有返回可选分类。");
+      setMessage(result.items.length > 0 ? "请选择要导入的分类，首次同步每个分类一页摘要。" : "当前源没有返回可选分类。");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "内容源读取失败");
     } finally {
@@ -82,12 +90,12 @@ export function ContentSourceLibraryCreate() {
     }
   }
 
-  /** 切换明确的视频分类，不默认选中任何分类。 */
+  /** 切换当前源返回的分类，不默认选中任何分类。 */
   function toggleCategory(id: string): void {
     setCategoryIds((current) => current.includes(id) ? current.filter((value) => value !== id) : [...current, id]);
   }
 
-  /** 全选当前可用视频叶分类，或清空用户的选择。 */
+  /** 全选当前可用叶分类，或清空用户的选择。 */
   function selectAllCategories(selected: boolean): void {
     setCategoryIds(selected ? leafCategories.map((category) => category.id) : []);
   }
@@ -132,7 +140,7 @@ export function ContentSourceLibraryCreate() {
     setBusy(true);
     setMessage("正在创建媒体库并启动目录同步…");
     try {
-      // 关键变量：影视库不传首次页数，沿用服务端每分类 1 页的默认样本同步。
+      // 关键变量：影视及听书库不传首次页数，沿用服务端每分类一页摘要的默认同步。
       const input = isMusicSource
         ? { displayName: displayName.trim(), albumIds: readContentMusicIds(albumIdsText, "专辑"), playlistIds: readContentMusicIds(playlistIdsText, "歌单") }
         : { displayName: displayName.trim(), categoryIds };
@@ -157,17 +165,18 @@ export function ContentSourceLibraryCreate() {
       <legend className="text-xs text-muted-foreground">内容源插件</legend>
       <div className="mt-1.5 flex flex-wrap gap-1.5">{plugins.map((entry) => {
         const key = `${entry.pluginId}@${entry.version}`;
-        return <button key={key} type="button" aria-pressed={pluginKey === key} onClick={() => selectPlugin(key)} title={entry.displayName} className={`flex min-w-0 max-w-full items-center gap-2 rounded-lg border px-3 py-2 text-left disabled:opacity-60 ${pluginKey === key ? "border-foreground" : "border-border"}`}><span className="min-w-0 truncate text-sm">{entry.displayName}</span><span className="shrink-0 text-xs text-muted-foreground">{entry.version}</span></button>;
+        return <button key={key} type="button" aria-pressed={pluginKey === key} onClick={() => selectPlugin(key)} title={entry.displayName} className={`flex min-w-0 max-w-full items-center gap-2 rounded-lg border px-3 py-2 text-left disabled:opacity-60 ${pluginKey === key ? "border-foreground" : "border-border"}`}><span className="min-w-0 truncate text-sm">{entry.displayName}</span>{entry.mediaType === "audiobook" && <span className="shrink-0 text-xs text-muted-foreground">听书</span>}<span className="shrink-0 text-xs text-muted-foreground">{entry.version}</span></button>;
       })}</div>
     </fieldset>
     <label><span className="text-xs text-muted-foreground">媒体库名称</span><input disabled={busy} required value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={100} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label>
     {!isMusicSource && <div className="flex flex-wrap gap-2 [&_button]:px-3 [&_button]:py-1.5"><SecondaryButton disabled={busy || !plugin} onClick={() => void readCategories()}>{busy && categories.length === 0 ? "正在读取…" : categories.length > 0 ? "重新读取分类" : "读取分类"}</SecondaryButton></div>}
     {leafCategories.length > 0 && <fieldset disabled={busy}><legend className="text-xs text-muted-foreground">导入分类（已选 {categoryIds.length} 个）</legend><div className="mt-1.5 flex flex-wrap gap-2 [&_button]:px-3 [&_button]:py-1.5"><SecondaryButton disabled={busy} onClick={() => selectAllCategories(true)}>全选</SecondaryButton><SecondaryButton disabled={busy} onClick={() => selectAllCategories(false)}>取消全选</SecondaryButton></div><div className="mt-2 flex flex-wrap gap-1.5">{leafCategories.map((category) => <button key={category.id} type="button" aria-pressed={categoryIds.includes(category.id)} onClick={() => toggleCategory(category.id)} className={`rounded-lg border px-3 py-1.5 text-left text-sm ${categoryIds.includes(category.id) ? "border-foreground" : "border-border"}`}>{category.name}</button>)}</div></fieldset>}
+    {isAudiobookSource && <p className="text-xs text-muted-foreground">列表同步书籍摘要，打开书籍详情和播放时再读取章节与音频资料。</p>}
     {isMusicSource && <div className="grid gap-2 rounded-lg border border-border p-3">
       <div><p className="text-sm">自动发现音乐目录</p><p className="mt-1 text-xs text-muted-foreground">客户端浏览时自动加载推荐歌单、排行榜和新专辑，无需填写专辑或歌单 ID。</p></div>
       <div className="flex flex-wrap items-center justify-between gap-2 [&_button]:px-3 [&_button]:py-1.5"><p className="text-xs text-muted-foreground">{albumIdsText || playlistIdsText ? "已添加自选补充目录" : "也可按需添加自选专辑和歌单"}</p><SecondaryButton disabled={busy} onClick={openMusicConfiguration}>高级配置（可选）</SecondaryButton></div>
     </div>}
-    <div className="[&_button]:px-3 [&_button]:py-2"><PrimaryButton type="submit" disabled={busy || showMusicConfiguration || !plugin || (!isMusicSource && categoryIds.length === 0) || !displayName.trim()}>{busy ? "正在处理…" : isMusicSource ? "创建在线音乐库" : "创建在线媒体库"}</PrimaryButton></div>
+    <div className="[&_button]:px-3 [&_button]:py-2"><PrimaryButton type="submit" disabled={busy || showMusicConfiguration || !plugin || (!isMusicSource && categoryIds.length === 0) || !displayName.trim()}>{busy ? "正在处理…" : isMusicSource ? "创建在线音乐库" : isAudiobookSource ? "创建在线听书库" : "创建在线媒体库"}</PrimaryButton></div>
     {message && <p role="status" className="text-sm text-muted-foreground">{message}</p>}
     {showMusicConfiguration && <ContentSourceSettingsDialog state={{ title: "补充音乐目录（可选）", description: "自动发现推荐歌单、排行榜和新专辑，无需填写以下内容。", busy, onClose: closeMusicConfiguration, children: <div className="grid gap-3">
       <div className="grid gap-3 sm:grid-cols-2"><label><span className="text-xs text-muted-foreground">补充专辑 ID（可选）</span><textarea disabled={busy} value={draftAlbumIdsText} onChange={(event) => setDraftAlbumIdsText(event.target.value)} rows={4} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label><label><span className="text-xs text-muted-foreground">补充歌单 ID（可选）</span><textarea disabled={busy} value={draftPlaylistIdsText} onChange={(event) => setDraftPlaylistIdsText(event.target.value)} rows={4} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label></div>

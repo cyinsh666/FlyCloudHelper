@@ -182,7 +182,7 @@ export class GuangyaProvider implements ProviderAdapter {
     displayName: "光鸭云盘",
     adapterVersion: "4.0.0-three-auth-modes",
     credentialSchemaVersion: 4,
-    supportedDataTypes: ["video", "music"],
+    supportedDataTypes: ["video", "music", "audiobook"],
     capabilities: [
       "list",
       "stableResourceId",

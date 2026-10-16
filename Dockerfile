@@ -99,6 +99,10 @@ RUN sed -i \
     && mkdir -p /data/database /data/secrets /data/plugins /data/exports /data/migrations /data/music-artwork \
     && chown -R node:node /data
 
+# NAS 构建目录的扩展 ACL 可能覆盖 COPY 的权限，运行前明确恢复应用读取与入口执行权限。
+RUN chmod -R u=rwX,go=rX /app \
+    && chmod 755 /usr/local/bin/docker-entrypoint.sh
+
 # 入口脚本需要先修复 NAS 挂载目录，随后立即通过 gosu 降权运行 Node 服务。
 USER root
 EXPOSE 9934

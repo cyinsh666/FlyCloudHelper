@@ -2,6 +2,8 @@ import { Link, useNavigate } from "@tanstack/react-router";
 import { Bell, CalendarClock, Copy, FolderOpen, Images, Pencil, Plus, ScanLine, Settings2, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { MediaCatalogView, type MediaCatalogQuery } from "@/components/MediaCatalogView";
+import { LibraryAudiobookSettings } from "@/components/LibraryAudiobookSettings";
+import { LibraryContentAudiobookSettingsPage } from "@/pages/LibraryContentAudiobookSettingsPage";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, StatusPill } from "@/components/ui-kit";
 import { ServicePathPicker, toProviderDirectory } from "@/components/ServicePathPicker";
@@ -132,10 +134,9 @@ async function copyLibraryText(value: string): Promise<void> {
 export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: string; admin?: boolean }) {
   const navigate = useNavigate();
   const resource = useApiResource(async () => {
-    const [libraryResult, settings] = await Promise.all([
-      getLibrary(serviceId, admin),
-      getServiceAccessSettings(serviceId, admin),
-    ]);
+    const libraryResult = await getLibrary(serviceId, admin);
+    // 有声书只使用独立 ABS 设置，不读取旧视频/音乐协议或隐式创建其账号。
+    const settings = libraryResult.library.dataType === "audiobook" ? null : await getServiceAccessSettings(serviceId, admin);
     return {
       service: { ...libraryResult.library, libraryId: libraryResult.library.id },
       scanProfile: libraryResult.scanProfile,
@@ -183,7 +184,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   const metadataProfile = resource.data?.metadataProfile ?? {};
   const isCloudAggregate = service?.libraryKind === "cloud_aggregate_video";
   const isMusicContentSource = service?.libraryKind === "content_source_music";
-  const isContentSource = service?.libraryKind === "content_source_video" || isMusicContentSource;
+  const isContentSource = service?.libraryKind === "content_source_video" || isMusicContentSource || service?.libraryKind === "content_source_audiobook";
   // 关键变量：聚合扫描只计入状态正常且已配置当前模式路径的来源。
   const readyAggregateSources = service?.sources.filter(isReadyAggregateSource) ?? [];
   const fullAggregateScanSources = readyAggregateSources.filter((source) => hasAggregateSourceRoots(source, "full"));
@@ -493,6 +494,22 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
     }
   }
 
+  if (service?.libraryKind === "content_source_audiobook") {
+    return <LibraryContentAudiobookSettingsPage state={{
+      library: service, admin, loading: resource.loading, clearingCatalog, message,
+      onRefresh: resource.refresh, onClear: clearCatalog, onDelete: deleteCurrentLibrary,
+    }} />;
+  }
+  if (service?.dataType === "audiobook") {
+    return <LibraryAudiobookSettings state={{
+      library: service, admin, metadataProfile,
+      fullRoots: readLibraryScanRoots(scanProfile, "full"), incrementalRoots: readLibraryScanRoots(scanProfile, "incremental"),
+      message, scanActionFeedback, creatingScanMode, clearingCatalog, unlinkingService, updatingNotification,
+      onRefresh: resource.refresh, onSaveRoots: saveScanRoots, onScan: triggerScan,
+      onClear: clearCatalog, onDelete: deleteCurrentLibrary, onUnlink: unlinkLastService,
+      onToggleNotification: toggleNotification,
+    }} />;
+  }
   if (!service || !settings) {
     return <Panel>{resource.error ? <p role="alert" className="text-sm text-destructive">{resource.error}</p> : <div aria-label="媒体库设置加载中" className="animate-pulse space-y-4"><div className="h-7 w-48 rounded bg-muted" /><div className="h-20 rounded bg-muted" /><div className="h-40 rounded bg-muted" /></div>}</Panel>;
   }
@@ -669,10 +686,10 @@ export function AdminLibrarySettingsPage({ serviceId }: { serviceId: string }) {
 /** 集中管理单个媒体库的 Jellyfin 中转、地区分组、地址和访问账号。 */
 export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serviceId: string; admin?: boolean }) {
   const resource = useApiResource(async () => {
-    const [service, settings] = await Promise.all([
-      getLibrary(serviceId, admin).then((result) => ({ ...result.library, libraryId: result.library.id })),
-      getServiceAccessSettings(serviceId, admin),
-    ]);
+    const detail = await getLibrary(serviceId, admin);
+    if (detail.library.dataType === "audiobook") throw new Error("有声书库请使用 ABS 账号与配置");
+    const service = { ...detail.library, libraryId: detail.library.id };
+    const settings = await getServiceAccessSettings(serviceId, admin);
     return { service, settings };
   }, [serviceId, admin]);
   const [message, setMessage] = useState<string | null>(null);
@@ -1116,8 +1133,8 @@ export function LibraryCatalogPage({ serviceId, admin = false }: { serviceId: st
     const options = {
       search: catalogQuery.search || undefined,
       mediaType: catalogQuery.mediaType === "all" ? service.dataType : catalogQuery.mediaType,
-      // 音乐库“全部”默认只展示专辑，歌曲和艺术家必须从独立分类进入。
-      itemType: selectedItemType ?? (service.dataType === "music" ? "music.album" : undefined),
+      // 音乐库展示专辑，有声书库展示作品；章节不作为独立作品进入顶层目录。
+      itemType: selectedItemType ?? (service.dataType === "music" ? "music.album" : service.dataType === "audiobook" ? "audiobook.book" : undefined),
       matchState: catalogQuery.matchState === "all" ? undefined : catalogQuery.matchState,
       sort: catalogQuery.sort,
       limit: LIBRARY_CATALOG_PAGE_SIZE,
@@ -1151,9 +1168,9 @@ export function LibraryCatalogPage({ serviceId, admin = false }: { serviceId: st
   const settingsPath = admin ? "/admin/libraries/$serviceId/settings" : "/app/libraries/$serviceId/settings";
   return (
     <>
-      <PageHeader title={`${service.displayName} · 海报墙`} actions={<div className="flex flex-wrap gap-2"><Link to={librariesPath}><SecondaryButton>返回媒体库</SecondaryButton></Link><Link to={settingsPath} params={{ serviceId }}><SecondaryButton>媒体库设置</SecondaryButton></Link></div>} />
+      <PageHeader title={`${service.displayName} · ${service.dataType === "audiobook" ? "有声书库" : "海报墙"}`} actions={<div className="flex flex-wrap gap-2"><Link to={librariesPath}><SecondaryButton>返回媒体库</SecondaryButton></Link><Link to={settingsPath} params={{ serviceId }}><SecondaryButton>媒体库设置</SecondaryButton></Link></div>} />
       {resource.error && <Panel className="mb-4"><p className="text-sm text-destructive">{resource.error}</p></Panel>}
-      <MediaCatalogView contextDescription={`${admin ? `用户 ${service.ownerUsername} · ` : ""}${service.displayName} · ${service.libraryId}`} items={catalog.items} total={catalog.total} catalogVersion={service.catalogVersion} fixedService showOwner={admin} admin={admin} loading={resource.loading} onRefresh={() => void resource.refresh()} serverFiltered pageOffset={pageOffset} pageLimit={LIBRARY_CATALOG_PAGE_SIZE} onQueryChange={updateCatalogQuery} onPageChange={setPageOffset} initialItemId={new URLSearchParams(window.location.search).get("itemId") ?? undefined} initialItemLibraryId={service.id} />
+      <MediaCatalogView key={service.id} contextDescription={`${admin ? `用户 ${service.ownerUsername} · ` : ""}${service.displayName} · ${service.libraryId}`} items={catalog.items} total={catalog.total} catalogVersion={service.catalogVersion} fixedService fixedMediaType={service.dataType === "audiobook" ? "audiobook" : undefined} showOwner={admin} admin={admin} loading={resource.loading} onRefresh={() => void resource.refresh()} serverFiltered pageOffset={pageOffset} pageLimit={LIBRARY_CATALOG_PAGE_SIZE} onQueryChange={updateCatalogQuery} onPageChange={setPageOffset} initialItemId={new URLSearchParams(window.location.search).get("itemId") ?? undefined} initialItemLibraryId={service.id} />
     </>
   );
 }

@@ -207,6 +207,7 @@ export function PosterCard({ item, onClick }: { item: MediaItem; onClick?: () =>
     "music.track": "歌曲",
     "music.artist": "艺术家",
     "audiobook.book": "有声书",
+    "audiobook.chapter": "有声书章节",
   };
   const hue = [...item.id].reduce((sum, character) => sum + character.charCodeAt(0), 0) % 360;
   const mediaProbeSummary = item.mediaProbeSummary;

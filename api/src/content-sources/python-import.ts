@@ -76,7 +76,7 @@ export async function importPythonSource(runtime: ApiRuntime, filename: string, 
   if (repairingInstalledPlugin && !createdFile) {
     throw new ApiError(409, "content_plugin_already_exists", "脚本已补回，不要重复导入");
   }
-  let inspection: { name: string; methods: string[] };
+  let inspection: { name: string; methods: string[]; mediaType: "video" | "audiobook" };
   try {
     // 关键变量：inspect 使用 AST 识别 Spider 和基础方法，导入管理端不运行源的初始化逻辑。
     inspection = await runtime.contentSources.pythonRuntime.inspect(absolutePath);
@@ -100,8 +100,11 @@ export async function importPythonSource(runtime: ApiRuntime, filename: string, 
     pluginId,
     version,
     displayName: sourceDisplayName(filename, inspection.name),
-    description: "Python Spider 视频内容源，通过 Jellyfin、Emby 提供目录、搜索和播放，实际能力以源站解析结果为准。",
+    description: inspection.mediaType === "audiobook"
+      ? "Python Spider 有声书源，通过标准 ABS 提供目录、实时搜索、章节和音频播放，章节必须提供真实时长。"
+      : "Python Spider 视频内容源，通过 Jellyfin、Emby 提供目录、搜索和播放，实际能力以源站解析结果为准。",
     adapter: "python_spider",
+    ...(inspection.mediaType === "audiobook" ? { mediaType: "audiobook" as const } : {}),
     endpoint: "",
     scriptFile,
     scriptHash,

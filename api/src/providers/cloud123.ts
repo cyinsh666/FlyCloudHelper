@@ -24,7 +24,7 @@ export class Cloud123Provider extends CloudDriveProviderBase {
   private nextRequestAtMs = 0;
   public readonly descriptor: ProviderDescriptor = {
     type: "cloud123", displayName: "123云盘", adapterVersion: "1.0.0", credentialSchemaVersion: 1,
-    supportedDataTypes: ["video", "music"],
+    supportedDataTypes: ["video", "music", "audiobook"],
     capabilities: ["list", "stableResourceId", "playbackLocator", "directDownload", "relay"],
     recommendedScanSettings: createProviderRecommendedScanSettings({ scanDirectoryConcurrency: { default: 4 } }),
     authenticationMode: "authorization_session", authMethods: [{ type: "app_qr", displayName: "123 App扫码登录", interaction: "qr", recommended: true }],

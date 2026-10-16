@@ -25,7 +25,9 @@ function getPluginKey(entry: PluginEntry): string {
 }
 
 /** 在详情中说明内容源对外提供的协议能力。 */
-function describeSourceCapabilities(adapter: string): string {
+function describeSourceCapabilities(plugin: ContentSourcePlugin): string {
+  if (plugin.mediaType === "audiobook") return "有声书内容 · Audiobookshelf（ABS）";
+  const adapter = plugin.adapter;
   if (adapter === "netease_http") return "网易云音乐 · Navidrome";
   if (adapter === "cms_json") return "影视内容 · Jellyfin / Emby";
   if (adapter === "python_spider") return "影视内容 · Jellyfin / Emby";
@@ -193,6 +195,7 @@ export function AdminPluginsPanel() {
       {initialLoading && [0, 1].map((index) => <div key={`loading-${index}`} aria-label="插件加载中" className="surface animate-pulse p-4"><div className="h-5 w-36 rounded bg-muted" /><div className="mt-4 h-8 w-40 rounded bg-muted" /></div>)}
       {entries.map((entry) => <article key={getPluginKey(entry)} className="surface p-4">
         <header className="flex items-center justify-between gap-3"><h2 className="min-w-0 truncate text-sm font-medium" title={entry.plugin.displayName}>{entry.plugin.displayName}</h2><StatusPill tone={entry.plugin.status === "enabled" ? "success" : "neutral"}>{pluginStatusLabels[entry.plugin.status]}</StatusPill></header>
+        {entry.kind === "source" && entry.plugin.mediaType === "audiobook" && <p className="mt-2 text-xs text-muted-foreground">有声书内容 · Audiobookshelf（ABS）</p>}
         <footer className="mt-4 flex flex-wrap gap-2">
           <SecondaryButton disabled={pending !== null} onClick={() => void togglePlugin(entry)}>{pending === getPluginKey(entry) ? "正在处理…" : entry.plugin.status === "enabled" ? "停用" : "启用"}</SecondaryButton>
           <SecondaryButton onClick={() => setSelectedKey(getPluginKey(entry))}>详情</SecondaryButton>
@@ -207,7 +210,7 @@ export function AdminPluginsPanel() {
       <PluginDetailField label="版本" value={selectedEntry.plugin.version} />
       <PluginDetailField label="插件 ID" value={selectedEntry.plugin.pluginId} />
       <PluginDetailField label="说明" value={getPluginDescription(selectedEntry)} />
-      <PluginDetailField label="能力" value={selectedEntry.kind === "source" ? describeSourceCapabilities(selectedEntry.plugin.adapter) : describeMetadataCapabilities(selectedEntry.plugin)} />
+      <PluginDetailField label="能力" value={selectedEntry.kind === "source" ? describeSourceCapabilities(selectedEntry.plugin) : describeMetadataCapabilities(selectedEntry.plugin)} />
       {selectedEntry.kind === "source" ? <>
         <PluginDetailField label="适配器" value={selectedEntry.plugin.adapter === "python_spider" ? "Python Spider" : selectedEntry.plugin.adapter} />
         <p className="text-xs text-muted-foreground">停用和卸载不会自动删除媒体库。停用后可重新启用；卸载后可重新导入原插件，继续使用原目录和播放记录。</p>

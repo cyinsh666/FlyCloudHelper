@@ -4,6 +4,7 @@ import { validationError } from "./errors.js";
 import { buildJellyfinPath } from "./jellyfin-path.js";
 import { buildEmbyPath } from "./emby-path.js";
 import { buildNavidromePath } from "./navidrome-path.js";
+import { buildAbsPath } from "./abs-path.js";
 
 const publicBaseUrlSettingKey = "public_base_url";
 
@@ -68,5 +69,11 @@ export class PublicAccessService {
   public async buildNavidromeUrl(pathSuffix: string): Promise<string | null> {
     const status = await this.getStatus();
     return status.publicBaseUrl ? `${status.publicBaseUrl}${buildNavidromePath(pathSuffix)}` : null;
+  }
+
+  /** 使用有声书媒体库的专属后缀生成 ABS 客户端连接地址。 */
+  public async buildAbsUrl(pathSuffix: string): Promise<string | null> {
+    const status = await this.getStatus();
+    return status.publicBaseUrl ? `${status.publicBaseUrl}${buildAbsPath(pathSuffix)}` : null;
   }
 }

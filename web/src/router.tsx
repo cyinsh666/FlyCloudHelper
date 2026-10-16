@@ -23,6 +23,7 @@ import {
 import { AdminServiceBasicDetailPage, UserServiceBasicDetailPage } from "@/pages/ServiceBasicDetailPage";
 import { LibraryCreatePage } from "@/pages/LibraryCreatePage";
 import { LibraryFileBrowsePage } from "@/pages/LibraryFileBrowsePage";
+import { LibraryAbsSettingsPage } from "@/pages/LibraryAbsSettingsPage";
 import {
   AdminCatalogPage,
   AdminJobsPage,
@@ -202,6 +203,12 @@ function UserLibraryEmbySettingsRouteComponent() {
   return <UserLibraryEmbySettingsPage serviceId={serviceId} />;
 }
 
+/** 个人媒体库的 ABS 协议设置。 */
+function UserLibraryAbsSettingsRouteComponent() {
+  const { serviceId } = userLibraryAbsSettingsRoute.useParams();
+  return <LibraryAbsSettingsPage key={`${serviceId}:user`} serviceId={serviceId} />;
+}
+
 /** 处理普通用户媒体库海报墙路由参数。 */
 function UserLibraryCatalogRouteComponent() {
   const { serviceId } = userLibraryCatalogRoute.useParams();
@@ -259,6 +266,12 @@ function AdminLibrarySettingsRouteComponent() {
 function AdminLibraryEmbySettingsRouteComponent() {
   const { serviceId } = adminLibraryEmbySettingsRoute.useParams();
   return <AdminLibraryEmbySettingsPage serviceId={serviceId} />;
+}
+
+/** 管理员查看指定媒体库的 ABS 协议设置。 */
+function AdminLibraryAbsSettingsRouteComponent() {
+  const { serviceId } = adminLibraryAbsSettingsRoute.useParams();
+  return <LibraryAbsSettingsPage key={`${serviceId}:admin`} serviceId={serviceId} admin />;
 }
 
 /** 处理管理员媒体库海报墙路由参数。 */
@@ -429,6 +442,12 @@ const userLibraryEmbySettingsRoute = createRoute({
   component: UserLibraryEmbySettingsRouteComponent,
 });
 
+const userLibraryAbsSettingsRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "libraries/$serviceId/abs",
+  component: UserLibraryAbsSettingsRouteComponent,
+});
+
 const adminRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "admin",
@@ -522,6 +541,12 @@ const adminLibraryEmbySettingsRoute = createRoute({
   component: AdminLibraryEmbySettingsRouteComponent,
 });
 
+const adminLibraryAbsSettingsRoute = createRoute({
+  getParentRoute: () => adminRoute,
+  path: "libraries/$serviceId/abs",
+  component: AdminLibraryAbsSettingsRouteComponent,
+});
+
 const adminPluginsRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "plugins",
@@ -581,6 +606,7 @@ const appRouteTree = appRoute.addChildren([
   userLibraryScanScheduleRoute,
   userLibraryJellyfinSettingsRoute,
   userLibraryEmbySettingsRoute,
+  userLibraryAbsSettingsRoute,
 ]);
 
 /** 组合超级管理员后台子路由。 */
@@ -599,6 +625,7 @@ const adminRouteTree = adminRoute.addChildren([
   adminLibraryScanScheduleRoute,
   adminLibraryJellyfinSettingsRoute,
   adminLibraryEmbySettingsRoute,
+  adminLibraryAbsSettingsRoute,
   adminPluginsRoute,
   adminAiModelsRoute,
   adminConfigurationRoute,

@@ -7,6 +7,8 @@ export interface ContentSourcePlugin {
   displayName: string;
   status: "enabled" | "disabled" | "imported" | "uninstalled";
   adapter: "cms_json" | "netease_http" | "python_spider";
+  /** 缺省沿用原适配器分类，听书 Python 源通过清单明确声明。 */
+  mediaType?: "video" | "music" | "audiobook";
   description: string;
 }
 

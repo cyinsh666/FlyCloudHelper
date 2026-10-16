@@ -109,7 +109,7 @@ function readExpectedRevision(value: unknown): number | undefined {
 
 /** 在线内容由源插件同步目录，不能进入网盘路径、刮削和文件规格任务。 */
 export function requireDriveLibrary(libraryKind: string): void {
-  if (libraryKind === "content_source_video" || libraryKind === "content_source_music") {
+  if (["content_source_video", "content_source_music", "content_source_audiobook"].includes(libraryKind)) {
     throw new ApiError(409, "content_source_requires_catalog_sync", "在线内容库请在内容源设置中同步目录");
   }
 }
@@ -538,6 +538,9 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     if (Object.keys(patch).length === 0) throw validationError("library", "没有可更新的媒体库字段");
     // 关键变量：先沿用仓储的同步任务与停用校验，成功提交 disabled 后再停止在线视频请求。
     const library = await runtime.repository.updateLibrary(request.params.libraryId, user.id, patch);
+    if (patch.status === "disabled" && library.libraryKind === "content_source_audiobook") {
+      await runtime.contentAudiobooks.withLibraryCatalogChange(library.id, async () => undefined);
+    }
     if (patch.status === "disabled" && library.libraryKind === "content_source_video") {
       // 关键变量：按库所属用户和绑定版本判断视频源，停用插件也能完成详情及目录清理。
       const binding = await runtime.database.query("content_source_libraries as b")
@@ -565,7 +568,7 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     }
     // 关键变量：管理员读取库的真实归属，再按所属用户调用更新，不扩展其他编辑权限。
     const library = await runtime.repository.getLibrary(request.params.libraryId);
-    if (library.libraryKind !== "content_source_video" && library.libraryKind !== "content_source_music") {
+    if (!["content_source_video", "content_source_music", "content_source_audiobook"].includes(library.libraryKind)) {
       throw new ApiError(409, "content_library_name_only", "此接口仅支持修改在线媒体库名称");
     }
     const updated = await runtime.repository.updateLibrary(library.id, library.userId, { displayName });
@@ -643,10 +646,10 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     );
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-media-library-metadata-profile",
-      事件: library.dataType === "music" ? "更新音乐媒体库元数据配置" : "更新影视媒体库元数据配置",
+      事件: library.dataType === "audiobook" ? "更新有声书媒体库元数据配置" : library.dataType === "music" ? "更新音乐媒体库元数据配置" : "更新影视媒体库元数据配置",
       用户ID: user.id,
       媒体库ID: library.id,
-      ...(library.dataType === "music" ? readMusicMetadataLogFields(profile) : readVideoMetadataLogFields(profile)),
+      ...(library.dataType === "audiobook" ? {} : library.dataType === "music" ? readMusicMetadataLogFields(profile) : readVideoMetadataLogFields(profile)),
     });
     return { library: updated };
   });
@@ -879,6 +882,8 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
       ? await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, user.id))
       : library.libraryKind === "content_source_music"
         ? await runtime.contentMusic.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, user.id))
+      : library.libraryKind === "content_source_audiobook"
+        ? await runtime.contentAudiobooks.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, user.id))
       : await runtime.repository.clearLibraryCatalog(library.id, user.id);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-media-library-catalog-clear",
@@ -901,6 +906,8 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
       ? await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, library.userId))
       : library.libraryKind === "content_source_music"
         ? await runtime.contentMusic.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, library.userId))
+      : library.libraryKind === "content_source_audiobook"
+        ? await runtime.contentAudiobooks.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, library.userId))
       : await runtime.repository.clearLibraryCatalog(library.id, library.userId);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-media-library-catalog-clear",
@@ -923,6 +930,8 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
       await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id, user.id));
     } else if (library.libraryKind === "content_source_music") {
       await runtime.contentMusic.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id, user.id));
+    } else if (library.libraryKind === "content_source_audiobook") {
+      await runtime.contentAudiobooks.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id, user.id));
     } else {
       await runtime.repository.deleteLibrary(library.id, user.id);
     }
@@ -945,6 +954,8 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
       await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id));
     } else if (library.libraryKind === "content_source_music") {
       await runtime.contentMusic.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id));
+    } else if (library.libraryKind === "content_source_audiobook") {
+      await runtime.contentAudiobooks.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id));
     } else {
       await runtime.repository.deleteLibrary(library.id);
     }

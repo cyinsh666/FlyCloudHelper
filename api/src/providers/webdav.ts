@@ -103,7 +103,7 @@ export class WebDavProvider implements ProviderAdapter {
     displayName: "WebDAV",
     adapterVersion: "1.0.0",
     credentialSchemaVersion: 1,
-    supportedDataTypes: ["video", "music"],
+    supportedDataTypes: ["video", "music", "audiobook"],
     capabilities: [
       "list",
       "readText",

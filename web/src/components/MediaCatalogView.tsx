@@ -42,6 +42,10 @@ const catalogSortLabels: Record<CatalogSort, string> = {
 };
 
 const metadataLabels: Record<string, string> = {
+  authors: "作者",
+  narrators: "演播者",
+  bookTitle: "书名",
+  audioFileCount: "音轨文件数",
   artist: "艺术家",
   artists: "艺术家",
   album: "专辑",
@@ -272,12 +276,13 @@ function MediaDetailDialog({
   const metadata = getDisplayMetadata(item.metadata);
   const externalIds = Object.entries(item.externalIds).filter(([, value]) => Boolean(value));
   const mediaProbeSummary = item.mediaProbeSummary;
-  const isContentSource = item.libraryKind === "content_source_video" || item.libraryKind === "content_source_music";
+  const isContentSource = item.libraryKind === "content_source_video" || item.libraryKind === "content_source_music" || item.libraryKind === "content_source_audiobook";
   const canMatchVideo = !isContentSource && item.mediaType === "video" && (item.itemType === "video.movie" || item.itemType === "video.series");
   const aggregateSourceNames = item.libraryKind === "cloud_aggregate_video" && Array.isArray(item.sourceNames) ? item.sourceNames : [];
   // 关键变量：只有节目详情使用季集位置展示子项，电影及其他媒体保持原展示。
   const isSeries = item.itemType === "video.series";
   const isMusicAlbum = item.itemType === "music.album";
+  const isAudiobook = item.itemType === "audiobook.book";
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center p-3 sm:p-6">
@@ -355,7 +360,7 @@ function MediaDetailDialog({
                 <div className="mt-3 flex flex-wrap gap-2">{externalIds.map(([key, value]) => <StatusPill key={key}>{key.toLocaleUpperCase("zh-CN")}：{value}</StatusPill>)}</div>
               </div>
             )}
-            {isContentSource ? <div className="rounded-xl border border-border bg-secondary/30 p-4"><p className="text-xs text-muted-foreground">{item.libraryKind === "content_source_music" ? "歌曲来自在线音乐源，通过该媒体库的 Navidrome 服务地址播放。" : "内容和分集来自在线源，通过该媒体库的 Jellyfin、Emby 服务地址播放。"}</p></div> : <div>
+            {isContentSource ? <div className="rounded-xl border border-border bg-secondary/30 p-4"><p className="text-xs text-muted-foreground">{item.libraryKind === "content_source_audiobook" ? "书籍与章节来自在线听书源，通过该媒体库的 Audiobookshelf（ABS）服务地址收听。" : item.libraryKind === "content_source_music" ? "歌曲来自在线音乐源，通过该媒体库的 Navidrome 服务地址播放。" : "内容和分集来自在线源，通过该媒体库的 Jellyfin、Emby 服务地址播放。"}</p></div> : <div>
               <h3 className="flex items-center gap-2 text-sm font-semibold"><FolderOpen className="size-4" /> 文件路径</h3>
               {loading ? <p className="mt-3 text-sm text-muted-foreground">正在读取路径…</p> : paths.length > 0 ? (
                 <ul className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
@@ -403,7 +408,7 @@ function MediaDetailDialog({
               </div>
             )}
             <div>
-              <h3 className="flex items-center gap-2 text-sm font-semibold">{isMusicAlbum && <Music2 className="size-4" />}{isSeries ? "剧集列表" : isMusicAlbum ? "歌曲" : "子项"}</h3>
+              <h3 className="flex items-center gap-2 text-sm font-semibold">{isMusicAlbum && <Music2 className="size-4" />}{isSeries ? "剧集列表" : isMusicAlbum ? "歌曲" : isAudiobook ? "章节" : "子项"}</h3>
               {loading ? <p className="mt-3 text-sm text-muted-foreground">正在读取详情…</p> : error ? <p className="mt-3 text-sm text-destructive">{error}</p> : children.length > 0 ? (
                 <ul className="mt-3 max-h-[32rem] space-y-2 overflow-y-auto pr-1">
                   {children.map((child) => {
@@ -429,7 +434,7 @@ function MediaDetailDialog({
                     );
                   })}
                 </ul>
-              ) : <p className="mt-3 text-sm text-muted-foreground">{isSeries ? "当前节目没有剧集" : isMusicAlbum ? "当前专辑没有歌曲" : "当前条目没有子项"}</p>}
+              ) : <p className="mt-3 text-sm text-muted-foreground">{isSeries ? "当前节目没有剧集" : isMusicAlbum ? "当前专辑没有歌曲" : isAudiobook ? "当前书籍没有章节" : "当前条目没有子项"}</p>}
             </div>
             <div className="mt-5 rounded-xl border border-border bg-secondary/30 p-4 text-xs leading-6 text-muted-foreground">
               所属用户：{item.ownerUsername}<br />所属媒体库：{item.serviceName}<br />{aggregateSourceNames.length > 0 && <>网盘来源：{aggregateSourceNames.join("、")}<br /></>}该页面不提供播放、下载或网盘地址。
@@ -448,6 +453,7 @@ export function MediaCatalogView({
   contextDescription,
   items,
   fixedService = false,
+  fixedMediaType,
   showOwner = false,
   total,
   catalogVersion,
@@ -465,6 +471,8 @@ export function MediaCatalogView({
   contextDescription: string;
   items: MediaItem[];
   fixedService?: boolean;
+  /** 单个有声书库固定展示书籍，不允许筛选到其他媒体类型。 */
+  fixedMediaType?: MediaType;
   showOwner?: boolean;
   total?: number;
   catalogVersion?: number;
@@ -480,7 +488,7 @@ export function MediaCatalogView({
   initialItemLibraryId?: string;
 }) {
   const [search, setSearch] = useState("");
-  const [mediaType, setMediaType] = useState<MediaType | "all">("all");
+  const [mediaType, setMediaType] = useState<MediaType | "all">(fixedMediaType ?? "all");
   // 关键变量：影视子类型和匹配状态共同决定海报墙可见条目，匹配状态按需求默认已匹配。
   const [videoItemType, setVideoItemType] = useState<"all" | "video.movie" | "video.series">("all");
   // 关键变量：音乐分类单独保存，切换影视筛选时不丢失用户上一次选择。
@@ -545,11 +553,16 @@ export function MediaCatalogView({
     setDetailError(null);
     setDetailLoading(true);
     try {
+      // 关键变量：在线听书首次打开详情会补齐章节，子项请求必须等待详情写入完成。
+      const detailRequest = getMediaItem(item, admin);
+      const childrenRequest = item.libraryKind === "content_source_audiobook"
+        ? detailRequest.then(() => listMediaItemChildren(item, admin))
+        : listMediaItemChildren(item, admin);
       const [detail, children, artists, paths] = await Promise.all([
-        getMediaItem(item, admin),
-        listMediaItemChildren(item, admin),
+        detailRequest,
+        childrenRequest,
         item.itemType === "music.album" ? listMediaItemArtists(item, admin) : Promise.resolve([]),
-        item.libraryKind === "content_source_video" || item.libraryKind === "content_source_music" ? Promise.resolve([]) : listMediaItemPaths(item, admin),
+        item.libraryKind === "content_source_video" || item.libraryKind === "content_source_music" || item.libraryKind === "content_source_audiobook" ? Promise.resolve([]) : listMediaItemPaths(item, admin),
       ]);
       setSelectedItem(detail);
       setSelectedChildren(children);
@@ -669,27 +682,28 @@ export function MediaCatalogView({
               className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
             />
           </div>
-          <div className="flex flex-wrap items-center gap-2">
+          {!fixedMediaType && <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs text-muted-foreground">媒体类型</span>
             <FilterChip active={mediaType === "all"} onClick={() => { setMediaType("all"); setVideoItemType("all"); setMusicItemType("all"); }}>全部</FilterChip>
             <FilterChip active={mediaType === "video"} onClick={() => { setMediaType("video"); setMusicItemType("all"); }}>影视</FilterChip>
             <FilterChip active={mediaType === "music"} onClick={() => { setMediaType("music"); setVideoItemType("all"); }}>音乐</FilterChip>
             <FilterChip active={mediaType === "audiobook"} onClick={() => { setMediaType("audiobook"); setVideoItemType("all"); setMusicItemType("all"); }}>有声书</FilterChip>
-          </div>
+          </div>}
         </div>
-        <div className="mt-3 flex flex-wrap items-center gap-2">
+        {(!fixedMediaType || fixedMediaType === "video") && <div className="mt-3 flex flex-wrap items-center gap-2">
           <span className="text-xs text-muted-foreground">影视类型</span>
           <FilterChip active={videoItemType === "all"} onClick={() => setVideoItemType("all")}>全部</FilterChip>
           <FilterChip active={videoItemType === "video.movie"} onClick={() => { setMediaType("video"); setMusicItemType("all"); setVideoItemType("video.movie"); }}>电影</FilterChip>
           <FilterChip active={videoItemType === "video.series"} onClick={() => { setMediaType("video"); setMusicItemType("all"); setVideoItemType("video.series"); }}>节目</FilterChip>
-        </div>
-        <div className="mt-3 flex flex-wrap items-center gap-2">
+        </div>}
+        {(!fixedMediaType || fixedMediaType === "music") && <div className="mt-3 flex flex-wrap items-center gap-2">
           <span className="text-xs text-muted-foreground">音乐分类</span>
           <FilterChip active={musicItemType === "all"} onClick={() => setMusicItemType("all")}>全部</FilterChip>
           <FilterChip active={musicItemType === "music.track"} onClick={() => { setMediaType("music"); setVideoItemType("all"); setMusicItemType("music.track"); }}>歌曲</FilterChip>
           <FilterChip active={musicItemType === "music.album"} onClick={() => { setMediaType("music"); setVideoItemType("all"); setMusicItemType("music.album"); }}>专辑</FilterChip>
           <FilterChip active={musicItemType === "music.artist"} onClick={() => { setMediaType("music"); setVideoItemType("all"); setMusicItemType("music.artist"); }}>艺术家</FilterChip>
-        </div>
+        </div>}
+        {fixedMediaType === "audiobook" && <p className="mt-3 text-xs text-muted-foreground">有声书作品 · 点击封面查看书籍资料和章节。</p>}
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <span className="text-xs text-muted-foreground">匹配状态</span>
           <FilterChip active={matchState === "matched"} onClick={() => setMatchState("matched")}>已匹配</FilterChip>

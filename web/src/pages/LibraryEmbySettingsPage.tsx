@@ -35,7 +35,10 @@ async function copyEmbyAddress(value: string): Promise<void> {
 /** 管理单个媒体库的独立 Emby 播放、地区分组、地址和多账号。 */
 export function LibraryEmbySettingsPage({ serviceId, admin = false }: { serviceId: string; admin?: boolean }) {
   const resource = useApiResource(async () => {
-    const [service, settings] = await Promise.all([getLibrary(serviceId, admin).then((result) => ({ ...result.library, libraryId: result.library.id })), getServiceAccessSettings(serviceId, admin)]);
+    const detail = await getLibrary(serviceId, admin);
+    if (detail.library.dataType === "audiobook") throw new Error("有声书库请使用 ABS 账号与配置");
+    const service = { ...detail.library, libraryId: detail.library.id };
+    const settings = await getServiceAccessSettings(serviceId, admin);
     return { service, settings };
   }, [serviceId, admin]);
   const [message, setMessage] = useState<string | null>(null);

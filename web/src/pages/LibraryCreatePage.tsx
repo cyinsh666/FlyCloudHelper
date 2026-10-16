@@ -73,7 +73,9 @@ export function LibraryCreatePage({ serviceId = "" }: { serviceId?: string }) {
     }
     setMessage("正在创建媒体库…");
     try {
-      const metadata = dataType === "music"
+      const metadata = dataType === "audiobook"
+        ? { profiles: { audiobook: { enabled: true, provider: "local", preferEmbeddedMetadata: true, extractEmbeddedChapters: true } } }
+        : dataType === "music"
         ? { profiles: { music: { providerId: "auto", aggregateMode: "fast", requiredFields: { artist: true, album: true, cover: true, lyrics: false } } } }
         : { profiles: { video: { providerId: "builtin.tmdb", language: "zh-CN", region: "CN", useNfo: true, syncDetails: false, analyzeMediaSpecs: false, aiCleaning: { enabled: false, modelId: "", triggerMode: "weak_or_unmatched", minConfidence: 0.75 } } } };
       const result = libraryKind === "cloud_aggregate_video"
@@ -100,7 +102,7 @@ export function LibraryCreatePage({ serviceId = "" }: { serviceId?: string }) {
   const modeSelection = !serviceId && <fieldset><legend className="text-xs text-muted-foreground">媒体库模式</legend><div className="mt-1.5 grid gap-2 sm:grid-cols-3">
     <button type="button" onClick={() => { setLibraryKind("cloud_aggregate_video"); setDataType("video"); }} className={`rounded-lg border px-3 py-2.5 text-left ${libraryKind === "cloud_aggregate_video" ? "border-foreground" : "border-border"}`}><span className="block text-sm font-medium">云聚合视频库</span><span className="mt-0.5 block text-xs text-muted-foreground">多个网盘来源，共用一个影视海报墙。</span></button>
     <button type="button" onClick={() => setLibraryKind("legacy_single_source")} className={`rounded-lg border px-3 py-2.5 text-left ${libraryKind === "legacy_single_source" ? "border-foreground" : "border-border"}`}><span className="block text-sm font-medium">旧单源媒体库</span><span className="mt-0.5 block text-xs text-muted-foreground">保留现有单个服务对应一个媒体库的模式。</span></button>
-    <button type="button" onClick={() => { setLibraryKind("content_source_video"); setDataType("video"); }} className={`rounded-lg border px-3 py-2.5 text-left ${libraryKind === "content_source_video" ? "border-foreground" : "border-border"}`}><span className="block text-sm font-medium">在线内容源媒体库</span><span className="mt-0.5 block text-xs text-muted-foreground">选择独立的影视或音乐源插件，创建在线媒体库。</span></button>
+    <button type="button" onClick={() => { setLibraryKind("content_source_video"); setDataType("video"); }} className={`rounded-lg border px-3 py-2.5 text-left ${libraryKind === "content_source_video" ? "border-foreground" : "border-border"}`}><span className="block text-sm font-medium">在线内容源媒体库</span><span className="mt-0.5 block text-xs text-muted-foreground">选择独立的影视、音乐或听书源插件，创建在线媒体库。</span></button>
   </div></fieldset>;
   const availableLegacyServices = services.data?.filter((service) => service.canCreateLibrary) ?? [];
   return <><PageHeader title="创建媒体库" /><Panel className="p-4 sm:p-4"><div className="grid gap-3">{modeSelection}
@@ -110,7 +112,7 @@ export function LibraryCreatePage({ serviceId = "" }: { serviceId?: string }) {
       {services.data.length === 0 && <p className="text-xs text-muted-foreground">当前没有可添加的网盘服务，也可以先创建空的云聚合库。</p>}
     </div><p className="mt-1.5 text-xs text-muted-foreground">这里只建立当前媒体库与网盘服务的来源关系；连接状态和登录凭据由网盘服务统一管理，已有扫描、刮削和海报墙数据不会带入。</p></fieldset> : <label><span className="text-xs text-muted-foreground">来源服务</span><select disabled={Boolean(serviceId)} value={selectedServiceId} onChange={(event) => selectSource(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm"><option value="">请选择网盘服务</option>{availableLegacyServices.map((service) => <option key={service.id} value={service.id}>{service.displayName} · {service.providerType}</option>)}</select></label>}
     <label><span className="text-xs text-muted-foreground">媒体库名称</span><input required value={displayName} onChange={(event) => changeDisplayName(event.target.value)} maxLength={100} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label>
-    {libraryKind === "legacy_single_source" && <fieldset><legend className="text-xs text-muted-foreground">媒体库类型</legend><div className="mt-1.5 flex gap-2">{(["video", "music"] as MediaType[]).map((type) => <button key={type} type="button" onClick={() => setDataType(type)} className={`rounded-lg border px-3 py-1.5 text-sm ${dataType === type ? "border-foreground" : "border-border"}`}>{type === "video" ? "影视" : "音乐"}</button>)}</div></fieldset>}
+    {libraryKind === "legacy_single_source" && <fieldset><legend className="text-xs text-muted-foreground">媒体库类型</legend><div className="mt-1.5 flex flex-wrap gap-2">{(["video", "music", "audiobook"] as MediaType[]).map((type) => <button key={type} type="button" onClick={() => setDataType(type)} className={`rounded-lg border px-3 py-1.5 text-sm ${dataType === type ? "border-foreground" : "border-border"}`}>{type === "video" ? "影视" : type === "music" ? "音乐" : "有声书 · ABS"}</button>)}</div>{dataType === "audiobook" && <p className="mt-2 text-xs text-muted-foreground">按目录和音频标签整理书籍及章节，通过 Audiobookshelf 协议提供客户端访问。</p>}</fieldset>}
     <p className="text-xs text-muted-foreground">创建后在媒体库设置中配置每个来源自己的扫描路径，再统一管理元数据、通知和对外访问。</p><div className="[&_button]:px-3 [&_button]:py-2"><PrimaryButton type="submit" disabled={!displayName.trim() || (libraryKind === "legacy_single_source" && !selectedServiceId)}>创建媒体库</PrimaryButton></div>{message && <p className="text-sm text-muted-foreground">{message}</p>}
   </form>}</div></Panel></>;
 }

@@ -3,7 +3,7 @@ import type { ScanCreatedMediaCounts } from "./service-repository.js";
 
 /** 创建通知统计失败时使用的空结果，保证扫描完成通知仍然能够送达。 */
 export function createEmptyScanCreatedMediaCounts(): ScanCreatedMediaCounts {
-  return { videoContentCount: 0, videoContents: [], songCount: 0, albumCount: 0, artistCount: 0 };
+  return { videoContentCount: 0, videoContents: [], songCount: 0, albumCount: 0, artistCount: 0, bookCount: 0, chapterCount: 0 };
 }
 
 /** 把本次新增的影视内容转换为通知明细，最多展示仓储层返回的五条内容。 */
@@ -28,6 +28,9 @@ export function buildScanCompletionMessage(
   createdMediaCounts: ScanCreatedMediaCounts,
 ): string {
   const scanModeLabel = job.scanMode === "full" ? "全量" : "增量";
+  if (job.dataType === "audiobook") {
+    return `服务“${job.serviceName}”的${scanModeLabel}扫描已完成：新增入库 ${createdMediaCounts.bookCount ?? 0} 本有声书、${createdMediaCounts.chapterCount ?? 0} 个音频文件。`;
+  }
   if (job.dataType === "music") {
     return `服务“${job.serviceName}”的${scanModeLabel}扫描已完成：新增入库 ${createdMediaCounts.songCount} 首歌曲、${createdMediaCounts.albumCount} 张专辑、${createdMediaCounts.artistCount} 位艺术家。`;
   }

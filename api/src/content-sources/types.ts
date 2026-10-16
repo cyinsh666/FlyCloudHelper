@@ -6,6 +6,8 @@ export interface ContentSourceManifest {
   displayName: string;
   description: string;
   adapter: "cms_json" | "python_spider" | "netease_http";
+  /** Python 听书源显式声明有声书；未声明的既有 Python 源仍按视频处理。 */
+  mediaType?: "video" | "music" | "audiobook";
   endpoint: string;
   headers?: Record<string, string>;
   /** 指定电影父分类；其他已选分类按节目分集。 */
@@ -30,6 +32,8 @@ export interface ContentSourcePluginRecord {
   displayName: string;
   description: string;
   adapter: ContentSourceManifest["adapter"];
+  /** 建库入口依据插件声明选择领域，不根据名称猜测影视或听书。 */
+  mediaType?: "video" | "music" | "audiobook";
   status: "enabled" | "disabled" | "imported" | "uninstalled";
 }
 

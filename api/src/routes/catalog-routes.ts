@@ -10,11 +10,12 @@ import {
 } from "../media/manual-video-match.js";
 import { hydrateRealtimeVideoDetails } from "../media/realtime-video-details.js";
 import type { ApiRuntime } from "../runtime.js";
+import { ensureContentAudiobookDetail } from "../audiobooks/content-source-detail.js";
 
 /** 查询媒体库并强制当前用户归属。 */
 async function requireLibrary(runtime: ApiRuntime, libraryId: string, userId: string) {
   const row = await runtime.database.query("media_libraries as l")
-    .select("l.id", "l.catalog_version")
+    .select("l.id", "l.catalog_version", "l.library_kind")
     .where("l.id", libraryId)
     .where("l.user_id", userId)
     .first();
@@ -69,6 +70,15 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
       ? sortValue as CatalogSort
       : "created_desc";
     const pagination = readPagination(request.query);
+    const searchTerm = typeof request.query.search === "string" ? request.query.search : typeof request.query.q === "string" ? request.query.q : "";
+    const remoteIds = library.library_kind === "content_source_audiobook" && searchTerm.trim()
+      ? await runtime.contentAudiobooks.search(request.params.libraryId, user.id, searchTerm, Math.min(200, pagination.offset + pagination.limit))
+      : undefined;
+    // 关键变量：实时搜索可能写入新摘要，返回写入后的目录版本。
+    const catalogVersion = remoteIds === undefined
+      ? Number(library.catalog_version)
+      : Number((await requireLibrary(runtime, request.params.libraryId, user.id)).catalog_version);
+    if (remoteIds?.length === 0) return { items: [], total: 0, catalogVersion };
     // 关键变量：目录查询耗时用于判断 SQLite 是否再次被扫描任务或慢查询阻塞。
     const queryStartedAt = Date.now();
     request.log.info({
@@ -83,17 +93,15 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
       const result = await runtime.repository.listCatalogItems({
         userId: user.id,
         libraryId: request.params.libraryId,
-        itemIds: typeof request.query.ids === "string"
+        itemIds: remoteIds ?? (typeof request.query.ids === "string"
           ? request.query.ids.split(",").map((value) => value.trim()).filter((value) => value.length > 0).slice(0, 200)
-          : undefined,
+          : undefined),
         mediaType: typeof request.query.mediaType === "string" ? request.query.mediaType as MediaType : undefined,
         itemType: typeof request.query.itemType === "string" ? request.query.itemType : undefined,
         matchState: typeof request.query.matchState === "string" ? request.query.matchState as MatchState : undefined,
         categoryKey: typeof request.query.categoryKey === "string" ? request.query.categoryKey : undefined,
         genre: typeof request.query.genre === "string" ? request.query.genre : undefined,
-        search: typeof request.query.search === "string"
-          ? request.query.search
-          : typeof request.query.q === "string" ? request.query.q : undefined,
+        search: remoteIds === undefined ? searchTerm || undefined : undefined,
         sort,
         ...pagination,
       });
@@ -105,7 +113,7 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
         返回数量: result.items.length,
         总数量: result.total,
       });
-      return { ...result, catalogVersion: Number(library.catalog_version) };
+      return { ...result, catalogVersion };
     } catch (error) {
       request.log.warn({
         日志关键字: "codex-catalog-query",
@@ -126,7 +134,8 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
     await requireLibrary(runtime, request.params.libraryId, user.id);
     const item = await requireLibraryItem(runtime, user.id, request.params.libraryId, request.params.itemId);
     // 网页单条详情与标准协议共用 Python 补齐，权限检查完成后才请求源站。
-    await runtime.contentSources.ensureItemDetail(request.params.libraryId, user.id, item.id);
+    if (item.libraryKind === "content_source_audiobook") await ensureContentAudiobookDetail(runtime, item);
+    else await runtime.contentSources.ensureItemDetail(request.params.libraryId, user.id, item.id);
     const detailed = await requireLibraryItem(runtime, user.id, request.params.libraryId, item.id);
     return { item: await hydrateRealtimeVideoDetails(runtime, detailed) };
   });
@@ -134,8 +143,9 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
   server.get<{ Params: { libraryId: string; itemId: string } }>("/api/v1/libraries/:libraryId/items/:itemId/children", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     await requireLibrary(runtime, request.params.libraryId, user.id);
-    await requireLibraryItem(runtime, user.id, request.params.libraryId, request.params.itemId);
-    await runtime.contentSources.ensureItemDetail(request.params.libraryId, user.id, request.params.itemId);
+    const item = await requireLibraryItem(runtime, user.id, request.params.libraryId, request.params.itemId);
+    if (item.libraryKind === "content_source_audiobook") await ensureContentAudiobookDetail(runtime, item);
+    else await runtime.contentSources.ensureItemDetail(request.params.libraryId, user.id, request.params.itemId);
     return { items: await runtime.repository.listCatalogChildren(request.params.itemId, user.id) };
   });
 

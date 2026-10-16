@@ -33,7 +33,7 @@ const BROWSE_CACHE_MS = 30_000;
 /** 核对视频库和来源的归属，管理员入口使用媒体库所属用户的凭据。 */
 async function requireBrowseContext(runtime: ApiRuntime, libraryId: string, sourceId: string, userId?: string): Promise<BrowseContext> {
   const library = await runtime.repository.getLibrary(libraryId, userId);
-  if (library.libraryKind === "content_source_video" || library.libraryKind === "content_source_music") {
+  if (["content_source_video", "content_source_music", "content_source_audiobook"].includes(library.libraryKind)) {
     throw new ApiError(409, "content_source_has_no_drive_files", "在线内容库请使用目录同步管理内容");
   }
   if (library.dataType !== "video") throw new ApiError(409, "video_library_required", "文件浏览当前只支持视频媒体库");

@@ -33,6 +33,11 @@ import { registerContentSourceRoutes, registerContentMusicRoutes } from "./route
 import { PublicAccessService } from "./public-access.js";
 import { ServiceAccessService } from "./service-access.js";
 import { EmbyAccessService } from "./emby-access.js";
+import { AbsAccessService } from "./abs/access.js";
+import { registerAbsRoutes } from "./routes/abs-routes.js";
+import { registerAbsSettingsRoutes } from "./routes/abs-settings-routes.js";
+import { registerContentAudiobookRoutes } from "./routes/content-audiobook-routes.js";
+import { ContentAudiobookManager } from "./content-sources/audiobook-manager.js";
 import { registerScanFailureReportRoutes } from "./routes/scan-failure-report-routes.js";
 import { registerServiceRoutes } from "./routes/service-routes.js";
 import { registerLibraryRoutes } from "./routes/library-routes.js";
@@ -162,6 +167,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   database.setNotificationDeliveryHandler((notification) => telegramNotifications.enqueue(notification));
   const serviceAccess = new ServiceAccessService(database, vault);
   const embyAccess = new EmbyAccessService(database);
+  const absAccess = new AbsAccessService(database, config);
   const repository = new ServiceRepository(database, serviceAccess, logger, {
     mediaProbeConcurrency: config.mediaProbeConcurrency,
   });
@@ -201,6 +207,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   const contentSources = new ContentSourceManager(database, config, repository);
   await contentSources.initialize();
   const contentMusic = new ContentMusicManager(database, config, repository);
+  const contentAudiobooks = new ContentAudiobookManager(database, config, repository, contentSources);
+  contentSources.onInstanceStopped((instanceId) => contentAudiobooks.stopInstance(instanceId));
   const contentSourceAutoSync = new ContentSourceAutoSyncWorker({ database, contentSources, logBusinessEvent: logger });
   await contentSourceAutoSync.initialize();
   const contentSourceDiagnostics = new ContentSourceDiagnostics({ database, config, contentSources, logBusinessEvent: logger });
@@ -253,6 +261,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     plugins,
     contentSources,
     contentMusic,
+    contentAudiobooks,
     contentSourceAutoSync,
     contentSourceDiagnostics,
     aiModels,
@@ -260,6 +269,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     publicAccess,
     serviceAccess,
     embyAccess,
+    absAccess,
     telegramNotifications,
     logBusinessEvent: logger,
   };
@@ -275,6 +285,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   server.addHook("onClose", async () => {
     await contentSourceAutoSync.stop();
     await contentSourceDiagnostics.shutdown();
+    await contentAudiobooks.shutdown();
     await contentSources.shutdown();
     await contentMusic.shutdown();
     await telegramNotifications.close();
@@ -290,7 +301,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     const requiresReadyState = request.url.startsWith("/api/")
       || request.url.startsWith("/j/")
       || request.url.startsWith("/e/")
-      || request.url.startsWith("/n/");
+      || request.url.startsWith("/n/")
+      || request.url.startsWith("/abs/");
     const systemState = requiresReadyState ? await database.getSystemState() : null;
     if (systemState?.setupRequired && !isSetupPublicPath(request.url)) {
       throw new ApiError(503, "setup_required", "实例尚未完成首次初始化");
@@ -455,6 +467,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerLibraryFileRoutes(server, runtime);
   await registerScanScheduleRoutes(server, runtime, scanSchedules);
   await registerServiceAccessRoutes(server, runtime);
+  await registerAbsSettingsRoutes(server, runtime);
   await registerScanFailureReportRoutes(server, runtime);
   await registerCatalogRoutes(server, runtime);
   server.log.info({ 日志关键字: "codex-library-route-registration", 路由: "GET /api/v1/libraries/:libraryId", 结果: "唯一注册" });
@@ -462,6 +475,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerJellyfinRoutes(server, runtime);
   await registerEmbyRoutes(server, runtime);
   await registerNavidromeRoutes(server, runtime);
+  await registerAbsRoutes(server, runtime);
   await registerNotificationRoutes(server, runtime);
   await registerAdminNotificationSettingsRoutes(server, runtime);
   await registerAdminRoutes(server, runtime);
@@ -469,6 +483,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerPluginRoutes(server, runtime);
   await registerContentSourceRoutes(server, runtime);
   await registerContentMusicRoutes(server, runtime);
+  await registerContentAudiobookRoutes(server, runtime);
 
   if (fs.existsSync(config.webDistDirectory)) {
     await server.register(fastifyStatic, {

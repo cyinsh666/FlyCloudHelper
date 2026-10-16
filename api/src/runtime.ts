@@ -13,11 +13,13 @@ import type { ScanWorker } from "./worker.js";
 import type { PublicAccessService } from "./public-access.js";
 import type { ServiceAccessService } from "./service-access.js";
 import type { EmbyAccessService } from "./emby-access.js";
+import type { AbsAccessService } from "./abs/access.js";
 import type { MediaProbeWorker } from "./media-probe-worker.js";
 import type { ScanScheduleStore, ScanScheduleWorker } from "./scan-schedule-service.js";
 import type { TelegramNotificationService } from "./telegram-notification-service.js";
 import type { ContentSourceManager } from "./content-sources/manager.js";
 import type { ContentMusicManager } from "./content-sources/music-manager.js";
+import type { ContentAudiobookManager } from "./content-sources/audiobook-manager.js";
 import type { ContentSourceAutoSyncWorker } from "./content-sources/auto-sync.js";
 import type { ContentSourceDiagnostics } from "./content-sources/diagnostics.js";
 
@@ -40,6 +42,8 @@ export interface ApiRuntime {
   contentSources: ContentSourceManager;
   /** 独立音乐源目录和播放定位，与网盘服务及文件扫描分开。 */
   contentMusic: ContentMusicManager;
+  /** 在线有声书摘要、实时搜索、按需章节和播放取址，复用标准 ABS 出口。 */
+  contentAudiobooks: ContentAudiobookManager;
   /** 用户主动开启的内容源更新计划，不与网盘定时扫描混用。 */
   contentSourceAutoSync: ContentSourceAutoSyncWorker;
   /** 内容源目录、线路抽查与最近播放失败的持久摘要。 */
@@ -50,6 +54,8 @@ export interface ApiRuntime {
   serviceAccess: ServiceAccessService;
   /** 独立 Emby 协议账号、令牌和会话服务，不能与 Jellyfin 共用。 */
   embyAccess: EmbyAccessService;
+  /** 按有声书媒体库隔离的 ABS 账号、JWT 和刷新会话。 */
+  absAccess: AbsAccessService;
   telegramNotifications: TelegramNotificationService;
   logBusinessEvent: (
     level: "info" | "warn",

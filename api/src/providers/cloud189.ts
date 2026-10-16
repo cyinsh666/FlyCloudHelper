@@ -40,7 +40,7 @@ export class Cloud189Provider extends CloudDriveProviderBase {
   private readonly sessionRefreshCoordinator = new CredentialRefreshCoordinator<Cloud189SessionResult>();
   public readonly descriptor: ProviderDescriptor = {
     type: "cloud189", displayName: "天翼云盘", adapterVersion: "1.0.0", credentialSchemaVersion: 1,
-    supportedDataTypes: ["video", "music"],
+    supportedDataTypes: ["video", "music", "audiobook"],
     capabilities: ["list", "stableResourceId", "playbackLocator", "directDownload", "relay", "personalCloud"],
     recommendedScanSettings: createProviderRecommendedScanSettings({ scanDirectoryConcurrency: { default: 2 } }),
     authenticationMode: "authorization_session", authMethods: [{ type: "qr", displayName: "扫码登录", interaction: "qr", recommended: true }],

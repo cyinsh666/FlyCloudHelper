@@ -23,7 +23,7 @@ export class QuarkProvider extends CloudDriveProviderBase {
   private readonly latestCookies = new Map<string, string>();
   public readonly descriptor: ProviderDescriptor = {
     type: "quark", displayName: "夸克网盘", adapterVersion: "1.0.0", credentialSchemaVersion: 1,
-    supportedDataTypes: ["video", "music"],
+    supportedDataTypes: ["video", "music", "audiobook"],
     capabilities: ["list", "stableResourceId", "playbackLocator", "directDownload", "relay"],
     recommendedScanSettings: createProviderRecommendedScanSettings({ scanDirectoryConcurrency: { default: 3 } }),
     authenticationMode: "authorization_session", authMethods: [{ type: "qr", displayName: "扫码登录", interaction: "qr", recommended: true }],

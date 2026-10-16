@@ -143,7 +143,7 @@ export async function requestJson<T>(path: string, init?: RequestInit): Promise<
 }
 
 export type MediaType = "video" | "music" | "audiobook";
-export type MediaLibraryKind = "legacy_single_source" | "cloud_aggregate_video" | "content_source_video" | "content_source_music";
+export type MediaLibraryKind = "legacy_single_source" | "cloud_aggregate_video" | "content_source_video" | "content_source_music" | "content_source_audiobook";
 export type CatalogSort = "created_desc" | "year_desc" | "premiere_date_desc" | "title_asc";
 export type MatchState = "matched" | "needs_review" | "unmatched" | "processing";
 export type ServiceStatus = "active" | "scanning" | "disabled" | "reauthorization_required";
@@ -345,6 +345,8 @@ export interface MediaLibrary {
   jellyfinEnabled: boolean;
   embyEnabled: boolean;
   navidromeEnabled: boolean;
+  /** 有声书库独立的 Audiobookshelf 协议开关。 */
+  absEnabled?: boolean;
   scanProfileRevision: number;
   metadataProfileRevision: number;
   catalogVersion: number;
@@ -450,7 +452,7 @@ export interface ServiceAccessSettings {
 export interface CreateCloudServiceResult { service: ServiceDetail; }
 export interface CreateMediaLibraryResult {
   library: MediaLibrary;
-  accessCredentials: { account: ServiceAccessAccount; password: string };
+  accessCredentials: { account: ServiceAccessAccount; password: string } | null;
 }
 
 

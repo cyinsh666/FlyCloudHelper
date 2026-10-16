@@ -8,7 +8,7 @@ export type JobStatus = "queued" | "running" | "retry_waiting" | "paused" | "com
 export type BackgroundJobType = "scan" | "media_probe";
 export type JobStage = "queued" | "enumerating" | "classifying" | "scraping" | "persisting" | "probing" | "completed";
 export type MediaType = "video" | "music" | "audiobook";
-export type MediaLibraryKind = "legacy_single_source" | "cloud_aggregate_video" | "content_source_video" | "content_source_music";
+export type MediaLibraryKind = "legacy_single_source" | "cloud_aggregate_video" | "content_source_video" | "content_source_music" | "content_source_audiobook";
 /** 文件浏览启动的精确视频扫描范围，跟随任务快照持久化并用于重试。 */
 export interface TargetedVideoScanScope {
   kind: "folder" | "video";
@@ -132,6 +132,8 @@ export interface MediaLibraryRecord {
   jellyfinEnabled: boolean;
   embyEnabled: boolean;
   navidromeEnabled: boolean;
+  /** 有声书媒体库独立 ABS 协议的启用状态。 */
+  absEnabled: boolean;
   scanProfileRevision: number;
   metadataProfileRevision: number;
   catalogVersion: number;

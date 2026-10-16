@@ -108,7 +108,7 @@ export class PythonSpiderRuntime {
   }
 
   /** 在独立进程中解析脚本 AST，不导入脚本，不创建 Spider，也不调用 getName。 */
-  public async inspect(scriptPath: string): Promise<{ name: string; methods: string[] }> {
+  public async inspect(scriptPath: string): Promise<{ name: string; methods: string[]; mediaType: "video" | "audiobook" }> {
     const worker = this.startWorker(`inspect-${randomUUID()}`, scriptPath);
     try {
       const value = await this.enqueue(worker, "__inspect__", []);
@@ -119,7 +119,8 @@ export class PythonSpiderRuntime {
       }
       const methods = new Set(result.methods as string[]);
       if (REQUIRED_SOURCE_METHODS.some((method) => !methods.has(method))) throw sourceError("python_source_method_missing");
-      return { name: result.name, methods: result.methods as string[] };
+      if (result.mediaType !== undefined && result.mediaType !== "video" && result.mediaType !== "audiobook") throw sourceError("python_source_result_invalid");
+      return { name: result.name, methods: result.methods as string[], mediaType: result.mediaType === "audiobook" ? "audiobook" : "video" };
     } finally {
       await this.stopWorker(worker, sourceError("python_source_stopped"), true);
     }

@@ -5,6 +5,7 @@ import type { Knex } from "knex";
 import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
 import { createMusicScanTables } from "./music/scan-state.js";
+import { initializeAbsSchema } from "./abs/schema.js";
 import {
   allowHistoricalServiceIdNull,
   backfillHistoricalProtocolPaths,
@@ -15,7 +16,7 @@ import {
   requireHistoricalLibrary,
 } from "./schema-upgrade-compatibility.js";
 
-export const currentSchemaVersion = 63;
+export const currentSchemaVersion = 65;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -2215,6 +2216,7 @@ export async function migrateDatabase(database: Knex, exportDirectory: string): 
   await migrateProtocolOwnershipToLibraries(database);
   await createOperationTables(database);
   await createMusicScanTables(database);
+  await initializeAbsSchema(database);
 
   const now = new Date().toISOString();
   if (!existingState) {

@@ -6,9 +6,15 @@ import type { ApiConfig } from "../config.js";
 import type { MediaDescriptor } from "../media/filename.js";
 import type { ProviderEntry, ProviderFileStreamAccess } from "../providers/types.js";
 
-export const AUDIO_TAG_PARSER_VERSION = "ffprobe-audio-tags-v4";
+export const AUDIO_TAG_PARSER_VERSION = "ffprobe-audio-tags-v5-chapters";
 
 export interface AudioTagFields {
+  /** 有声书原始标签；可选以兼容已有音乐文件快照。 */
+  authors?: string[];
+  narrators?: string[];
+  description?: string;
+  publisher?: string;
+  language?: string;
   title: string;
   artists: string[];
   album: string;
@@ -53,6 +59,8 @@ export interface AudioTagReadResult {
   errorCode: string | null;
   errorMessage: string | null;
   readAt: string;
+  /** 单个音频文件内的章节，start/end 使用秒，不是毫秒或协议 ticks。 */
+  chapters?: Array<{ id: string; title: string; start: number; end: number }>;
 }
 
 interface FfprobeStream {
@@ -76,6 +84,7 @@ interface FfprobeDocument {
     tags?: Record<string, unknown>;
   };
   streams?: FfprobeStream[];
+  chapters?: Array<{ id?: number | string; start_time?: string; end_time?: string; tags?: Record<string, unknown> }>;
 }
 
 /** 构建音频标签缓存指纹，文件或解析器变化后自动失效。 */
@@ -146,6 +155,11 @@ function mapFfprobeDocument(document: FfprobeDocument, readBytesLimit: number): 
   const artists = readTagList(readTag(tags, ["artist", "artists", "performer"]));
   const albumArtists = readTagList(readTag(tags, ["album_artist", "albumartist"]));
   const mappedTags: AudioTagFields = {
+    authors: readTagList(readTag(tags, ["author", "writer", "artist", "album_artist", "albumartist"])),
+    narrators: readTagList(readTag(tags, ["narrator", "narrators", "read_by", "readby", "performer"])),
+    description: readTag(tags, ["description", "comment", "synopsis"]),
+    publisher: readTag(tags, ["publisher", "organization"]),
+    language: readTag(tags, ["language"]),
     title: readTag(tags, ["title"]),
     artists,
     album: readTag(tags, ["album"]),
@@ -168,7 +182,8 @@ function mapFfprobeDocument(document: FfprobeDocument, readBytesLimit: number): 
     musicBrainzArtistIds: readTagList(readTag(tags, ["musicbrainz_artistid"])),
     musicBrainzAlbumArtistIds: readTagList(readTag(tags, ["musicbrainz_albumartistid"])),
   };
-  const durationSeconds = Number(document.format?.duration ?? audioStream?.duration ?? 0);
+  const durationSeconds = [document.format?.duration, audioStream?.duration]
+    .map((value) => Number(value)).find((value) => Number.isFinite(value) && value > 0) ?? 0;
   const technical: AudioTechnicalFields = {
     durationMs: Number.isFinite(durationSeconds) && durationSeconds > 0 ? Math.round(durationSeconds * 1000) : 0,
     container: String(document.format?.format_name ?? "").split(",", 1)[0] ?? "",
@@ -190,6 +205,13 @@ function mapFfprobeDocument(document: FfprobeDocument, readBytesLimit: number): 
     errorCode: null,
     errorMessage: null,
     readAt: new Date().toISOString(),
+    chapters: (Array.isArray(document.chapters) ? document.chapters : []).flatMap((chapter, index) => {
+      const start = Number(chapter.start_time);
+      const end = Number(chapter.end_time);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start) return [];
+      const chapterTags = indexTags(chapter.tags);
+      return [{ id: String(chapter.id ?? index), title: readTag(chapterTags, ["title"]) || `第 ${index + 1} 章`, start, end }];
+    }).sort((left, right) => left.start - right.start || left.end - right.end),
   };
 }
 
@@ -295,9 +317,9 @@ export function readRemoteAudioTags(input: {
   const readBytesLimit = Math.min(input.config.ffprobeProbeSizeBytes, 2 * 1024 * 1024);
   const args = [
     "-hide_banner", "-v", "error", "-print_format", "json",
-    "-show_format", "-show_streams", "-analyzeduration", "0", "-probesize", String(readBytesLimit),
+    "-show_format", "-show_streams", "-show_chapters", "-analyzeduration", "0", "-probesize", String(readBytesLimit),
     "-show_entries",
-    "format=format_name,duration,bit_rate:format_tags:stream=codec_type,codec_name,sample_rate,channels,channel_layout,bits_per_raw_sample,bits_per_sample,duration,disposition:stream_tags",
+    "format=format_name,duration,bit_rate:format_tags:stream=codec_type,codec_name,sample_rate,channels,channel_layout,bits_per_raw_sample,bits_per_sample,duration,disposition:stream_tags:chapter=id,start_time,end_time:chapter_tags",
   ];
   const headerText = buildFfprobeHeaders(input.access.headers);
   if (headerText) args.push("-headers", headerText);

@@ -36,6 +36,10 @@ export async function registerContentSourceRoutes(server: FastifyInstance, runti
   /** 读取插件分类只做预览，不提前创建用户源记录。 */
   server.get<{ Params: { pluginId: string; version: string } }>("/api/v1/content-source-plugins/:pluginId/:version/categories", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
+    const manifest = await runtime.contentSources.manifestForPlugin(request.params.pluginId, request.params.version);
+    if (manifest.mediaType === "audiobook") {
+      return { items: await runtime.contentAudiobooks.previewPluginCategories(manifest.pluginId, manifest.version, user.id) };
+    }
     return { items: await runtime.contentSources.previewPluginCategories(request.params.pluginId, request.params.version, user.id) };
   });
 
@@ -61,7 +65,9 @@ export async function registerContentSourceRoutes(server: FastifyInstance, runti
       ...(request.body.initialPageCount !== undefined ? { initialPageCount: Number(request.body.initialPageCount) } : {}),
     };
     const source = await runtime.contentSources.createInstance(user.id, { pluginId: manifest.pluginId, pluginVersion: manifest.version, displayName: manifest.displayName });
-    const result = await runtime.contentSources.createLibrary(source.id, user.id, input);
+    const result = manifest.mediaType === "audiobook"
+      ? await runtime.contentAudiobooks.createLibrary(source.id, user.id, input)
+      : await runtime.contentSources.createLibrary(source.id, user.id, input);
     reply.code(201);
     return result;
   });
@@ -133,12 +139,21 @@ export async function registerContentSourceRoutes(server: FastifyInstance, runti
 
   server.get<{ Params: { id: string } }>("/api/v1/content-sources/:id/categories", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
+    const manifest = await runtime.contentSources.manifestForInstance(request.params.id, user.id);
+    if (manifest.mediaType === "audiobook") return { items: await runtime.contentAudiobooks.categories(request.params.id, user.id) };
     return { items: await runtime.contentSources.categories(request.params.id, user.id) };
   });
 
   server.post<{ Params: { id: string }; Body: Record<string, unknown> }>("/api/v1/content-sources/:id/libraries", async (request, reply) => {
     const user = await requireRequestUser(request, runtime.database);
     const manifest = await runtime.contentSources.manifestForInstance(request.params.id, user.id);
+    if (manifest.mediaType === "audiobook") {
+      const result = await runtime.contentAudiobooks.createLibrary(request.params.id, user.id, {
+        displayName: requireString(request.body, "displayName", "媒体库名称", 100),
+        categoryIds: readCategoryIds(request.body.categoryIds),
+      });
+      return reply.code(201).send(result);
+    }
     if (manifest.adapter === "netease_http") {
       const result = await runtime.contentMusic.createLibrary(request.params.id, user.id, {
         displayName: requireString(request.body, "displayName", "媒体库名称", 100),

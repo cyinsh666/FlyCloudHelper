@@ -1,6 +1,6 @@
 import { MusicScanStages } from "../components/MusicScanStages";
 import { Link } from "@tanstack/react-router";
-import { Download, Images, Layers3, Music2, Pause, Play, Plus, Radio, RefreshCw, RotateCcw, Settings2, Sparkles, Square, Trash2 } from "lucide-react";
+import { BookOpen, Download, Images, Layers3, Music2, Pause, Play, Plus, Radio, RefreshCw, RotateCcw, Settings2, Sparkles, Square, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { AdminServiceFilters } from "@/components/AdminServiceFilters";
@@ -157,14 +157,14 @@ function getScannedMediaLabel(dataType: "video" | "music" | "audiobook"): string
 /** 根据服务数据类型显示完成处理的媒体业务对象。 */
 function getProcessedMediaLabel(dataType: "video" | "music" | "audiobook"): string {
   if (dataType === "music") return "处理曲目";
-  if (dataType === "audiobook") return "处理有声书";
+  if (dataType === "audiobook") return "处理作品";
   return "处理影片";
 }
 
 /** 根据服务数据类型说明任务处理数量的统计口径。 */
 function getProcessedMediaDescription(dataType: "video" | "music" | "audiobook"): string {
   if (dataType === "music") return "已经完成标签读取、元数据刮削和落库的曲目文件数量";
-  if (dataType === "audiobook") return "已经完成识别、元数据刮削和落库的有声书数量";
+  if (dataType === "audiobook") return "已完成本地标签、章节整理和落库的有声书作品数量；单个音轨文件不单独算一本书";
   return "按 Flymby APP 刮削任务聚合后，已经成功处理或最终失败的完整电影、节目数量";
 }
 
@@ -1014,11 +1014,11 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
             <header className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
               <div className="flex min-w-0 items-center gap-3">
                 <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-border text-xs font-semibold" style={{ backgroundImage: "var(--gradient-surface)" }}>
-                  {library.libraryKind === "content_source_music" ? <Music2 className="size-5 text-muted-foreground" /> : library.libraryKind === "content_source_video" ? <Images className="size-5 text-muted-foreground" /> : <ProviderSelectionIcon providerType={library.libraryKind === "cloud_aggregate_video" ? "aggregate" : library.providerType} />}
+                  {library.libraryKind === "content_source_audiobook" ? <BookOpen className="size-5 text-muted-foreground" /> : library.libraryKind === "content_source_music" ? <Music2 className="size-5 text-muted-foreground" /> : library.libraryKind === "content_source_video" ? <Images className="size-5 text-muted-foreground" /> : <ProviderSelectionIcon providerType={library.libraryKind === "cloud_aggregate_video" ? "aggregate" : library.providerType} />}
                 </span>
                 <div className="min-w-0">
                   <h2 className="truncate text-sm font-semibold">{library.displayName}</h2>
-                  <p className="truncate text-[11px] text-muted-foreground">{library.libraryKind === "content_source_music" ? `在线音乐源 · ${library.sourceServiceName}` : library.libraryKind === "content_source_video" ? `在线内容源 · ${library.sourceServiceName}` : library.libraryKind === "cloud_aggregate_video" ? `云聚合视频库 · ${library.sourceCount} 个来源` : `${library.sourceServiceName} · ${library.providerType}`}{admin ? ` · ${library.ownerUsername}` : ""}</p>
+                  <p className="truncate text-[11px] text-muted-foreground">{library.libraryKind === "content_source_audiobook" ? `在线听书源 · ${library.sourceServiceName}` : library.libraryKind === "content_source_music" ? `在线音乐源 · ${library.sourceServiceName}` : library.libraryKind === "content_source_video" ? `在线内容源 · ${library.sourceServiceName}` : library.libraryKind === "cloud_aggregate_video" ? `云聚合视频库 · ${library.sourceCount} 个来源` : `${library.sourceServiceName} · ${library.providerType}`}{admin ? ` · ${library.ownerUsername}` : ""}</p>
                 </div>
               </div>
               <span className={`mt-1 size-2.5 rounded-full ${library.status === "active" && library.sourceConnectionStatus === "valid" ? "bg-success" : "bg-warning"}`} title={library.status === "active" ? "媒体库已启用" : "媒体库已停用"} />
@@ -1027,7 +1027,7 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
               <StatusPill>{catalogDataTypeLabels[library.dataType] ?? library.dataType}</StatusPill>
               <span>条目 {library.itemCount.toLocaleString()}</span>
               <span>版本 v{library.catalogVersion}</span>
-              {library.dataType === "music" ? <span>Navidrome {library.navidromeEnabled ? "已启用" : "未启用"}</span> : <span>Jellyfin {library.jellyfinEnabled ? "已启用" : "未启用"}</span>}
+              {library.dataType === "music" ? <span>Navidrome {library.navidromeEnabled ? "已启用" : "未启用"}</span> : library.dataType === "audiobook" ? <span>ABS {library.absEnabled ? "已启用" : "未启用"}</span> : <span>Jellyfin {library.jellyfinEnabled ? "已启用" : "未启用"}</span>}
             </div>
             <footer className="mt-3 flex flex-wrap gap-2 border-t border-border/70 pt-3">
               <Link to={admin ? "/admin/libraries/$serviceId/catalog" : "/app/libraries/$serviceId/catalog"} params={{ serviceId: library.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Images className="size-3.5" /> 海报</Link>

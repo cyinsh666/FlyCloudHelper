@@ -80,12 +80,14 @@ function selectedVideoCategories(input: string[], available: ContentSourceCatego
 /** 清单转换为管理端公开摘要，接口地址和请求头保留在服务端。 */
 function mapPlugin(row: Record<string, unknown>): ContentSourcePluginRecord {
   const manifest = parseJsonObject(row.manifest_json);
-  return { pluginId: String(row.plugin_id), version: String(row.version), displayName: String(manifest.displayName), description: String(manifest.description ?? ""), adapter: manifest.adapter === "netease_http" ? "netease_http" : manifest.adapter === "python_spider" ? "python_spider" : "cms_json", status: String(row.status) as ContentSourcePluginRecord["status"] };
+  return { pluginId: String(row.plugin_id), version: String(row.version), displayName: String(manifest.displayName), description: String(manifest.description ?? ""), adapter: manifest.adapter === "netease_http" ? "netease_http" : manifest.adapter === "python_spider" ? "python_spider" : "cms_json", mediaType: manifest.mediaType === "audiobook" ? "audiobook" : manifest.adapter === "netease_http" ? "music" : "video", status: String(row.status) as ContentSourcePluginRecord["status"] };
 }
 
 /** 管理内容源插件和用户实例，统一 CMS、Python 视频目录与即时播放取址。 */
 export class ContentSourceManager {
   public readonly pythonRuntime: PythonSpiderRuntime;
+  /** 其他内容领域在同一实例停用时一并取消请求，不各自保留可回填的旧会话。 */
+  private readonly instanceStopListeners = new Set<(instanceId: string) => Promise<void>>();
   private readonly pythonAdapters = new Map<string, PythonVideoSourceAdapter>();
   private readonly jobs = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   private readonly categoryLibraryReader: SourceCategoryLibraryReader;
@@ -168,7 +170,7 @@ export class ContentSourceManager {
       }
       throw error;
     }
-    return { pluginId: manifest.pluginId, version: manifest.version, displayName: manifest.displayName, description: manifest.description, adapter: manifest.adapter, status: "imported" };
+    return { pluginId: manifest.pluginId, version: manifest.version, displayName: manifest.displayName, description: manifest.description, adapter: manifest.adapter, mediaType: manifest.mediaType ?? (manifest.adapter === "netease_http" ? "music" : "video"), status: "imported" };
   }
 
   /** 启停或卸载仅改变执行状态，保留已绑定版本、实例、媒体库和观看记录。 */
@@ -279,8 +281,19 @@ export class ContentSourceManager {
     return source;
   }
 
+  /** 听书等领域复用真实实例归属与启停校验，不绕过插件固定版本。 */
+  public async sourceForInstance(instanceId: string, userId: string): Promise<ContentSourceInstance> {
+    return this.instance(instanceId, userId);
+  }
+
+  /** 绑定不同媒体领域的取消入口，生命周期仍由插件及实例管理统一触发。 */
+  public onInstanceStopped(listener: (instanceId: string) => Promise<void>): void {
+    this.instanceStopListeners.add(listener);
+  }
+
   /** 停止 CMS 与 Python 的详情任务，再释放 Python 缓存和宿主，重新启用使用新会话。 */
   private async stopPythonAdapter(instanceId: string): Promise<void> {
+    await Promise.all([...this.instanceStopListeners].map((listener) => listener(instanceId)));
     await this.itemDetails.stopInstance(instanceId);
     this.pythonAdapters.get(instanceId)?.invalidate();
     this.pythonAdapters.delete(instanceId);
@@ -296,6 +309,7 @@ export class ContentSourceManager {
 
   /** CMS 保持原执行方式，Python 按实例保留适配器与分类上下文。 */
   private videoAdapter(manifest: ContentSourceManifest, instanceId: string): { adapter: VideoSourceAdapter; manifest: ContentSourceManifest } {
+    if (manifest.mediaType === "audiobook") throw new ApiError(409, "content_audiobook_adapter_required", "有声书源请使用在线有声书目录入口");
     if (manifest.adapter === "netease_http") throw new ApiError(409, "content_music_adapter_required", "网易音乐源请使用在线音乐目录入口");
     if (manifest.adapter === "python_spider") {
       let adapter = this.pythonAdapters.get(instanceId);

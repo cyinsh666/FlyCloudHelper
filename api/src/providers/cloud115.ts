@@ -41,7 +41,7 @@ export class Cloud115Provider extends CloudDriveProviderBase {
   private readonly recentRefreshes = new Map<string, Cloud115RecentRefresh>();
   public readonly descriptor: ProviderDescriptor = {
     type: "cloud115", displayName: "115网盘", adapterVersion: "1.0.0", credentialSchemaVersion: 1,
-    supportedDataTypes: ["video", "music"],
+    supportedDataTypes: ["video", "music", "audiobook"],
     capabilities: ["list", "stableResourceId", "playbackLocator", "directDownload", "relay"],
     recommendedScanSettings: createProviderRecommendedScanSettings({ scanDirectoryConcurrency: { default: 4 } }),
     authenticationMode: "authorization_session", authMethods: [{ type: "qr", displayName: "扫码登录", interaction: "qr", recommended: true }],

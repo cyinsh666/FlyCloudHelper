@@ -12,6 +12,7 @@ async function requireManagedLibrary(runtime: ApiRuntime, request: FastifyReques
     ? await requireSuperAdmin(request, runtime.database)
     : await requireRequestUser(request, runtime.database);
   const library = await runtime.repository.getLibrary(libraryId, admin ? undefined : operator.id);
+  if (library.dataType === "audiobook") throw new ApiError(409, "audiobook_uses_abs", "有声书媒体库请使用 ABS 协议配置");
   const service = library.libraryKind !== "legacy_single_source"
     ? { id: library.id, providerType: library.sources[0]?.providerType ?? "" }
     : await runtime.repository.getServiceDetail(library.sourceServiceId, admin ? undefined : operator.id);

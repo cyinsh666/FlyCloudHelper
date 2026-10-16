@@ -38,6 +38,7 @@ import {
   type AudioTagReadResult,
 } from "./music/audio-tag-reader.js";
 import { ServiceAccessService, type GeneratedLibraryAccessCredentials } from "./service-access.js";
+import { refreshAudiobookCatalogSummaries } from "./audiobooks/catalog.js";
 
 type ServiceRepositoryLogger = (
   level: "info" | "warn",
@@ -128,6 +129,7 @@ interface LibraryRow {
   jellyfin_enabled: number | string | boolean;
   emby_enabled: number | string | boolean;
   navidrome_enabled: number | string | boolean;
+  abs_enabled: number | string | boolean;
   scan_profile_revision: number | string;
   metadata_profile_revision: number | string;
   catalog_version: number | string;
@@ -307,6 +309,9 @@ export interface ScanCreatedMediaCounts {
   songCount: number;
   albumCount: number;
   artistCount: number;
+  /** 本轮有声书新增作品与音频章节数。 */
+  bookCount?: number;
+  chapterCount?: number;
 }
 
 /** 把媒体标题限制为适合单行 Telegram 通知展示的长度。 */
@@ -364,6 +369,7 @@ function mapLibrary(row: LibraryRow, sources: LibrarySourceRecord[] = []): Media
     jellyfinEnabled: Number(row.jellyfin_enabled) === 1 || row.jellyfin_enabled === true,
     embyEnabled: Number(row.emby_enabled) === 1 || row.emby_enabled === true,
     navidromeEnabled: Number(row.navidrome_enabled) === 1 || row.navidrome_enabled === true,
+    absEnabled: Number(row.abs_enabled) === 1 || row.abs_enabled === true,
     scanProfileRevision: Number(row.scan_profile_revision),
     metadataProfileRevision: Number(row.metadata_profile_revision),
     catalogVersion: Number(row.catalog_version),
@@ -961,7 +967,8 @@ export class ServiceRepository {
       .leftJoin("media_items as m", function joinActiveMedia() {
         this.on("m.library_id", "=", "l.id")
           .andOnNull("m.deleted_at")
-          .andOnVal("m.item_type", "<>", "video.episode");
+          .andOnVal("m.item_type", "<>", "video.episode")
+          .andOnVal("m.item_type", "<>", "audiobook.chapter");
       })
       .leftJoin("library_sources as source_count_rows", function joinVisibleSources() {
         this.on("source_count_rows.library_id", "=", "l.id")
@@ -979,6 +986,7 @@ export class ServiceRepository {
         "l.jellyfin_enabled",
         "l.emby_enabled",
         "l.navidrome_enabled",
+        "l.abs_enabled",
         "l.scan_profile_revision",
         "l.metadata_profile_revision",
         "l.catalog_version",
@@ -991,7 +999,7 @@ export class ServiceRepository {
       .groupBy(
         "l.id", "l.user_id", "u.username", "l.display_name", "l.data_type", "l.status",
         "l.library_kind",
-        "l.notification_enabled", "l.jellyfin_enabled", "l.emby_enabled", "l.navidrome_enabled",
+        "l.notification_enabled", "l.jellyfin_enabled", "l.emby_enabled", "l.navidrome_enabled", "l.abs_enabled",
         "l.scan_profile_revision", "l.metadata_profile_revision", "l.catalog_version",
         "l.last_scan_at", "l.created_at", "l.updated_at",
       );
@@ -1086,7 +1094,7 @@ export class ServiceRepository {
     dataType: MediaType;
     scanProfile: Record<string, unknown>;
     metadataProfile: Record<string, unknown>;
-  }): Promise<{ library: MediaLibraryRecord; accessCredentials: GeneratedLibraryAccessCredentials }> {
+  }): Promise<{ library: MediaLibraryRecord; accessCredentials: GeneratedLibraryAccessCredentials | null }> {
     const now = new Date().toISOString();
     let accessCredentials: GeneratedLibraryAccessCredentials | null = null;
     await this.database.query.transaction(async (transaction) => {
@@ -1127,6 +1135,10 @@ export class ServiceRepository {
         navidrome_relay_playback_enabled: 1,
         navidrome_path_suffix: input.libraryId,
         navidrome_path_suffix_lookup: input.libraryId.toLowerCase(),
+        abs_enabled: 0,
+        abs_path_suffix: input.libraryId,
+        abs_path_suffix_lookup: input.libraryId.toLowerCase(),
+        abs_relay_playback_enabled: 1,
         jellyfin_path_suffix: input.libraryId,
         jellyfin_path_suffix_lookup: input.libraryId.toLowerCase(),
         emby_path_suffix: input.libraryId,
@@ -1170,9 +1182,9 @@ export class ServiceRepository {
         created_at: now,
       });
       // 关键变量：协议账号属于媒体库，来源服务只负责保存网盘登录凭据。
-      accessCredentials = await this.serviceAccess.createForLibrary(input.libraryId, transaction);
+      if (input.dataType !== "audiobook") accessCredentials = await this.serviceAccess.createForLibrary(input.libraryId, transaction);
     });
-    if (!accessCredentials) throw new ApiError(500, "service_access_account_create_failed", "协议访问账号创建失败");
+    if (input.dataType !== "audiobook" && !accessCredentials) throw new ApiError(500, "service_access_account_create_failed", "协议访问账号创建失败");
     return { library: await this.getLibrary(input.libraryId, input.userId), accessCredentials };
   }
 
@@ -1188,7 +1200,11 @@ export class ServiceRepository {
     providerType?: "cms_json" | "python_spider";
     configuration: Record<string, unknown>;
     syncState: Record<string, unknown>;
+    /** 仅由有声书专用仓储入口传入，旧视频调用不改变行为。 */
+    mediaType?: "audiobook";
   }): Promise<{ library: MediaLibraryRecord }> {
+    const dataType = input.mediaType === "audiobook" ? "audiobook" : "video";
+    const libraryKind = dataType === "audiobook" ? "content_source_audiobook" : "content_source_video";
     const now = new Date().toISOString();
     await this.database.query.transaction(async (transaction) => {
       const instanceQuery = transaction("content_source_instances").where({ id: input.instanceId, user_id: input.userId, status: "active" });
@@ -1197,11 +1213,14 @@ export class ServiceRepository {
       if (!instance) throw new ApiError(404, "content_source_not_found", "内容源实例不存在或已停用");
       const plugin = await transaction("content_source_plugins").where({ plugin_id: instance.plugin_id, version: instance.plugin_version, status: "enabled" }).first();
       if (!plugin) throw new ApiError(409, "content_source_plugin_disabled", "请先启用内容源插件");
+      if ((parseJsonObject(plugin.manifest_json).mediaType === "audiobook") !== (dataType === "audiobook")) {
+        throw new ApiError(409, "content_source_media_type_mismatch", "插件媒体类型与要创建的媒体库不一致");
+      }
       const bound = await transaction("content_source_libraries").where({ instance_id: input.instanceId }).first();
       if (bound) throw new ApiError(409, "content_source_library_exists", "此源实例已经创建在线媒体库");
       await transaction("media_libraries").insert({
         id: input.libraryId, user_id: input.userId, display_name: input.displayName,
-        data_type: "video", library_kind: "content_source_video", singleton_key: null,
+        data_type: dataType, library_kind: libraryKind, singleton_key: null,
         catalog_version: 0, notification_enabled: 0, scan_profile_revision: 1, metadata_profile_revision: 1,
         last_scan_at: null, jellyfin_relay_playback_enabled: 1, jellyfin_download_enabled: 0,
         jellyfin_region_libraries_enabled: 0, jellyfin_enabled: 0,
@@ -1210,6 +1229,7 @@ export class ServiceRepository {
         navidrome_path_suffix: input.libraryId, navidrome_path_suffix_lookup: input.libraryId.toLowerCase(),
         jellyfin_path_suffix: input.libraryId, jellyfin_path_suffix_lookup: input.libraryId.toLowerCase(),
         emby_path_suffix: input.libraryId, emby_path_suffix_lookup: input.libraryId.toLowerCase(),
+        ...(dataType === "audiobook" ? { abs_enabled: 0, abs_path_suffix: input.libraryId, abs_path_suffix_lookup: input.libraryId.toLowerCase(), abs_relay_playback_enabled: 1 } : {}),
         status: "active", created_at: now, updated_at: now,
       });
       await transaction("library_sources").insert({
@@ -1226,14 +1246,21 @@ export class ServiceRepository {
       });
       await transaction("library_scan_profiles").insert({
         id: randomUUID(), user_id: input.userId, library_id: input.libraryId, revision: 1,
-        configuration_json: JSON.stringify({ mediaTypes: ["video"], fullRoots: [], incrementalRoots: [] }), created_at: now,
+        configuration_json: JSON.stringify({ mediaTypes: [dataType], fullRoots: [], incrementalRoots: [] }), created_at: now,
       });
       await transaction("library_metadata_profiles").insert({
         id: randomUUID(), user_id: input.userId, library_id: input.libraryId, revision: 1,
-        configuration_json: JSON.stringify({ profiles: { video: { providerId: "content_source", language: "zh-CN", analyzeMediaSpecs: false } } }), created_at: now,
+        configuration_json: JSON.stringify({ profiles: { [dataType]: { providerId: "content_source", language: "zh-CN", analyzeMediaSpecs: false } } }), created_at: now,
       });
     });
     return { library: await this.getLibrary(input.libraryId, input.userId) };
+  }
+
+  /** 复用在线库原有关系表建立有声书，不创建网盘服务、源文件或默认协议账号。 */
+  public async createContentSourceAudiobookLibrary(
+    input: Omit<Parameters<ServiceRepository["createContentSourceVideoLibrary"]>[0], "mediaType">,
+  ): Promise<{ library: MediaLibraryRecord }> {
+    return this.createContentSourceVideoLibrary({ ...input, providerType: "python_spider", mediaType: "audiobook" });
   }
 
   /** 复用既有表创建独立音乐内容源库和 Navidrome 账号，不创建网盘服务或文件记录。 */
@@ -1918,6 +1945,9 @@ export class ServiceRepository {
       if (String(library.library_kind) === "content_source_music" && patch.dataType && patch.dataType !== "music") {
         throw new ApiError(409, "content_library_music_only", "内容源音乐库不能改变媒体类型");
       }
+      if (String(library.library_kind) === "content_source_audiobook" && patch.dataType && patch.dataType !== "audiobook") {
+        throw new ApiError(409, "content_library_audiobook_only", "内容源有声书库不能改变媒体类型");
+      }
       if (patch.dataType && patch.dataType !== String(library.data_type)) {
         // 关键变量：已有目录、任务或协议配置时改变类型会使扫描结果和对外协议语义不一致。
         const [catalog, job] = await Promise.all([
@@ -1926,7 +1956,8 @@ export class ServiceRepository {
         ]);
         const protocolEnabled = Number(library.jellyfin_enabled ?? 0) === 1
           || Number(library.emby_enabled ?? 0) === 1
-          || Number(library.navidrome_enabled ?? 0) === 1;
+          || Number(library.navidrome_enabled ?? 0) === 1
+          || Number(library.abs_enabled ?? 0) === 1;
         if (catalog || job || protocolEnabled) {
           throw new ApiError(409, "library_type_change_conflict", "媒体库已有目录、任务或协议配置，不能修改类型");
         }
@@ -3798,7 +3829,7 @@ export class ServiceRepository {
       .where({ library_id: job.libraryId })
       .whereNull("deleted_at")
       .where("created_at", ">=", job.startedAt)
-      .whereIn("item_type", ["video.movie", "video.series", "music.track", "music.album", "music.artist"])
+      .whereIn("item_type", ["video.movie", "video.series", "music.track", "music.album", "music.artist", "audiobook.book", "audiobook.chapter"])
       .groupBy("item_type");
     const counts = new Map(rows.map((row) => [String(row.item_type), Number(row.count ?? 0)]));
 
@@ -3871,6 +3902,8 @@ export class ServiceRepository {
       songCount: counts.get("music.track") ?? 0,
       albumCount: counts.get("music.album") ?? 0,
       artistCount: counts.get("music.artist") ?? 0,
+      bookCount: counts.get("audiobook.book") ?? 0,
+      chapterCount: counts.get("audiobook.chapter") ?? 0,
     };
   }
 
@@ -4120,7 +4153,7 @@ export class ServiceRepository {
           last_scan_at: null,
           updated_at: new Date().toISOString(),
         });
-        if (String(library.library_kind) === "content_source_video" || String(library.library_kind) === "content_source_music") {
+        if (["content_source_video", "content_source_music", "content_source_audiobook"].includes(String(library.library_kind))) {
           await transaction("content_source_libraries").where({ library_id: libraryId }).update({
             sync_status: "idle",
             sync_json: JSON.stringify({ status: "idle", processedCount: 0, pageCount: 0, nextPageByCategory: {}, startedAt: null, finishedAt: null, lastError: null }),
@@ -4151,6 +4184,11 @@ export class ServiceRepository {
     return {
       status: row.status as AudioTagReadResult["status"],
       tags: {
+        authors: readStringArray(tags.authors),
+        narrators: readStringArray(tags.narrators),
+        description: String(tags.description ?? ""),
+        publisher: String(tags.publisher ?? ""),
+        language: String(tags.language ?? ""),
         title: String(tags.title ?? ""),
         artists: readStringArray(tags.artists),
         album: String(tags.album ?? ""),
@@ -4190,6 +4228,14 @@ export class ServiceRepository {
       errorCode: row.error_code ? String(row.error_code) : null,
       errorMessage: row.error_message ? String(row.error_message) : null,
       readAt: String(row.read_at),
+      chapters: Array.isArray(technical.chapters) ? technical.chapters.flatMap((value) => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+        const chapter = value as Record<string, unknown>;
+        const start = Number(chapter.start);
+        const end = Number(chapter.end);
+        return Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end > start
+          ? [{ id: String(chapter.id ?? ""), title: String(chapter.title ?? ""), start, end }] : [];
+      }) : [],
     };
   }
 
@@ -4210,7 +4256,7 @@ export class ServiceRepository {
         status: input.result.status,
         parser_version: AUDIO_TAG_PARSER_VERSION,
         tag_json: JSON.stringify(input.result.tags),
-        technical_json: JSON.stringify(input.result.technical),
+        technical_json: JSON.stringify({ ...input.result.technical, chapters: input.result.chapters ?? [] }),
         artwork_json: JSON.stringify(input.result.artwork),
         read_bytes_limit: input.result.readBytesLimit,
         error_code: input.result.errorCode,
@@ -4225,7 +4271,7 @@ export class ServiceRepository {
         status: input.result.status,
         parser_version: AUDIO_TAG_PARSER_VERSION,
         tag_json: JSON.stringify(input.result.tags),
-        technical_json: JSON.stringify(input.result.technical),
+        technical_json: JSON.stringify({ ...input.result.technical, chapters: input.result.chapters ?? [] }),
         artwork_json: JSON.stringify(input.result.artwork),
         read_bytes_limit: input.result.readBytesLimit,
         error_code: input.result.errorCode,
@@ -5343,11 +5389,11 @@ export class ServiceRepository {
       metadata: asObject(candidatePayload.metadata),
     } : input;
     // 关键变量：音乐平台偶发缺图时保留上一轮已成功取得的歌曲、专辑或艺术家图片。
-    const artworkPreservingInput = existing && selectedInput.mediaType === "music" ? {
+    const artworkPreservingInput = existing && (selectedInput.mediaType === "music" || selectedInput.mediaType === "audiobook") ? {
       ...selectedInput,
       posterUrl: selectedInput.posterUrl || (existing.poster_url ? String(existing.poster_url) : null),
       backdropUrl: selectedInput.backdropUrl || (existing.backdrop_url ? String(existing.backdrop_url) : null),
-      ...(selectedInput.itemType !== "music.track" ? {
+      ...(selectedInput.itemType === "music.album" || selectedInput.itemType === "music.artist" || selectedInput.itemType === "audiobook.book" ? {
         year: selectedInput.year ?? (existing.year == null ? null : Number(existing.year)),
         overview: selectedInput.overview || String(existing.overview ?? ""),
         matchState: existing.match_state === "matched" ? "matched" as const : selectedInput.matchState,
@@ -6230,6 +6276,18 @@ export class ServiceRepository {
     return orphanIds;
   }
 
+  /** 扫描对账后根据活动章节刷新作品摘要，并发布作品资料的目录版本变化。 */
+  public async refreshAudiobookBookSummaries(userId: string, libraryId: string): Promise<void> {
+    await this.database.query.transaction(async (transaction) => {
+      const libraryQuery = transaction("media_libraries").where({ id: libraryId, user_id: userId });
+      if (this.database.databaseType !== "sqlite") libraryQuery.forUpdate();
+      if (!(await libraryQuery.first())) return;
+      const now = new Date().toISOString();
+      const changedIds = await refreshAudiobookCatalogSummaries(transaction, userId, libraryId, now);
+      await this.recordCatalogItemChanges(transaction, userId, libraryId, changedIds, now);
+    });
+  }
+
   /** 查询当前用户媒体目录，管理端可省略用户并增加服务筛选。 */
   public async listCatalogItems(filters: {
     userId?: string;
@@ -6260,12 +6318,15 @@ export class ServiceRepository {
     if (filters.mediaType) base.where("m.media_type", filters.mediaType);
     if (filters.itemType) {
       base.where("m.item_type", filters.itemType);
+    } else if (filters.mediaType === "audiobook") {
+      // 有声书以作品为入口，章节通过作品详情显式读取。
+      base.where("m.item_type", "audiobook.book");
     } else if (filters.mediaType === "music") {
       // 音乐媒体库默认以专辑为入口，歌曲和艺术家通过显式分类筛选查看。
       base.where("m.item_type", "music.album");
     } else {
       // 通用海报墙不直接展示单集和歌曲；对应分类页可通过 itemType 明确请求。
-      base.whereNotIn("m.item_type", ["video.episode", "music.track"]);
+      base.whereNotIn("m.item_type", ["video.episode", "music.track", "audiobook.chapter"]);
     }
     if (filters.regionGroup) base.where("m.region_group", filters.regionGroup);
     if (filters.matchState) base.where("m.match_state", filters.matchState);
@@ -6642,10 +6703,15 @@ export class ServiceRepository {
       source_names: sourceNames.get(String(row.id)) ?? [],
     })]));
     // 关键变量：数据库批量查询不保证 IN 条件顺序，返回时恢复媒体关系中的季集排序。
-    return childIds.flatMap((childId) => {
+    const children = childIds.flatMap((childId) => {
       const child = childrenById.get(childId);
       return child ? [child] : [];
     });
+    // 关键变量：同一卷中未写章节号的文件仍按中文自然顺序排列，数据库返回顺序不参与章节排序。
+    if (parent.itemType === "audiobook.book") {
+      children.sort((left, right) => left.sortTitle.localeCompare(right.sortTitle, "zh-CN", { numeric: true }) || left.id.localeCompare(right.id));
+    }
+    return children;
   }
 
   /** 查询音乐专辑或歌曲反向关联的艺术家，不把艺术家混入原有子项列表。 */
@@ -7368,7 +7434,7 @@ export class ServiceRepository {
 
   /** 在线内容同步时阻止删除、清空或停用媒体库，和同步抢占共用媒体库行锁。 */
   private async assertContentSourceSyncIdle(transaction: Knex.Transaction, libraryId: string, libraryKind: string): Promise<void> {
-    if (libraryKind !== "content_source_video" && libraryKind !== "content_source_music") return;
+    if (!["content_source_video", "content_source_music", "content_source_audiobook"].includes(libraryKind)) return;
     const binding = await transaction("content_source_libraries").where({ library_id: libraryId }).whereIn("sync_status", ["queued", "running"]).first();
     if (binding) throw new ApiError(409, "content_library_sync_running", "在线媒体库正在同步，请等待同步结束后操作");
   }
@@ -7463,8 +7529,8 @@ export class ServiceRepository {
     const services = this.database.query("cloud_services").whereNull("deleted_at");
     const media = this.database.query("media_items as m")
       .whereNull("m.deleted_at")
-      // 概览与海报墙使用相同口径：节目单集只计入父节目，不重复计入媒体总数。
-      .whereNot("m.item_type", "video.episode");
+      // 节目单集与有声书音频文件只计入各自作品，不重复计入媒体总数。
+      .whereNotIn("m.item_type", ["video.episode", "audiobook.chapter"]);
     const jobs = this.database.query("scan_jobs");
     const mediaProbeJobs = this.database.query("media_probe_jobs");
     if (userId) {

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import type { MediaType } from "../domain.js";
 import type { ProviderEntry } from "../providers/types.js";
+import { describeAudiobookFile } from "../audiobooks/filename.js";
 import {
   buildFlymbyScrapeTaskKey,
   parseFlymbyVideoDirectory,
@@ -13,7 +14,7 @@ import {
 const videoExtensions = new Set([
   "mp4", "mkv", "avi", "mov", "wmv", "flv", "m4v", "ts", "m2ts", "mpg", "mpeg", "rmvb", "webm", "3gp", "iso", "strm",
 ]);
-const audioExtensions = new Set(["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "ape", "wma", "mka", "aiff", "aif", "dsf", "dff", "alac"]);
+const audioExtensions = new Set(["mp3", "flac", "m4a", "m4b", "aac", "ogg", "opus", "wav", "ape", "wma", "mka", "aiff", "aif", "dsf", "dff", "alac"]);
 
 export interface MediaDescriptor {
   identityKey: string;
@@ -52,21 +53,6 @@ export function getFileExtension(name: string): string {
   return path.posix.extname(value).slice(1).toLocaleLowerCase("en-US");
 }
 
-/** 清理发布组、分辨率和年份标记，保留可用于刮削的可读标题。 */
-function cleanMediaTitle(rawName: string): { title: string; year: number | null } {
-  const withoutExtension = rawName.replace(/\.[^.]+$/u, "");
-  const yearMatch = withoutExtension.match(/(?:^|[. _\-(])((?:19|20)\d{2})(?:$|[. _\-)])/u);
-  const year = yearMatch ? Number(yearMatch[1]) : null;
-  const title = withoutExtension
-    .replace(/\[[^\]]*\]/gu, " ")
-    .replace(/\b(?:2160p|1080p|720p|4k|bluray|web[- .]?dl|webrip|hdtv|x264|x265|hevc|av1)\b.*$/iu, " ")
-    .replace(/(?:^|[. _\-(])(?:19|20)\d{2}(?:$|[. _\-)])/u, " ")
-    .replace(/[._]+/gu, " ")
-    .replace(/\s+/gu, " ")
-    .trim();
-  return { title: title || withoutExtension, year };
-}
-
 /** 按根目录媒体范围和路径特征区分音乐与有声书。 */
 function resolveAudioType(entry: ProviderEntry, allowedTypes: MediaType[]): MediaType {
   if (allowedTypes.length === 1 && allowedTypes[0] === "audiobook") {
@@ -96,7 +82,7 @@ export function describeMediaFile(
     if (!allowedTypes.includes(audioType)) {
       return null;
     }
-    return audioType === "music" ? describeMusic(entry) : describeAudiobook(entry);
+    return audioType === "music" ? describeMusic(entry) : describeAudiobookFile(entry, scanRootPath);
   }
   return null;
 }
@@ -258,35 +244,5 @@ function describeMusic(entry: ProviderEntry): MediaDescriptor {
     title, sortTitle: title, subtitle: "", year: null, matchState: "unmatched",
     metadata: { fileName: entry.name, artist: "", album: "", trackNumber: 0 },
     parent: { identityKey: `music:album:${directory}`, itemType: "music.album", title: "未知专辑", subtitle: "", year: null, sortOrder: 0, relationType: "album_track" },
-  };
-}
-
-/** 按“作品/章节”目录惯例识别有声书条目。 */
-function describeAudiobook(entry: ProviderEntry): MediaDescriptor {
-  const directory = path.posix.dirname(entry.path);
-  const bookTitle = cleanMediaTitle(path.posix.basename(directory)).title;
-  const rawChapter = cleanMediaTitle(entry.name).title;
-  const chapterMatch = entry.name.match(/^\s*(\d{1,5})(?:[-._ ]|$)/u);
-  const chapterNumber = chapterMatch ? Number(chapterMatch[1]) : 0;
-  const chapterTitle = rawChapter.replace(/^\s*\d{1,5}\s*[-._ ]\s*/u, "").trim() || rawChapter;
-  return {
-    identityKey: `audiobook:chapter:${entry.resourceId}`,
-    mediaType: "audiobook",
-    itemType: "audiobook.chapter",
-    title: chapterTitle,
-    sortTitle: String(chapterNumber).padStart(7, "0"),
-    subtitle: bookTitle,
-    year: null,
-    matchState: "unmatched",
-    metadata: { chapterNumber },
-    parent: {
-      identityKey: `audiobook:book:${directory}`,
-      itemType: "audiobook.book",
-      title: bookTitle,
-      subtitle: "有声书",
-      year: null,
-      sortOrder: chapterNumber,
-      relationType: "book_chapter",
-    },
   };
 }

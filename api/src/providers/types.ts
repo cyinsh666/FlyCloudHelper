@@ -155,7 +155,7 @@ export interface ProviderDescriptor {
   adapterVersion: string;
   credentialSchemaVersion: number;
   /** Provider 可以完整执行扫描、刮削和协议访问的数据类型。 */
-  supportedDataTypes: Array<"video" | "music">;
+  supportedDataTypes: Array<"video" | "music" | "audiobook">;
   capabilities: string[];
   recommendedScanSettings: ProviderRecommendedScanSettings;
   /** 表单型 Provider 动态填写字段；authorization_session 由 FlyCloudHelper 自己完成官方扫码。 */

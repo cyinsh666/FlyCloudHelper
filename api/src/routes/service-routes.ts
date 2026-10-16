@@ -32,24 +32,24 @@ export function readServiceDescription(body: Record<string, unknown>): string | 
   return value.trim();
 }
 
-/** 当前版本允许创建的服务数据类型；有声书仍保留为后续阶段。 */
-const supportedServiceDataTypes = new Set<MediaType>(["video", "music"]);
+/** 当前版本允许创建的媒体库数据类型。 */
+const supportedServiceDataTypes = new Set<MediaType>(["video", "music", "audiobook"]);
 
-/** 校验服务级数据类型，当前开放影视和音乐。 */
+/** 校验媒体库的数据类型，网盘连接本身不区分媒体类型。 */
 export function validateServiceDataType(value: unknown): MediaType {
   if (typeof value !== "string" || !supportedServiceDataTypes.has(value as MediaType)) {
-    throw validationError("dataType", "当前服务数据类型仅支持影视或音乐");
+    throw validationError("dataType", "媒体库类型仅支持影视、音乐或有声书");
   }
   return value as MediaType;
 }
 
 /** 校验 Provider 已明确声明支持所选数据类型，避免服务创建后才在扫描阶段失败。 */
 export function validateProviderDataType(adapter: ProviderAdapter, dataType: MediaType): void {
-  if (dataType === "audiobook" || !adapter.descriptor.supportedDataTypes.includes(dataType)) {
+  if (!adapter.descriptor.supportedDataTypes.includes(dataType)) {
     throw new ApiError(
       422,
       "provider_data_type_unsupported",
-      `${adapter.descriptor.displayName}暂不支持${dataType === "music" ? "音乐" : "影视"}服务`,
+      `${adapter.descriptor.displayName}暂不支持${dataType === "audiobook" ? "有声书" : dataType === "music" ? "音乐" : "影视"}媒体库`,
     );
   }
 }
@@ -498,9 +498,28 @@ export function validateMetadataProfile(
   }
   const selectedProfile = profiles[serviceDataType];
   if (!selectedProfile || typeof selectedProfile !== "object" || Array.isArray(selectedProfile)) {
-    throw validationError(`metadata.profiles.${serviceDataType}`, `${serviceDataType === "music" ? "音乐" : "影视"}元数据配置必须是对象`);
+    throw validationError(`metadata.profiles.${serviceDataType}`, `${serviceDataType === "audiobook" ? "有声书" : serviceDataType === "music" ? "音乐" : "影视"}元数据配置必须是对象`);
   }
   const metadataSettings = selectedProfile as Record<string, unknown>;
+  if (serviceDataType === "audiobook") {
+    const allowedFields = new Set(["enabled", "provider", "providerId", "preferEmbeddedMetadata", "extractEmbeddedChapters"]);
+    for (const field of Object.keys(metadataSettings)) {
+      if (!allowedFields.has(field)) {
+        throw validationError(`metadata.profiles.audiobook.${field}`, "有声书仅支持本地音频标签与章节配置");
+      }
+    }
+    for (const field of ["enabled", "preferEmbeddedMetadata", "extractEmbeddedChapters"]) {
+      if (metadataSettings[field] !== undefined && typeof metadataSettings[field] !== "boolean") {
+        throw validationError(`metadata.profiles.audiobook.${field}`, "有声书元数据开关必须是布尔值");
+      }
+    }
+    for (const field of ["provider", "providerId"]) {
+      if (metadataSettings[field] !== undefined && metadataSettings[field] !== "local") {
+        throw validationError(`metadata.profiles.audiobook.${field}`, "有声书当前仅支持本地音频标签，不支持影视、音乐或 AI 元数据源");
+      }
+    }
+    return profile;
+  }
   if (metadataSettings.providerId !== undefined
     && (typeof metadataSettings.providerId !== "string" || !metadataSettings.providerId.trim())) {
     throw validationError(`metadata.profiles.${serviceDataType}.providerId`, "元数据来源必须是非空字符串");
