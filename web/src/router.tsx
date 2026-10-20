@@ -24,6 +24,7 @@ import { AdminServiceBasicDetailPage, UserServiceBasicDetailPage } from "@/pages
 import { LibraryCreatePage } from "@/pages/LibraryCreatePage";
 import { LibraryFileBrowsePage } from "@/pages/LibraryFileBrowsePage";
 import { LibraryAbsSettingsPage } from "@/pages/LibraryAbsSettingsPage";
+import { NativeAudiobookServicesPage } from "@/pages/native-audiobook";
 import {
   AdminCatalogPage,
   AdminJobsPage,
@@ -207,6 +208,23 @@ function UserLibraryEmbySettingsRouteComponent() {
 function UserLibraryAbsSettingsRouteComponent() {
   const { serviceId } = userLibraryAbsSettingsRoute.useParams();
   return <LibraryAbsSettingsPage key={`${serviceId}:user`} serviceId={serviceId} />;
+}
+
+/** 普通用户统一管理听书入口，实际库链接只负责预选和筛选。 */
+function UserNativeAudiobookRouteComponent() {
+  const { libraryId } = userNativeAudiobookRoute.useSearch();
+  return <NativeAudiobookServicesPage key={`user:${libraryId ?? "all"}`} libraryId={libraryId} />;
+}
+
+/** 管理员复用同一入口页面，库归属仍由服务端校验。 */
+function AdminNativeAudiobookRouteComponent() {
+  const { libraryId } = adminNativeAudiobookRoute.useSearch();
+  return <NativeAudiobookServicesPage key={`admin:${libraryId ?? "all"}`} libraryId={libraryId} admin />;
+}
+
+/** 仅接受有限的库 ID 作为设置页上下文，不从 URL 接收账号凭据。 */
+function nativeAudiobookSearch(input: Record<string, unknown>): { libraryId?: string } {
+  return typeof input.libraryId === "string" && input.libraryId.length <= 128 ? { libraryId: input.libraryId } : {};
 }
 
 /** 处理普通用户媒体库海报墙路由参数。 */
@@ -448,6 +466,13 @@ const userLibraryAbsSettingsRoute = createRoute({
   component: UserLibraryAbsSettingsRouteComponent,
 });
 
+const userNativeAudiobookRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "audiobook-services",
+  validateSearch: nativeAudiobookSearch,
+  component: UserNativeAudiobookRouteComponent,
+});
+
 const adminRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "admin",
@@ -547,6 +572,13 @@ const adminLibraryAbsSettingsRoute = createRoute({
   component: AdminLibraryAbsSettingsRouteComponent,
 });
 
+const adminNativeAudiobookRoute = createRoute({
+  getParentRoute: () => adminRoute,
+  path: "audiobook-services",
+  validateSearch: nativeAudiobookSearch,
+  component: AdminNativeAudiobookRouteComponent,
+});
+
 const adminPluginsRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "plugins",
@@ -607,6 +639,7 @@ const appRouteTree = appRoute.addChildren([
   userLibraryJellyfinSettingsRoute,
   userLibraryEmbySettingsRoute,
   userLibraryAbsSettingsRoute,
+  userNativeAudiobookRoute,
 ]);
 
 /** 组合超级管理员后台子路由。 */
@@ -626,6 +659,7 @@ const adminRouteTree = adminRoute.addChildren([
   adminLibraryJellyfinSettingsRoute,
   adminLibraryEmbySettingsRoute,
   adminLibraryAbsSettingsRoute,
+  adminNativeAudiobookRoute,
   adminPluginsRoute,
   adminAiModelsRoute,
   adminConfigurationRoute,

@@ -46,6 +46,7 @@ import {
   readVideoMetadataLogFields,
   resolveProviderConnection,
   requireSameCloudDriveAccount,
+  requireSameBaiduPanLoginSource,
   validateConfiguredScanRoots,
   validateMetadataProfile,
   validateProviderDataType,
@@ -614,10 +615,11 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       service.providerType,
       requireObject(request.body, "connection", "连接配置"),
     ).connection;
-    const result = await runtime.providers.get(service.providerType).validateConnection(connection);
     const currentConnection = runtime.vault.decrypt(
       await runtime.repository.getActiveEncryptedConnection(service.id, service.userId),
     );
+    requireSameBaiduPanLoginSource(service.providerType, currentConnection, connection);
+    const result = await runtime.providers.get(service.providerType).validateConnection(connection);
     requireSameCloudDriveAccount(service.providerType, currentConnection, connection);
     return result;
   });
@@ -634,10 +636,11 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     );
     const connection = resolvedConnection.connection;
     const adapter = runtime.providers.get(service.providerType);
-    await validateProviderAccess(adapter, connection, { fullRoots: [], incrementalRoots: [] });
     const currentConnection = runtime.vault.decrypt(
       await runtime.repository.getActiveEncryptedConnection(service.id, service.userId),
     );
+    requireSameBaiduPanLoginSource(service.providerType, currentConnection, connection);
+    await validateProviderAccess(adapter, connection, { fullRoots: [], incrementalRoots: [] });
     requireSameCloudDriveAccount(service.providerType, currentConnection, connection);
     const updated = await runtime.repository.updateConnection({
       serviceId: service.id,

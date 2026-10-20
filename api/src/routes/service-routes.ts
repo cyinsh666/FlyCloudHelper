@@ -246,12 +246,29 @@ export function consumeProviderAuthorization(
   }
 }
 
+/** 百度登录方式固定；旧网页表单未携带来源时只允许沿用原 OpenList 方式。 */
+export function requireSameBaiduPanLoginSource(
+  providerType: string,
+  currentConnection: Record<string, unknown>,
+  nextConnection: Record<string, unknown>,
+): void {
+  if (providerType !== "baidupan") return;
+  const currentSource = readConnectionIdentityText(currentConnection, "authSource") || "openlist";
+  const submittedSource = readConnectionIdentityText(nextConnection, "authSource");
+  if (!submittedSource && currentSource !== "baidu_official") nextConnection.authSource = currentSource;
+  const nextSource = readConnectionIdentityText(nextConnection, "authSource") || "openlist";
+  if (currentSource !== nextSource) {
+    throw new ApiError(409, "baidupan_auth_source_locked", "已有百度服务不能切换登录方式；官方应用连接请在 Flymby 中使用原方式重新登录后同步");
+  }
+}
+
 /** 替换连接时核对稳定账号标识，缺少历史标识则允许本次验证结果补齐。 */
 export function requireSameCloudDriveAccount(
   providerType: string,
   currentConnection: Record<string, unknown>,
   nextConnection: Record<string, unknown>,
 ): void {
+  requireSameBaiduPanLoginSource(providerType, currentConnection, nextConnection);
   const identityFields: Record<string, string[]> = {
     cloud115: ["userId"],
     cloud123: ["userId"],
@@ -765,6 +782,8 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
           requireObject(request.body, "connection", "连接配置"),
         );
         const adapter = runtime.providers.get(providerType);
+        const currentConnection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(existing.id, user.id));
+        requireSameBaiduPanLoginSource(providerType, currentConnection, resolvedConnection.connection);
         await validateProviderAccess(adapter, resolvedConnection.connection, { fullRoots: [], incrementalRoots: [] });
         await runtime.repository.updateConnection({
           serviceId: existing.id,
@@ -897,10 +916,11 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       service.providerType,
       requireObject(request.body, "connection", "连接配置"),
     ).connection;
-    const result = await runtime.providers.get(service.providerType).validateConnection(connection);
     const currentConnection = runtime.vault.decrypt(
       await runtime.repository.getActiveEncryptedConnection(service.id, user.id),
     );
+    requireSameBaiduPanLoginSource(service.providerType, currentConnection, connection);
+    const result = await runtime.providers.get(service.providerType).validateConnection(connection);
     requireSameCloudDriveAccount(service.providerType, currentConnection, connection);
     return result;
   });
@@ -917,10 +937,11 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     );
     const connection = resolvedConnection.connection;
     const adapter = runtime.providers.get(service.providerType);
-    await validateProviderAccess(adapter, connection, { fullRoots: [], incrementalRoots: [] });
     const currentConnection = runtime.vault.decrypt(
       await runtime.repository.getActiveEncryptedConnection(service.id, user.id),
     );
+    requireSameBaiduPanLoginSource(service.providerType, currentConnection, connection);
+    await validateProviderAccess(adapter, connection, { fullRoots: [], incrementalRoots: [] });
     requireSameCloudDriveAccount(service.providerType, currentConnection, connection);
     const updated = await runtime.repository.updateConnection({
       serviceId: service.id,

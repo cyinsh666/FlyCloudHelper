@@ -360,7 +360,7 @@ function MediaDetailDialog({
                 <div className="mt-3 flex flex-wrap gap-2">{externalIds.map(([key, value]) => <StatusPill key={key}>{key.toLocaleUpperCase("zh-CN")}：{value}</StatusPill>)}</div>
               </div>
             )}
-            {isContentSource ? <div className="rounded-xl border border-border bg-secondary/30 p-4"><p className="text-xs text-muted-foreground">{item.libraryKind === "content_source_audiobook" ? "书籍与章节来自在线听书源，通过该媒体库的 Audiobookshelf（ABS）服务地址收听。" : item.libraryKind === "content_source_music" ? "歌曲来自在线音乐源，通过该媒体库的 Navidrome 服务地址播放。" : "内容和分集来自在线源，通过该媒体库的 Jellyfin、Emby 服务地址播放。"}</p></div> : <div>
+            {isContentSource ? <div className="rounded-xl border border-border bg-secondary/30 p-4"><p className="text-xs text-muted-foreground">{item.libraryKind === "content_source_audiobook" ? "书籍与章节来自在线听书源，通过原生听书入口按章收听；ABS 播放需要完整、真实的章节时长。" : item.libraryKind === "content_source_music" ? "歌曲来自在线音乐源，通过该媒体库的 Navidrome 服务地址播放。" : "内容和分集来自在线源，通过该媒体库的 Jellyfin、Emby 服务地址播放。"}</p></div> : <div>
               <h3 className="flex items-center gap-2 text-sm font-semibold"><FolderOpen className="size-4" /> 文件路径</h3>
               {loading ? <p className="mt-3 text-sm text-muted-foreground">正在读取路径…</p> : paths.length > 0 ? (
                 <ul className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">

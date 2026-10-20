@@ -37,6 +37,7 @@ import { AbsAccessService } from "./abs/access.js";
 import { registerAbsRoutes } from "./routes/abs-routes.js";
 import { registerAbsSettingsRoutes } from "./routes/abs-settings-routes.js";
 import { registerContentAudiobookRoutes } from "./routes/content-audiobook-routes.js";
+import { registerNativeAudiobookRoutes } from "./native-audiobook/routes.js";
 import { ContentAudiobookManager } from "./content-sources/audiobook-manager.js";
 import { registerScanFailureReportRoutes } from "./routes/scan-failure-report-routes.js";
 import { registerServiceRoutes } from "./routes/service-routes.js";
@@ -142,6 +143,10 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
           "botToken",
           "body.botToken",
           "req.body.botToken",
+          "Password",
+          "AccessToken",
+          "body.Password",
+          "req.body.Password",
         ],
         censor: "[已脱敏]",
       },
@@ -302,7 +307,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
       || request.url.startsWith("/j/")
       || request.url.startsWith("/e/")
       || request.url.startsWith("/n/")
-      || request.url.startsWith("/abs/");
+      || request.url.startsWith("/abs/")
+      || request.url.toLowerCase().startsWith("/a/");
     const systemState = requiresReadyState ? await database.getSystemState() : null;
     if (systemState?.setupRequired && !isSetupPublicPath(request.url)) {
       throw new ApiError(503, "setup_required", "实例尚未完成首次初始化");
@@ -455,6 +461,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
         jellyfinCompatibility: true,
         embyCompatibility: true,
         navidromeCompatibility: true,
+        nativeAudiobookProtocol: true,
       },
     };
   });
@@ -484,6 +491,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerContentSourceRoutes(server, runtime);
   await registerContentMusicRoutes(server, runtime);
   await registerContentAudiobookRoutes(server, runtime);
+  await registerNativeAudiobookRoutes(server, runtime);
 
   if (fs.existsSync(config.webDistDirectory)) {
     await server.register(fastifyStatic, {

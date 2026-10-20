@@ -40,7 +40,7 @@ function readAudiobookProfile(metadata: Record<string, unknown>): Record<string,
     : {};
 }
 
-/** 有声书库紧凑设置，扫描按书籍聚合，协议仅显示 ABS。 */
+/** 有声书库紧凑设置，扫描按书籍聚合，独立协议通过各自设置页管理。 */
 export function LibraryAudiobookSettings({ state }: { state: AudiobookSettingsState }) {
   const { library, admin } = state;
   const abs = useApiResource(() => getAbsSettings(library.id, admin), [library.id, admin]);
@@ -149,6 +149,9 @@ export function LibraryAudiobookSettings({ state }: { state: AudiobookSettingsSt
                 <CalendarClock className="size-4" />
                 定时任务
               </SecondaryButton>
+            </Link>
+            <Link to={admin ? "/admin/audiobook-services" : "/app/audiobook-services"} search={{ libraryId: library.id }}>
+              <SecondaryButton><Settings2 className="size-4" />原生听书设置</SecondaryButton>
             </Link>
             <Link to={catalogPath} params={{ serviceId: library.id }}>
               <PrimaryButton>

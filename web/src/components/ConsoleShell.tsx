@@ -5,6 +5,7 @@ import {
   BrainCircuit,
   ChevronRight,
   HardDrive,
+  Headphones,
   LayoutDashboard,
   LibraryBig,
   ListChecks,
@@ -67,6 +68,7 @@ const userNavigation: NavigationItem[] = [
   { to: "/app/services", label: "我的服务", icon: HardDrive },
   { to: "/app/jobs", label: "后台任务", icon: ListChecks },
   { to: "/app/catalog", label: "媒体库", icon: LibraryBig },
+  { to: "/app/audiobook-services", label: "听书服务", icon: Headphones },
 ];
 
 /** 超级管理员后台导航。 */
@@ -76,6 +78,7 @@ const adminNavigation: NavigationItem[] = [
   { to: "/admin/services", label: "全部服务", icon: HardDrive },
   { to: "/admin/jobs", label: "后台任务", icon: ListChecks },
   { to: "/admin/catalog", label: "媒体库", icon: LibraryBig },
+  { to: "/admin/audiobook-services", label: "听书服务", icon: Headphones },
   { to: "/admin/plugins", label: "插件管理", icon: Puzzle },
   { to: "/admin/ai-models", label: "AI 模型", icon: BrainCircuit },
   { to: "/admin/config", label: "系统设置", icon: Settings2 },

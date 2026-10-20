@@ -23,6 +23,17 @@ interface PythonRequest {
   abort: () => void;
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
+  priority: number;
+  queueKey?: string;
+  discardRunningOnCancel: boolean;
+}
+
+/** 调度只影响尚未执行的调用，默认保留原有调用的普通优先级。 */
+export interface PythonInvocationOptions {
+  priority?: number;
+  queueKey?: string;
+  /** 听书普通请求放弃在途结果时继续排空响应，不终止同实例的其他等待调用。 */
+  discardRunningOnCancel?: boolean;
 }
 
 interface PythonWorker {
@@ -49,6 +60,7 @@ function sourceError(code: string): ApiError {
     python_source_stopped: [409, "Python 源实例已经停止，请重新打开"],
     python_source_busy: [503, "Python 源调用较多，请稍后重试"],
     python_source_timeout: [504, "Python 源调用超时，已结束本次源进程，请稍后重试"],
+    python_source_queue_timeout: [504, "Python 源排队超时，请稍后重试"],
     python_source_cancelled: [499, "Python 源调用已取消"],
     python_source_message_too_large: [413, "Python 源调用或返回内容超过大小限制"],
     python_source_invalid_method: [422, "Python 源方法名称无效"],
@@ -126,8 +138,8 @@ export class PythonSpiderRuntime {
     }
   }
 
-  /** 按实例串行调用；排队时间计入预算，超时或取消会释放整个实例的进程和等待项。 */
-  public async invoke(instanceId: string, scriptPath: string, method: string, args: unknown[], signal?: AbortSignal): Promise<unknown> {
+  /** 按实例串行调用；排队取消只移除该项，执行中的超时才释放源进程。 */
+  public async invoke(instanceId: string, scriptPath: string, method: string, args: unknown[], signal?: AbortSignal, options?: PythonInvocationOptions): Promise<unknown> {
     if (this.closed) throw sourceError("python_source_closed");
     if (signal?.aborted) throw sourceError("python_source_cancelled");
     if (!instanceId || !/^[A-Za-z][A-Za-z0-9_]*$/u.test(method) || !Array.isArray(args)) throw sourceError("python_source_invalid_method");
@@ -145,7 +157,19 @@ export class PythonSpiderRuntime {
       worker = this.startWorker(instanceId, resolvedScriptPath);
       this.instances.set(instanceId, worker);
     }
-    return this.enqueue(worker, method, args, signal);
+    return this.enqueue(worker, method, args, signal, options);
+  }
+
+  /** 前台合并已有预取后提升同一逻辑任务的待执行项，不启动重复 Python 调用。 */
+  public promote(instanceId: string, queueKey: string): void {
+    this.setPriority(instanceId, queueKey, 0);
+  }
+
+  /** 共享取址失去前台消费者时可以降回预取优先级，执行中的调用仍不能抢占。 */
+  public setPriority(instanceId: string, queueKey: string, priority: number): void {
+    const worker = this.instances.get(instanceId);
+    if (!worker) return;
+    for (const request of worker.queue) if (request.queueKey === queueKey) request.priority = priority;
   }
 
   /** 停止一个源实例；空闲时允许 destroy 收尾，正在调用时立即结束进程。 */
@@ -197,7 +221,7 @@ export class PythonSpiderRuntime {
   }
 
   /** 将一次调用放入有界队列，只有队头会写入 stdin，避免无限积压进程输入。 */
-  private enqueue(worker: PythonWorker, method: string, args: unknown[], signal?: AbortSignal): Promise<unknown> {
+  private enqueue(worker: PythonWorker, method: string, args: unknown[], signal?: AbortSignal, options?: PythonInvocationOptions): Promise<unknown> {
     if (worker.stopping || worker.exited) return Promise.reject(sourceError("python_source_stopped"));
     if (worker.pending.size >= MAX_PENDING_PER_WORKER) return Promise.reject(sourceError("python_source_busy"));
     const id = randomUUID();
@@ -206,10 +230,11 @@ export class PythonSpiderRuntime {
     catch { return Promise.reject(sourceError("python_source_result_invalid")); }
     if (Buffer.byteLength(serialized) > MAX_REQUEST_BYTES) return Promise.reject(sourceError("python_source_message_too_large"));
     return new Promise<unknown>((resolve, reject) => {
-      const abort = () => { void this.stopWorker(worker, sourceError("python_source_cancelled"), false); };
-      const timer = setTimeout(() => { void this.stopWorker(worker, sourceError("python_source_timeout"), false); }, REQUEST_TIMEOUT_MS);
+      const abort = () => this.cancelRequest(worker, request, sourceError("python_source_cancelled"));
+      // 关键变量：等待预算只影响当前待执行项，不能误杀正在播放的另一条调用。
+      const timer = setTimeout(() => this.cancelRequest(worker, request, sourceError("python_source_queue_timeout")), REQUEST_TIMEOUT_MS);
       timer.unref();
-      const request: PythonRequest = { id, method, serialized, timer, signal, abort, resolve, reject };
+      const request: PythonRequest = { id, method, serialized, timer, signal, abort, resolve, reject, priority: options?.priority ?? 1, queueKey: options?.queueKey, discardRunningOnCancel: options?.discardRunningOnCancel ?? false };
       worker.pending.set(id, request);
       worker.queue.push(request);
       signal?.addEventListener("abort", abort, { once: true });
@@ -218,12 +243,36 @@ export class PythonSpiderRuntime {
     });
   }
 
+  /** 未执行的取消和排队超时不终止 worker；已经执行的 Python 调用只能结束进程释放。 */
+  private cancelRequest(worker: PythonWorker, request: PythonRequest, failure: ApiError): void {
+    if (!worker.pending.has(request.id)) return;
+    if (worker.current === request) {
+      if (request.discardRunningOnCancel && failure.code === "python_source_cancelled") {
+        // 关键变量：保留current/pending及真实执行计时器，晚到响应仍必须按ID排空才能发送下一条。
+        request.signal?.removeEventListener("abort", request.abort);
+        request.reject(failure);
+        return;
+      }
+      void this.stopWorker(worker, failure, false);
+      return;
+    }
+    worker.queue = worker.queue.filter((entry) => entry !== request);
+    this.clearRequest(worker, request);
+    request.reject(failure);
+  }
+
   /** 前一响应收尾后才发送下一条调用，Python 会话不承受同实例的并发修改。 */
   private pump(worker: PythonWorker): void {
     if (worker.stopping || worker.exited || worker.current) return;
+    // 关键变量：排序稳定，同优先级仍按入队顺序；当前正在执行的请求不受提权影响。
+    worker.queue.sort((left, right) => left.priority - right.priority);
     const request = worker.queue.shift();
     if (!request) return;
     worker.current = request;
+    clearTimeout(request.timer);
+    // 关键变量：执行超时从真正写入 stdin 开始计算，排队不能消耗当前调用的执行预算。
+    request.timer = setTimeout(() => { void this.stopWorker(worker, sourceError("python_source_timeout"), false); }, REQUEST_TIMEOUT_MS);
+    request.timer.unref();
     worker.process.stdin.write(request.serialized, "utf8", (error) => {
       if (error && !worker.stopping) void this.stopWorker(worker, sourceError("python_source_protocol_failed"), false);
     });

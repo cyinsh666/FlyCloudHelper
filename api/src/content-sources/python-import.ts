@@ -101,7 +101,7 @@ export async function importPythonSource(runtime: ApiRuntime, filename: string, 
     version,
     displayName: sourceDisplayName(filename, inspection.name),
     description: inspection.mediaType === "audiobook"
-      ? "Python Spider 有声书源，通过标准 ABS 提供目录、实时搜索、章节和音频播放，章节必须提供真实时长。"
+      ? "Python Spider 有声书源，提供目录、实时搜索、章节和音频播放；原生听书协议支持未知时长，标准 ABS 播放需要真实章节时长。"
       : "Python Spider 视频内容源，通过 Jellyfin、Emby 提供目录、搜索和播放，实际能力以源站解析结果为准。",
     adapter: "python_spider",
     ...(inspection.mediaType === "audiobook" ? { mediaType: "audiobook" as const } : {}),

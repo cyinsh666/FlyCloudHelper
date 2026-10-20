@@ -247,12 +247,68 @@ class Spider(BaseSpider):
                           "vod_play_from": "audiobook", "vod_audio_tracks": audio_tracks,
                           "vod_play_url": "#".join("%s$%s" % (track["title"].replace("$", "￥").replace("#", "﹟"), track["playbackId"]) for track in audio_tracks)}]}
 
+    def audioChapterPage(self, book_id, page=1):
+        """原生听书每次只读取一页目录，未知时长保留为空，不串行读取全书。"""
+        album_id = self._source_id(book_id, "album")
+        page = self._page(page)
+        payload = self._album_page(album_id, page)
+        album, info = payload.get("album"), payload.get("tracks")
+        if not isinstance(album, dict) or not isinstance(info, dict) or not isinstance(info.get("list"), list):
+            raise RuntimeError("喜马拉雅章节分页返回结构无效")
+        if album.get("isPaid") is not False or album.get("isVipFree") is True:
+            raise RuntimeError("本插件仅支持喜马拉雅匿名免费专辑")
+        page_count = max(1, int(info.get("maxPageId") or 1))
+        if page_count > 500 or page > page_count:
+            raise RuntimeError("喜马拉雅章节分页范围无效")
+        tracks = []
+        seen = set()
+        for index, track in enumerate(info["list"]):
+            if not isinstance(track, dict) or not self._free_track(track):
+                continue
+            track_id = str(track.get("trackId") or "")
+            if not track_id.isdigit() or track_id in seen:
+                raise RuntimeError("喜马拉雅章节分页身份无效或重复")
+            seen.add(track_id)
+            _, mime_type = self._audio_address(track)
+            if not mime_type:
+                continue
+            try:
+                duration = float(track.get("duration"))
+            except (TypeError, ValueError):
+                duration = None
+            if duration is not None and (not math.isfinite(duration) or duration <= 0):
+                duration = None
+            tracks.append({"id": track_id, "title": self._clean(track.get("title")) or "未命名章节",
+                           "duration": duration, "mimeType": mime_type, "flag": "audiobook",
+                           "order": (page - 1) * self.TRACK_PAGE_SIZE + index + 1,
+                           "playbackId": "xm:track:%s" % track_id})
+        title = self._clean(album.get("title"))
+        if not title:
+            raise RuntimeError("喜马拉雅专辑缺少作品名称")
+        # 关键变量：公开页没有不可变快照令牌，不能凭一次翻页缺失便删除已知章节。
+        return {"list": [{"vod_id": "xm:album:%s" % album_id, "vod_name": title,
+                          "vod_pic": self._cover(album.get("coverLarge") or album.get("coverMiddle")),
+                          "vod_content": self._clean(album.get("intro")), "vod_audio_tracks": tracks}],
+                "page": page, "pagecount": page_count, "raw_count": len(info["list"]),
+                "authoritative": False, "snapshot_id": None}
+
+    def audioChapterPlayback(self, book_id, chapter_id):
+        """永久书籍和章节身份直接取址，切章不依赖完整目录缓存。"""
+        album_id = self._source_id(book_id, "album")
+        return self._track_playback(chapter_id, album_id)
+
     def playerContent(self, flag, id, vipFlags=None):
         """按永久章节 ID 重新取公开地址，过期地址和付费试听不能冒充完整免费章节。"""
+        return self._track_playback(id)
+
+    def _track_playback(self, id, expected_album_id=None):
+        """只读取当前章节公开信息；有原站专辑身份时同时核对书章归属。"""
         track_id = self._source_id(id, "track")
         payload = self._request_json(self.MOBILE_API + "/v1/track/baseInfo", {"device": "android", "trackId": track_id})
         if str(payload.get("trackId") or "") != track_id or not self._free_track(payload):
             raise RuntimeError("喜马拉雅章节已下架、改为付费或当前不允许匿名播放")
+        if expected_album_id and payload.get("albumId") is not None and str(payload["albumId"]) != expected_album_id:
+            raise RuntimeError("喜马拉雅章节不属于当前专辑")
         address, mime_type = self._audio_address(payload)
         if not address:
             raise RuntimeError("喜马拉雅章节暂未提供公开音频地址")

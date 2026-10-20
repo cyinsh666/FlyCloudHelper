@@ -31,6 +31,30 @@ export interface AudiobookSourceTrack {
   mimeType: string;
   playbackId: string;
   flag: string;
+  /** 来源在整本书内给出的固定顺序；分页时不能重新从一编号。 */
+  order?: number;
+}
+
+/** 可分批读取的章节页；只有明确完整且可核实的来源快照允许删除缺失章节。 */
+export interface AudiobookChapterPage {
+  detail: AudiobookSourceDetail;
+  page: number;
+  pageCount: number;
+  rawItemCount: number;
+  authoritative: boolean;
+  snapshotId: string | null;
+}
+
+/** 目录准备状态与内容版本独立保存，不把检查时间作为客户端目录修订号。 */
+export interface AudiobookDirectoryState {
+  status: "NotLoaded" | "Preparing" | "Ready" | "Failed";
+  catalogComplete: boolean;
+  catalogRevision: string;
+  chapterCount: number | null;
+  checkedAt: string | null;
+  lastError: string | null;
+  runId?: string;
+  leaseExpiresAt?: string;
 }
 
 /** 完整详情只在内存携带播放器输入，持久目录必须去掉该字段。 */

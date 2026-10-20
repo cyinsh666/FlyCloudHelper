@@ -1,3 +1,4 @@
+import { refreshBaiduOfficialToken } from "./baidupan-official-refresh.js";
 import { loadEnumerationPage } from "./types.js";
 import { ApiError } from "../errors.js";
 import { CredentialRefreshCoordinator } from "./credential-refresh-coordinator.js";
@@ -75,8 +76,18 @@ export class BaiduPanProvider implements ProviderAdapter {
   /** 按旧 Refresh Token 合并跨请求刷新，并接住稍晚到达的旧连接副本。 */
   private readonly tokenRefreshCoordinator = new CredentialRefreshCoordinator<BaiduTokenRefreshResult>();
 
+  /** 创建百度请求适配器，官方应用密钥始终由 FlymbyServer 保存。 */
   public constructor(networkOptions: ProviderNetworkOptions) {
     this.networkOptions = networkOptions;
+  }
+
+  /** 官方与原来源显式区分，未知来源不能静默退回 OpenList。 */
+  private readAuthSource(connection: Record<string, unknown>): string {
+    const source = String(connection.authSource || "openlist").trim();
+    if (!["openlist", "flymby_server", "baidu_official"].includes(source)) {
+      throw new ApiError(422, "baidupan_auth_source_invalid", "不支持的百度网盘登录来源");
+    }
+    return source;
   }
 
   /** 读取根目录验证百度网盘 Access Token。 */
@@ -85,6 +96,7 @@ export class BaiduPanProvider implements ProviderAdapter {
     signal?: AbortSignal,
     context?: ProviderConnectionContext,
   ): Promise<ProviderValidationResult> {
+    this.readAuthSource(connection);
     await this.listDirectory(connection, "/", 0, signal, context?.persistConnection);
     return { valid: true, accountLabel: null, rootAccessible: true };
   }
@@ -401,6 +413,7 @@ export class BaiduPanProvider implements ProviderAdapter {
     signal?: AbortSignal,
     forceRefresh = false,
   ): Promise<void> {
+    const authSource = this.readAuthSource(connection);
     const accessToken = typeof connection.accessToken === "string" ? connection.accessToken.trim() : "";
     const expiresAt = Number(connection.expiresAt ?? 0);
     if (!forceRefresh && accessToken && (expiresAt <= 0 || Date.now() + TOKEN_REFRESH_AHEAD_MS < expiresAt)) return;
@@ -413,9 +426,9 @@ export class BaiduPanProvider implements ProviderAdapter {
       ? `${configuredRefreshUrl}\n${refreshToken}\n${accessToken}`
       : `${configuredRefreshUrl}\n${refreshToken}`;
     const sharedRefresh = await this.tokenRefreshCoordinator.execute(
-      refreshCoordinationKey,
+      `${authSource}\n${refreshCoordinationKey}`,
       // 轮换独立使用 Provider 的30秒超时，避免首个等待任务取消后丢失已经轮换的令牌。
-      () => this.performTokenRefresh(refreshToken, configuredRefreshUrl),
+      () => this.performTokenRefresh(refreshToken, configuredRefreshUrl, authSource),
     );
     connection.accessToken = sharedRefresh.result.accessToken;
     connection.refreshToken = sharedRefresh.result.refreshToken;
@@ -424,12 +437,28 @@ export class BaiduPanProvider implements ProviderAdapter {
     await persistConnection?.(connection);
   }
 
+  /** 官方令牌交回 FlymbyServer 使用同一应用续期，不发送到 OpenList。 */
+  private async performOfficialTokenRefresh(refreshToken: string, signal?: AbortSignal): Promise<BaiduTokenRefreshResult> {
+    const payload = await refreshBaiduOfficialToken(refreshToken, this.networkOptions, signal);
+    const accessToken = typeof payload.accessToken === "string" ? payload.accessToken.trim() : "";
+    const nextRefreshToken = typeof payload.refreshToken === "string" ? payload.refreshToken.trim() : "";
+    if (!accessToken || !nextRefreshToken) {
+      throw new ApiError(410, "baidupan_official_refresh_failed", "百度官方应用登录已失效，请通过原来的官方应用方式重新登录");
+    }
+    const expiresIn = Number(payload.expiresIn ?? 0);
+    return { accessToken, refreshToken: nextRefreshToken,
+      expiresAt: Number.isFinite(expiresIn) && expiresIn > 0 ? Date.now() + expiresIn * 1000 : 0,
+      refreshUrl: "" };
+  }
+
   /** 向百度刷新端点提交一次旧 Refresh Token，只返回结果，不修改调用方连接。 */
   private async performTokenRefresh(
     refreshToken: string,
     configuredRefreshUrl: string,
+    authSource: string,
     signal?: AbortSignal,
   ): Promise<BaiduTokenRefreshResult> {
+    if (authSource === "baidu_official") return this.performOfficialTokenRefresh(refreshToken, signal);
     const refreshUrl = new URL(configuredRefreshUrl);
     if (refreshUrl.protocol !== "https:") throw new Error("百度网盘 Token 刷新地址必须使用 HTTPS");
     refreshUrl.searchParams.set("refresh_ui", refreshToken);

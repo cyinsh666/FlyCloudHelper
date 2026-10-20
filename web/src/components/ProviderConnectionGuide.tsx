@@ -97,7 +97,7 @@ const providerReplacementGuides: Record<string, ProviderConnectionGuideContent> 
     ],
     toolUrl: "https://api.oplist.org/",
     toolLabel: "打开 OpenList Token 工具",
-    note: "旧 Token 不会回显。百度网盘目录仍使用原路径和文件 fs_id，保存前会验证新账号能否访问原来配置的扫描目录。",
+    note: "已有百度服务不能切换登录方式。官方应用方式请在 Flymby 中重新登录后同步到云助手；此处 OpenList 步骤仅适用于原方式。旧 Token 不会回显。",
   },
 };
 

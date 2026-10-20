@@ -20,13 +20,41 @@ export async function loadAbsBook(
   context: AbsContext,
   itemId: string,
 ): Promise<AbsBook> {
+  const library = await runtime.database.query("media_libraries").where({ id: context.libraryId, user_id: context.ownerUserId }).select("library_kind").first();
+  if (library?.library_kind !== "content_source_audiobook") return readAbsBook(runtime, context, itemId);
+  // 关键变量：ABS必须等待完整目录；超时只取消本次等待，不回收原生共用的目录准备任务。
+  try {
+    await runtime.contentAudiobooks.ensureBookDetails(context.libraryId, context.ownerUserId, itemId, AbortSignal.timeout(12000));
+  } catch (error) {
+    if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")
+      || error instanceof ApiError && error.code === "audiobook_request_cancelled")
+      throw new ApiError(409, "abs_audio_details_incomplete", "有声书目录正在准备，请稍后重试");
+    throw error;
+  }
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const before = await runtime.contentAudiobooks.getBookDirectoryState(context.libraryId, context.ownerUserId, itemId);
+    if (!before.catalogComplete || before.status !== "Ready")
+      throw new ApiError(409, "abs_audio_details_incomplete", "有声书目录正在准备，请稍后重试");
+    const book = await readAbsBook(runtime, context, itemId);
+    const after = await runtime.contentAudiobooks.getBookDirectoryState(context.libraryId, context.ownerUserId, itemId);
+    if (after.catalogComplete && after.status === "Ready" && before.catalogRevision === after.catalogRevision) return book;
+  }
+  throw new ApiError(409, "abs_audio_details_incomplete", "有声书目录正在更新，请稍后重试");
+}
+
+/** 在完整目录门控内装配标准 ABS 对象，原生部分目录不进入全书时间轴。 */
+async function readAbsBook(
+  runtime: ApiRuntime,
+  context: AbsContext,
+  itemId: string,
+): Promise<AbsBook> {
   context = await withAbsLibraryViews(runtime, context);
   let item = await runtime.repository.getCatalogItem(itemId, context.ownerUserId);
   if (item.libraryId !== context.libraryId || item.itemType !== "audiobook.book" || !absBookMatchesLibrary(context, item))
     throw new ApiError(404, "abs_book_not_found", "有声书不存在");
   const onlineAudiobook = String(item.libraryKind) === "content_source_audiobook";
   if (onlineAudiobook) {
-    await runtime.contentAudiobooks.ensureBookDetails(context.libraryId, context.ownerUserId, item.id);
+    // 关键变量：完整准备及预算已由外层门控执行，此处只读，不能再次无界等待。
     item = await runtime.repository.getCatalogItem(itemId, context.ownerUserId);
     if (!absBookMatchesLibrary(context, item))
       throw new ApiError(404, "abs_book_not_found", "此分类中不存在该有声书");

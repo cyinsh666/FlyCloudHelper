@@ -45,7 +45,7 @@ export function LibraryContentAudiobookSettingsPage({ state }: { state: {
   return <>
     <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
       <ContentSourceLibraryNameEditor state={{ libraryId: library.id, displayName: library.displayName, admin, loading: state.loading, onSaved: state.onRefresh }} />
-      <div className="flex flex-wrap gap-2"><Link to={librariesPath}><SecondaryButton>返回媒体库</SecondaryButton></Link><Link to={catalogPath} params={{ serviceId: library.id }}><PrimaryButton><LibraryBig className="size-4" />书库</PrimaryButton></Link></div>
+      <div className="flex flex-wrap gap-2"><Link to={librariesPath}><SecondaryButton>返回媒体库</SecondaryButton></Link><Link to={admin ? "/admin/audiobook-services" : "/app/audiobook-services"} search={{ libraryId: library.id }}><SecondaryButton><Settings2 className="size-4" />原生听书设置</SecondaryButton></Link><Link to={catalogPath} params={{ serviceId: library.id }}><PrimaryButton><LibraryBig className="size-4" />书库</PrimaryButton></Link></div>
     </div>
     {(state.message || message) && <Panel className="mb-3 p-3 sm:p-3"><p role="status" className="text-sm text-muted-foreground">{state.message || message}</p></Panel>}
     <div className="mb-3 grid gap-3 sm:grid-cols-3">
@@ -62,7 +62,7 @@ export function LibraryContentAudiobookSettingsPage({ state }: { state: {
           <div className="flex flex-wrap items-center justify-between gap-2"><StatusPill tone={abs.data.enabled ? "success" : "neutral"}>{abs.data.enabled ? "已启用" : "未启用"}</StatusPill><Link to={absPath} params={{ serviceId: library.id }}><SecondaryButton><Settings2 className="size-4" />账号与协议设置</SecondaryButton></Link></div>
           <p className="break-all font-mono text-xs text-muted-foreground">{resolveAbsAddress(abs.data)}</p>
           <div><SecondaryButton onClick={() => void copyAddress()}><Copy className="size-4" />复制服务地址</SecondaryButton></div>
-          <p className="text-xs text-muted-foreground">创建书库后，可在协议设置中添加账号并开启 ABS，使用有声书客户端收听。</p>
+          <p className="text-xs text-muted-foreground">ABS 需要真实章节时长；悦听吧等缺少时长的来源，请使用页面顶部的原生听书设置。</p>
         </div>}
       </Panel>
       <Panel title="危险操作" description="清空在线目录或删除当前听书库。" className="p-4 sm:p-4">
