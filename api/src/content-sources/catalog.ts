@@ -45,7 +45,7 @@ export async function persistCmsContent(input: {
   // 关键变量：分类身份供协议入口筛选，电影/节目/单集共用，不参与稳定媒体 ID。
   const category = categories.find((item) => item.id === content.categoryId);
   const contentSource: Record<string, unknown> = { instanceId, remoteItemId: content.id, categoryId: content.categoryId, categoryName: content.categoryName || category?.name || "", parentCategoryId: content.parentCategoryId ?? category?.parentId ?? null };
-  const supportsCards = manifest.adapter === "python_spider" || manifest.adapter === "cms_json";
+  const supportsCards = manifest.adapter === "python_spider" || manifest.adapter === "catvod_js" || manifest.adapter === "cms_json";
   if (supportsCards && content.detailState === "card") {
     const countries = originCountries(content.area); // 摘要和完整详情沿用同一份明确地区转换。
     return persistContentCard({ database, repository, userId, libraryId, identityKey, generationId, movie, content, contentSource,
@@ -67,7 +67,7 @@ export async function persistCmsContent(input: {
   };
   const common = {
     userId, serviceId: null, libraryId, mediaType: "video" as const,
-    year: content.year, overview: content.overview, posterUrl: content.posterUrl, backdropUrl: null,
+    year: content.year, overview: content.overview, posterUrl: content.posterUrl, backdropUrl: content.backdropUrl ?? null,
     matchState: "matched" as const, externalIds: {}, generationId,
   };
   const parent = await repository.upsertMediaItem({

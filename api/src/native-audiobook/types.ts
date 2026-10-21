@@ -34,6 +34,8 @@ export interface NativeAccount {
   Username: string;
   DisplayName: string;
   PasswordHash: string;
+  /** 只有用户显式保存空密码时为 false；既有账号缺省仍要求密码。 */
+  PasswordRequired?: boolean;
   AllowedLibraryIds: string[];
   Enabled: boolean;
   CanDownload: boolean;

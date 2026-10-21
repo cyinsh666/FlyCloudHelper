@@ -297,7 +297,7 @@ export async function listAbsBooks(
 }
 
 /** 摘要目录保留完整总数与折叠系列信息，供列表、搜索、筛选器和个性书架复用。 */
-interface AbsBookSummaryPage {
+export interface AbsBookSummaryPage {
   books: AbsBookSummary[];
   total: number;
   limit: number;
@@ -311,13 +311,17 @@ export async function listAbsBookSummaries(
   runtime: ApiRuntime,
   context: AbsContext,
   query: Record<string, unknown> = {},
+  itemIds?: string[],
 ): Promise<AbsBookSummaryPage> {
   context = await withAbsLibraryViews(runtime, context);
+  const progressQuery = runtime.database
+    .query("library_abs_progress")
+    .where({ library_id: context.libraryId, account_id: context.accountId });
+  // 在线源窗口只需要对应作品的进度，不随每次翻页遍历整个账号的历史。
+  if (itemIds) progressQuery.whereIn("item_id", itemIds);
   const [books, progressRows] = await Promise.all([
-    loadAbsBookSummaries(runtime, context),
-    runtime.database
-      .query("library_abs_progress")
-      .where({ library_id: context.libraryId, account_id: context.accountId }),
+    loadAbsBookSummaries(runtime, context, itemIds),
+    progressQuery,
   ]);
   // 同一请求只读取一次进度，筛选和排序使用同一批状态。
   const progress = new Map<string, Record<string, unknown>>(

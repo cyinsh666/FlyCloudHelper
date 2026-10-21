@@ -200,7 +200,9 @@ export class AbsAccessService {
             })
             .first()
         : null;
-    if (!row || typeof password !== "string" || !(await verifyPassword(String(row.password_hash), password)))
+    // 关键变量：仅明确设置免密码的账号允许客户端省略密码字段，仍校验其空密码哈希。
+    const suppliedPassword = password === undefined && row && Number(row.password_required) === 0 ? "" : password;
+    if (!row || typeof suppliedPassword !== "string" || !(await verifyPassword(String(row.password_hash), suppliedPassword)))
       throw new ApiError(401, "abs_login_failed", "用户名或密码错误");
     const context = this.context(library, mapAccount(row));
     const now = Date.now();
@@ -460,10 +462,10 @@ function validateUsername(value: unknown): string {
     throw validationError("username", "用户名需为 4 至 255 字符且不含首尾空白");
   return value;
 }
-/** ABS 协议账号必须有非空密码，避免误把管理入口启用动作变成免密开放。 */
+/** 显式空字符串表示免密码；省略值由管理接口按创建或编辑语义处理。 */
 function validatePassword(value: unknown): string {
-  if (typeof value !== "string" || value.length === 0 || value.length > 4096)
-    throw validationError("password", "ABS 密码不能为空且不能超过 4096 字符");
+  if (typeof value !== "string" || value.length > 4096)
+    throw validationError("password", "ABS 密码必须为字符串且不能超过 4096 字符");
   return value;
 }
 /** 刷新凭据只按 SHA256 查询，正文以部署主密钥加密保存以支持宽限重试。 */

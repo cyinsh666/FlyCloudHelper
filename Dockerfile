@@ -94,7 +94,7 @@ RUN sed -i \
         -e 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g' \
         /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ffmpeg gosu python3 python3-requests python3-bs4 python3-pycryptodome \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg gosu python3 python3-requests python3-bs4 python3-pycryptodome python3-lxml python3-pyquery \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /data/database /data/secrets /data/plugins /data/exports /data/migrations /data/music-artwork \
     && chown -R node:node /data

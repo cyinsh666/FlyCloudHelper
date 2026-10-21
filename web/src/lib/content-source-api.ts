@@ -6,7 +6,7 @@ export interface ContentSourcePlugin {
   version: string;
   displayName: string;
   status: "enabled" | "disabled" | "imported" | "uninstalled";
-  adapter: "cms_json" | "netease_http" | "python_spider";
+  adapter: "cms_json" | "netease_http" | "python_spider" | "catvod_js";
   /** 缺省沿用原适配器分类，听书 Python 源通过清单明确声明。 */
   mediaType?: "video" | "music" | "audiobook";
   description: string;
@@ -28,6 +28,8 @@ export interface ContentSourceCategory {
   id: string;
   name: string;
   parentId: string | null;
+  /** 源明确提供的无筛选总目录，允许与真实子分类一起选择。 */
+  isAll?: boolean;
 }
 
 /** 在线媒体库的最近目录同步状态。 */
@@ -172,14 +174,28 @@ export async function importContentSourcePlugin(file: File): Promise<ContentSour
 
 /** 上传独立 Python 源，使用浏览器生成的 multipart 边界，由服务端静态检查后登记。 */
 export async function importPythonContentSourcePlugin(file: File): Promise<ContentSourcePlugin> {
+  return importScriptContentSourcePlugin(file, "import-python", "Python");
+}
+
+/** 上传独立 CatVod JavaScript 源，文件内容与兼容接口由服务端统一检查。 */
+export async function importJavaScriptContentSourcePlugin(file: File): Promise<ContentSourcePlugin> {
+  // 关键变量：JS 文件大小与服务端限制保持一致，上传前直接给出可读提示。
+  const maxFileBytes = 2 * 1024 * 1024;
+  if (file.size > maxFileBytes) throw new Error("JavaScript 内容源文件不能超过 2 MiB。");
+  return importScriptContentSourcePlugin(file, "import-javascript", "JavaScript");
+}
+
+/** 脚本源共用上传和错误读取流程，具体运行时与类型仍由服务端判定。 */
+async function importScriptContentSourcePlugin(file: File, action: "import-python" | "import-javascript", label: string): Promise<ContentSourcePlugin> {
+  // 关键变量：保持原始文件名与内容，交由浏览器生成 multipart 边界。
   const form = new FormData();
   form.set("file", file);
-  const response = await fetch("/api/v1/admin/content-source-plugins/import-python", {
+  const response = await fetch(`/api/v1/admin/content-source-plugins/${action}`, {
     method: "POST", body: form, credentials: "include", cache: "no-store",
   });
   if (!response.ok) {
     const payload = (await response.json().catch(() => ({}))) as { error?: { code?: string; message?: string } };
-    throw new ApiClientError(response.status, payload.error?.code ?? "request_failed", payload.error?.message ?? "Python 内容源导入失败");
+    throw new ApiClientError(response.status, payload.error?.code ?? "request_failed", payload.error?.message ?? `${label} 内容源导入失败`);
   }
   return (await response.json() as { plugin: ContentSourcePlugin }).plugin;
 }

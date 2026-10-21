@@ -7,6 +7,7 @@ import { AbsProgressService } from "../abs/progress.js";
 import { AbsSessionService } from "../abs/sessions.js";
 import { AbsCollectionService, type AbsListKind } from "../abs/collections.js";
 import { absEntityId, listAbsBookSummaries, loadAbsBook, mapAbsBook } from "../abs/catalog.js";
+import { AbsSourceBookCatalog } from "../abs/catalog-source-books.js";
 import {
   absFacets,
   absFilterData,
@@ -28,6 +29,8 @@ export async function registerAbsRoutes(server: FastifyInstance, runtime: ApiRun
   const progress = new AbsProgressService(runtime, hub, access);
   const sessions = new AbsSessionService(runtime, progress, hub);
   const collections = new AbsCollectionService(runtime, hub);
+  // 在线书目分页只扩充摘要，不改变详情、全书音轨、网盘扫描或播放会话。
+  const sourceBooks = new AbsSourceBookCatalog();
   const loginAttempts = new Map<string, { startedAt: number; count: number }>();
   server.route<{
     Params: { pathSuffix: string; "*": string };
@@ -161,7 +164,8 @@ export async function registerAbsRoutes(server: FastifyInstance, runtime: ApiRun
             return mapped;
           }
           if (action === "items") {
-            const result = await listAbsBookSummaries(runtime, context, query);
+            const result = await sourceBooks.read(runtime, context, query)
+              ?? await listAbsBookSummaries(runtime, context, query);
             return {
               results: result.books.map((book) => ({
                 ...mapAbsBook(context, book, false),

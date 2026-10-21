@@ -3,7 +3,7 @@ import type { ApiRuntime } from "../runtime.js";
 
 /** 返回当前原生入口的站内路径，保留部署公开地址或代理声明的前缀。 */
 export async function nativeRequestBasePath(runtime: ApiRuntime, request: FastifyRequest, suffix: string): Promise<string> {
-  const marker = `/a/${encodeURIComponent(suffix)}`;
+  const marker = `/fab/${encodeURIComponent(suffix)}`;
   const pathname = request.url.split("?", 1)[0] ?? "";
   const markerIndex = pathname.toLowerCase().lastIndexOf(marker.toLowerCase());
   if (markerIndex > 0) return pathname.slice(0, markerIndex + marker.length);

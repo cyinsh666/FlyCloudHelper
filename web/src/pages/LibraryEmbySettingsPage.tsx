@@ -3,6 +3,7 @@ import { Copy, Pencil, Plus, Settings2, Trash2 } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, StatusPill } from "@/components/ui-kit";
+import { ProtocolPasswordInput } from "@/components/ProtocolPasswordInput";
 import { ContentSourcePlaybackModeSettings } from "@/components/ContentSourcePlaybackModeSettings";
 import {
   createServiceEmbyAccount,
@@ -46,12 +47,14 @@ export function LibraryEmbySettingsPage({ serviceId, admin = false }: { serviceI
   const [saving, setSaving] = useState(false);
   const [newUsername, setNewUsername] = useState("");
   const [newPassword, setNewPassword] = useState("");
+  const [newNoPassword, setNewNoPassword] = useState(false);
   const [creating, setCreating] = useState(false);
   // 关键变量：默认收起新增账号表单，避免账号配置区长期占用大块纵向空间。
   const [showCreateAccount, setShowCreateAccount] = useState(false);
   const [editingAccountId, setEditingAccountId] = useState<string | null>(null);
   const [editingUsername, setEditingUsername] = useState("");
   const [editingPassword, setEditingPassword] = useState("");
+  const [editingNoPassword, setEditingNoPassword] = useState(false);
   // 关键变量：账号相关操作串行执行，防止刷新前重复修改同一份 Emby 用户状态。
   const [accountAction, setAccountAction] = useState<string | null>(null);
   const service = resource.data?.service;
@@ -103,8 +106,8 @@ export function LibraryEmbySettingsPage({ serviceId, admin = false }: { serviceI
     if (creating) return;
     setCreating(true);
     try {
-      await createServiceEmbyAccount(serviceId, { username: newUsername, password: newPassword }, admin);
-      setNewUsername(""); setNewPassword(""); setShowCreateAccount(false); setMessage("Emby 访问账号已创建");
+      await createServiceEmbyAccount(serviceId, { username: newUsername, password: newNoPassword ? "" : newPassword }, admin);
+      setNewUsername(""); setNewPassword(""); setNewNoPassword(false); setShowCreateAccount(false); setMessage("Emby 访问账号已创建");
       await resource.refresh();
     } catch (error) { setMessage(error instanceof Error ? error.message : "创建 Emby 账号失败"); } finally { setCreating(false); }
   }
@@ -123,19 +126,22 @@ export function LibraryEmbySettingsPage({ serviceId, admin = false }: { serviceI
   }
 
   /** 打开账号凭据编辑区；密码留空时表示保持现有密码不变。 */
-  function beginEditAccount(account: { id: string; username: string }): void {
+  function beginEditAccount(account: { id: string; username: string; hasPassword: boolean }): void {
     setEditingAccountId(account.id);
     setEditingUsername(account.username);
     setEditingPassword("");
+    setEditingNoPassword(!account.hasPassword);
   }
 
   /** 保存 Emby 用户名和可选新密码，保存后由服务端撤销该账号旧会话。 */
-  async function saveAccount(event: FormEvent<HTMLFormElement>, account: { id: string; username: string }): Promise<void> {
+  async function saveAccount(event: FormEvent<HTMLFormElement>, account: { id: string; username: string; hasPassword: boolean }): Promise<void> {
     event.preventDefault();
     if (accountAction) return;
     const input: { username?: string; password?: string } = {};
     if (editingUsername !== account.username) input.username = editingUsername;
-    if (editingPassword.length > 0) input.password = editingPassword;
+    if (editingNoPassword && account.hasPassword) input.password = "";
+    else if (!editingNoPassword && editingPassword.length > 0) input.password = editingPassword;
+    if (!editingNoPassword && !account.hasPassword && !editingPassword) { setMessage("请设置新密码或勾选无密码"); return; }
     if (input.username === undefined && input.password === undefined) { setMessage("账号凭据没有修改"); return; }
     setAccountAction(`save:${account.id}`);
     try {
@@ -145,17 +151,6 @@ export function LibraryEmbySettingsPage({ serviceId, admin = false }: { serviceI
       setMessage(`Emby 账号“${editingUsername}”已保存，旧会话已撤销`);
       await resource.refresh();
     } catch (error) { setMessage(error instanceof Error ? error.message : "保存 Emby 账号失败"); } finally { setAccountAction(null); }
-  }
-
-  /** 将有密码账号切换为免密码登录，规则与 Jellyfin 协议账号保持一致。 */
-  async function clearAccountPassword(account: { id: string; username: string; hasPassword: boolean }): Promise<void> {
-    if (!account.hasPassword || accountAction || !window.confirm(`确定把 Emby 账号“${account.username}”改为免密码登录吗？`)) return;
-    setAccountAction(`passwordless:${account.id}`);
-    try {
-      await updateServiceEmbyAccount(serviceId, account.id, { password: "" }, admin);
-      setMessage(`Emby 账号“${account.username}”已改为免密码登录`);
-      await resource.refresh();
-    } catch (error) { setMessage(error instanceof Error ? error.message : "切换免密码登录失败"); } finally { setAccountAction(null); }
   }
 
   /** 启用或停用 Emby 账号，最后一个启用账号由服务端拒绝停用。 */
@@ -206,7 +201,11 @@ export function LibraryEmbySettingsPage({ serviceId, admin = false }: { serviceI
       className="mt-4"
       action={<SecondaryButton type="button" disabled={creating || accountAction !== null} onClick={() => setShowCreateAccount((value) => !value)}><Plus className="size-4" /> 添加账号</SecondaryButton>}
     >
-      {showCreateAccount && <form className="mb-3 grid gap-2 rounded-lg border border-border bg-secondary/35 p-3 md:grid-cols-2" onSubmit={(event) => void createAccount(event)}><label><span className="text-xs text-muted-foreground">新账号用户名</span><input required minLength={4} maxLength={255} value={newUsername} onChange={(event) => setNewUsername(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label><label><span className="text-xs text-muted-foreground">登录密码（可选）</span><input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} placeholder="留空则无需密码" className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label><div className="flex flex-wrap gap-2 md:col-span-2"><PrimaryButton type="submit" disabled={creating || accountAction !== null}><Plus className="size-4" /> {creating ? "正在创建…" : "创建账号"}</PrimaryButton><SecondaryButton type="button" disabled={creating || accountAction !== null} onClick={() => setShowCreateAccount(false)}>取消</SecondaryButton></div></form>}
+      {showCreateAccount && <form className="mb-3 grid gap-2 rounded-lg border border-border bg-secondary/35 p-3 md:grid-cols-2" onSubmit={(event) => void createAccount(event)}>
+        <label><span className="text-xs text-muted-foreground">新账号用户名</span><input required minLength={4} maxLength={255} value={newUsername} onChange={(event) => setNewUsername(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label>
+        <div><span className="text-xs text-muted-foreground">登录密码</span><ProtocolPasswordInput state={{ value: newPassword, noPassword: newNoPassword, required: true, disabled: creating || accountAction !== null, placeholder: "请输入密码或勾选无密码", onChange: setNewPassword, onNoPasswordChange: setNewNoPassword }} /></div>
+        <div className="flex flex-wrap gap-2 md:col-span-2"><PrimaryButton type="submit" disabled={creating || accountAction !== null}><Plus className="size-4" /> {creating ? "正在创建…" : "创建账号"}</PrimaryButton><SecondaryButton type="button" disabled={creating || accountAction !== null} onClick={() => setShowCreateAccount(false)}>取消</SecondaryButton></div>
+      </form>}
       <div className="space-y-2">{settings.embyAccounts.map((account, index) => {
         const editing = editingAccountId === account.id;
         const pending = accountAction?.endsWith(account.id) ?? false;
@@ -220,7 +219,11 @@ export function LibraryEmbySettingsPage({ serviceId, admin = false }: { serviceI
               <button type="button" disabled={accountAction !== null || settings.embyAccounts.length <= 1} onClick={() => void deleteAccount(account.id, account.username)} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/8 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /> {pending && accountAction?.startsWith("delete:") ? "正在删除…" : "删除"}</button>
             </div>
           </div>
-          {editing && <form onSubmit={(event) => void saveAccount(event, account)} className="mt-3 grid gap-2 border-t border-border pt-3 md:grid-cols-2"><label><span className="text-xs text-muted-foreground">访问用户名</span><input value={editingUsername} required minLength={4} maxLength={255} onChange={(event) => setEditingUsername(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label><label><span className="text-xs text-muted-foreground">新密码</span><input value={editingPassword} type="password" autoComplete="new-password" placeholder="留空表示不修改" onChange={(event) => setEditingPassword(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label><div className="flex flex-wrap gap-2 md:col-span-2"><PrimaryButton type="submit" disabled={accountAction !== null}><Settings2 className="size-4" /> {pending && accountAction?.startsWith("save:") ? "正在保存…" : "保存账号"}</PrimaryButton>{account.hasPassword && <SecondaryButton type="button" disabled={accountAction !== null} onClick={() => void clearAccountPassword(account)}>改为免密码</SecondaryButton>}<SecondaryButton type="button" disabled={accountAction !== null} onClick={() => setEditingAccountId(null)}>取消</SecondaryButton></div></form>}
+          {editing && <form onSubmit={(event) => void saveAccount(event, account)} className="mt-3 grid gap-2 border-t border-border pt-3 md:grid-cols-2">
+            <label><span className="text-xs text-muted-foreground">访问用户名</span><input value={editingUsername} required minLength={4} maxLength={255} onChange={(event) => setEditingUsername(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label>
+            <div><span className="text-xs text-muted-foreground">新密码</span><ProtocolPasswordInput state={{ value: editingPassword, noPassword: editingNoPassword, required: !account.hasPassword, disabled: accountAction !== null, placeholder: "留空表示不修改", onChange: setEditingPassword, onNoPasswordChange: setEditingNoPassword }} /></div>
+            <div className="flex flex-wrap gap-2 md:col-span-2"><PrimaryButton type="submit" disabled={accountAction !== null}><Settings2 className="size-4" /> {pending && accountAction?.startsWith("save:") ? "正在保存…" : "保存账号"}</PrimaryButton><SecondaryButton type="button" disabled={accountAction !== null} onClick={() => setEditingAccountId(null)}>取消</SecondaryButton></div>
+          </form>}
         </article>;
       })}</div>
     </Panel>

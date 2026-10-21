@@ -6,6 +6,7 @@ import { StatusPill } from "@/components/ui-kit";
 import { importPlugin, listPlugins, updatePluginStatus, type PluginVersion } from "@/lib/api";
 import {
   importContentSourcePlugin,
+  importJavaScriptContentSourcePlugin,
   importPythonContentSourcePlugin,
   listContentSourcePlugins,
   uninstallContentSourcePlugin,
@@ -31,6 +32,14 @@ function describeSourceCapabilities(plugin: ContentSourcePlugin): string {
   if (adapter === "netease_http") return "网易云音乐 · Navidrome";
   if (adapter === "cms_json") return "影视内容 · Jellyfin / Emby";
   if (adapter === "python_spider") return "影视内容 · Jellyfin / Emby";
+  if (adapter === "catvod_js") return "影视内容 · Jellyfin / Emby";
+  return adapter;
+}
+
+/** 详情使用运行时名称，便于区分声明式配置与脚本源。 */
+function describeSourceAdapter(adapter: ContentSourcePlugin["adapter"]): string {
+  if (adapter === "python_spider") return "Python Spider";
+  if (adapter === "catvod_js") return "CatVod JavaScript";
   return adapter;
 }
 
@@ -126,11 +135,16 @@ export function AdminPluginsPanel() {
         setMessage(plugin.status === "enabled"
           ? `${plugin.displayName} ${plugin.version} 已安装并启用，可以创建在线媒体库。`
           : `${plugin.displayName} ${plugin.version} 已导入，请启用后创建在线媒体库。`);
+      } else if (fileName.endsWith(".js")) {
+        const plugin = await importJavaScriptContentSourcePlugin(file);
+        setMessage(plugin.status === "enabled"
+          ? `${plugin.displayName} ${plugin.version} 已安装并启用，可以创建在线媒体库。`
+          : `${plugin.displayName} ${plugin.version} 已导入，请启用后创建在线媒体库。`);
       } else if (fileName.endsWith(".flymby-plugin")) {
         const plugin = await importPlugin(file);
         setMessage(`${plugin.displayName} ${plugin.version} 导入成功，请启用后使用。`);
       } else {
-        throw new Error("请选择 .json、.py 或 .flymby-plugin 插件文件，系统会自动识别插件类型。");
+        throw new Error("请选择 .json、.py、.js 或 .flymby-plugin 插件文件，系统会自动识别插件类型。");
       }
       await refreshPlugins();
     } catch (error) {
@@ -187,7 +201,7 @@ export function AdminPluginsPanel() {
       </span>
       <SecondaryButton disabled={loading || pending !== null} onClick={() => void refreshPlugins()}><RefreshCw aria-hidden="true" className="size-4" />刷新</SecondaryButton>
     </>} />
-    <p className="mb-4 text-xs text-muted-foreground">选择插件文件即可导入，系统自动识别类型。</p>
+    <p className="mb-4 text-xs text-muted-foreground">支持 JSON、Python、CatVod JS 和元数据插件文件，系统自动识别类型。</p>
     {sources.error && <p role="alert" className="mb-3 text-sm text-destructive">插件加载失败：{sources.error}</p>}
     {metadata.error && <p role="alert" className="mb-3 text-sm text-destructive">插件加载失败：{metadata.error}</p>}
     {message && <p role="status" className="mb-4 text-sm text-muted-foreground">{message}</p>}
@@ -212,7 +226,7 @@ export function AdminPluginsPanel() {
       <PluginDetailField label="说明" value={getPluginDescription(selectedEntry)} />
       <PluginDetailField label="能力" value={selectedEntry.kind === "source" ? describeSourceCapabilities(selectedEntry.plugin) : describeMetadataCapabilities(selectedEntry.plugin)} />
       {selectedEntry.kind === "source" ? <>
-        <PluginDetailField label="适配器" value={selectedEntry.plugin.adapter === "python_spider" ? "Python Spider" : selectedEntry.plugin.adapter} />
+        <PluginDetailField label="适配器" value={describeSourceAdapter(selectedEntry.plugin.adapter)} />
         <p className="text-xs text-muted-foreground">停用和卸载不会自动删除媒体库。停用后可重新启用；卸载后可重新导入原插件，继续使用原目录和播放记录。</p>
       </> : <>
         <PluginDetailField label="配置修订" value={`r${selectedEntry.plugin.configurationRevision}`} />

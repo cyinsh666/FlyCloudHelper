@@ -1,12 +1,11 @@
 import { Link } from "@tanstack/react-router";
-import { CalendarClock, Copy, LibraryBig, ScanLine, Settings2, Trash2 } from "lucide-react";
+import { CalendarClock, LibraryBig, ScanLine, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { ServicePathPicker } from "@/components/ServicePathPicker";
 import { Panel } from "@/components/ui-kit";
+import { LibraryAudiobookProtocols } from "@/components/LibraryAudiobookProtocols";
 import { updateLibraryMetadataProfile, type MediaLibrary, type ProviderDirectory } from "@/lib/api";
-import { getAbsSettings, resolveAbsAddress, updateAbsSettings } from "@/lib/abs-api";
-import { useApiResource } from "@/lib/use-api-resource";
 
 /** 复用媒体库现有扫描、通知和删除流程，有声书展示独立元数据与 ABS 协议。 */
 interface AudiobookSettingsState {
@@ -43,14 +42,11 @@ function readAudiobookProfile(metadata: Record<string, unknown>): Record<string,
 /** 有声书库紧凑设置，扫描按书籍聚合，独立协议通过各自设置页管理。 */
 export function LibraryAudiobookSettings({ state }: { state: AudiobookSettingsState }) {
   const { library, admin } = state;
-  const abs = useApiResource(() => getAbsSettings(library.id, admin), [library.id, admin]);
   const [preferEmbeddedMetadata, setPreferEmbeddedMetadata] = useState(true);
   const [extractEmbeddedChapters, setExtractEmbeddedChapters] = useState(true);
   const [savingMetadata, setSavingMetadata] = useState(false);
-  const [savingProtocol, setSavingProtocol] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const catalogPath = admin ? "/admin/libraries/$serviceId/catalog" : "/app/libraries/$serviceId/catalog";
-  const absPath = admin ? "/admin/libraries/$serviceId/abs" : "/app/libraries/$serviceId/abs";
   const schedulePath = admin
     ? "/admin/libraries/$serviceId/scan-schedules"
     : "/app/libraries/$serviceId/scan-schedules";
@@ -99,42 +95,6 @@ export function LibraryAudiobookSettings({ state }: { state: AudiobookSettingsSt
     }
   }
 
-  /** 切换 ABS 开关，只影响当前有声书库。 */
-  async function toggleProtocol(): Promise<void> {
-    if (!abs.data || savingProtocol) return;
-    setSavingProtocol(true);
-    try {
-      await updateAbsSettings(library.id, { enabled: !abs.data.enabled }, admin);
-      await abs.refresh();
-      setMessage("ABS 协议开关已保存");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "ABS 设置保存失败");
-    } finally {
-      setSavingProtocol(false);
-    }
-  }
-
-  /** 复制客户端填写的完整协议根地址。 */
-  async function copyAddress(): Promise<void> {
-    if (!abs.data) return;
-    try {
-      const address = resolveAbsAddress(abs.data);
-      if (navigator.clipboard) await navigator.clipboard.writeText(address);
-      else {
-        const input = document.createElement("textarea");
-        input.value = address;
-        document.body.appendChild(input);
-        input.select();
-        const copied = document.execCommand("copy");
-        input.remove();
-        if (!copied) throw new Error("请手动复制地址");
-      }
-      setMessage("ABS 服务地址已复制");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "复制失败");
-    }
-  }
-
   return (
     <>
       <PageHeader
@@ -149,9 +109,6 @@ export function LibraryAudiobookSettings({ state }: { state: AudiobookSettingsSt
                 <CalendarClock className="size-4" />
                 定时任务
               </SecondaryButton>
-            </Link>
-            <Link to={admin ? "/admin/audiobook-services" : "/app/audiobook-services"} search={{ libraryId: library.id }}>
-              <SecondaryButton><Settings2 className="size-4" />原生听书设置</SecondaryButton>
             </Link>
             <Link to={catalogPath} params={{ serviceId: library.id }}>
               <PrimaryButton>
@@ -206,9 +163,9 @@ export function LibraryAudiobookSettings({ state }: { state: AudiobookSettingsSt
           <span className="float-right text-sm font-medium">v{library.catalogVersion}</span>
         </Panel>
         <Panel className="p-3 sm:p-3">
-          <span className="text-xs text-muted-foreground">ABS</span>
+          <span className="text-xs text-muted-foreground">对外协议</span>
           <span className="float-right text-sm font-medium">
-            {abs.loading ? "读取中" : abs.error ? "读取失败" : abs.data?.enabled ? "已启用" : "未启用"}
+            ABS / FlyAudioBook
           </span>
         </Panel>
       </div>
@@ -294,57 +251,8 @@ export function LibraryAudiobookSettings({ state }: { state: AudiobookSettingsSt
           </div>
         </Panel>
       </div>
-      <div className="mt-3 grid gap-3 xl:grid-cols-[minmax(0,3fr)_minmax(240px,1fr)]">
-        <Panel
-          title="播放与协议"
-          description="有声书通过标准 Audiobookshelf 协议访问，使用原音频播放。"
-          className="p-4 sm:p-4"
-        >
-          {abs.error ? (
-            <p role="alert" className="text-sm text-destructive">
-              {abs.error}
-            </p>
-          ) : !abs.data ? (
-            <div aria-label="ABS 配置加载中" className="h-12 animate-pulse rounded bg-muted" />
-          ) : (
-            <>
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="text-sm font-medium">ABS 协议</p>
-                  <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
-                    {resolveAbsAddress(abs.data)}
-                  </p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    {abs.data.accounts.length} 个独立账号 ·{" "}
-                    {abs.data.relayPlaybackEnabled ? "中转播放" : "直连优先"}
-                  </p>
-                </div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <SecondaryButton onClick={() => void copyAddress()}>
-                    <Copy className="size-4" />
-                    复制
-                  </SecondaryButton>
-                  <Link to={absPath} params={{ serviceId: library.id }}>
-                    <SecondaryButton>
-                      <Settings2 className="size-4" />
-                      账号与配置
-                    </SecondaryButton>
-                  </Link>
-                  <label className="inline-flex items-center gap-2 text-xs">
-                    <input
-                      type="checkbox"
-                      checked={abs.data.enabled}
-                      disabled={savingProtocol}
-                      onChange={() => void toggleProtocol()}
-                      className="size-4 accent-foreground"
-                    />
-                    启用
-                  </label>
-                </div>
-              </div>
-            </>
-          )}
-        </Panel>
+      <div className="mt-4 grid items-start gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(240px,1fr)]">
+        <LibraryAudiobookProtocols state={{ library, admin }} />
         <Panel title="危险操作" description="清空或删除当前有声书库数据。" className="p-4 sm:p-4">
           <button
             type="button"

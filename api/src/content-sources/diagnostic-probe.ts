@@ -1,8 +1,12 @@
-import type { IncomingMessage } from "node:http";
+import type { Readable } from "node:stream";
 import { ApiError } from "../errors.js";
 import { providerProbeStream } from "../providers/network.js";
 import { readHlsRunTimeTicks } from "./hls-relay.js";
+import { isSpiderProxyUrl, type ContentSourceResourceResponse } from "./spider-proxy.js";
 import type { ContentVideoContainer } from "./types.js";
+
+/** 由诊断调用方注入已校验用户及媒体库范围的源代理读取能力。 */
+export type ContentDiagnosticResourceLoader = (url: string, headers: Record<string, string>, signal: AbortSignal) => Promise<ContentSourceResourceResponse>;
 
 /** 将业务错误转换为诊断摘要，不返回源地址、签名参数或请求头。 */
 export function summarizeContentError(error: unknown): { message: string; upstreamStatus: number | null } {
@@ -13,9 +17,9 @@ export function summarizeContentError(error: unknown): { message: string; upstre
     provider_resource_not_found: 404, content_diagnostic_unauthorized: 401,
     content_diagnostic_forbidden: 403, content_diagnostic_missing: 404,
   };
-  const status = knownStatuses[code] ?? (error instanceof ApiError && /(?:http_failed|request_failed|diagnostic_http)$/u.test(code)
+  const status = knownStatuses[code] ?? (error instanceof ApiError && /(?:http_failed|request_failed|diagnostic_http|proxy_upstream_failed)$/u.test(code)
     ? Number(error.message.match(/(?:HTTP|状态码)\s+(\d{3})/u)?.[1] ?? 0) || null : null);
-  if (status) return { message: `源站返回 HTTP ${status}`, upstreamStatus: status };
+  if (status) return { message: `${code === "content_source_proxy_upstream_failed" ? "源代理" : "源站"}返回 HTTP ${status}`, upstreamStatus: status };
   if (code.includes("disabled")) return { message: "媒体库、源配置或插件已停用", upstreamStatus: null };
   if (code.includes("categories_missing")) return { message: "源站未返回有效的分类目录", upstreamStatus: null };
   if (code.includes("missing") || code.includes("not_found")) return { message: "播放内容或线路已不存在，请刷新已入库内容", upstreamStatus: null };
@@ -26,7 +30,7 @@ export function summarizeContentError(error: unknown): { message: string; upstre
 }
 
 /** 读取完整清单或少量资源前缀；上游忽略 Range 时也及时关闭连接。 */
-async function readProbeBody(body: IncomingMessage, maximumBytes: number, complete: boolean): Promise<Buffer> {
+async function readProbeBody(body: Readable, maximumBytes: number, complete: boolean): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let receivedBytes = 0; // 关键变量：清单有上限，视频资源最多保留 4 KB。
   try {
@@ -51,8 +55,8 @@ function requireProbeStatus(status: number): void {
 }
 
 /** 确认视频、分片或密钥返回了实际字节，拒绝 HTML/JSON 错误页。 */
-async function probeResource(url: string, headers: Record<string, string>, allowInsecureHttp: boolean, signal: AbortSignal): Promise<void> {
-  const response = await providerProbeStream(url, { method: "GET", headers: { ...headers, Range: "bytes=0-4095" } }, { allowInsecureHttp }, signal);
+async function probeResource(url: string, headers: Record<string, string>, allowInsecureHttp: boolean, signal: AbortSignal, resourceLoader?: ContentDiagnosticResourceLoader): Promise<void> {
+  const response = await openProbeResource(url, { ...headers, Range: "bytes=0-4095" }, allowInsecureHttp, signal, resourceLoader);
   try {
     requireProbeStatus(response.statusCode);
     const type = String(response.headers["content-type"] ?? "").toLowerCase();
@@ -65,20 +69,32 @@ async function probeResource(url: string, headers: Record<string, string>, allow
   }
 }
 
+/** 普通 HTTP 保留原探测语义，虚拟地址必须经调用方的范围校验，不能进入 Provider 网络。 */
+async function openProbeResource(url: string, headers: Record<string, string>, allowInsecureHttp: boolean, signal: AbortSignal, resourceLoader?: ContentDiagnosticResourceLoader): Promise<ContentSourceResourceResponse> {
+  signal.throwIfAborted();
+  if (isSpiderProxyUrl(url)) {
+    if (!resourceLoader) throw new ApiError(403, "content_diagnostic_proxy_scope_required", "源代理诊断需要媒体库访问范围");
+    return resourceLoader(url, headers, signal);
+  }
+  return providerProbeStream(url, { method: "GET", headers }, { allowInsecureHttp }, signal);
+}
+
 /** HLS 检查一个视频变体及必要资源；其他格式只读字节，不把未知格式伪装为 MP4。 */
 export async function probeContentLine(input: {
   url: string; headers: Record<string, string>; container: ContentVideoContainer;
   allowInsecureHttp: boolean; signal: AbortSignal;
+  /** 只用于 Spider 虚拟资源；缺省沿用原 HTTP 探测，不开放匿名脚本代理。 */
+  resourceLoader?: ContentDiagnosticResourceLoader;
 }): Promise<number> {
   const headers = { ...input.headers, Accept: "*/*", "Accept-Encoding": "identity" };
   if (input.container !== "hls") {
-    await probeResource(input.url, headers, input.allowInsecureHttp, input.signal);
+    await probeResource(input.url, headers, input.allowInsecureHttp, input.signal, input.resourceLoader);
     return 0;
   }
   let manifestUrl = input.url;
   for (let depth = 0; depth < 4; depth += 1) {
     input.signal.throwIfAborted();
-    const response = await providerProbeStream(manifestUrl, { method: "GET", headers }, { allowInsecureHttp: input.allowInsecureHttp }, input.signal);
+    const response = await openProbeResource(manifestUrl, headers, input.allowInsecureHttp, input.signal, input.resourceLoader);
     let manifest: string;
     try {
       requireProbeStatus(response.statusCode);
@@ -105,7 +121,7 @@ export async function probeContentLine(input: {
       if (reference && !reference.startsWith("data:")) references.add(reference);
     }
     for (const reference of references) {
-      await probeResource(new URL(reference, response.finalUrl).href, headers, input.allowInsecureHttp, input.signal);
+      await probeResource(new URL(reference, response.finalUrl).href, headers, input.allowInsecureHttp, input.signal, input.resourceLoader);
     }
     return readHlsRunTimeTicks(manifest);
   }

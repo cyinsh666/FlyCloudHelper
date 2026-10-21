@@ -141,6 +141,8 @@ export async function persistContentCard(input: {
       payload.sort_title = preserveCompleteFields && previous.sort_title ? String(previous.sort_title) : title;
       payload.year = preserveCompleteFields && previousYear !== null ? previousYear : content.year ?? previousYear;
       payload.poster_url = preserveCompleteFields && previousPoster ? previousPoster : content.posterUrl || previousPoster;
+      // 关键变量：列表可补充源实际提供的横图，缺少横图的摘要不能清空已有背景。
+      if (content.backdropUrl) payload.backdrop_url = preserveCompleteFields && previous.backdrop_url ? previous.backdrop_url : content.backdropUrl;
       if (content.overview) payload.overview = preserveCompleteFields && previous.overview ? String(previous.overview) : content.overview;
       if (JSON.stringify(displayMetadata.originCountries ?? []) !== JSON.stringify(previousMetadata.originCountries ?? [])) {
         // 摘要更新或补齐地区时复用原仓储派生；完整已知地区和人工分组继续保留。
@@ -170,7 +172,7 @@ export async function persistContentCard(input: {
     id: createStableId("itm", libraryId, identityKey), userId, serviceId: null, libraryId, identityKey,
     mediaType: "video", itemType: movie ? "video.movie" : "video.series",
     title: content.title, sortTitle: content.title, subtitle: "", year: content.year, overview: content.overview,
-    posterUrl: content.posterUrl, backdropUrl: null, matchState: "matched", externalIds: {},
+    posterUrl: content.posterUrl, backdropUrl: content.backdropUrl ?? null, matchState: "matched", externalIds: {},
     metadata: { ...cardMetadata, contentSource: { ...input.contentSource, detailState: "card" } }, generationId,
   });
   if (!result.changed) return [];

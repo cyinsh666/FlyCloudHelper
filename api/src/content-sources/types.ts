@@ -5,7 +5,7 @@ export interface ContentSourceManifest {
   version: string;
   displayName: string;
   description: string;
-  adapter: "cms_json" | "python_spider" | "netease_http";
+  adapter: "cms_json" | "python_spider" | "catvod_js" | "netease_http";
   /** Python 听书源显式声明有声书；未声明的既有 Python 源仍按视频处理。 */
   mediaType?: "video" | "music" | "audiobook";
   endpoint: string;
@@ -20,6 +20,8 @@ export interface ContentSourceManifest {
   scriptHash?: string;
   /** Spider 初始化参数及缺少 limit 时使用的明确分页尺寸。 */
   pythonConfig?: { extend?: string; pageSize?: number };
+  /** CatVod 初始化扩展参数；脚本、Cookie 与存储仍按源实例隔离。 */
+  jsConfig?: { extend?: string; pageSize?: number };
 }
 
 /** 尚未即时取址的 Spider 分集不猜测媒体格式。 */
@@ -56,6 +58,8 @@ export interface ContentSourceCategory {
   id: string;
   name: string;
   parentId: string | null;
+  /** 源明确提供的无分类筛选总目录，不能依据名称或 ID 猜测。 */
+  isAll?: boolean;
 }
 
 /** 协议层使用源分类作为虚拟媒体库；空 ID 仅承接尚未补齐分类的历史条目。 */
@@ -64,6 +68,8 @@ export interface ContentSourceCategoryDefinition {
   name: string;
   parentId: string | null;
   collectionType?: "movies" | "tvshows";
+  /** 总目录保留源分页定位，本地读取覆盖该源的全部实际分类。 */
+  isAll?: boolean;
 }
 
 /** 在线内容源按协议选择自动、客户端直连或云助手中转。 */
@@ -101,6 +107,8 @@ export interface CmsContentItem {
   year: number | null;
   overview: string;
   posterUrl: string | null;
+  /** 源明确给出的横图；缺失时不把竖海报冒充背景图。 */
+  backdropUrl?: string | null;
   area: string;
   genres: string[];
   /** 源站明确给出的有效评分和标签；旧浏览缓存没有这些字段时保留缺失。 */
@@ -184,6 +192,8 @@ export interface ContentSourceSyncState {
   processedCount: number;
   pageCount: number;
   nextPageByCategory: Record<string, number>;
+  /** 听书分类最近一次明确返回的总页数，保存在既有同步 JSON 中，不增加数据库字段。 */
+  sourcePageCountByCategory?: Record<string, number>;
   startedAt: string | null;
   finishedAt: string | null;
   lastError: string | null;

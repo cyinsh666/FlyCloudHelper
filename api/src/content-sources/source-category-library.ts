@@ -64,8 +64,11 @@ export class SourceCategoryLibraryReader {
     const actualCategories = new Map<string, ContentSourceCategory>();
     // 关键变量：入口类型依据该分类的实际顶层媒体类型，混合分类不能声明为单一电影或节目库。
     const itemTypesByCategory = new Map<string, Set<string>>();
+    // 关键变量：总目录类型来自全库实际内容，不能仅依据仍未补齐细分类的摘要卡片。
+    const allItemTypes = new Set<string>();
     let hasUncategorizedItems = false;
     for (const row of rows) {
+      allItemTypes.add(String(row.item_type));
       const id = String(row.category_id ?? "").trim();
       if (!id || id === "null") {
         hasUncategorizedItems = true;
@@ -81,8 +84,9 @@ export class SourceCategoryLibraryReader {
     const definitions: ContentSourceCategoryDefinition[] = [];
     for (const id of categoryIds) {
       const category = completeCatalog.find((item) => item.id === id);
-      const definition: ContentSourceCategoryDefinition = { categoryId: id, name: category?.name ?? `分类 ${id}`, parentId: category?.parentId ?? null };
-      const itemTypes = itemTypesByCategory.get(id);
+      const definition: ContentSourceCategoryDefinition = { categoryId: id, name: category?.name ?? `分类 ${id}`, parentId: category?.parentId ?? null,
+        ...(category?.isAll ? { isAll: true } : {}) };
+      const itemTypes = category?.isAll ? allItemTypes : itemTypesByCategory.get(id);
       if (itemTypes?.size === 1) {
         definition.collectionType = itemTypes.has("video.movie") ? "movies" : "tvshows";
       } else if (!itemTypes?.size) {

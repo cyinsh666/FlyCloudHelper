@@ -4,6 +4,7 @@ import { parseJsonObject } from "../domain.js";
 import { ApiError } from "../errors.js";
 import { probeContentLine, summarizeContentError } from "./diagnostic-probe.js";
 import type { ContentSourceManager } from "./manager.js";
+import { openSpiderProxyResource } from "./spider-proxy.js";
 import type { ContentSourcePlaybackProtocol } from "./types.js";
 
 interface CatalogDiagnostic {
@@ -239,7 +240,13 @@ export class ContentSourceDiagnostics {
     if (parentSignal.aborted) abort();
     try {
       const access = await this.options.contentSources.resolvePlayback(result.sourceId, ownerUserId, libraryId, controller.signal);
-      result.runTimeTicks = await probeContentLine({ ...access, allowInsecureHttp: this.options.config.allowInsecureProviderHttp, signal: controller.signal });
+      result.runTimeTicks = await probeContentLine({
+        ...access, allowInsecureHttp: this.options.config.allowInsecureProviderHttp, signal: controller.signal,
+        /** 代理根清单及其子资源共用本次已校验的用户、媒体库和取消信号。 */
+        resourceLoader: (url, headers, signal) => openSpiderProxyResource(
+          { contentSources: this.options.contentSources }, url, headers, { ownerUserId, libraryId }, signal,
+        ),
+      });
       result.status = "ok";
     } catch (error) {
       result.error = summarizeContentError(error).message;

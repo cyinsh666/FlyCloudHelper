@@ -20,6 +20,11 @@ export default defineConfig({
     host: "0.0.0.0",
     port: 9935,
     proxy: {
+      "/fab/": {
+        target: "http://127.0.0.1:9934",
+        // FlyAudioBook 使用固定一级路径，保留请求 Host 生成当前可访问的媒体地址。
+        changeOrigin: false,
+      },
       "/abs/": {
         target: "http://127.0.0.1:9934",
         // ABS HTTP 与 Socket.IO 使用同一根路径，开发入口支持升级 WebSocket。

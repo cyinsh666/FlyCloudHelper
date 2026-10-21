@@ -10,6 +10,10 @@ import { contentKey, validateContentManifest } from "./cms-adapter.js";
 import { CmsVideoSourceAdapter } from "./video-adapter.js";
 import { PythonVideoSourceAdapter } from "./python-adapter.js";
 import { PythonSpiderRuntime } from "./python-runtime.js";
+import { JavaScriptSpiderRuntime } from "./js-runtime.js";
+import { JavaScriptVideoSourceAdapter } from "./js-adapter.js";
+import { SpiderVideoSourceAdapter } from "./spider-adapter.js";
+import { isSpiderProxyUrl, readSpiderProxyInstance } from "./spider-proxy.js";
 import { ContentItemDetailLoader, type ContentItemDetailContext } from "./content-detail-loader.js";
 import { DynamicContentCatalog, type DynamicCatalogContext, type DynamicCatalogQuery } from "./dynamic-catalog.js";
 import { initializeContentSourceSchema } from "./schema.js";
@@ -62,10 +66,21 @@ function emptySync(): ContentSourceSyncState {
   return { status: "idle", processedCount: 0, pageCount: 0, nextPageByCategory: {}, startedAt: null, finishedAt: null, lastError: null };
 }
 
-/** 创建和编辑都只展示源站支持的视频叶分类，父分类和排除分类不参与全选。 */
+/** 只允许明确的连接、DNS、TLS 或超时故障退回已同步目录，权限和源解析错误继续返回。 */
+function isSourceConnectionFailure(error: unknown): error is ApiError {
+  if (!(error instanceof ApiError)) return false;
+  return [
+    "provider_connection_timeout", "provider_connection_refused", "provider_network_unreachable",
+    "provider_dns_resolution_failed", "provider_unavailable", "provider_tls_failed",
+    "javascript_source_network_failed", "javascript_source_network_timeout", "javascript_source_timeout",
+    "javascript_source_queue_timeout", "python_source_timeout", "python_source_queue_timeout",
+  ].includes(error.code);
+}
+
+/** 仅展示视频叶分类与源明确可浏览的总目录，普通父占位和排除分类不参与全选。 */
 function selectableVideoCategories(categories: ContentSourceCategory[], manifest: ContentSourceManifest): ContentSourceCategory[] {
   const parentIds = new Set(categories.map((category) => category.parentId).filter((id) => id !== null));
-  return categories.filter((category) => !parentIds.has(category.id) && !categoryMatches(category.id, manifest.excludedCategoryIds ?? [], categories));
+  return categories.filter((category) => (!parentIds.has(category.id) || category.isAll) && !categoryMatches(category.id, manifest.excludedCategoryIds ?? [], categories));
 }
 
 /** 校验明确选择的分类集合，不限制全选数量，并保存源站名称快照。 */
@@ -80,15 +95,17 @@ function selectedVideoCategories(input: string[], available: ContentSourceCatego
 /** 清单转换为管理端公开摘要，接口地址和请求头保留在服务端。 */
 function mapPlugin(row: Record<string, unknown>): ContentSourcePluginRecord {
   const manifest = parseJsonObject(row.manifest_json);
-  return { pluginId: String(row.plugin_id), version: String(row.version), displayName: String(manifest.displayName), description: String(manifest.description ?? ""), adapter: manifest.adapter === "netease_http" ? "netease_http" : manifest.adapter === "python_spider" ? "python_spider" : "cms_json", mediaType: manifest.mediaType === "audiobook" ? "audiobook" : manifest.adapter === "netease_http" ? "music" : "video", status: String(row.status) as ContentSourcePluginRecord["status"] };
+  return { pluginId: String(row.plugin_id), version: String(row.version), displayName: String(manifest.displayName), description: String(manifest.description ?? ""), adapter: manifest.adapter === "netease_http" ? "netease_http" : manifest.adapter === "python_spider" ? "python_spider" : manifest.adapter === "catvod_js" ? "catvod_js" : "cms_json", mediaType: manifest.mediaType === "audiobook" ? "audiobook" : manifest.adapter === "netease_http" ? "music" : "video", status: String(row.status) as ContentSourcePluginRecord["status"] };
 }
 
-/** 管理内容源插件和用户实例，统一 CMS、Python 视频目录与即时播放取址。 */
+/** 管理内容源插件和用户实例，统一 CMS、Python／JavaScript 视频目录与即时播放取址。 */
 export class ContentSourceManager {
   public readonly pythonRuntime: PythonSpiderRuntime;
+  /** JavaScript 与 Python 共用目录模型，独立维护各自的执行进程。 */
+  public readonly javascriptRuntime: JavaScriptSpiderRuntime;
   /** 其他内容领域在同一实例停用时一并取消请求，不各自保留可回填的旧会话。 */
   private readonly instanceStopListeners = new Set<(instanceId: string) => Promise<void>>();
-  private readonly pythonAdapters = new Map<string, PythonVideoSourceAdapter>();
+  private readonly spiderAdapters = new Map<string, SpiderVideoSourceAdapter>();
   private readonly jobs = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   private readonly categoryLibraryReader: SourceCategoryLibraryReader;
   private readonly dynamicCatalog: DynamicContentCatalog;
@@ -100,6 +117,7 @@ export class ContentSourceManager {
   /** 复用既有数据库和目录仓储，建立按实例复用且按需启动的 Python 宿主。 */
   public constructor(private readonly database: FlyCloudHelperDatabase, private readonly config: ApiConfig, private readonly repository: ServiceRepository) {
     this.pythonRuntime = new PythonSpiderRuntime(config.pluginDirectory, config.pythonPath);
+    this.javascriptRuntime = new JavaScriptSpiderRuntime(config.pluginDirectory, config.allowInsecureProviderHttp);
     this.categoryLibraryReader = new SourceCategoryLibraryReader(database);
     this.dynamicCatalog = new DynamicContentCatalog(
       (libraryId, userId, query) => this.dynamicContext(libraryId, userId, query),
@@ -125,11 +143,11 @@ export class ContentSourceManager {
   /** 停止后台请求并等待写入收尾，避免关闭数据库之后任务继续运行。 */
   public async shutdown(): Promise<void> {
     this.closing = true;
-    for (const adapter of this.pythonAdapters.values()) adapter.invalidate();
+    for (const adapter of this.spiderAdapters.values()) adapter.invalidate();
     for (const job of this.jobs.values()) job.controller.abort();
     await Promise.allSettled([this.dynamicCatalog.shutdown(), this.itemDetails.close(), ...[...this.jobs.values()].map((job) => job.promise)]);
-    await this.pythonRuntime.close();
-    this.pythonAdapters.clear();
+    await Promise.all([this.pythonRuntime.close(), this.javascriptRuntime.close()]);
+    this.spiderAdapters.clear();
   }
 
   /** 普通用户只看到启用版本，管理员能够看到全部安装状态。 */
@@ -145,6 +163,17 @@ export class ContentSourceManager {
     const matches = rows.filter((row) => {
       const manifest = parseJsonObject(row.manifest_json);
       return manifest.adapter === "python_spider" && manifest.scriptHash === scriptHash;
+    });
+    const row = matches.find((entry) => entry.status !== "uninstalled") ?? matches[0];
+    return row ? mapPlugin(row) : null;
+  }
+
+  /** JavaScript 原始字节重复导入时复用已登记身份，不创建同内容的第二个插件。 */
+  public async findJavaScriptPluginByScriptHash(scriptHash: string): Promise<ContentSourcePluginRecord | null> {
+    const rows = await this.database.query("content_source_plugins").select("*").orderBy("created_at", "asc");
+    const matches = rows.filter((row) => {
+      const manifest = parseJsonObject(row.manifest_json);
+      return manifest.adapter === "catvod_js" && manifest.scriptHash === scriptHash;
     });
     const row = matches.find((entry) => entry.status !== "uninstalled") ?? matches[0];
     return row ? mapPlugin(row) : null;
@@ -188,7 +217,7 @@ export class ContentSourceManager {
     if (status !== "enabled") {
       const instances = await this.database.query("content_source_instances").select("id").where({ plugin_id: pluginId, plugin_version: version });
       for (const instance of instances) {
-        await this.stopPythonAdapter(String(instance.id));
+        await this.stopSpiderAdapter(String(instance.id));
       }
       const bindings = await this.database.query("content_source_libraries as b").join("content_source_instances as i", "i.id", "b.instance_id").select("b.library_id").where({ "i.plugin_id": pluginId, "i.plugin_version": version });
       for (const binding of bindings) this.jobs.get(String(binding.library_id))?.controller.abort();
@@ -209,7 +238,7 @@ export class ContentSourceManager {
     return this.manifest(pluginId, version);
   }
 
-  /** 预览插件分类不写入实例，Python 临时会话无论成功或失败都立即释放。 */
+  /** 预览插件分类不写入实例，脚本临时会话无论成功或失败都立即释放。 */
   public async previewPluginCategories(pluginId: string, version: string, userId: string): Promise<ContentSourceCategory[]> {
     const manifest = await this.manifest(pluginId, version);
     // 关键变量：每次预览都有独立身份，不共享已有库的 Cookie、加密会话和分类上下文。
@@ -218,7 +247,7 @@ export class ContentSourceManager {
     try {
       return selectableVideoCategories(await runtime.adapter.categories(), runtime.manifest);
     } finally {
-      if (manifest.adapter === "python_spider") await this.stopPythonAdapter(previewId);
+      if (["python_spider", "catvod_js"].includes(manifest.adapter)) await this.stopSpiderAdapter(previewId);
     }
   }
 
@@ -277,7 +306,7 @@ export class ContentSourceManager {
     await this.database.query("content_source_instances").where({ id: instanceId, user_id: userId }).update({ ...(patch.displayName !== undefined ? { display_name: patch.displayName } : {}), ...(patch.status ? { status: patch.status } : {}), updated_at: new Date().toISOString() });
     const source = await this.instance(instanceId, userId, false);
     if (patch.status === "disabled" && source.libraryId) this.jobs.get(source.libraryId)?.controller.abort();
-    if (patch.status === "disabled") await this.stopPythonAdapter(instanceId);
+    if (patch.status === "disabled") await this.stopSpiderAdapter(instanceId);
     return source;
   }
 
@@ -291,13 +320,13 @@ export class ContentSourceManager {
     this.instanceStopListeners.add(listener);
   }
 
-  /** 停止 CMS 与 Python 的详情任务，再释放 Python 缓存和宿主，重新启用使用新会话。 */
-  private async stopPythonAdapter(instanceId: string): Promise<void> {
+  /** 停止详情任务并释放对应脚本缓存和宿主，重新启用使用新会话。 */
+  private async stopSpiderAdapter(instanceId: string): Promise<void> {
     await Promise.all([...this.instanceStopListeners].map((listener) => listener(instanceId)));
     await this.itemDetails.stopInstance(instanceId);
-    this.pythonAdapters.get(instanceId)?.invalidate();
-    this.pythonAdapters.delete(instanceId);
-    await this.pythonRuntime.stopInstance(instanceId);
+    this.spiderAdapters.get(instanceId)?.invalidate();
+    this.spiderAdapters.delete(instanceId);
+    await Promise.all([this.pythonRuntime.stopInstance(instanceId), this.javascriptRuntime.stopInstance(instanceId)]);
   }
 
   /** 从用户实例创建固定适配器，自动继承实例 HTTP 开关。 */
@@ -307,13 +336,24 @@ export class ContentSourceManager {
     return { source, ...this.videoAdapter(manifest, instanceId) };
   }
 
-  /** CMS 保持原执行方式，Python 按实例保留适配器与分类上下文。 */
+  /** CMS 保持原执行方式，Python／JavaScript 按实例保留适配器与分类上下文。 */
   private videoAdapter(manifest: ContentSourceManifest, instanceId: string): { adapter: VideoSourceAdapter; manifest: ContentSourceManifest } {
     if (manifest.mediaType === "audiobook") throw new ApiError(409, "content_audiobook_adapter_required", "有声书源请使用在线有声书目录入口");
     if (manifest.adapter === "netease_http") throw new ApiError(409, "content_music_adapter_required", "网易音乐源请使用在线音乐目录入口");
-    if (manifest.adapter === "python_spider") {
-      let adapter = this.pythonAdapters.get(instanceId);
-      if (!adapter) { adapter = new PythonVideoSourceAdapter(manifest, this.pythonRuntime, instanceId, this.config.pluginDirectory); this.pythonAdapters.set(instanceId, adapter); }
+    if (manifest.adapter === "python_spider" || manifest.adapter === "catvod_js") {
+      let adapter = this.spiderAdapters.get(instanceId);
+      // 关键变量：脚本升级后不能复用旧解析器；宿主在下次调用时按新路径结束旧进程并重新初始化。
+      if (adapter && adapter.sourceManifest.scriptHash !== manifest.scriptHash) {
+        adapter.invalidate();
+        this.spiderAdapters.delete(instanceId);
+        adapter = undefined;
+      }
+      if (!adapter) {
+        adapter = manifest.adapter === "catvod_js"
+          ? new JavaScriptVideoSourceAdapter(manifest, this.javascriptRuntime, instanceId, this.config.pluginDirectory, this.config.allowInsecureProviderHttp)
+          : new PythonVideoSourceAdapter(manifest, this.pythonRuntime, instanceId, this.config.pluginDirectory, this.config.allowInsecureProviderHttp);
+        this.spiderAdapters.set(instanceId, adapter);
+      }
       return { adapter, manifest: adapter.sourceManifest };
     }
     return { adapter: new CmsVideoSourceAdapter(manifest, this.config.allowInsecureProviderHttp), manifest };
@@ -346,7 +386,7 @@ export class ContentSourceManager {
     const initialPageCount = 1;
     const configuration: ContentLibraryConfiguration = { ...selected, categoryCatalog: categories, initialPageCount };
     const libraryId = randomUUID();
-    const created = await this.repository.createContentSourceVideoLibrary({ libraryId, sourceId: randomUUID(), instanceId, userId, displayName: input.displayName, sourceName: runtime.source.displayName, providerType: runtime.manifest.adapter === "python_spider" ? "python_spider" : "cms_json", configuration: configuration as unknown as Record<string, unknown>, syncState: emptySync() as unknown as Record<string, unknown> });
+    const created = await this.repository.createContentSourceVideoLibrary({ libraryId, sourceId: randomUUID(), instanceId, userId, displayName: input.displayName, sourceName: runtime.source.displayName, providerType: runtime.manifest.adapter === "python_spider" ? "python_spider" : runtime.manifest.adapter === "catvod_js" ? "catvod_js" : "cms_json", configuration: configuration as unknown as Record<string, unknown>, syncState: emptySync() as unknown as Record<string, unknown> });
     const sync = await this.startLibrarySync(libraryId, userId, { pageCount: initialPageCount });
     return { libraryId, library: created.library, sync };
   }
@@ -370,6 +410,10 @@ export class ContentSourceManager {
     try { return await this.dynamicCatalog.browse(libraryId, userId, options); }
     catch (error) {
       if (error instanceof ApiError && ["content_plugin_disabled", "content_source_disabled"].includes(error.code)) return null;
+      if (isSourceConnectionFailure(error)) {
+        console.warn(JSON.stringify({ 日志关键字: "codex-content-source-catalog", 事件: "源连接失败，读取已同步分类目录", 媒体库ID: libraryId, 分类ID: options.categoryId, 请求起点: options.startIndex ?? 0, 错误码: error.code }));
+        return null;
+      }
       throw error;
     }
   }
@@ -379,6 +423,10 @@ export class ContentSourceManager {
     try { return await this.dynamicCatalog.search(libraryId, userId, options); }
     catch (error) {
       if (error instanceof ApiError && ["content_search_unsupported", "content_plugin_disabled", "content_source_disabled"].includes(error.code)) return null;
+      if (isSourceConnectionFailure(error)) {
+        console.warn(JSON.stringify({ 日志关键字: "codex-content-source-catalog", 事件: "源连接失败，搜索已同步目录", 媒体库ID: libraryId, 分类ID: options.categoryId ?? null, 请求起点: options.startIndex ?? 0, 错误码: error.code }));
+        return null;
+      }
       throw error;
     }
   }
@@ -387,7 +435,7 @@ export class ContentSourceManager {
   public async withLibraryCatalogChange<T>(libraryId: string, operation: () => Promise<T>): Promise<T> {
     return this.itemDetails.withLibraryChange(libraryId, () => this.dynamicCatalog.withLibraryCatalogChange(libraryId, async () => {
       const binding = await this.database.query("content_source_libraries").select("instance_id").where({ library_id: libraryId }).first();
-      if (binding) await this.stopPythonAdapter(String(binding.instance_id));
+      if (binding) await this.stopSpiderAdapter(String(binding.instance_id));
       return operation();
     }));
   }
@@ -409,7 +457,7 @@ export class ContentSourceManager {
       .select("p.manifest_json", "b.library_source_id").where({ "b.library_id": libraryId, "b.user_id": userId, "i.user_id": userId }).first();
     if (!sourceType) return null;
     const adapterType = parseJsonObject(sourceType.manifest_json).adapter;
-    if (adapterType !== "python_spider" && adapterType !== "cms_json") return null;
+    if (adapterType !== "python_spider" && adapterType !== "catvod_js" && adapterType !== "cms_json") return null;
     if (library.status !== "active") throw new ApiError(409, "content_library_disabled", "媒体库已停用");
     const binding = await this.getLibrary(libraryId, userId);
     const sourceStatus = await this.database.query("library_sources").select("status")
@@ -427,7 +475,7 @@ export class ContentSourceManager {
       throw new ApiError(409, "content_source_locator_missing", "内容源条目定位已变化，请刷新目录");
     }
     const categories = mergeCategoryCatalog(binding.configuration, []);
-    if (runtime.adapter instanceof PythonVideoSourceAdapter) {
+    if (runtime.adapter instanceof SpiderVideoSourceAdapter) {
       runtime.adapter.useCategoryCatalog(categories);
       if (typeof locator.categoryId === "string") runtime.adapter.useItemCategory(locator.remoteItemId, locator.categoryId);
     }
@@ -452,15 +500,19 @@ export class ContentSourceManager {
     const categories = mergeCategoryCatalog(configuration, []);
     const runtime = this.videoAdapter(validateContentManifest(parseJsonObject(row.manifest_json)), String(row.instance_id));
     const manifest = runtime.manifest;
-    if (runtime.adapter instanceof PythonVideoSourceAdapter) runtime.adapter.useCategoryCatalog(categories);
-    if (query.kind === "search" && manifest.adapter !== "python_spider" && !CMS_REMOTE_SEARCH_PLUGIN_IDS.has(String(row.plugin_id))) throw new ApiError(422, "content_search_unsupported", "此插件继续使用已入库内容搜索");
-    // 关键变量：全库搜索也只接纳当前所选且仍受清单支持的视频叶分类。
+    if (runtime.adapter instanceof SpiderVideoSourceAdapter) runtime.adapter.useCategoryCatalog(categories);
+    if (query.kind === "search" && manifest.adapter !== "python_spider" && manifest.adapter !== "catvod_js" && !CMS_REMOTE_SEARCH_PLUGIN_IDS.has(String(row.plugin_id))) throw new ApiError(422, "content_search_unsupported", "此插件继续使用已入库内容搜索");
+    // 关键变量：普通目录按当前选择筛选；源明确提供的总目录可接纳其真实细分类。
     const availableIds = new Set(selectableVideoCategories(categories, manifest).map((category) => category.id));
     const selectedIds = configuration.categoryIds.filter((id) => availableIds.has(id));
     const categoryId = query.categoryId;
     if (categoryId !== undefined && !configuration.categoryIds.includes(categoryId)) throw new ApiError(404, "content_category_not_selected", "此分类不在媒体库当前选择范围内");
     if (categoryId !== undefined && !availableIds.has(categoryId)) throw new ApiError(422, "content_category_unsupported", "此分类不支持视频目录查询");
-    const categoryIds = categoryId === undefined ? selectedIds : [categoryId];
+    const requestedIds = categoryId === undefined ? selectedIds : [categoryId];
+    const includesAll = categories.some((category) => category.isAll && requestedIds.includes(category.id));
+    const categoryIds = includesAll
+      ? categories.filter((category) => !categoryMatches(category.id, manifest.excludedCategoryIds ?? [], categories)).map((category) => category.id)
+      : requestedIds;
     const instanceId = String(row.instance_id);
     const identity = JSON.stringify([instanceId, manifest, categories, [...configuration.categoryIds].sort()]);
     return { libraryId, userId, instanceId, query, categoryIds, identity, manifest, categories, adapter: runtime.adapter };
@@ -509,7 +561,7 @@ export class ContentSourceManager {
       const batch = itemIds.slice(offset, offset + 100);
       const query = this.database.query("media_items as m").select("m.id", "m.metadata_json")
         .where({ "m.library_id": context.libraryId, "m.user_id": context.userId }).whereIn("m.id", batch).whereIn("m.item_type", itemTypes).whereNull("m.deleted_at");
-      if (context.manifest.adapter !== "python_spider" && context.manifest.adapter !== "cms_json") query.where((builder) => builder.where((movies) => movies.where("m.item_type", "video.movie")
+      if (context.manifest.adapter !== "python_spider" && context.manifest.adapter !== "catvod_js" && context.manifest.adapter !== "cms_json") query.where((builder) => builder.where((movies) => movies.where("m.item_type", "video.movie")
           .whereExists(this.database.query("content_playback_sources as p").select("p.id")
             .whereRaw("?? = ??", ["p.item_id", "m.id"]).where({ "p.library_id": context.libraryId, "p.user_id": context.userId, "p.instance_id": context.instanceId, "p.status": "active" })))
           .orWhere((series) => series.where("m.item_type", "video.series")
@@ -730,8 +782,8 @@ export class ContentSourceManager {
         for (const row of rows) {
           signal.throwIfAborted();
           try {
-            if (runtime.adapter instanceof PythonVideoSourceAdapter) {
-              await this.restorePythonItemCategory(runtime.adapter, libraryId, userId, detail.source.id, String(row.remote_item_id));
+            if (runtime.adapter instanceof SpiderVideoSourceAdapter) {
+              await this.restoreSpiderItemCategory(runtime.adapter, libraryId, userId, detail.source.id, String(row.remote_item_id));
             }
             await persist(await runtime.adapter.detail(String(row.remote_item_id), signal));
           } catch (error) {
@@ -751,9 +803,10 @@ export class ContentSourceManager {
         for (const categoryId of selectedCategoryIds) {
           signal.throwIfAborted();
           const firstPage = await runtime.adapter.page(categoryId, 1, signal);
+          const isAll = categories.some((category) => category.id === categoryId && category.isAll);
           for (const content of firstPage.items) {
-            // 源站必须返回该叶分类的真实作品；同一源条目在本次同步中只写入一次。
-            if (content.categoryId !== categoryId || processedRemoteIds.has(content.id)) continue;
+            // 总目录保留真实细分类；普通分类仍校验归属，同一源条目本轮只写入一次。
+            if ((!isAll && content.categoryId !== categoryId) || processedRemoteIds.has(content.id)) continue;
             await persist(content);
             processedRemoteIds.add(content.id);
           }
@@ -833,7 +886,7 @@ export class ContentSourceManager {
   }
 
   /** 从既有父条目元数据恢复源分类，刷新和播放共用，不新增数据库字段。 */
-  private async restorePythonItemCategory(adapter: PythonVideoSourceAdapter, libraryId: string, userId: string, instanceId: string, remoteItemId: string): Promise<void> {
+  private async restoreSpiderItemCategory(adapter: SpiderVideoSourceAdapter, libraryId: string, userId: string, instanceId: string, remoteItemId: string): Promise<void> {
     // 关键变量：稳定父身份同时覆盖电影与剧集，不依赖进程中的分类缓存。
     const identityKey = `content:${instanceId}:${contentKey(remoteItemId)}`;
     const item = await this.database.query("media_items").select("metadata_json")
@@ -852,10 +905,10 @@ export class ContentSourceManager {
     const locator = await this.database.query("content_playback_sources").where({ id: sourceId, user_id: userId, library_id: libraryId, status: "active" }).first();
     if (!locator || !(await this.listPlaybackSources(String(locator.item_id), userId)).some((source) => source.id === sourceId)) throw new ApiError(404, "content_playback_source_missing", "此在线播放来源已不可用");
     const runtime = await this.adapter(String(locator.instance_id), userId);
-    if (runtime.adapter instanceof PythonVideoSourceAdapter) {
+    if (runtime.adapter instanceof SpiderVideoSourceAdapter) {
       const binding = await this.getLibrary(libraryId, userId);
       runtime.adapter.useCategoryCatalog(mergeCategoryCatalog(binding.configuration, []));
-      await this.restorePythonItemCategory(runtime.adapter, libraryId, userId, String(locator.instance_id), String(locator.remote_item_id));
+      await this.restoreSpiderItemCategory(runtime.adapter, libraryId, userId, String(locator.instance_id), String(locator.remote_item_id));
     }
     const detail = await runtime.adapter.detail(String(locator.remote_item_id), signal);
     signal?.throwIfAborted();
@@ -864,11 +917,42 @@ export class ContentSourceManager {
     const episode = episodes[0]!;
     const access = await runtime.adapter.resolveEpisode(episode, signal);
     if (runtime.manifest.adapter === "cms_json" && access.container !== locator.container) throw new ApiError(409, "content_playback_container_changed", "源站媒体格式发生变化，请先刷新已入库内容后重新播放");
-    await validateProviderUrl(access.url, { allowInsecureHttp: this.config.allowInsecureProviderHttp });
+    if (isSpiderProxyUrl(access.url)) {
+      if (readSpiderProxyInstance(access.url) !== String(locator.instance_id)) throw new ApiError(403, "content_source_proxy_scope_invalid", "源代理不属于当前播放实例");
+    } else {
+      await validateProviderUrl(access.url, { allowInsecureHttp: this.config.allowInsecureProviderHttp });
+    }
     // 网络取址期间可能发生停用，返回前再次检查，禁止把失效源交给协议中转。
     if (!(await this.listPlaybackSources(String(locator.item_id), userId)).some((source) => source.id === sourceId)) throw new ApiError(409, "content_playback_disabled", "内容源已停用");
     signal?.throwIfAborted();
     return { ...access, sourceId };
+  }
+
+  /** 媒体和图片代理必须属于当前用户的真实在线库，不能凭内部 URL 越权调用源脚本。 */
+  public async invokeSourceProxy(value: string, userId: string, libraryId: string, headers: Record<string, string>, signal?: AbortSignal): Promise<unknown> {
+    signal?.throwIfAborted();
+    const instanceId = readSpiderProxyInstance(value);
+    const binding = await this.database.query("content_source_libraries as b")
+      .join("media_libraries as l", "l.id", "b.library_id")
+      .join("library_sources as s", "s.id", "b.library_source_id")
+      .select("b.instance_id")
+      .where({ "b.library_id": libraryId, "b.user_id": userId, "b.instance_id": instanceId,
+        "l.user_id": userId, "l.status": "active", "l.library_kind": "content_source_video", "s.status": "active" }).first();
+    if (!binding) throw new ApiError(404, "content_source_proxy_missing", "内容源代理已经停用或不属于当前媒体库");
+    const runtime = await this.adapter(instanceId, userId);
+    if (!(runtime.adapter instanceof SpiderVideoSourceAdapter)) throw new ApiError(422, "content_source_proxy_unsupported", "此内容源不提供脚本代理");
+    const url = new URL(value);
+    url.searchParams.delete("instance");
+    const query: Record<string, string> = {};
+    for (const [name, field] of url.searchParams) {
+      if (name in query) throw new ApiError(422, "content_source_proxy_query_invalid", "内容源代理参数重复");
+      query[name] = field;
+    }
+    const result = await runtime.adapter.proxyResource(query, headers, signal);
+    signal?.throwIfAborted();
+    // 请求期间停用必须在响应前再次检查，避免已经失效的源回填媒体字节。
+    await this.instance(instanceId, userId);
+    return result;
   }
 
   /** 持久化中转实际读取的完整 HLS 时长，源站文本时长不作为准确值。 */

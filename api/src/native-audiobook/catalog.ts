@@ -8,6 +8,7 @@ import type { NativeContext, NativeQuery } from "./types.js";
 import { NativeStore, nativeHash, nativeKey } from "./store.js";
 import { nativeLocalChapters } from "./local-chapters.js";
 import { NativeCatalogSearch } from "./catalog-search.js";
+import { NativeSourceBooks } from "./catalog-source-books.js";
 import { boundedText, catalogJson, catalogLimit, catalogNames, catalogPage, catalogText, makeCatalogCursor, nativeCatalogItem, readCatalogCursor, whereCatalogArray } from "./catalog-query.js";
 
 /** 目录装配只批量请求当前页用户状态，不引用完整账号对象。 */
@@ -20,6 +21,7 @@ export interface NativeCatalogState {
 /** 原生目录直接读取已授权条目；不复用 ABS 全书投影或通用媒体统计。 */
 export class NativeCatalog {
   private readonly searches = new NativeCatalogSearch();
+  private readonly sourceBooks = new NativeSourceBooks();
 
   public constructor(private readonly runtime: ApiRuntime, private readonly store: NativeStore, private readonly access: NativeAccess) {}
 
@@ -95,7 +97,7 @@ export class NativeCatalog {
         values.push({ LibraryId: id, Name: boundedText(library.displayName), Capabilities: {
           Categories: true, RealtimeSearch: library.libraryKind === "content_source_audiobook",
           ChapterPlayback: true, ChapterPagination: true, UnknownDuration: true,
-          Downloads: context.account.CanDownload, SourceCatalogMode: library.libraryKind === "content_source_audiobook" ? "FullIndex" : "RandomPage",
+          Downloads: context.account.CanDownload, SourceCatalogMode: "RandomPage",
         } });
       } catch (error) {
         if (!(error instanceof ApiError) || ![404, 409].includes(error.statusCode)) throw error;
@@ -161,6 +163,21 @@ export class NativeCatalog {
     const order = String(query.order ?? "Desc");
     if (!["Title", "AddedAt", "UpdatedAt"].includes(String(sort)) || !["Asc", "Desc"].includes(String(order)))
       throw new ApiError(400, "invalid_sort", "排序字段或方向无效");
+    if (library.libraryKind === "content_source_audiobook" && !seriesId) {
+      let sourceCategoryId: string | undefined;
+      if (categoryId) {
+        const category = await this.store.get<{ LibraryId: string; Dimension: string; Name: string; Id: string }>(nativeKey("dimension", libraryId, "source-category", categoryId));
+        if (!category || category.value.LibraryId !== libraryId || category.value.Dimension !== "source-category" || category.value.Id !== categoryId)
+          throw new ApiError(404, "category_unavailable", "分类不存在，请重新读取分类列表");
+        sourceCategoryId = category.value.Name;
+      }
+      const page = await this.sourceBooks.read(context, this.runtime, libraryId, query, sourceCategoryId, sort, order, limit);
+      const rows: Record<string, unknown>[] = page.ids.length ? await this.items(context)
+        .where({ "m.library_id": libraryId, "m.item_type": "audiobook.book" }).whereIn("m.id", page.ids).select("m.*", "l.library_kind") : [];
+      const byId = new Map(rows.map((row) => [String(row.id), nativeCatalogItem(row)]));
+      if (byId.size !== page.ids.length) throw new ApiError(409, "catalog_changed", "书籍目录已变化，请重新读取");
+      return catalogPage(await Promise.all(page.ids.map((id) => this.summary(context, byId.get(id)!))), page.revision, page.next, page.previous);
+    }
     const column = sort === "Title" ? "m.sort_title" : sort === "AddedAt" ? "m.created_at" : "m.updated_at";
     const scope = [context.service.ServiceId, context.account.AccountId, libraryId, "books", categoryId, seriesId, sort, order];
     for (let attempt = 0; attempt < 3; attempt += 1) {

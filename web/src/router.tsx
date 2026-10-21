@@ -24,7 +24,7 @@ import { AdminServiceBasicDetailPage, UserServiceBasicDetailPage } from "@/pages
 import { LibraryCreatePage } from "@/pages/LibraryCreatePage";
 import { LibraryFileBrowsePage } from "@/pages/LibraryFileBrowsePage";
 import { LibraryAbsSettingsPage } from "@/pages/LibraryAbsSettingsPage";
-import { NativeAudiobookServicesPage } from "@/pages/native-audiobook";
+import { LibraryFlyAudiobookSettingsPage } from "@/pages/LibraryFlyAudiobookSettingsPage";
 import {
   AdminCatalogPage,
   AdminJobsPage,
@@ -210,16 +210,16 @@ function UserLibraryAbsSettingsRouteComponent() {
   return <LibraryAbsSettingsPage key={`${serviceId}:user`} serviceId={serviceId} />;
 }
 
-/** 普通用户统一管理听书入口，实际库链接只负责预选和筛选。 */
+/** 普通用户在当前媒体库配置 FlyAudioBook。 */
 function UserNativeAudiobookRouteComponent() {
-  const { libraryId } = userNativeAudiobookRoute.useSearch();
-  return <NativeAudiobookServicesPage key={`user:${libraryId ?? "all"}`} libraryId={libraryId} />;
+  const { serviceId } = userNativeAudiobookRoute.useParams();
+  return <LibraryFlyAudiobookSettingsPage key={`user:${serviceId}`} libraryId={serviceId} />;
 }
 
-/** 管理员复用同一入口页面，库归属仍由服务端校验。 */
+/** 管理员复用媒体库协议页，库归属仍由服务端校验。 */
 function AdminNativeAudiobookRouteComponent() {
-  const { libraryId } = adminNativeAudiobookRoute.useSearch();
-  return <NativeAudiobookServicesPage key={`admin:${libraryId ?? "all"}`} libraryId={libraryId} admin />;
+  const { serviceId } = adminNativeAudiobookRoute.useParams();
+  return <LibraryFlyAudiobookSettingsPage key={`admin:${serviceId}`} libraryId={serviceId} admin />;
 }
 
 /** 仅接受有限的库 ID 作为设置页上下文，不从 URL 接收账号凭据。 */
@@ -468,9 +468,19 @@ const userLibraryAbsSettingsRoute = createRoute({
 
 const userNativeAudiobookRoute = createRoute({
   getParentRoute: () => appRoute,
+  path: "libraries/$serviceId/flyaudiobook",
+  component: UserNativeAudiobookRouteComponent,
+});
+
+// 旧收藏地址只跳转到对应媒体库，不再提供独立听书服务管理页面。
+const userLegacyAudiobookRoute = createRoute({
+  getParentRoute: () => appRoute,
   path: "audiobook-services",
   validateSearch: nativeAudiobookSearch,
-  component: UserNativeAudiobookRouteComponent,
+  beforeLoad: ({ search }) => {
+    if (search.libraryId) throw redirect({ to: "/app/libraries/$serviceId/flyaudiobook", params: { serviceId: search.libraryId }, replace: true });
+    throw redirect({ to: "/app/catalog", replace: true });
+  },
 });
 
 const adminRoute = createRoute({
@@ -574,9 +584,19 @@ const adminLibraryAbsSettingsRoute = createRoute({
 
 const adminNativeAudiobookRoute = createRoute({
   getParentRoute: () => adminRoute,
+  path: "libraries/$serviceId/flyaudiobook",
+  component: AdminNativeAudiobookRouteComponent,
+});
+
+// 管理员旧地址沿用媒体库上下文，避免继续暴露多库创建流程。
+const adminLegacyAudiobookRoute = createRoute({
+  getParentRoute: () => adminRoute,
   path: "audiobook-services",
   validateSearch: nativeAudiobookSearch,
-  component: AdminNativeAudiobookRouteComponent,
+  beforeLoad: ({ search }) => {
+    if (search.libraryId) throw redirect({ to: "/admin/libraries/$serviceId/flyaudiobook", params: { serviceId: search.libraryId }, replace: true });
+    throw redirect({ to: "/admin/catalog", replace: true });
+  },
 });
 
 const adminPluginsRoute = createRoute({
@@ -640,6 +660,7 @@ const appRouteTree = appRoute.addChildren([
   userLibraryEmbySettingsRoute,
   userLibraryAbsSettingsRoute,
   userNativeAudiobookRoute,
+  userLegacyAudiobookRoute,
 ]);
 
 /** 组合超级管理员后台子路由。 */
@@ -660,6 +681,7 @@ const adminRouteTree = adminRoute.addChildren([
   adminLibraryEmbySettingsRoute,
   adminLibraryAbsSettingsRoute,
   adminNativeAudiobookRoute,
+  adminLegacyAudiobookRoute,
   adminPluginsRoute,
   adminAiModelsRoute,
   adminConfigurationRoute,

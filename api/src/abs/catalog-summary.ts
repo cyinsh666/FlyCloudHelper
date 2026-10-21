@@ -19,9 +19,11 @@ export interface AbsBookSummary extends Omit<AbsBook, "tracks" | "chapters"> {
 export async function loadAbsBookSummaries(
   runtime: ApiRuntime,
   context: AbsContext,
+  itemIds?: string[],
 ): Promise<AbsBookSummary[]> {
+  if (itemIds?.length === 0) return [];
   context = await withAbsLibraryViews(runtime, context);
-  const rows = await runtime.database
+  const query = runtime.database
     .query("media_items as b")
     .join("media_libraries as l", "l.id", "b.library_id")
     .join("user_accounts as u", "u.id", "b.user_id")
@@ -32,6 +34,9 @@ export async function loadAbsBookSummaries(
       "b.item_type": "audiobook.book",
     })
     .whereNull("b.deleted_at");
+  // 源站浏览只装配当前窗口或客户端小页的摘要，避免每次追加都读取全库。
+  if (itemIds) query.whereIn("b.id", itemIds);
+  const rows = await query;
   // 关键变量：先按分类收窄目录，再统计、排序和分页；不加载章节或请求源站详情。
   const visibleRows = rows.filter((row) => absBookMatchesLibrary(context, {
     metadata: readAbsObject(row.metadata_json),

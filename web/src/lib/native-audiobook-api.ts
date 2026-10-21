@@ -10,6 +10,7 @@ export interface NativeAudiobookService {
 /** 账号列表只能读取授权摘要，已有密码不可读取。 */
 export interface NativeAudiobookAccount {
   AccountId: string; ServiceId: string; Username: string; DisplayName: string; AllowedLibraryIds: string[];
+  HasPassword: boolean;
   Enabled: boolean; CanDownload: boolean; PermissionsRevision: string; CreatedAt: string; UpdatedAt: string;
 }
 
@@ -24,7 +25,8 @@ export interface NativeAudiobookPage<T> { Items: T[]; NextCursor: string | null;
 /** 创建和编辑入口共享相同显式字段，不修改实际媒体库。 */
 export interface NativeAudiobookServiceInput { Name: string; Mode: NativeAudiobookService["Mode"]; PathSuffix: string; LibraryIds: string[]; Enabled: boolean; RelayPlaybackEnabled: boolean; }
 /** 密码省略时保留旧值，新建省略则由服务端生成。 */
-export interface NativeAudiobookAccountInput { Username: string; DisplayName: string; Password?: string; AllowedLibraryIds: string[]; Enabled: boolean; CanDownload: boolean; }
+/** 显示名称可省略：创建默认采用用户名，编辑时保留已有值。 */
+export interface NativeAudiobookAccountInput { Username: string; DisplayName?: string; Password?: string; AllowedLibraryIds: string[]; Enabled: boolean; CanDownload: boolean; }
 
 const base = "/api/v1/audiobook-services";
 
@@ -39,6 +41,22 @@ function pageQuery(cursor: string | null, libraryId?: string): string {
 /** 统一入口页或实际库设置页按服务端索引分页查询。 */
 export function listNativeAudiobookServices(cursor: string | null, libraryId?: string): Promise<NativeAudiobookPage<NativeAudiobookService>> {
   return requestJson(`${base}?${pageQuery(cursor, libraryId)}`);
+}
+
+/** 当前媒体库读取自己的协议配置，未配置时保持空值，不自动建立记录。 */
+export function getLibraryFlyAudiobookSettings(libraryId: string): Promise<{ Service: NativeAudiobookService | null }> {
+  return requestJson(`/api/v1/libraries/${encodeURIComponent(libraryId)}/flyaudiobook`);
+}
+
+/** 显式启用或保存时固定关联当前库，已有配置沿用身份、地址和账号。 */
+export function saveLibraryFlyAudiobookSettings(library: MediaLibrary, service: NativeAudiobookService | null, patch: Partial<Pick<NativeAudiobookServiceInput, "PathSuffix" | "Enabled" | "RelayPlaybackEnabled">>): Promise<NativeAudiobookService> {
+  if (service) return requestJson<{ Service: NativeAudiobookService }>(`${base}/${encodeURIComponent(service.ServiceId)}`, {
+    method: "PATCH", body: JSON.stringify(patch),
+  }).then((result) => result.Service);
+  return saveNativeAudiobookService(null, {
+    Name: library.displayName, Mode: "SingleLibrary", LibraryIds: [library.id], PathSuffix: library.id,
+    Enabled: false, RelayPlaybackEnabled: true, ...patch,
+  });
 }
 
 /** 读取当前入口最终配置，用于刷新账号授权范围。 */

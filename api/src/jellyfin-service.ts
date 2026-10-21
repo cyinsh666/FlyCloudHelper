@@ -75,6 +75,8 @@ interface JellyfinLibraryDefinition {
   regionGroup?: VideoRegionGroup;
   /** 源分类入口不依赖条目 Movie/Series 类型；null 仅为历史未分类。 */
   sourceCategoryId?: string | null;
+  /** 源明确声明的全部目录：保留远端分类 ID，本地读取包含所有真实分类。 */
+  sourceCategoryIsAll?: boolean;
 }
 
 interface JellyfinGenreSummary {
@@ -482,7 +484,7 @@ export class JellyfinCompatibilityService {
     const internalId = `${context.libraryId}:source-category:${identity}`;
     return {
       internalId, id: createProtocolUuid("content_source_category", internalId), name: category.name,
-      sourceCategoryId: category.categoryId, collectionType: category.collectionType,
+      sourceCategoryId: category.categoryId, sourceCategoryIsAll: category.isAll, collectionType: category.collectionType,
     };
   }
 
@@ -618,9 +620,11 @@ export class JellyfinCompatibilityService {
   private getItemLibraryDefinition(context: JellyfinContext, item: MediaItemRecord): JellyfinLibraryDefinition {
     if (isContentSourceLibrary(context.libraryKind)) {
       const categoryId = readJellyfinSourceCategoryId(item.metadata);
-      // 关键变量：取消分类只隐藏入口，已有条目仍使用原类别身份，不能混入未分类。
+      // 全部目录保留详情中的真实分类，未单独选择该分类时仍使用已配置的全部入口。
+      const roots = this.getLibraryDefinitions(context);
       const source = item.metadata.contentSource as Record<string, unknown> | undefined;
-      return this.getLibraryDefinitions(context).find((library) => library.sourceCategoryId === categoryId)
+      return roots.find((library) => library.sourceCategoryId === categoryId)
+        ?? roots.find((library) => library.sourceCategoryIsAll)
         ?? this.sourceCategoryLibrary(context, {
           categoryId, name: categoryId === null ? "未分类" : String(source?.categoryName ?? `分类 ${categoryId}`),
           parentId: source?.parentCategoryId === undefined || source.parentCategoryId === null ? null : String(source.parentCategoryId),
@@ -648,7 +652,7 @@ export class JellyfinCompatibilityService {
     }
     const entries = await this.catalogSort.load({ ...context, accountId: "", accessToken: "" }, {
       itemTypes: library.itemType ? [library.itemType] : undefined, topLevel: true,
-      regionGroup: library.regionGroup, sourceCategoryId: library.sourceCategoryId,
+      regionGroup: library.regionGroup, sourceCategoryId: library.sourceCategoryIsAll ? undefined : library.sourceCategoryId,
     }, { fields: [{ name: "datemodified", descending: true }], randomSeed: "" });
     const items = await this.runtime.repository.listCatalogItemsByIds(entries.slice(0, 60).map((entry) => entry.id), context.ownerUserId);
     const byId = new Map(items.map((item) => [item.id, item]));
@@ -662,7 +666,7 @@ export class JellyfinCompatibilityService {
     if (!parentId || parentId === context.libraryId) return {};
     const library = this.findLibraryDefinition(context, parentId);
     if (library) return {
-      sourceCategoryId: library.sourceCategoryId, regionGroup: library.regionGroup,
+      sourceCategoryId: library.sourceCategoryIsAll ? undefined : library.sourceCategoryId, regionGroup: library.regionGroup,
       itemTypes: library.itemType === "video.movie" ? ["video.movie"]
         : library.itemType === "video.series" ? ["video.series", "video.episode"] : undefined,
     };
@@ -1048,7 +1052,7 @@ export class JellyfinCompatibilityService {
     return this.listSortedCatalogPage(context, query, {
       itemTypes: effectiveTypes, itemIds, topLevel: identityFilter.itemIds === undefined,
       regionGroup: virtualLibrary?.regionGroup, genres,
-      sourceCategoryId: virtualLibrary?.sourceCategoryId,
+      sourceCategoryId: virtualLibrary?.sourceCategoryIsAll ? undefined : virtualLibrary?.sourceCategoryId,
       search,
     });
   }
@@ -1077,7 +1081,7 @@ export class JellyfinCompatibilityService {
       : categoryId !== undefined
         ? await this.runtime.contentSources.browseLibraryCategory(context.libraryId, context.ownerUserId, { ...sourceOptions, categoryId })
         : null;
-    // 关键变量：未支持实时搜索或源停用才回本地目录，网络、解析与权限错误继续原样抛出。
+    // 关键变量：源停用、不支持查询或连接故障可读已同步目录，解析与权限错误继续原样抛出。
     if (!page) return null;
     // 关键变量：原序 ID 包含稳定顶层条目；不能本地再次排序或分页，否则下一页跳项。
     const entries = page.itemIds.map((id): JellyfinSortEntry => ({ id, itemType: "", values: {} }));
@@ -1128,7 +1132,7 @@ export class JellyfinCompatibilityService {
     }
     const entries = types.length === 0 ? [] : await this.catalogSort.load(context, {
       itemTypes: types, itemIds: identityIds, favorite, played: !favorite, regionGroup: library?.regionGroup,
-      sourceCategoryId: library?.sourceCategoryId,
+      sourceCategoryId: library?.sourceCategoryIsAll ? undefined : library?.sourceCategoryId,
       parentId: internalParentId, seasonNumber: season?.seasonNumber,
       search, genres: await this.readGenreNames(context, query),
       contentFilters,

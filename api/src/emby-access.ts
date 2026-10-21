@@ -39,7 +39,8 @@ export class EmbyAccessService {
     const libraries = await this.database.query("media_libraries as l")
       .leftJoin("library_emby_accounts as a", "a.library_id", "l.id")
       .select("l.id", "l.library_kind", "l.emby_enabled")
-      .whereNot("l.data_type", "audiobook")
+      // 关键变量：只有影视库补齐 Emby 账号；音乐使用 Navidrome，听书使用各自协议。
+      .where("l.data_type", "video")
       .whereNull("a.id");
     // 关键变量：未开启 Emby 的在线影视库不在启动时生成账号，已有账号和其他库保持原流程。
     const services = libraries.filter((library) => library.library_kind !== "content_source_video" || Number(library.emby_enabled) === 1);

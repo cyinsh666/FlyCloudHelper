@@ -23,9 +23,9 @@ export function ContentSourceLibraryCreate() {
   const navigate = useNavigate();
   const resource = useApiResource(async () => {
     const plugins = await listContentSourcePlugins();
-    // 关键变量：Python 源由清单区分影视与听书，复用插件选择和分类预览入口。
+    // 关键变量：脚本源复用插件选择和分类预览，影视与听书仍由清单区分。
     return plugins.items.filter((plugin) => plugin.status === "enabled"
-      && (plugin.adapter === "cms_json" || plugin.adapter === "python_spider" || plugin.adapter === "netease_http"));
+      && (plugin.adapter === "cms_json" || plugin.adapter === "python_spider" || plugin.adapter === "catvod_js" || plugin.adapter === "netease_http"));
   }, []);
   const [pluginKey, setPluginKey] = useState("");
   const [displayName, setDisplayName] = useState("在线影视库");
@@ -49,7 +49,7 @@ export function ContentSourceLibraryCreate() {
   const isMusicSource = plugin?.adapter === "netease_http";
   const isAudiobookSource = plugin?.mediaType === "audiobook";
   // 关键变量：只展示叶分类，避免选择一个父分类后导入全部内容。
-  const leafCategories = categories.filter((entry) => !categories.some((child) => child.parentId === entry.id));
+  const leafCategories = categories.filter((entry) => entry.isAll || !categories.some((child) => child.parentId === entry.id));
 
   useEffect(() => {
     if (plugins.length > 0 && !pluginKey) {

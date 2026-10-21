@@ -1,12 +1,12 @@
 import { createHash, randomBytes } from "node:crypto";
-import type { IncomingMessage } from "node:http";
 import type { Readable } from "node:stream";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { ApiError } from "../errors.js";
-import { providerStream, type ProviderStreamResponse } from "../providers/network.js";
+import { providerStream } from "../providers/network.js";
 import type { ApiRuntime } from "../runtime.js";
 import { canDirectContentPlayback } from "./direct-playback.js";
 import { detectContentContainer, inspectContentBody } from "./media-format.js";
+import { isSpiderProxyUrl, openSpiderProxyResource, type ContentSourceResourceResponse } from "./spider-proxy.js";
 import type { ContentSourcePlaybackProtocol, ContentVideoContainer } from "./types.js";
 
 /** 已认证的协议账号范围；票据不能跨账号、媒体库或单集使用。 */
@@ -145,6 +145,8 @@ function rewriteManifest(
         headers: childResourceHeaders(ticket.headers, finalUrl, resolved),
         manifest: manifestResource,
         formatUncertain: false,
+        // 关键变量：Spider 内部资源只能经宿主读取，即使父清单使用直连也不能跳到客户端。
+        directResources: ticket.directResources && !isSpiderProxyUrl(resolved.href),
         measureDuration,
         segmentExtension: subtitles ? "vtt" : ticket.segmentExtension,
       }, extension);
@@ -189,14 +191,18 @@ async function openContentResponse(
   fullManifest: boolean,
   signal: AbortSignal,
   retryState: { remaining: number; attempts: number },
-): Promise<ProviderStreamResponse> {
+): Promise<ContentSourceResourceResponse> {
   let retried = false;
   while (true) {
     signal.throwIfAborted();
     const attempt = ++retryState.attempts;
     try {
+      const headers = buildContentUpstreamHeaders(request, ticket.headers, fullManifest);
+      if (isSpiderProxyUrl(ticket.url)) {
+        return openSpiderProxyResource(runtime, ticket.url, headers, { ownerUserId: ticket.ownerUserId, libraryId: ticket.libraryId }, signal);
+      }
       const response = await providerStream(ticket.url, {
-        method, headers: buildContentUpstreamHeaders(request, ticket.headers, fullManifest),
+        method, headers,
       }, {
         allowInsecureHttp: runtime.config.allowInsecureProviderHttp,
         logConnectionFailure: (fields) => runtime.logBusinessEvent("warn", {
@@ -240,7 +246,7 @@ async function sendResource(
   request.raw.once("aborted", abort);
   reply.raw.once("close", abort);
   if (request.raw.aborted || reply.raw.destroyed) abort();
-  let body: IncomingMessage | undefined;
+  let body: ContentSourceResourceResponse["body"] | undefined;
   let responseBody: Readable | undefined;
   // 关键变量：同一个下游请求共享一次重试额度，格式探测后的普通 HEAD/Range 请求不能重新获得额度。
   const retryState = { remaining: ticket.manifest || ticket.formatUncertain ? 1 : 0, attempts: 0 };
@@ -264,7 +270,7 @@ async function sendResource(
       responseBody = inspected.stream;
     }
     let isManifest = ticket.manifest || detectContentContainer(prefix, rawContentType, upstream.finalUrl) === "hls";
-    if (!isManifest && ticket.directResources) {
+    if (!isManifest && ticket.directResources && !isSpiderProxyUrl(ticket.url)) {
       body.destroy();
       responseBody.destroy();
       cleanup();
@@ -304,7 +310,7 @@ async function sendResource(
     if (!isManifest) {
       // 普通媒体可能持续数小时；只限制空闲等待，不能按总播放时间截断整条字节流。
       clearTimeout(timeout);
-      body.setTimeout(120_000, abort);
+      body.setTimeout?.(120_000, abort);
     }
     reply.header("Cache-Control", "private, no-store").header("X-Accel-Buffering", "no");
     if (isManifest && upstream.statusCode !== 416) {
@@ -399,7 +405,9 @@ export async function sendContentPlayback(
     const configuredMode = await runtime.contentSources.getLibraryPlaybackMode(context.libraryId, context.ownerUserId, options.protocol);
     controller.signal.throwIfAborted();
     // 关键变量：显式路线优先；普通客户端无须传参数，auto 使用所选协议独立保存的模式。
-    const mode = options.route === "origin" ? "direct" : options.route === "server" ? "relay" : configuredMode;
+    const configuredRoute = options.route === "origin" ? "direct" : options.route === "server" ? "relay" : configuredMode;
+    // 关键变量：虚拟代理地址只在源宿主内有效，任何播放模式都必须经过已鉴权的资源入口。
+    const mode = isSpiderProxyUrl(resolved.url) ? "relay" : configuredRoute;
     if (mode === "direct" && resolved.container !== "hls" && resolved.container !== "unknown") {
       // 显式直连由实际播放器尝试；访问云助手的 UA 和跳转后的媒体 UA 可能不同，不能用前者探测拦截。
       reply.header("Cache-Control", "private, no-store");
@@ -462,7 +470,7 @@ export async function sendContentResource(
   const sources = await runtime.contentSources.listPlaybackSources(itemId, context.ownerUserId);
   if (item.libraryId !== context.libraryId || !sources.some((source) => source.id === ticket.sourceId)) throw new ApiError(404, "content_resource_not_found", "播放来源已停用或不存在");
   ticket.expiresAt = Date.now() + TICKET_LIFETIME_MS;
-  if (ticket.directResources && !ticket.manifest) {
+  if (ticket.directResources && !ticket.manifest && !isSpiderProxyUrl(ticket.url)) {
     // 仅返回已鉴权的原资源跳转，不把协议令牌附加到源站地址，也不读取视频字节。
     reply.header("Cache-Control", "private, no-store");
     return reply.redirect(ticket.url, 307);
@@ -471,7 +479,7 @@ export async function sendContentResource(
 }
 
 /** 有界探测真实媒体格式，按需累计首个完整视频变体时长，不请求视频分片。 */
-export async function probeContentMediaInfo(runtime: ApiRuntime, url: string, headers: Record<string, string>, measureDuration: boolean, parentSignal?: AbortSignal): Promise<{ container: ContentVideoContainer; runTimeTicks: number }> {
+export async function probeContentMediaInfo(runtime: ApiRuntime, url: string, headers: Record<string, string>, measureDuration: boolean, parentSignal?: AbortSignal, scope?: Pick<ContentRelayContext, "ownerUserId" | "libraryId">): Promise<{ container: ContentVideoContainer; runTimeTicks: number }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 12_000);
   const abortParent = () => controller.abort();
@@ -480,10 +488,18 @@ export async function probeContentMediaInfo(runtime: ApiRuntime, url: string, he
   let currentUrl = url;
   let currentHeaders = headers;
   let detectedContainer: ContentVideoContainer = "unknown"; // 关键变量：时长探测失败不能丢失已确认的 HLS 格式。
-  let probeBody: IncomingMessage | undefined;
+  let probeBody: ContentSourceResourceResponse["body"] | undefined;
   try {
     for (let depth = 0; depth < 4; depth += 1) {
-      const upstream = await providerStream(currentUrl, { method: "GET", headers: { ...currentHeaders, Accept: "*/*", "Accept-Encoding": "identity" } }, { allowInsecureHttp: runtime.config.allowInsecureProviderHttp }, controller.signal);
+      const requestHeaders = { ...currentHeaders, Accept: "*/*", "Accept-Encoding": "identity" };
+      // 关键变量：探测子清单也按当前用户和媒体库调用源代理，缺少范围时明确拒绝内部地址。
+      let upstream: ContentSourceResourceResponse;
+      if (isSpiderProxyUrl(currentUrl)) {
+        if (!scope) throw new ApiError(403, "content_proxy_scope_required", "源代理资源需要媒体库访问范围");
+        upstream = await openSpiderProxyResource(runtime, currentUrl, requestHeaders, scope, controller.signal);
+      } else {
+        upstream = await providerStream(currentUrl, { method: "GET", headers: requestHeaders }, { allowInsecureHttp: runtime.config.allowInsecureProviderHttp }, controller.signal);
+      }
       probeBody = upstream.body;
       const inspected = await inspectContentBody(upstream.body);
       const container = detectContentContainer(inspected.prefix, String(upstream.headers["content-type"] ?? ""), upstream.finalUrl);

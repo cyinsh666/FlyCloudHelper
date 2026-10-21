@@ -12,6 +12,9 @@ import type { ApiRuntime } from "../runtime.js";
 import { enqueueProtocolScan, listProtocolVirtualFolders } from "../protocol-scan-service.js";
 import { contentPlaybackServerRoot, isContentSourceLibrary } from "../content-sources/playback.js";
 import { sendContentPlayback, sendContentResource } from "../content-sources/hls-relay.js";
+import { sendContentSourceHttpImage } from "../content-sources/http-image.js";
+import { isSpiderProxyUrl } from "../content-sources/spider-proxy.js";
+import { sendSpiderSourceImage } from "../content-sources/spider-image.js";
 import { buildUpstreamHeaders, copyMediaResponseHeaders, handleProviderAuthenticationFailure, resolveRelayAccess, type RelayLibraryRow } from "./media-stream-routes.js";
 
 /** 读取 Emby 查询参数，保留官方 PascalCase 与部分客户端 camelCase。 */
@@ -104,7 +107,7 @@ function toRelayLibrary(service: Record<string, unknown>, file: Record<string, u
 }
 
 /** 代理 Emby 项目图片，图片接口可不带令牌以兼容海报组件。 */
-async function sendImage(compatibility: EmbyCompatibilityService, context: EmbyLibraryContext, request: FastifyRequest, reply: FastifyReply, itemId: string, imageType: string) {
+async function sendImage(runtime: ApiRuntime, compatibility: EmbyCompatibilityService, context: EmbyLibraryContext, request: FastifyRequest, reply: FastifyReply, itemId: string, imageType: string) {
   const source = await compatibility.resolveImageSource(context, itemId, imageType);
   let url: URL;
   try { url = new URL(source.url); } catch { throw new ApiError(404, "emby_image_not_found", "图片地址不可用"); }
@@ -112,6 +115,8 @@ async function sendImage(compatibility: EmbyCompatibilityService, context: EmbyL
   const etag = `"${source.imageTag}"`;
   reply.header("ETag", etag).header("Last-Modified", new Date(source.updatedAt).toUTCString());
   if (request.headers["if-none-match"] === etag) return reply.status(304).send();
+  if (isSpiderProxyUrl(source.url)) return sendSpiderSourceImage(runtime, context, request, reply, source);
+  if (context.libraryKind === "content_source_video" && source.sourceType === "media") return sendContentSourceHttpImage(request, reply, url);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10_000);
   try {
@@ -277,9 +282,9 @@ export async function registerEmbyRoutes(server: FastifyInstance, runtime: ApiRu
       const internalItemId = compatibility.toInternalItemId(params.itemId);
       return sendContentResource(runtime, context, request, reply, internalItemId, compatibility.toProtocolItemId(internalItemId), params.ticket);
     } });
-    server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType`, handler: async (request, reply) => sendImage(compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
-    server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType/:index`, handler: async (request, reply) => sendImage(compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
-    server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType/:index/:tag/:format/:maxWidth/:maxHeight/:percentPlayed/:unplayedCount`, handler: async (request, reply) => sendImage(compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
+    server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType`, handler: async (request, reply) => sendImage(runtime, compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
+    server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType/:index`, handler: async (request, reply) => sendImage(runtime, compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
+    server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType/:index/:tag/:format/:maxWidth/:maxHeight/:percentPlayed/:unplayedCount`, handler: async (request, reply) => sendImage(runtime, compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
     server.post(`${prefix}/Sessions/Playing`, async (request, reply) => { await compatibility.reportPlayback(await authenticated(request), "playing", (request.body ?? {}) as Record<string, unknown>); return reply.status(204).send(); });
     server.post(`${prefix}/Sessions/Playing/Progress`, async (request, reply) => { await compatibility.reportPlayback(await authenticated(request), "progress", (request.body ?? {}) as Record<string, unknown>); return reply.status(204).send(); });
     server.post(`${prefix}/Sessions/Playing/Stopped`, async (request, reply) => { await compatibility.reportPlayback(await authenticated(request), "stopped", (request.body ?? {}) as Record<string, unknown>); return reply.status(204).send(); });

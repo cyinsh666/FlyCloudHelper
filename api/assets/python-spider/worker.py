@@ -10,12 +10,16 @@ import importlib.util
 import inspect
 import json
 import os
+import re
 import sys
 import tokenize
 
 # 关键变量：单条消息有明确大小上限，源脚本打印内容不能占用 RPC 通道。
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+# 关键变量：代理仅放宽二进制回应，普通目录消息继续使用原来的 8 MiB 上限。
+MAX_PROXY_BODY_BYTES = 16 * 1024 * 1024
+MAX_PROXY_RESPONSE_BYTES = (MAX_PROXY_BODY_BYTES * 4 + 2) // 3 + 64 * 1024
 MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 CONTENT_METHODS = ("homeContent", "homeVideoContent", "categoryContent", "detailContent", "searchContent", "playerContent")
 
@@ -247,17 +251,98 @@ def search_invocation(target, function, args):
     paged_function = getattr(target, "searchContentPage", None)
     if callable(paged_function):
         function = paged_function
-        signature = function_signature(function)
-        parameters = positional_parameters(signature)
-        # 专门分页入口也常采用 key,page 两参数，不能把 quick 误传成页码。
-        if not accepts_variable_arguments(signature) and len(parameters) == 2:
-            arguments = [arguments[0] if arguments else "", page]
-        return function, arguments, True
     signature = function_signature(function)
-    supports_pages = accepts_variable_arguments(signature) or len(positional_parameters(signature)) >= 3
+    parameters = positional_parameters(signature)
+    # 关键变量：有些 CatVod Python 源签名是 key,pg,filter，页码不能传到 filter。
+    page_names = {"pg", "page", "pagenum", "page_num", "pageno", "page_no"}
+    supports_pages = callable(paged_function) or accepts_variable_arguments(signature)
+    if not accepts_variable_arguments(signature):
+        supports_pages = supports_pages or any(parameter.name.lower() in page_names
+                                               for parameter in parameters[1:])
+        if len(parameters) >= 3:
+            supports_pages = True
+        if len(parameters) >= 2 and parameters[1].name.lower() in page_names:
+            quick = arguments[1] if len(arguments) > 1 else False
+            arguments = [arguments[0] if arguments else "", page]
+            if len(parameters) >= 3:
+                arguments.append(quick)
+        elif callable(paged_function) and len(parameters) == 2:
+            arguments = [arguments[0] if arguments else "", page]
     if not supports_pages and page > 1:
         raise WorkerFailure("python_source_paging_unsupported")
     return function, arguments, supports_pages
+
+
+def proxy_response(value, request_headers=None):
+    """将标准 localProxy 数组转换为有界二进制 RPC，不输出原始响应正文。"""
+    if not isinstance(value, (list, tuple)) or len(value) not in (3, 4):
+        raise WorkerFailure("python_source_result_invalid")
+    status, content_type, body = value[:3]
+    if isinstance(status, bool) or not isinstance(status, int) or not 100 <= status <= 599:
+        raise WorkerFailure("python_source_result_invalid")
+    if not isinstance(content_type, str) or "\r" in content_type or "\n" in content_type:
+        raise WorkerFailure("python_source_result_invalid")
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    elif isinstance(body, (bytearray, memoryview)):
+        body = bytes(body)
+    if not isinstance(body, bytes):
+        raise WorkerFailure("python_source_result_invalid")
+    if len(body) > MAX_PROXY_BODY_BYTES:
+        raise WorkerFailure("python_source_message_too_large")
+    headers = value[3] if len(value) >= 4 and isinstance(value[3], dict) else {}
+    selected_headers = {}
+    for name, header_value in headers.items():
+        if not isinstance(name, str) or not isinstance(header_value, (str, int)):
+            raise WorkerFailure("python_source_result_invalid")
+        header_text = str(header_value)
+        if any(character in name + header_text for character in ("\r", "\n")):
+            raise WorkerFailure("python_source_result_invalid")
+        selected_headers[name] = header_text
+    status, body, selected_headers = proxy_range(status, content_type, body, selected_headers, request_headers or {})
+    return {"statusCode": status, "contentType": content_type,
+            "bodyBase64": base64.b64encode(body).decode("ascii"), "headers": selected_headers}
+
+
+def proxy_range(status, content_type, body, headers, request_headers):
+    """在源完成格式转换后的字节上处理单段 Range，已有部分回应保持原样。"""
+    if status != 200 or "mpegurl" in content_type.lower() or body.lstrip().startswith(b"#EXTM3U"):
+        return status, body, headers
+    requested = {str(name).lower(): str(value) for name, value in request_headers.items()}
+    response_headers = {name.lower(): value for name, value in headers.items()}
+    range_value = requested.get("range", "")
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_value.strip(), re.IGNORECASE)
+    if match is None or not any(match.groups()):
+        return status, body, headers
+    # 关键变量：If-Range 没有匹配的强 ETag 或明确 Last-Modified 时，回应完整 200。
+    condition = requested.get("if-range")
+    if condition:
+        etag = response_headers.get("etag", "")
+        modified = response_headers.get("last-modified", "")
+        matches_etag = bool(etag and not etag.startswith("W/") and not condition.startswith("W/") and etag == condition)
+        if not matches_etag and (not modified or condition != modified):
+            return status, body, headers
+    size = len(body)
+    first, last = match.groups()
+    if first:
+        start = int(first)
+        end = min(int(last), size - 1) if last else size - 1
+    else:
+        suffix = int(last)
+        start, end = max(0, size - suffix), size - 1
+        if suffix == 0:
+            start = size
+    selected_headers = {name: value for name, value in headers.items()
+                        if name.lower() not in ("content-range", "content-length", "accept-ranges")}
+    selected_headers["Accept-Ranges"] = "bytes"
+    if start >= size or start > end:
+        selected_headers["Content-Range"] = "bytes */%s" % size
+        selected_headers["Content-Length"] = "0"
+        return 416, b"", selected_headers
+    selected = body[start:end + 1]
+    selected_headers["Content-Range"] = "bytes %s-%s/%s" % (start, end, size)
+    selected_headers["Content-Length"] = str(len(selected))
+    return 206, selected, selected_headers
 
 
 def mark_search_result(result, supports_pages):
@@ -288,6 +373,7 @@ class SpiderWorker:
         self.initialized = False
         self.initial_result = None
         self.destroyed = False
+        self.proxy_url = ""
 
     def initialize(self, extend=""):
         """首次实际调用时导入源并执行 init，后续调用保留同一个实例。"""
@@ -311,6 +397,8 @@ class SpiderWorker:
                 if inspect.isclass(candidate) and any(callable(getattr(candidate, method, None)) for method in CONTENT_METHODS):
                     self.target = candidate()
                     break
+            # 关键变量：在源 init 之前注入地址，初始化期间生成的封面代理也能识别。
+            setattr(self.target, "_cloud_helper_proxy_url", self.proxy_url)
             initializer = getattr(self.target, "init", None)
             if callable(initializer):
                 clear_source_error(self.target)
@@ -329,6 +417,15 @@ class SpiderWorker:
         """分发公开 Spider 接口；检查入口始终不触发源导入。"""
         if method == "__inspect__":
             return inspect_script(self.script_path)
+        if method == "__set_proxy__":
+            if len(args) != 1 or not isinstance(args[0], str):
+                raise WorkerFailure("python_source_protocol_failed")
+            self.proxy_url = args[0]
+            if self.target is not None:
+                setattr(self.target, "_cloud_helper_proxy_url", self.proxy_url)
+            return None
+        if method == "__proxy__":
+            return self.proxy(args)
         if method == "init":
             return self.initialize(args[0] if args else "")
         if not isinstance(method, str) or not method.isidentifier() or method.startswith("_"):
@@ -354,6 +451,29 @@ class SpiderWorker:
         except BaseException:
             raise WorkerFailure("python_source_call_failed") from None
 
+    def proxy(self, args):
+        """只调用本实例 localProxy，传入通用请求头，不自动请求任何远端地址。"""
+        if len(args) != 2 or not isinstance(args[0], dict) or not isinstance(args[1], dict):
+            raise WorkerFailure("python_source_protocol_failed")
+        self.initialize()
+        function = getattr(self.target, "localProxy", None)
+        if not callable(function):
+            raise WorkerFailure("python_source_method_missing")
+        parameters = dict(args[0])
+        parameters["headers"] = dict(args[1])
+        parameters["requestHeaders"] = dict(args[1])
+        try:
+            clear_source_error(self.target)
+            result = invoke_function(function, [parameters])
+            check_source_error(self.target)
+            return proxy_response(result, args[1])
+        except WorkerFailure:
+            raise
+        except (ModuleNotFoundError, ImportError):
+            raise WorkerFailure("python_source_dependency_missing") from None
+        except BaseException:
+            raise WorkerFailure("python_source_call_failed") from None
+
     def destroy(self):
         """正常退出时至多调用一次 destroy；强制终止由宿主保证释放进程。"""
         if self.destroyed or self.target is None:
@@ -368,11 +488,11 @@ class SpiderWorker:
         return None
 
 
-def write_response(output, response):
+def write_response(output, response, maximum_bytes=MAX_RESPONSE_BYTES):
     """输出有界 JSON 行，序列化失败不输出源对象或异常正文。"""
     try:
         line = json.dumps(response, ensure_ascii=False, allow_nan=False, default=json_value, separators=(",", ":"))
-        if len(line.encode("utf-8")) + 1 > MAX_RESPONSE_BYTES:
+        if len(line.encode("utf-8")) + 1 > maximum_bytes:
             raise WorkerFailure("python_source_message_too_large")
     except WorkerFailure as error:
         line = json.dumps({"id": response.get("id"), "ok": False, "error": {"code": error.code}})
@@ -411,7 +531,8 @@ def main():
                 if request.get("method") == "__shutdown__":
                     break
                 value = worker.dispatch(request.get("method"), request["args"])
-                write_response(output, {"id": request_id, "ok": True, "value": value})
+                maximum_bytes = MAX_PROXY_RESPONSE_BYTES if request.get("method") == "__proxy__" else MAX_RESPONSE_BYTES
+                write_response(output, {"id": request_id, "ok": True, "value": value}, maximum_bytes)
             except WorkerFailure as error:
                 write_response(output, {"id": request_id, "ok": False, "error": {"code": error.code}})
             except BaseException:

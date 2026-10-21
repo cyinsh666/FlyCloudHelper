@@ -3,6 +3,7 @@ import { Copy, Pencil, Plus, Settings2, Trash2, X } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, StatusPill } from "@/components/ui-kit";
+import { ProtocolPasswordInput } from "@/components/ProtocolPasswordInput";
 import { getLibrary } from "@/lib/api";
 import {
   createAbsAccount,
@@ -53,9 +54,11 @@ export function LibraryAbsSettingsPage({ serviceId, admin = false }: { serviceId
   const [createOpen, setCreateOpen] = useState(false);
   const [newUsername, setNewUsername] = useState("");
   const [newPassword, setNewPassword] = useState("");
+  const [newNoPassword, setNewNoPassword] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingUsername, setEditingUsername] = useState("");
   const [editingPassword, setEditingPassword] = useState("");
+  const [editingNoPassword, setEditingNoPassword] = useState(false);
   // 关键变量：明文仅在用户创建账号后的当前页面内存中保留，不写入本地存储。
   const [createdCredential, setCreatedCredential] = useState<{
     account: AbsAccount;
@@ -126,15 +129,16 @@ export function LibraryAbsSettingsPage({ serviceId, admin = false }: { serviceId
       async () => {
         const created = await createAbsAccount(
           serviceId,
-          { username: newUsername.trim(), ...(newPassword ? { password: newPassword } : {}) },
+          { username: newUsername.trim(), ...(newNoPassword ? { password: "" } : newPassword ? { password: newPassword } : {}) },
           admin,
         );
-        setCreatedCredential(created);
+        setCreatedCredential(created.account.hasPassword ? created : null);
         setNewUsername("");
         setNewPassword("");
+        setNewNoPassword(false);
         setCreateOpen(false);
       },
-      "ABS 账号已创建，请保存本次显示的密码",
+      newNoPassword ? "ABS 免密码账号已创建" : "ABS 账号已创建，请保存本次显示的密码",
     );
   }
 
@@ -144,6 +148,7 @@ export function LibraryAbsSettingsPage({ serviceId, admin = false }: { serviceId
     setEditingId(account.id);
     setEditingUsername(account.username);
     setEditingPassword("");
+    setEditingNoPassword(!account.hasPassword);
   }
 
   /** 保存显式修改的用户名或新密码。 */
@@ -151,7 +156,9 @@ export function LibraryAbsSettingsPage({ serviceId, admin = false }: { serviceId
     event.preventDefault();
     const patch: AbsAccountPatch = {};
     if (editingUsername.trim() !== account.username) patch.username = editingUsername.trim();
-    if (editingPassword) patch.password = editingPassword;
+    if (editingNoPassword && account.hasPassword) patch.password = "";
+    else if (!editingNoPassword && editingPassword) patch.password = editingPassword;
+    if (!editingNoPassword && !account.hasPassword && !editingPassword) { setMessage("请设置新密码或勾选无密码"); return; }
     if (patch.username === undefined && patch.password === undefined) {
       setMessage("账号没有修改");
       return;
@@ -325,11 +332,7 @@ export function LibraryAbsSettingsPage({ serviceId, admin = false }: { serviceId
               <input required minLength={4} maxLength={255} autoComplete="off" disabled={busy} value={newUsername}
                 onChange={(event) => setNewUsername(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" />
             </label>
-            <label>
-              <span className="text-xs text-muted-foreground">登录密码（可选）</span>
-              <input type="password" autoComplete="new-password" disabled={busy} placeholder="留空时自动生成密码" value={newPassword}
-                onChange={(event) => setNewPassword(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" />
-            </label>
+            <div><span className="text-xs text-muted-foreground">登录密码</span><ProtocolPasswordInput state={{ value: newPassword, noPassword: newNoPassword, disabled: busy, placeholder: "留空时自动生成密码", onChange: setNewPassword, onNoPasswordChange: setNewNoPassword }} /></div>
             <div className="flex flex-wrap gap-2 md:col-span-2">
               <PrimaryButton type="submit" disabled={busy || !newUsername.trim()}><Plus className="size-4" /> {action === "create" ? "正在创建…" : "创建账号"}</PrimaryButton>
               <SecondaryButton type="button" disabled={busy} onClick={() => setCreateOpen(false)}>取消</SecondaryButton>
@@ -385,11 +388,7 @@ export function LibraryAbsSettingsPage({ serviceId, admin = false }: { serviceId
                       <input required minLength={4} maxLength={255} disabled={busy} value={editingUsername}
                         onChange={(event) => setEditingUsername(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" />
                     </label>
-                    <label>
-                      <span className="text-xs text-muted-foreground">新密码</span>
-                      <input type="password" autoComplete="new-password" disabled={busy} placeholder="留空表示不修改" value={editingPassword}
-                        onChange={(event) => setEditingPassword(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" />
-                    </label>
+                    <div><span className="text-xs text-muted-foreground">新密码</span><ProtocolPasswordInput state={{ value: editingPassword, noPassword: editingNoPassword, disabled: busy, required: !account.hasPassword, placeholder: "留空表示不修改", onChange: setEditingPassword, onNoPasswordChange: setEditingNoPassword }} /></div>
                     <div className="flex flex-wrap gap-2 md:col-span-2">
                       <PrimaryButton type="submit" disabled={busy}><Settings2 className="size-4" /> {action === `edit:${account.id}` ? "正在保存…" : "保存账号"}</PrimaryButton>
                       <SecondaryButton type="button" disabled={busy} onClick={() => { setEditingId(null); setEditingPassword(""); }}>取消</SecondaryButton>

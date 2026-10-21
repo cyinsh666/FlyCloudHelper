@@ -107,7 +107,7 @@ async function refreshContentDuration(runtime: ApiRuntime, source: ContentPlayba
       const access = await runtime.contentSources.resolvePlayback(source.id, ownerUserId, libraryId, controller.signal);
       result.container = access.container;
       if (access.container !== "unknown" && (access.container !== "hls" || !shouldProbeDuration)) return result;
-      const media = await probeContentMediaInfo(runtime, access.url, access.headers, shouldProbeDuration, controller.signal);
+      const media = await probeContentMediaInfo(runtime, access.url, access.headers, shouldProbeDuration, controller.signal, { ownerUserId, libraryId });
       result.container = media.container === "unknown" ? access.container : media.container;
       const ticks = media.runTimeTicks;
       if (ticks > 0) {

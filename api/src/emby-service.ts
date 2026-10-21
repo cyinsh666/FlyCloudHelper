@@ -58,6 +58,8 @@ interface EmbyLibraryDefinition {
   regionGroup?: VideoRegionGroup;
   /** 精确源分类 ID；null 仅表示历史未分类。 */
   sourceCategoryId?: string | null;
+  /** 源明确声明的全部目录：远端仍按原分类 ID 分页，本地覆盖所有真实分类。 */
+  sourceCategoryIsAll?: boolean;
 }
 
 interface EmbyPersonSummary {
@@ -387,7 +389,7 @@ export class EmbyCompatibilityService {
     // 外部编号先限定真实条目，再按原有类型、地区和搜索条件排序，不能只匹配原列表前 500 项。
     // 关键变量：候选只读取排序键，所有筛选和排序完成后才装配当前页，普通网盘不再截断到 500 条。
     const result = await this.listCatalogPage(context, query, {
-      itemTypes: types, itemIds: identityIds, sourceCategoryId: library?.sourceCategoryId,
+      itemTypes: types, itemIds: identityIds, sourceCategoryId: library?.sourceCategoryIsAll ? undefined : library?.sourceCategoryId,
       regionGroup: library?.regionGroup, topLevel: identityFilter.itemIds === undefined,
     });
     this.runtime.logBusinessEvent("info", {
@@ -644,7 +646,7 @@ export class EmbyCompatibilityService {
     if (isContentSourceLibrary(context.libraryKind) && library) {
       const entries = await this.catalogSort.load(context, {
         stateProtocol: "emby",
-        itemTypes: [current.itemType], sourceCategoryId: library.sourceCategoryId, regionGroup: library.regionGroup, genres,
+        itemTypes: [current.itemType], sourceCategoryId: library.sourceCategoryIsAll ? undefined : library.sourceCategoryId, regionGroup: library.regionGroup, genres,
       }, { fields: [{ name: "datemodified", descending: true }], randomSeed: "" });
       const ids = entries.filter((entry) => entry.id !== current.id).slice(0, requestedLimit).map((entry) => entry.id);
       const records = await this.runtime.repository.listCatalogItemsByIds(ids, context.ownerUserId);
@@ -699,7 +701,7 @@ export class EmbyCompatibilityService {
     const search = this.queryString(query, "SearchTerm").toLocaleLowerCase("zh-CN");
     const entries = await this.readCatalogEntries(context, { ...query, SearchTerm: "", SortBy: "SortName" }, {
       itemTypes: library?.itemType ? [library.itemType] : ["video.movie", "video.series"],
-      sourceCategoryId: library?.sourceCategoryId, regionGroup: library?.regionGroup,
+      sourceCategoryId: library?.sourceCategoryIsAll ? undefined : library?.sourceCategoryId, regionGroup: library?.regionGroup,
     });
     const counts = new Map<string, number>();
     for (let offset = 0; offset < entries.length; offset += 300) {
@@ -987,7 +989,7 @@ export class EmbyCompatibilityService {
     const identity = category.categoryId === null ? "unknown" : `id:${encodeURIComponent(category.categoryId)}`;
     const internalId = `${context.libraryId}:source-category:${identity}`;
     return { internalId, id: protocolUuid("content_source_category", internalId), name: category.name,
-      collectionType: category.collectionType, sourceCategoryId: category.categoryId };
+      collectionType: category.collectionType, sourceCategoryId: category.categoryId, sourceCategoryIsAll: category.isAll };
   }
 
   /** 普通网盘维持原电影、节目和地区入口，在线库仅兼容旧客户端缓存的入口 ID。 */
@@ -1016,7 +1018,7 @@ export class EmbyCompatibilityService {
     const entries = await this.catalogSort.load({ ...context, accountId: "", accessToken: "" }, {
       stateProtocol: "emby",
       itemTypes: library.itemType ? [library.itemType] : undefined, topLevel: true,
-      sourceCategoryId: library.sourceCategoryId, regionGroup: library.regionGroup,
+      sourceCategoryId: library.sourceCategoryIsAll ? undefined : library.sourceCategoryId, regionGroup: library.regionGroup,
     }, { fields: [{ name: "datemodified", descending: true }], randomSeed: "" });
     const records = await this.runtime.repository.listCatalogItemsByIds(entries.slice(0, 60).map((entry) => entry.id), context.ownerUserId);
     const byId = new Map(records.filter((item) => item.libraryId === context.libraryId).map((item) => [item.id, item]));
@@ -1154,7 +1156,7 @@ export class EmbyCompatibilityService {
     const library = this.findLibraryDefinition(context, parentId);
     const season = decodeSeasonId(parentId);
     const filters: JellyfinSortFilters = library ? {
-      sourceCategoryId: library.sourceCategoryId, regionGroup: library.regionGroup,
+      sourceCategoryId: library.sourceCategoryIsAll ? undefined : library.sourceCategoryId, regionGroup: library.regionGroup,
       itemTypes: library.itemType === "video.movie" ? ["video.movie"] : library.itemType === "video.series" ? ["video.series", "video.episode"] : undefined,
     } : season ? { parentId: season.seriesId, seasonNumber: season.seasonNumber }
       : UUID_PATTERN.test(parentId) || INTERNAL_ITEM_ID_PATTERN.test(parentId) ? { parentId: decodeItemId(parentId) } : {};
@@ -1287,16 +1289,18 @@ export class EmbyCompatibilityService {
     };
   }
 
-  /** 顶层条目属于其原源分类，单集仍保持原节目和季关系。 */
+  /** 顶层条目优先使用真实分类入口或已选全部目录，单集仍保持原节目和季关系。 */
   private libraryForItem(context: EmbyLibraryContext, item: MediaItemRecord): EmbyLibraryDefinition {
     const roots = this.libraryDefinitions(context);
     if (isContentSourceLibrary(context.libraryKind)) {
       const categoryId = readJellyfinSourceCategoryId(item.metadata);
       const source = item.metadata.contentSource as Record<string, unknown> | undefined;
-      return roots.find((entry) => entry.sourceCategoryId === categoryId) ?? this.sourceCategoryLibrary(context, {
-        categoryId, name: categoryId === null ? "未分类" : String(source?.categoryName ?? `分类 ${categoryId}`),
-        parentId: source?.parentCategoryId === undefined || source.parentCategoryId === null ? null : String(source.parentCategoryId),
-      });
+      return roots.find((entry) => entry.sourceCategoryId === categoryId)
+        ?? roots.find((entry) => entry.sourceCategoryIsAll)
+        ?? this.sourceCategoryLibrary(context, {
+          categoryId, name: categoryId === null ? "未分类" : String(source?.categoryName ?? `分类 ${categoryId}`),
+          parentId: source?.parentCategoryId === undefined || source.parentCategoryId === null ? null : String(source.parentCategoryId),
+        });
     }
     return roots.find((entry) => entry.itemType === (item.itemType === "video.movie" ? "video.movie" : "video.series")
       && entry.regionGroup === (context.regionLibrariesEnabled ? item.regionGroup : undefined)) ?? roots[0]!;

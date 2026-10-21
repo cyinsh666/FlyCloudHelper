@@ -142,7 +142,8 @@ export class PythonSpiderRuntime {
   public async invoke(instanceId: string, scriptPath: string, method: string, args: unknown[], signal?: AbortSignal, options?: PythonInvocationOptions): Promise<unknown> {
     if (this.closed) throw sourceError("python_source_closed");
     if (signal?.aborted) throw sourceError("python_source_cancelled");
-    if (!instanceId || !/^[A-Za-z][A-Za-z0-9_]*$/u.test(method) || !Array.isArray(args)) throw sourceError("python_source_invalid_method");
+    const hostMethod = method === "__set_proxy__" || method === "__proxy__";
+    if (!instanceId || (!hostMethod && !/^[A-Za-z][A-Za-z0-9_]*$/u.test(method)) || !Array.isArray(args)) throw sourceError("python_source_invalid_method");
     const resolvedScriptPath = path.resolve(scriptPath);
     let worker = this.instances.get(instanceId);
     while (worker && worker.scriptPath !== resolvedScriptPath) {
@@ -282,7 +283,8 @@ export class PythonSpiderRuntime {
   private readOutput(worker: PythonWorker, chunk: string): void {
     if (worker.stopping) return;
     worker.output += chunk;
-    if (Buffer.byteLength(worker.output) > MAX_RESPONSE_BYTES) {
+    const responseLimit = worker.current?.method === "__proxy__" ? 24 * 1024 * 1024 : MAX_RESPONSE_BYTES;
+    if (Buffer.byteLength(worker.output) > responseLimit) {
       void this.stopWorker(worker, sourceError("python_source_message_too_large"), false);
       return;
     }

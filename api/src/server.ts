@@ -308,7 +308,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
       || request.url.startsWith("/e/")
       || request.url.startsWith("/n/")
       || request.url.startsWith("/abs/")
-      || request.url.toLowerCase().startsWith("/a/");
+      || request.url.toLowerCase().startsWith("/fab/");
     const systemState = requiresReadyState ? await database.getSystemState() : null;
     if (systemState?.setupRequired && !isSetupPublicPath(request.url)) {
       throw new ApiError(503, "setup_required", "实例尚未完成首次初始化");

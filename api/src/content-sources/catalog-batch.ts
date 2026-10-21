@@ -66,7 +66,7 @@ export async function persistCmsEpisodes(input: EpisodeBatchInput): Promise<{ it
           id: itemId, user_id: userId, service_id: null, library_id: libraryId, identity_key: identity,
           media_type: "video", item_type: "video.episode", region_group: "other",
           title: episode.name, sort_title: episode.name, subtitle: content.title, year: content.year,
-          premiere_date: null, overview: content.overview, poster_url: content.posterUrl, backdrop_url: null,
+          premiere_date: null, overview: content.overview, poster_url: content.posterUrl, backdrop_url: content.backdropUrl ?? null,
           match_state: "matched", external_ids_json: "{}",
           metadata_json: JSON.stringify({ ...metadata, seriesTitle: content.title, seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber }),
           generation_id: generationId, created_at: previous?.created_at ?? now, updated_at: now, deleted_at: null,

@@ -100,6 +100,7 @@ function readContentItem(value: unknown, manifest: ContentSourceManifest, detail
     categoryName: plainText(raw.type_name),
     year: Number.isInteger(parsedYear) && parsedYear >= 1800 && parsedYear <= 2200 ? parsedYear : null,
     overview: plainText(raw.vod_content), posterUrl: artworkUrl(raw.vod_pic, manifest.endpoint),
+    backdropUrl: artworkUrl(raw.vod_pic_slide, manifest.endpoint),
     area: plainText(raw.vod_area),
     genres: plainText(raw.vod_class || raw.type_name).split(/[,，/]/u).filter(Boolean),
     rating,
@@ -214,10 +215,11 @@ export class CmsJsonAdapter {
 export function validateContentManifest(value: unknown): ContentSourceManifest {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw validationError("manifest", "插件清单必须是 JSON 对象");
   const raw = value as Record<string, unknown>;
-  if (raw.protocolVersion !== 1 || !["cms_json", "python_spider", "netease_http"].includes(String(raw.adapter))) throw validationError("manifest", "只支持 protocolVersion 1 的 CMS、Python Spider 或网易音乐内容源插件");
+  if (raw.protocolVersion !== 1 || !["cms_json", "python_spider", "catvod_js", "netease_http"].includes(String(raw.adapter))) throw validationError("manifest", "只支持 protocolVersion 1 的 CMS、Python Spider、CatVod JS 或网易音乐内容源插件");
   if (raw.mediaType !== undefined && !["video", "music", "audiobook"].includes(String(raw.mediaType))) throw validationError("mediaType", "内容源类型无效");
   if (raw.mediaType === "audiobook" && raw.adapter !== "python_spider") throw validationError("mediaType", "当前有声书内容源需要 Python Spider 适配器");
   if (raw.adapter === "python_spider" && raw.mediaType === "music") throw validationError("mediaType", "Python 内容源当前只支持视频和有声书");
+  if (raw.adapter === "catvod_js" && raw.mediaType !== undefined && raw.mediaType !== "video") throw validationError("mediaType", "CatVod JS 当前只支持视频内容源");
   const readText = (field: string, maximum: number): string => {
     const text = typeof raw[field] === "string" ? String(raw[field]).trim() : "";
     if (!text || text.length > maximum) throw validationError(field, `${field} 不能为空且不能超过 ${maximum} 个字符`);
@@ -226,6 +228,20 @@ export function validateContentManifest(value: unknown): ContentSourceManifest {
   const pluginId = readText("pluginId", 128);
   const version = readText("version", 64);
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/u.test(pluginId) || !/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/u.test(version)) throw validationError("manifest", "插件 ID 或版本格式无效");
+  if (raw.adapter === "catvod_js") {
+    const scriptFile = readText("scriptFile", 200);
+    const scriptHash = readText("scriptHash", 64);
+    if (!/^[a-f0-9]{64}$/u.test(scriptHash) || scriptFile !== `javascript-sources/${scriptHash}/source.js`) throw validationError("scriptFile", "JavaScript 源必须使用导入时保存的固定脚本路径和摘要");
+    const configuration = raw.jsConfig;
+    if (configuration !== undefined && (!configuration || typeof configuration !== "object" || Array.isArray(configuration))) throw validationError("jsConfig", "JavaScript 初始化配置必须是对象");
+    const config = (configuration ?? {}) as Record<string, unknown>;
+    if (config.extend !== undefined && (typeof config.extend !== "string" || config.extend.length > 10000)) throw validationError("extend", "JavaScript 初始化参数必须是文本且不超过 10000 字符");
+    const pageSize = Number(config.pageSize ?? 20);
+    if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 200) throw validationError("pageSize", "JavaScript 源每页条数必须为 1 至 200");
+    return { protocolVersion: 1, pluginId, version, displayName: readText("displayName", 100), description: String(raw.description ?? "").slice(0, 2000), adapter: "catvod_js", mediaType: "video", endpoint: "", headers: {}, scriptFile, scriptHash,
+      movieCategoryIds: Array.isArray(raw.movieCategoryIds) ? raw.movieCategoryIds.map(String) : [], excludedCategoryIds: Array.isArray(raw.excludedCategoryIds) ? raw.excludedCategoryIds.map(String) : [],
+      jsConfig: { extend: String(config.extend ?? ""), pageSize } };
+  }
   if (raw.adapter === "python_spider") {
     const scriptFile = readText("scriptFile", 200);
     const scriptHash = readText("scriptHash", 64);

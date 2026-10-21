@@ -203,7 +203,8 @@ export class ServiceAccessService {
       .first();
     if (!row) throw new ApiError(401, "subsonic_login_failed", "用户名或密码错误");
 
-    let matched = false;
+    // 关键变量：明确免密码的账号允许省略认证参数；提供了 token 或密码时仍走对应校验。
+    let matched = Number(row.password_required ?? 1) === 0 && input.password === undefined && input.token === undefined && input.salt === undefined;
     if (typeof input.password === "string") {
       const password = this.decodeSubsonicPassword(input.password);
       matched = await verifyPassword(String(row.password_hash ?? ""), password);

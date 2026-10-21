@@ -111,8 +111,7 @@ export async function registerAbsSettingsRoutes(server: FastifyInstance, runtime
         const body = request.body ?? {};
         // 关键变量：生成密码只在创建响应中提供一次，后续不能读取原密码。
         const password = body.password === undefined ? randomBytes(18).toString("base64url") : body.password;
-        if (typeof password !== "string" || !password.trim())
-          throw validationError("password", "ABS 账号密码不能为空");
+        if (typeof password !== "string") throw validationError("password", "ABS 账号密码必须为字符串");
         const account = await runtime.absAccess.createAccount(libraryId, {
           username: body.username,
           password,
@@ -130,8 +129,8 @@ export async function registerAbsSettingsRoutes(server: FastifyInstance, runtime
         const body = request.body ?? {};
         if (body.status !== undefined && body.status !== "active" && body.status !== "disabled")
           throw validationError("status", "账号状态无效");
-        if (body.password !== undefined && (typeof body.password !== "string" || !body.password.trim()))
-          throw validationError("password", "ABS 账号密码不能为空");
+        if (body.password !== undefined && typeof body.password !== "string")
+          throw validationError("password", "ABS 账号密码必须为字符串");
         const account = await runtime.absAccess.updateAccount(libraryId, accountId, {
           username: body.username,
           password: body.password,

@@ -12,6 +12,9 @@ import type { ApiRuntime } from "../runtime.js";
 import { enqueueProtocolScan, listProtocolVirtualFolders } from "../protocol-scan-service.js";
 import { contentPlaybackServerRoot, isContentSourceLibrary, mapContentMediaSource, prepareContentPlaybackSources } from "../content-sources/playback.js";
 import { sendContentPlayback, sendContentResource } from "../content-sources/hls-relay.js";
+import { sendContentSourceHttpImage } from "../content-sources/http-image.js";
+import { isSpiderProxyUrl } from "../content-sources/spider-proxy.js";
+import { sendSpiderSourceImage } from "../content-sources/spider-image.js";
 import {
   buildUpstreamHeaders,
   copyMediaResponseHeaders,
@@ -393,7 +396,7 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
 }
 
 /** 通过 Jellyfin 图片接口代理媒体库已经保存的公开 HTTP 图片。 */
-async function sendItemImage(compatibility: JellyfinCompatibilityService, context: JellyfinLibraryContext, request: FastifyRequest, reply: FastifyReply, itemId: string, imageType: string) {
+async function sendItemImage(runtime: ApiRuntime, compatibility: JellyfinCompatibilityService, context: JellyfinLibraryContext, request: FastifyRequest, reply: FastifyReply, itemId: string, imageType: string) {
   const imageSource = await compatibility.resolveImageSource(context, itemId, imageType);
   const rawUrl = imageSource.url;
   let imageUrl: URL;
@@ -405,6 +408,8 @@ async function sendItemImage(compatibility: JellyfinCompatibilityService, contex
   reply.header("ETag", responseEtag);
   reply.header("Last-Modified", new Date(imageSource.updatedAt).toUTCString());
   if (request.headers["if-none-match"] === responseEtag) return reply.status(304).send();
+  if (isSpiderProxyUrl(rawUrl)) return sendSpiderSourceImage(runtime, context, request, reply, imageSource);
+  if (context.libraryKind === "content_source_video" && imageSource.sourceType === "media") return sendContentSourceHttpImage(request, reply, imageUrl);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10_000);
   try {
@@ -696,10 +701,10 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
     const internalItemId = compatibility.toInternalItemId(params.itemId);
     return sendContentResource(runtime, context, request, reply, internalItemId, compatibility.toProtocolItemId(internalItemId), params.ticket);
   } });
-  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType`, handler: async (request, reply) => sendItemImage(compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
-  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType/:index`, handler: async (request, reply) => sendItemImage(compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
+  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType`, handler: async (request, reply) => sendItemImage(runtime, compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
+  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType/:index`, handler: async (request, reply) => sendItemImage(runtime, compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
   // 兼容 Jellyfin 旧客户端仍在使用的完整图片路径参数形式，实际缩放参数由上游图片承担。
-  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType/:index/:tag/:format/:maxWidth/:maxHeight/:percentPlayed/:unplayedCount`, handler: async (request, reply) => sendItemImage(compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
+  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType/:index/:tag/:format/:maxWidth/:maxHeight/:percentPlayed/:unplayedCount`, handler: async (request, reply) => sendItemImage(runtime, compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
   server.post(`${prefix}/Sessions/Playing`, async (request, reply) => { await compatibility.reportPlayback(await authenticated(request), "playing", (request.body ?? {}) as Record<string, unknown>); return reply.status(204).send(); });
   server.post(`${prefix}/Sessions/Playing/Progress`, async (request, reply) => { await compatibility.reportPlayback(await authenticated(request), "progress", (request.body ?? {}) as Record<string, unknown>); return reply.status(204).send(); });
   server.post(`${prefix}/Sessions/Playing/Stopped`, async (request, reply) => { await compatibility.reportPlayback(await authenticated(request), "stopped", (request.body ?? {}) as Record<string, unknown>); return reply.status(204).send(); });

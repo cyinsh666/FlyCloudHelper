@@ -22,7 +22,7 @@ export async function registerNativeAudiobookRoutes(server: FastifyInstance, run
   const playback = new NativePlayback(runtime, store, access, catalog, state);
   await registerNativeAudiobookManagement(server, runtime, store, access);
   await server.register(async (native) => {
-    const base = "/a/:pathSuffix";
+    const base = "/fab/:pathSuffix";
     const api = `${base}/api/v1`;
     native.addHook("onClose", async () => {
       playback.close();

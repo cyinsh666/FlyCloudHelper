@@ -1197,7 +1197,7 @@ export class ServiceRepository {
     displayName: string;
     sourceName: string;
     /** 来源类型只用于新内容库记录，已有网盘与 CMS 记录不变。 */
-    providerType?: "cms_json" | "python_spider";
+    providerType?: "cms_json" | "python_spider" | "catvod_js";
     configuration: Record<string, unknown>;
     syncState: Record<string, unknown>;
     /** 仅由有声书专用仓储入口传入，旧视频调用不改变行为。 */

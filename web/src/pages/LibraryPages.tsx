@@ -6,6 +6,7 @@ import { LibraryAudiobookSettings } from "@/components/LibraryAudiobookSettings"
 import { LibraryContentAudiobookSettingsPage } from "@/pages/LibraryContentAudiobookSettingsPage";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, StatusPill } from "@/components/ui-kit";
+import { ProtocolPasswordInput } from "@/components/ProtocolPasswordInput";
 import { ServicePathPicker, toProviderDirectory } from "@/components/ServicePathPicker";
 import { ContentSourceLibraryPanel } from "@/components/ContentSourceLibraryPanel";
 import { ContentSourceLibraryNameEditor } from "@/components/ContentSourceLibraryNameEditor";
@@ -703,9 +704,11 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
   const [showCreateAccount, setShowCreateAccount] = useState(false);
   const [newAccountUsername, setNewAccountUsername] = useState("");
   const [newAccountPassword, setNewAccountPassword] = useState("");
+  const [newAccountNoPassword, setNewAccountNoPassword] = useState(false);
   const [editingAccountId, setEditingAccountId] = useState<string | null>(null);
   const [editingAccountUsername, setEditingAccountUsername] = useState("");
   const [editingAccountPassword, setEditingAccountPassword] = useState("");
+  const [editingAccountNoPassword, setEditingAccountNoPassword] = useState(false);
   const [pendingAccountAction, setPendingAccountAction] = useState<string | null>(null);
   // 关键变量：账号操作同步写入引用，拦截 React 更新按钮状态之前的重复提交。
   const pendingAccountActionRef = useRef<string | null>(null);
@@ -868,10 +871,11 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
     try {
       await createServiceAccessAccount(serviceId, {
         username: newAccountUsername,
-        password: newAccountPassword,
+        password: newAccountNoPassword ? "" : newAccountPassword,
       }, admin);
       setNewAccountUsername("");
       setNewAccountPassword("");
+      setNewAccountNoPassword(false);
       setShowCreateAccount(false);
       setMessage("协议访问账号已创建，可使用同一个服务地址登录");
       await resource.refresh();
@@ -887,6 +891,7 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
     setEditingAccountId(account.id);
     setEditingAccountUsername(account.username);
     setEditingAccountPassword("");
+    setEditingAccountNoPassword(!account.hasPassword);
   }
 
   /** 保存指定协议账号的用户名和可选新密码。 */
@@ -895,8 +900,12 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
     if (!settings || !beginAccountAction(`save:${account.id}`)) return;
     const input: { username?: string; password?: string } = {};
     if (editingAccountUsername !== account.username) input.username = editingAccountUsername;
-    // 关键变量：编辑时密码留空表示不修改，避免仅改用户名时意外清空现有密码。
-    if (editingAccountPassword.length > 0) input.password = editingAccountPassword;
+    // 关键变量：只有明确勾选无密码才清空已有密码，其他空输入继续表示不修改。
+    if (editingAccountNoPassword && account.hasPassword) input.password = "";
+    else if (!editingAccountNoPassword && editingAccountPassword.length > 0) input.password = editingAccountPassword;
+    if (!editingAccountNoPassword && !account.hasPassword && !editingAccountPassword) {
+      setMessage("请设置新密码或勾选无密码"); finishAccountAction(); return;
+    }
     if (input.username === undefined && input.password === undefined) {
       setMessage("访问用户名和密码均未修改");
       finishAccountAction();
@@ -910,21 +919,6 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
       await resource.refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "协议访问凭据保存失败");
-    } finally {
-      finishAccountAction();
-    }
-  }
-
-  /** 将指定账号改为免密码登录，同时撤销其旧会话。 */
-  async function clearAccessAccountPassword(account: ServiceAccessAccount): Promise<void> {
-    if (!account.hasPassword || !window.confirm(`确定把账号“${account.username}”改为免密码登录吗？`)) return;
-    if (!beginAccountAction(`passwordless:${account.id}`)) return;
-    try {
-      await updateServiceAccessAccount(serviceId, account.id, { password: "" }, admin);
-      setMessage(`账号“${account.username}”已改为免密码登录`);
-      await resource.refresh();
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "切换免密码登录失败");
     } finally {
       finishAccountAction();
     }
@@ -1060,7 +1054,7 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
         {showCreateAccount && (
           <form onSubmit={(event) => void createAccessAccount(event)} className="mb-3 grid gap-2 rounded-lg border border-border bg-secondary/35 p-3 md:grid-cols-2">
             <label><span className="text-xs text-muted-foreground">新账号用户名</span><input value={newAccountUsername} required minLength={4} maxLength={255} onChange={(event) => setNewAccountUsername(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label>
-            <label><span className="text-xs text-muted-foreground">登录密码（可选）</span><input value={newAccountPassword} type="password" autoComplete="new-password" placeholder="留空则无需密码" onChange={(event) => setNewAccountPassword(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label>
+            <div><span className="text-xs text-muted-foreground">登录密码</span><ProtocolPasswordInput state={{ value: newAccountPassword, noPassword: newAccountNoPassword, required: true, disabled: pendingAccountAction !== null, placeholder: "请输入密码或勾选无密码", onChange: setNewAccountPassword, onNoPasswordChange: setNewAccountNoPassword }} /></div>
             <div className="flex flex-wrap gap-2 md:col-span-2">
               <PrimaryButton type="submit" disabled={pendingAccountAction !== null}><Plus className="size-4" /> {pendingAccountAction === "create" ? "正在创建…" : "创建账号"}</PrimaryButton>
               <SecondaryButton type="button" disabled={pendingAccountAction !== null} onClick={() => setShowCreateAccount(false)}>取消</SecondaryButton>
@@ -1094,10 +1088,9 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
                 {editing && (
                   <form onSubmit={(event) => void saveAccessAccount(event, account)} className="mt-3 grid gap-2 border-t border-border pt-3 md:grid-cols-2">
                     <label><span className="text-xs text-muted-foreground">访问用户名</span><input value={editingAccountUsername} required minLength={4} maxLength={255} onChange={(event) => setEditingAccountUsername(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label>
-                    <label><span className="text-xs text-muted-foreground">新密码</span><input value={editingAccountPassword} type="password" autoComplete="new-password" placeholder="留空表示不修改" onChange={(event) => setEditingAccountPassword(event.target.value)} className="mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm" /></label>
+                    <div><span className="text-xs text-muted-foreground">新密码</span><ProtocolPasswordInput state={{ value: editingAccountPassword, noPassword: editingAccountNoPassword, required: !account.hasPassword, disabled: pendingAccountAction !== null, placeholder: "留空表示不修改", onChange: setEditingAccountPassword, onNoPasswordChange: setEditingAccountNoPassword }} /></div>
                     <div className="flex flex-wrap gap-2 md:col-span-2">
                       <PrimaryButton type="submit" disabled={pendingAccountAction !== null}><Settings2 className="size-4" /> {accountPending && pendingAccountAction?.startsWith("save:") ? "正在保存…" : "保存账号"}</PrimaryButton>
-                      {account.hasPassword && <SecondaryButton type="button" disabled={pendingAccountAction !== null} onClick={() => void clearAccessAccountPassword(account)}>改为免密码</SecondaryButton>}
                       <SecondaryButton type="button" disabled={pendingAccountAction !== null} onClick={() => setEditingAccountId(null)}>取消</SecondaryButton>
                     </div>
                   </form>

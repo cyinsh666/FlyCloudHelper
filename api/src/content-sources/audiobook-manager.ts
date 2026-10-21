@@ -9,7 +9,7 @@ import type { ContentSourceCategory, ContentSourceInstance, ContentSourceManifes
 import { audiobookAudioExtension, PythonAudiobookSourceAdapter } from "./audiobook-adapter.js";
 import { audiobookContentSource, audiobookSourceCategories, contentAudiobookItemId, persistContentAudiobook } from "./audiobook-catalog.js";
 import { AUDIOBOOK_SEARCH_CATEGORY, type AudiobookSourceCard, type AudiobookSourceManifest, type ContentAudiobookConfiguration, type ContentAudiobookLocator } from "./audiobook-types.js";
-import type { AudiobookDirectoryState, AudiobookSourceDetail } from "./audiobook-types.js";
+import type { AudiobookDirectoryState, AudiobookSourceDetail, AudiobookSourcePage } from "./audiobook-types.js";
 import { claimAudiobookDirectory, failAudiobookDirectory, readAudiobookDirectory } from "./audiobook-directory-state.js";
 import type { PythonInvocationOptions } from "./python-runtime.js";
 
@@ -26,6 +26,15 @@ interface AudiobookQueuedOperation {
 /** 同步状态复用既有内容源表和标准状态结构。 */
 function emptySync(): ContentSourceSyncState {
   return { status: "idle", processedCount: 0, pageCount: 0, nextPageByCategory: {}, startedAt: null, finishedAt: null, lastError: null };
+}
+
+/** 仅按源声明的总页数或真实空页记录末页，过滤后的空作品列表不能作为结束依据。 */
+function rememberCategoryPageCount(sync: ContentSourceSyncState, categoryId: string, page: number, result: AudiobookSourcePage): void {
+  if (result.sourcePageCount !== null) {
+    (sync.sourcePageCountByCategory ??= {})[categoryId] = result.sourcePageCount;
+  } else if (result.rawItemCount === 0) {
+    (sync.sourcePageCountByCategory ??= {})[categoryId] = Math.max(0, page - 1);
+  }
 }
 
 /** 听书源必须显式声明媒体类型，不将视频或音乐脚本推断为听书源。 */
@@ -237,7 +246,7 @@ export class ContentAudiobookManager {
       await this.assertLibraryAvailable(libraryId, userId);
       const current = await this.getLibrary(libraryId, userId);
       if (this.jobs.has(libraryId) || ["queued", "running"].includes(current.sync.status)) throw new ApiError(409, "content_sync_running", "同步期间不能修改听书分类");
-      const sync: ContentSourceSyncState = { ...emptySync(), nextPageByCategory: { ...current.sync.nextPageByCategory } };
+      const sync: ContentSourceSyncState = { ...emptySync(), nextPageByCategory: { ...current.sync.nextPageByCategory }, sourcePageCountByCategory: { ...current.sync.sourcePageCountByCategory } };
       for (const id of selected.categoryIds) sync.nextPageByCategory[id] ??= 1;
       await this.database.query("content_source_libraries").where({ library_id: libraryId, user_id: userId }).update({ configuration_json: JSON.stringify({ ...current.configuration, ...selected }), sync_status: sync.status, sync_json: JSON.stringify(sync), updated_at: new Date().toISOString() });
     });
@@ -309,7 +318,19 @@ export class ContentAudiobookManager {
         if (mode === "next" && sync.pendingBatch?.completedCategoryIds.includes(categoryId)) continue;
         let page = mode === "next" ? sync.nextPageByCategory[categoryId] ?? 1 : 1;
         const end = mode === "next" ? sync.pendingBatch?.endPageExclusiveByCategory[categoryId] ?? page : sync.pageCount + 1;
-        while (page < end) {
+        // 关键变量：旧同步没有保存总页数，先读取有效第一页恢复边界，绝不拿越界请求的错误当作末页。
+        if (mode === "next" && page > 1 && page < end && sync.sourcePageCountByCategory?.[categoryId] === undefined) {
+          const firstPage = await this.enqueue(libraryId, async () => {
+            await this.assertLibraryAvailable(libraryId, userId);
+            return runtime.adapter.page(categoryId, 1, signal);
+          }, signal, new AbortController(), 3);
+          this.checkpoint(libraryId, generation, signal);
+          rememberCategoryPageCount(sync, categoryId, 1, firstPage);
+          await this.saveSync(libraryId, userId, sync);
+        }
+        // 最新和重新同步必须重读第一页，才能发现源站增加的新页或原空分类的新内容。
+        if (mode !== "next" && sync.sourcePageCountByCategory) delete sync.sourcePageCountByCategory[categoryId];
+        while (page < end && (sync.sourcePageCountByCategory?.[categoryId] === undefined || page <= sync.sourcePageCountByCategory[categoryId]!)) {
           this.checkpoint(libraryId, generation, signal);
           const result = await this.enqueue(libraryId, async () => {
             await this.assertLibraryAvailable(libraryId, userId);
@@ -323,12 +344,16 @@ export class ContentAudiobookManager {
             return pageResult;
           }, signal, new AbortController(), 3);
           this.checkpoint(libraryId, generation, signal);
+          rememberCategoryPageCount(sync, categoryId, page, result);
           page += 1;
           if (mode === "next") sync.nextPageByCategory[categoryId] = page;
           await this.saveSync(libraryId, userId, sync);
           if (result.sourcePageCount !== null ? page > result.sourcePageCount : result.rawItemCount === 0) break;
         }
-        if (mode === "next") sync.pendingBatch?.completedCategoryIds.push(categoryId);
+        if (mode === "next") {
+          sync.pendingBatch?.completedCategoryIds.push(categoryId);
+          await this.saveSync(libraryId, userId, sync);
+        }
       }
       this.checkpoint(libraryId, generation, signal);
       sync.status = "completed";
@@ -355,6 +380,47 @@ export class ContentAudiobookManager {
       if (!result.hasMore) break;
     }
     return ids;
+  }
+
+  /** FAB 全部书籍与分类书籍按源页读取摘要，不补详情、不推进后台同步的连续导入游标。 */
+  public async browsePage(libraryId: string, userId: string, page: number, categoryId?: string, parentSignal?: AbortSignal): Promise<{ ids: string[]; hasMore: boolean }> {
+    if (!Number.isSafeInteger(page) || page < 1 || page > 100000) throw validationError("page", "听书目录页号无效");
+    return this.enqueue(libraryId, async (signal, generation) => {
+      await this.assertLibraryAvailable(libraryId, userId);
+      const detail = await this.getLibrary(libraryId, userId);
+      const categories = categoryId ? detail.configuration.categoryIds.filter((id) => id === categoryId) : detail.configuration.categoryIds;
+      if (categoryId && !categories.length) throw new ApiError(404, "audiobook_category_not_found", "听书分类不存在或尚未选择");
+      const runtime = await this.runtime(detail.source.id, userId);
+      const ids: string[] = [];
+      let hasMore = false;
+      let learnedBoundary = false;
+      for (const id of categories) {
+        this.checkpoint(libraryId, generation, signal);
+        // 旧库没有页数记录时先探明有效第一页，不能直接请求一个可能已越界的后续页。
+        if (page > 1 && detail.sync.sourcePageCountByCategory?.[id] === undefined) {
+          const first = await runtime.adapter.page(id, 1, signal);
+          rememberCategoryPageCount(detail.sync, id, 1, first);
+          learnedBoundary = true;
+        }
+        const knownCount = detail.sync.sourcePageCountByCategory?.[id];
+        if (page > 1 && knownCount !== undefined && page > knownCount) continue;
+        const result = await runtime.adapter.page(id, page, signal);
+        this.checkpoint(libraryId, generation, signal);
+        rememberCategoryPageCount(detail.sync, id, page, result);
+        learnedBoundary = true;
+        for (const card of result.items) {
+          if (card.categoryId !== id) continue;
+          this.checkpoint(libraryId, generation, signal);
+          const itemId = await persistContentAudiobook({ database: this.database, repository: this.repository,
+            libraryId, userId, instanceId: detail.source.id, content: withCategoryNames(card, detail.configuration.categoryCatalog) });
+          if (!ids.includes(itemId)) ids.push(itemId);
+        }
+        hasMore ||= result.sourcePageCount !== null ? page < result.sourcePageCount : result.rawItemCount > 0;
+      }
+      // 后台同步正在执行时由它保存边界，前台翻页不能覆盖其在途批次和已处理数量。
+      if (learnedBoundary && !this.jobs.has(libraryId)) await this.saveSync(libraryId, userId, detail.sync);
+      return { ids, hasMore };
+    }, parentSignal);
   }
 
   /** 原生实时搜索每次只读取一个真实源窗口，过滤后空页仍根据原始范围续页。 */

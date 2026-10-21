@@ -40,7 +40,7 @@ export function validateNativePathSuffix(value: unknown): string {
 
 /** 账号投影不包含密码校验值及内部凭据修订号。 */
 export function nativePublicAccount(account: NativeAccount): Record<string, unknown> {
-  return { AccountId: account.AccountId, ServiceId: account.ServiceId, Username: account.Username, DisplayName: account.DisplayName, AllowedLibraryIds: account.AllowedLibraryIds, Enabled: account.Enabled, CanDownload: account.CanDownload, PermissionsRevision: account.PermissionsRevision, CreatedAt: account.CreatedAt, UpdatedAt: account.UpdatedAt };
+  return { AccountId: account.AccountId, ServiceId: account.ServiceId, Username: account.Username, DisplayName: account.DisplayName, HasPassword: account.PasswordRequired !== false, AllowedLibraryIds: account.AllowedLibraryIds, Enabled: account.Enabled, CanDownload: account.CanDownload, PermissionsRevision: account.PermissionsRevision, CreatedAt: account.CreatedAt, UpdatedAt: account.UpdatedAt };
 }
 
 /** 设备列表不能返回访问令牌摘要或其他账号资料。 */
@@ -187,7 +187,8 @@ export class NativeAccess {
     const username = typeof input.Username === "string" && [...input.Username].length <= 255 ? input.Username : "";
     const lookup = await this.store.get<{ ServiceId: string; AccountId: string; Lookup: string }>(nativeUsernameKey(service.ServiceId, username));
     const account = lookup && lookup.value.ServiceId === service.ServiceId && lookup.value.Lookup === createUsernameLookup(username) ? await this.store.get<NativeAccount>(nativeAccountKey(service.ServiceId, lookup.value.AccountId)) : null;
-    if (!account || !account.value.Enabled || typeof input.Password !== "string" || [...input.Password].length > 256 || !(await verifyPassword(account.value.PasswordHash, input.Password))) throw new ApiError(401, "invalid_credentials", "用户名或密码错误");
+    const suppliedPassword = input.Password === undefined && account?.value.PasswordRequired === false ? "" : input.Password;
+    if (!account || !account.value.Enabled || typeof suppliedPassword !== "string" || [...suppliedPassword].length > 256 || !(await verifyPassword(account.value.PasswordHash, suppliedPassword))) throw new ApiError(401, "invalid_credentials", "用户名或密码错误");
     const deviceInfo = readDeviceInfo(input.DeviceInfo);
     const token = randomBytes(32).toString("base64url");
     const now = new Date().toISOString();

@@ -22,6 +22,23 @@ function libraryServicePrefix(libraryId: string): string { return `ab1:libsvc:${
 /** 同一实际库可以被多个原生入口引用，索引只存关联身份。 */
 function libraryServiceKey(libraryId: string, serviceId: string): string { return `${libraryServicePrefix(libraryId)}${nativeHash(serviceId)}`; }
 
+/** 按当前库索引复用既有单库配置，不创建入口或改写历史多库记录。 */
+async function singleLibraryService(store: NativeStore, libraryId: string, query?: NativeQuery): Promise<NativeService | null> {
+  let after: string | undefined;
+  let selected: NativeService | null = null;
+  for (;;) {
+    const rows = await store.scan<{ ServiceId: string }>(libraryServicePrefix(libraryId), { after, limit: 50 }, query);
+    for (const index of rows) {
+      const row = await store.get<NativeService>(nativeServiceKey(index.value.ServiceId), query);
+      if (!row || row.value.Mode !== "SingleLibrary" || row.value.LibraryIds.length !== 1 || row.value.LibraryIds[0] !== libraryId) continue;
+      if (selected) throw new ApiError(409, "library_protocol_ambiguous", "当前媒体库存在多个 FlyAudioBook 配置，请先核对已有配置");
+      selected = row.value;
+    }
+    if (rows.length < 50) return selected;
+    after = rows.at(-1)!.key;
+  }
+}
+
 /** 请求对象限制为普通 JSON 对象，不把数组当配置。 */
 function readBody(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw validationError("body", "请求参数必须为对象");
@@ -78,7 +95,7 @@ function nextCredentialRevision(value: number): number {
 
 /** 服务公开配置不返回内部令牌或密码资料。 */
 function publicService(service: NativeService, publicBaseUrl: string | null = null): Record<string, unknown> {
-  const path = `/a/${encodeURIComponent(service.PathSuffix)}`;
+  const path = `/fab/${encodeURIComponent(service.PathSuffix)}`;
   return { ServiceId: service.ServiceId, OwnerUserId: service.OwnerUserId, Name: service.Name, Mode: service.Mode, PathSuffix: service.PathSuffix, Path: path, Url: publicBaseUrl ? `${publicBaseUrl}${path}` : null, LibraryIds: service.LibraryIds, Enabled: service.Enabled, RelayPlaybackEnabled: service.RelayPlaybackEnabled, PermissionsRevision: service.PermissionsRevision, CreatedAt: service.CreatedAt, UpdatedAt: service.UpdatedAt, Deleting: service.Deleting === true };
 }
 
@@ -214,6 +231,14 @@ async function deleteAccountData(store: NativeStore, access: NativeAccess, servi
 export async function registerNativeAudiobookManagement(server: FastifyInstance, runtime: ApiRuntime, store: NativeStore, access: NativeAccess): Promise<void> {
   const root = "/api/v1/audiobook-services";
 
+  /** 协议配置从媒体库读取；未启用的库返回空配置，不因访问页面新增业务记录。 */
+  server.get<{ Params: { libraryId: string } }>("/api/v1/libraries/:libraryId/flyaudiobook", async (request) => {
+    const user = await requireRequestUser(request, runtime.database);
+    await validateLibraries(runtime, user, [request.params.libraryId]);
+    const service = await singleLibraryService(store, request.params.libraryId);
+    return { Service: service ? publicService(service, (await runtime.publicAccess.getStatus()).publicBaseUrl) : null };
+  });
+
   server.get(root, async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     const input = request.query && typeof request.query === "object" ? request.query as Record<string, unknown> : {};
@@ -239,10 +264,17 @@ export async function registerNativeAudiobookManagement(server: FastifyInstance,
     const user = await requireRequestUser(request, runtime.database);
     const body = readBody(request.body);
     const ids = readLibraryIds(body.LibraryIds);
+    if (body.Mode !== "SingleLibrary" || ids.length !== 1) throw validationError("Mode", "FlyAudioBook 当前仅支持单个有声书媒体库");
     const owner = await validateLibraries(runtime, user, ids);
     const now = new Date().toISOString();
     const service: NativeService = { ServiceId: randomUUID(), OwnerUserId: owner, Name: readName(body.Name, "Name"), Mode: readMode(body.Mode, ids), PathSuffix: validateNativePathSuffix(body.PathSuffix), LibraryIds: ids, Enabled: optionalBoolean(body, "Enabled", false), RelayPlaybackEnabled: optionalBoolean(body, "RelayPlaybackEnabled", true), CredentialRevision: 1, PermissionsRevision: randomUUID(), CreatedAt: now, UpdatedAt: now };
     await store.transaction(async (query) => {
+      // 关键变量：锁定已有媒体库行，串行检查同库创建，避免多窗口生成重复协议配置。
+      let libraryQuery = query("media_libraries").where({ id: ids[0], user_id: owner, data_type: "audiobook" }).select("id");
+      if (!String(query.client.config.client).includes("sqlite")) libraryQuery = libraryQuery.forUpdate();
+      const library = await libraryQuery.first();
+      if (!library) throw new ApiError(404, "library_unavailable", "媒体库不存在或已变化");
+      if (await singleLibraryService(store, ids[0]!, query)) throw new ApiError(409, "library_protocol_exists", "当前媒体库已配置 FlyAudioBook，请刷新后使用已有配置");
       const suffixKey = nativeSuffixKey(service.PathSuffix);
       if (await store.get(suffixKey, query)) throw new ApiError(409, "service_path_conflict", "该原生听书地址已被使用");
       await store.put(suffixKey, { ServiceId: service.ServiceId, Lookup: service.PathSuffix.toLowerCase() }, null, query);
@@ -262,6 +294,9 @@ export async function registerNativeAudiobookManagement(server: FastifyInstance,
     const { user, row } = await ownedService(runtime, store, request, request.params.serviceId);
     const body = readBody(request.body);
     const ids = body.LibraryIds === undefined ? row.value.LibraryIds : readLibraryIds(body.LibraryIds);
+    if (body.Mode === "MultiLibrary" || body.LibraryIds !== undefined && (ids.length !== 1 || JSON.stringify(ids) !== JSON.stringify(row.value.LibraryIds))) {
+      throw validationError("LibraryIds", "FlyAudioBook 协议配置固定属于当前媒体库，暂不支持多库聚合或转移");
+    }
     if (body.LibraryIds !== undefined) await validateLibraries(runtime, user, ids, row.value.OwnerUserId);
     const service: NativeService = { ...row.value, Name: body.Name === undefined ? row.value.Name : readName(body.Name, "Name"), Mode: readMode(body.Mode ?? row.value.Mode, ids), PathSuffix: body.PathSuffix === undefined ? row.value.PathSuffix : validateNativePathSuffix(body.PathSuffix), LibraryIds: ids, Enabled: optionalBoolean(body, "Enabled", row.value.Enabled), RelayPlaybackEnabled: optionalBoolean(body, "RelayPlaybackEnabled", row.value.RelayPlaybackEnabled), UpdatedAt: new Date().toISOString() };
     const permissionsChanged = JSON.stringify(ids) !== JSON.stringify(row.value.LibraryIds);
@@ -330,11 +365,12 @@ export async function registerNativeAudiobookManagement(server: FastifyInstance,
     const { row } = await ownedService(runtime, store, request, request.params.serviceId);
     const body = readBody(request.body);
     const username = validateUsername(body.Username);
-    const password = body.Password === undefined ? randomBytes(18).toString("base64url") : validatePassword(body.Password);
+    // 关键变量：省略密码保持自动生成，只有显式空字符串才创建免密码账号。
+    const password = body.Password === "" ? "" : body.Password === undefined ? randomBytes(18).toString("base64url") : validatePassword(body.Password);
     const ids = body.AllowedLibraryIds === undefined ? [...row.value.LibraryIds] : readLibraryIds(body.AllowedLibraryIds, true);
     if (ids.some((id) => !row.value.LibraryIds.includes(id))) throw validationError("AllowedLibraryIds", "账号只能授权当前入口关联的媒体库");
     const now = new Date().toISOString();
-    const account: NativeAccount = { AccountId: randomUUID(), ServiceId: row.value.ServiceId, Username: username, DisplayName: body.DisplayName === undefined ? username : readName(body.DisplayName, "DisplayName"), PasswordHash: await hashPassword(password), AllowedLibraryIds: ids, Enabled: optionalBoolean(body, "Enabled", true), CanDownload: optionalBoolean(body, "CanDownload", false), CredentialRevision: 1, PermissionsRevision: randomUUID(), CreatedAt: now, UpdatedAt: now };
+    const account: NativeAccount = { AccountId: randomUUID(), ServiceId: row.value.ServiceId, Username: username, DisplayName: body.DisplayName === undefined ? username : readName(body.DisplayName, "DisplayName"), PasswordHash: await hashPassword(password), PasswordRequired: password !== "", AllowedLibraryIds: ids, Enabled: optionalBoolean(body, "Enabled", true), CanDownload: optionalBoolean(body, "CanDownload", false), CredentialRevision: 1, PermissionsRevision: randomUUID(), CreatedAt: now, UpdatedAt: now };
     await store.transaction(async (query) => {
       const service = await currentService(store, account.ServiceId, query);
       if (ids.some((id) => !service.value.LibraryIds.includes(id))) throw new ApiError(409, "service_permissions_changed", "入口关联已变化，请重新选择授权");
@@ -355,7 +391,11 @@ export async function registerNativeAudiobookManagement(server: FastifyInstance,
     if (body.AllowedLibraryIds !== undefined && ids.some((id) => !serviceRow.value.LibraryIds.includes(id))) throw validationError("AllowedLibraryIds", "账号只能授权当前入口关联的媒体库");
     const username = body.Username === undefined ? row.value.Username : validateUsername(body.Username);
     const account: NativeAccount = { ...row.value, Username: username, DisplayName: body.DisplayName === undefined ? row.value.DisplayName : readName(body.DisplayName, "DisplayName"), AllowedLibraryIds: ids, Enabled: optionalBoolean(body, "Enabled", row.value.Enabled), CanDownload: optionalBoolean(body, "CanDownload", row.value.CanDownload), UpdatedAt: new Date().toISOString() };
-    if (body.Password !== undefined) account.PasswordHash = await hashPassword(validatePassword(body.Password));
+    if (body.Password !== undefined) {
+      const password = body.Password === "" ? "" : validatePassword(body.Password);
+      account.PasswordHash = await hashPassword(password);
+      account.PasswordRequired = password !== "";
+    }
     const credentialsChanged = body.Password !== undefined || account.Enabled !== row.value.Enabled || account.Username !== row.value.Username;
     if (credentialsChanged) account.CredentialRevision = nextCredentialRevision(row.value.CredentialRevision);
     if (JSON.stringify(ids) !== JSON.stringify(row.value.AllowedLibraryIds) || account.CanDownload !== row.value.CanDownload) account.PermissionsRevision = randomUUID();

@@ -13,7 +13,7 @@ export interface DynamicCatalogContext {
   userId: string;
   instanceId: string;
   query: DynamicCatalogQuery;
-  /** 当前查询实际允许的叶分类；全库搜索也不能越过用户当前选择范围。 */
+  /** 当前查询允许的真实分类；明确选中源总目录时包含其全部受支持分类。 */
   categoryIds: string[];
   /** 固定源版本和分类配置签名；请求中途变更时不返回旧范围。 */
   identity: string;
@@ -220,7 +220,7 @@ export class DynamicContentCatalog {
         : await context.adapter.page(context.query.categoryId, page, signal);
       // 关键变量：CMS JSON 和 Python 明确标记的摘要允许尚无分集，详情入口才验证完整播放目录。
       // 搜索可能跨全站，必须继续用真实分类精确筛选，不能把卡片挂到当前查询类别。
-      const supportsCards = context.manifest.adapter === "cms_json" || context.manifest.adapter === "python_spider";
+      const supportsCards = context.manifest.adapter === "cms_json" || context.manifest.adapter === "python_spider" || context.manifest.adapter === "catvod_js";
       const candidates = result.items.filter((content) => (content.episodes.length > 0
         || (supportsCards && content.detailState === "card")) && context.categoryIds.includes(content.categoryId)
         && !categoryMatches(content.categoryId, context.manifest.excludedCategoryIds ?? [], context.categories))

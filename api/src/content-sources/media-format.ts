@@ -1,9 +1,8 @@
-import type { IncomingMessage } from "node:http";
 import { Readable } from "node:stream";
 import type { ContentVideoContainer } from "./types.js";
 
 /** 累计读取到 512 字节或流结束用于格式判断，再返回能够回放全部原始字节的媒体流。 */
-export async function inspectContentBody(body: IncomingMessage): Promise<{ prefix: Buffer; stream: Readable }> {
+export async function inspectContentBody(body: Readable): Promise<{ prefix: Buffer; stream: Readable }> {
   // 关键变量：退出前缀读取不能销毁原流，后续清单读取或媒体中转仍需继续消费它。
   const iterator = body.iterator({ destroyOnReturn: false });
   // 关键变量：首块可能只有几个字节，累计到签名判断长度；覆盖边界的完整数据块也必须保留。

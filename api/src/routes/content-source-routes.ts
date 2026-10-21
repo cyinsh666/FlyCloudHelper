@@ -4,6 +4,7 @@ import { requireObject, requireRequestUser, requireString, requireSuperAdmin } f
 import type { ApiRuntime } from "../runtime.js";
 import type { ContentSourcePlaybackMode, ContentSourcePlaybackProtocol } from "../content-sources/types.js";
 import { importPythonSource, PYTHON_SOURCE_MAX_BYTES } from "../content-sources/python-import.js";
+import { importJavaScriptSource, JAVASCRIPT_SOURCE_MAX_BYTES } from "../content-sources/js-import.js";
 
 /** 读取用户选择的视频分类，创建库不允许默认为全站。 */
 function readCategoryIds(value: unknown): string[] {
@@ -92,6 +93,22 @@ export async function registerContentSourceRoutes(server: FastifyInstance, runti
     const bytes = await part.toBuffer(); // 关键变量：最多读取 2 MB，UTF-8 校验后仍保存原始上传字节。
     if (part.file.truncated) throw new ApiError(413, "python_source_too_large", "Python 源文件不能超过 2 MB");
     const plugin = await importPythonSource(runtime, part.filename, bytes);
+    reply.code(201);
+    return { plugin };
+  });
+
+  /** JavaScript 与 Python 共用导入操作，服务端只静态检查，不执行源站初始化。 */
+  server.post("/api/v1/admin/content-source-plugins/import-javascript", async (request, reply) => {
+    await requireSuperAdmin(request, runtime.database);
+    const part = await request.file({ limits: { fileSize: JAVASCRIPT_SOURCE_MAX_BYTES, files: 1 } });
+    if (!part) throw new ApiError(400, "javascript_source_file_required", "请选择 JavaScript 内容源文件");
+    if (!part.filename.toLowerCase().endsWith(".js")) {
+      part.file.resume();
+      throw new ApiError(415, "javascript_source_file_type_invalid", "请选择 .js 内容源文件");
+    }
+    const bytes = await part.toBuffer();
+    if (part.file.truncated) throw new ApiError(413, "javascript_source_too_large", "JavaScript 源文件不能超过 2 MB");
+    const plugin = await importJavaScriptSource(runtime, part.filename, bytes);
     reply.code(201);
     return { plugin };
   });

@@ -551,7 +551,7 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
         .select("p.manifest_json")
         .where({ "b.library_id": library.id, "b.user_id": user.id, "i.user_id": user.id }).first();
       const adapterType = parseJsonObject(binding?.manifest_json).adapter;
-      if (adapterType === "python_spider" || adapterType === "cms_json") {
+      if (adapterType === "python_spider" || adapterType === "catvod_js" || adapterType === "cms_json") {
         // 关键变量：取消 CMS／Python 详情及动态请求、失效窗口，并按需释放 Python 宿主。
         await runtime.contentSources.withLibraryCatalogChange(library.id, async () => undefined);
       }
