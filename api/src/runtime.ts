@@ -1,3 +1,4 @@
+import type { LiveLibraryManager } from "./live/manager.js";
 import type { ApiConfig } from "./config.js";
 import type { AiModelManager } from "./ai/ai-model-manager.js";
 import type { FlyCloudHelperDatabase } from "./database.js";
@@ -44,6 +45,8 @@ export interface ApiRuntime {
   contentMusic: ContentMusicManager;
   /** 在线有声书摘要、实时搜索、按需章节和播放取址，复用标准 ABS 出口。 */
   contentAudiobooks: ContentAudiobookManager;
+  /** 独立直播频道订阅、常驻来源和即时 HLS 代理。 */
+  liveLibraries: LiveLibraryManager;
   /** 用户主动开启的内容源更新计划，不与网盘定时扫描混用。 */
   contentSourceAutoSync: ContentSourceAutoSyncWorker;
   /** 内容源目录、线路抽查与最近播放失败的持久摘要。 */

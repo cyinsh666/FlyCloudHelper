@@ -1,3 +1,5 @@
+import { LiveLibraryManager } from "./live/manager.js";
+import { registerLiveRoutes } from "./live/routes.js";
 import fs from "node:fs";
 import path from "node:path";
 import cookie from "@fastify/cookie";
@@ -214,6 +216,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   const contentMusic = new ContentMusicManager(database, config, repository);
   const contentAudiobooks = new ContentAudiobookManager(database, config, repository, contentSources);
   contentSources.onInstanceStopped((instanceId) => contentAudiobooks.stopInstance(instanceId));
+  const liveLibraries = new LiveLibraryManager({ config, database, repository, contentSources });
+  contentSources.onInstanceStopped((instanceId) => liveLibraries.process.stop(instanceId));
   const contentSourceAutoSync = new ContentSourceAutoSyncWorker({ database, contentSources, logBusinessEvent: logger });
   await contentSourceAutoSync.initialize();
   const contentSourceDiagnostics = new ContentSourceDiagnostics({ database, config, contentSources, logBusinessEvent: logger });
@@ -267,6 +271,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     contentSources,
     contentMusic,
     contentAudiobooks,
+    liveLibraries,
     contentSourceAutoSync,
     contentSourceDiagnostics,
     aiModels,
@@ -290,6 +295,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   server.addHook("onClose", async () => {
     await contentSourceAutoSync.stop();
     await contentSourceDiagnostics.shutdown();
+    await liveLibraries.process.close();
     await contentAudiobooks.shutdown();
     await contentSources.shutdown();
     await contentMusic.shutdown();
@@ -307,6 +313,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
       || request.url.startsWith("/j/")
       || request.url.startsWith("/e/")
       || request.url.startsWith("/n/")
+      || request.url.startsWith("/live/")
       || request.url.startsWith("/abs/")
       || request.url.toLowerCase().startsWith("/fab/");
     const systemState = requiresReadyState ? await database.getSystemState() : null;
@@ -488,6 +495,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerAdminRoutes(server, runtime);
   await registerAiModelRoutes(server, runtime);
   await registerPluginRoutes(server, runtime);
+  await registerLiveRoutes(server, runtime);
   await registerContentSourceRoutes(server, runtime);
   await registerContentMusicRoutes(server, runtime);
   await registerContentAudiobookRoutes(server, runtime);
@@ -500,7 +508,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
       wildcard: false,
     });
     server.setNotFoundHandler((request, reply) => {
-      if (request.url.startsWith("/api/") || request.url.startsWith("/j/") || request.url.startsWith("/e/") || request.url.startsWith("/n/")) {
+      if (request.url.startsWith("/api/") || request.url.startsWith("/live/") || request.url.startsWith("/j/") || request.url.startsWith("/e/") || request.url.startsWith("/n/")) {
         return reply.status(404).send({ error: { code: "not_found", message: "接口不存在" } });
       }
       return reply.sendFile("index.html");

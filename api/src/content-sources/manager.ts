@@ -95,7 +95,7 @@ function selectedVideoCategories(input: string[], available: ContentSourceCatego
 /** 清单转换为管理端公开摘要，接口地址和请求头保留在服务端。 */
 function mapPlugin(row: Record<string, unknown>): ContentSourcePluginRecord {
   const manifest = parseJsonObject(row.manifest_json);
-  return { pluginId: String(row.plugin_id), version: String(row.version), displayName: String(manifest.displayName), description: String(manifest.description ?? ""), adapter: manifest.adapter === "netease_http" ? "netease_http" : manifest.adapter === "python_spider" ? "python_spider" : manifest.adapter === "catvod_js" ? "catvod_js" : "cms_json", mediaType: manifest.mediaType === "audiobook" ? "audiobook" : manifest.adapter === "netease_http" ? "music" : "video", status: String(row.status) as ContentSourcePluginRecord["status"] };
+  return { pluginId: String(row.plugin_id), version: String(row.version), displayName: String(manifest.displayName), description: String(manifest.description ?? ""), adapter: manifest.adapter === "python_live" ? "python_live" : manifest.adapter === "netease_http" ? "netease_http" : manifest.adapter === "python_spider" ? "python_spider" : manifest.adapter === "catvod_js" ? "catvod_js" : "cms_json", mediaType: manifest.mediaType === "audiobook" ? "audiobook" : manifest.adapter === "netease_http" ? "music" : "video", status: String(row.status) as ContentSourcePluginRecord["status"] };
 }
 
 /** 管理内容源插件和用户实例，统一 CMS、Python／JavaScript 视频目录与即时播放取址。 */
@@ -162,7 +162,7 @@ export class ContentSourceManager {
     const rows = await this.database.query("content_source_plugins").select("*").orderBy("created_at", "asc");
     const matches = rows.filter((row) => {
       const manifest = parseJsonObject(row.manifest_json);
-      return manifest.adapter === "python_spider" && manifest.scriptHash === scriptHash;
+      return ["python_spider", "python_live"].includes(String(manifest.adapter)) && manifest.scriptHash === scriptHash;
     });
     const row = matches.find((entry) => entry.status !== "uninstalled") ?? matches[0];
     return row ? mapPlugin(row) : null;
@@ -338,6 +338,7 @@ export class ContentSourceManager {
 
   /** CMS 保持原执行方式，Python／JavaScript 按实例保留适配器与分类上下文。 */
   private videoAdapter(manifest: ContentSourceManifest, instanceId: string): { adapter: VideoSourceAdapter; manifest: ContentSourceManifest } {
+    if (manifest.adapter === "python_live") throw new ApiError(409, "content_live_adapter_required", "直播源请通过直播媒体库订阅，不使用点播接口");
     if (manifest.mediaType === "audiobook") throw new ApiError(409, "content_audiobook_adapter_required", "有声书源请使用在线有声书目录入口");
     if (manifest.adapter === "netease_http") throw new ApiError(409, "content_music_adapter_required", "网易音乐源请使用在线音乐目录入口");
     if (manifest.adapter === "python_spider" || manifest.adapter === "catvod_js") {

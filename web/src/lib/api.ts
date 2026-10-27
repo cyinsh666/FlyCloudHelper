@@ -143,7 +143,7 @@ export async function requestJson<T>(path: string, init?: RequestInit): Promise<
 }
 
 export type MediaType = "video" | "music" | "audiobook";
-export type MediaLibraryKind = "legacy_single_source" | "cloud_aggregate_video" | "content_source_video" | "content_source_music" | "content_source_audiobook";
+export type MediaLibraryKind = "legacy_single_source" | "cloud_aggregate_video" | "content_source_video" | "content_source_music" | "content_source_audiobook" | "content_source_live";
 export type CatalogSort = "created_desc" | "year_desc" | "premiere_date_desc" | "title_asc";
 export type MatchState = "matched" | "needs_review" | "unmatched" | "processing";
 export type ServiceStatus = "active" | "scanning" | "disabled" | "reauthorization_required";

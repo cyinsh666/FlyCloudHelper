@@ -1197,14 +1197,14 @@ export class ServiceRepository {
     displayName: string;
     sourceName: string;
     /** 来源类型只用于新内容库记录，已有网盘与 CMS 记录不变。 */
-    providerType?: "cms_json" | "python_spider" | "catvod_js";
+    providerType?: "cms_json" | "python_spider" | "python_live" | "catvod_js";
     configuration: Record<string, unknown>;
     syncState: Record<string, unknown>;
-    /** 仅由有声书专用仓储入口传入，旧视频调用不改变行为。 */
-    mediaType?: "audiobook";
+    /** 仅由有声书或直播专用入口传入，既有视频调用不改变行为。 */
+    mediaType?: "audiobook" | "live";
   }): Promise<{ library: MediaLibraryRecord }> {
     const dataType = input.mediaType === "audiobook" ? "audiobook" : "video";
-    const libraryKind = dataType === "audiobook" ? "content_source_audiobook" : "content_source_video";
+    const libraryKind = input.mediaType === "live" ? "content_source_live" : dataType === "audiobook" ? "content_source_audiobook" : "content_source_video";
     const now = new Date().toISOString();
     await this.database.query.transaction(async (transaction) => {
       const instanceQuery = transaction("content_source_instances").where({ id: input.instanceId, user_id: input.userId, status: "active" });
@@ -1216,6 +1216,8 @@ export class ServiceRepository {
       if ((parseJsonObject(plugin.manifest_json).mediaType === "audiobook") !== (dataType === "audiobook")) {
         throw new ApiError(409, "content_source_media_type_mismatch", "插件媒体类型与要创建的媒体库不一致");
       }
+      if ((parseJsonObject(plugin.manifest_json).adapter === "python_live") !== (input.mediaType === "live"))
+        throw new ApiError(409, "content_source_media_type_mismatch", "直播插件只能创建直播媒体库");
       const bound = await transaction("content_source_libraries").where({ instance_id: input.instanceId }).first();
       if (bound) throw new ApiError(409, "content_source_library_exists", "此源实例已经创建在线媒体库");
       await transaction("media_libraries").insert({
@@ -1282,6 +1284,8 @@ export class ServiceRepository {
       if (!instance) throw new ApiError(404, "content_source_not_found", "内容源实例不存在或已停用");
       const plugin = await transaction("content_source_plugins").where({ plugin_id: instance.plugin_id, version: instance.plugin_version, status: "enabled" }).first();
       if (!plugin) throw new ApiError(409, "content_source_plugin_disabled", "请先启用内容源插件");
+      if (parseJsonObject(plugin.manifest_json).adapter === "python_live")
+        throw new ApiError(409, "content_source_media_type_mismatch", "直播插件不能创建音乐媒体库");
       const bound = await transaction("content_source_libraries").where({ instance_id: input.instanceId }).first();
       if (bound) throw new ApiError(409, "content_source_library_exists", "此源实例已经创建在线媒体库");
       await transaction("media_libraries").insert({
@@ -1939,6 +1943,7 @@ export class ServiceRepository {
         .forUpdate()
         .first();
       if (!library) throw new ApiError(404, "library_not_found", "媒体库不存在");
+      if (String(library.library_kind) === "content_source_live" && patch.dataType && patch.dataType !== "video") throw new ApiError(409, "live_type_fixed", "直播媒体库不能修改为其他内容类型");
       if (String(library.library_kind) === "content_source_video" && patch.dataType && patch.dataType !== "video") {
         throw new ApiError(409, "content_library_video_only", "内容源视频库不能改变媒体类型");
       }
@@ -4153,7 +4158,7 @@ export class ServiceRepository {
           last_scan_at: null,
           updated_at: new Date().toISOString(),
         });
-        if (["content_source_video", "content_source_music", "content_source_audiobook"].includes(String(library.library_kind))) {
+        if (["content_source_video", "content_source_music", "content_source_audiobook", "content_source_live"].includes(String(library.library_kind))) {
           await transaction("content_source_libraries").where({ library_id: libraryId }).update({
             sync_status: "idle",
             sync_json: JSON.stringify({ status: "idle", processedCount: 0, pageCount: 0, nextPageByCategory: {}, startedAt: null, finishedAt: null, lastError: null }),
@@ -7434,7 +7439,7 @@ export class ServiceRepository {
 
   /** 在线内容同步时阻止删除、清空或停用媒体库，和同步抢占共用媒体库行锁。 */
   private async assertContentSourceSyncIdle(transaction: Knex.Transaction, libraryId: string, libraryKind: string): Promise<void> {
-    if (!["content_source_video", "content_source_music", "content_source_audiobook"].includes(libraryKind)) return;
+    if (!["content_source_video", "content_source_music", "content_source_audiobook", "content_source_live"].includes(libraryKind)) return;
     const binding = await transaction("content_source_libraries").where({ library_id: libraryId }).whereIn("sync_status", ["queued", "running"]).first();
     if (binding) throw new ApiError(409, "content_library_sync_running", "在线媒体库正在同步，请等待同步结束后操作");
   }

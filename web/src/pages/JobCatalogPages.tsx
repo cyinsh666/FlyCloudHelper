@@ -1014,23 +1014,23 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
             <header className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
               <div className="flex min-w-0 items-center gap-3">
                 <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-border text-xs font-semibold" style={{ backgroundImage: "var(--gradient-surface)" }}>
-                  {library.libraryKind === "content_source_audiobook" ? <BookOpen className="size-5 text-muted-foreground" /> : library.libraryKind === "content_source_music" ? <Music2 className="size-5 text-muted-foreground" /> : library.libraryKind === "content_source_video" ? <Images className="size-5 text-muted-foreground" /> : <ProviderSelectionIcon providerType={library.libraryKind === "cloud_aggregate_video" ? "aggregate" : library.providerType} />}
+                  {library.libraryKind === "content_source_live" ? <Radio className="size-5 text-muted-foreground" /> : library.libraryKind === "content_source_audiobook" ? <BookOpen className="size-5 text-muted-foreground" /> : library.libraryKind === "content_source_music" ? <Music2 className="size-5 text-muted-foreground" /> : library.libraryKind === "content_source_video" ? <Images className="size-5 text-muted-foreground" /> : <ProviderSelectionIcon providerType={library.libraryKind === "cloud_aggregate_video" ? "aggregate" : library.providerType} />}
                 </span>
                 <div className="min-w-0">
                   <h2 className="truncate text-sm font-semibold">{library.displayName}</h2>
-                  <p className="truncate text-[11px] text-muted-foreground">{library.libraryKind === "content_source_audiobook" ? `在线听书源 · ${library.sourceServiceName}` : library.libraryKind === "content_source_music" ? `在线音乐源 · ${library.sourceServiceName}` : library.libraryKind === "content_source_video" ? `在线内容源 · ${library.sourceServiceName}` : library.libraryKind === "cloud_aggregate_video" ? `云聚合视频库 · ${library.sourceCount} 个来源` : `${library.sourceServiceName} · ${library.providerType}`}{admin ? ` · ${library.ownerUsername}` : ""}</p>
+                  <p className="truncate text-[11px] text-muted-foreground">{library.libraryKind === "content_source_live" ? `电视直播源 · ${library.sourceServiceName}` : library.libraryKind === "content_source_audiobook" ? `在线听书源 · ${library.sourceServiceName}` : library.libraryKind === "content_source_music" ? `在线音乐源 · ${library.sourceServiceName}` : library.libraryKind === "content_source_video" ? `在线内容源 · ${library.sourceServiceName}` : library.libraryKind === "cloud_aggregate_video" ? `云聚合视频库 · ${library.sourceCount} 个来源` : `${library.sourceServiceName} · ${library.providerType}`}{admin ? ` · ${library.ownerUsername}` : ""}</p>
                 </div>
               </div>
               <span className={`mt-1 size-2.5 rounded-full ${library.status === "active" && library.sourceConnectionStatus === "valid" ? "bg-success" : "bg-warning"}`} title={library.status === "active" ? "媒体库已启用" : "媒体库已停用"} />
             </header>
             <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-              <StatusPill>{catalogDataTypeLabels[library.dataType] ?? library.dataType}</StatusPill>
-              <span>条目 {library.itemCount.toLocaleString()}</span>
-              <span>版本 v{library.catalogVersion}</span>
-              {library.dataType === "music" ? <span>Navidrome {library.navidromeEnabled ? "已启用" : "未启用"}</span> : library.dataType === "audiobook" ? <span>ABS {library.absEnabled ? "已启用" : "未启用"}</span> : <span>Jellyfin {library.jellyfinEnabled ? "已启用" : "未启用"}</span>}
+              <StatusPill>{library.libraryKind === "content_source_live" ? "电视直播" : catalogDataTypeLabels[library.dataType] ?? library.dataType}</StatusPill>
+              {library.libraryKind !== "content_source_live" && <span>条目 {library.itemCount.toLocaleString()}</span>}
+              {library.libraryKind !== "content_source_live" && <span>版本 v{library.catalogVersion}</span>}
+              {library.libraryKind === "content_source_live" ? <span>M3U 频道订阅</span> : library.dataType === "music" ? <span>Navidrome {library.navidromeEnabled ? "已启用" : "未启用"}</span> : library.dataType === "audiobook" ? <span>ABS {library.absEnabled ? "已启用" : "未启用"}</span> : <span>Jellyfin {library.jellyfinEnabled ? "已启用" : "未启用"}</span>}
             </div>
             <footer className="mt-3 flex flex-wrap gap-2 border-t border-border/70 pt-3">
-              <Link to={admin ? "/admin/libraries/$serviceId/catalog" : "/app/libraries/$serviceId/catalog"} params={{ serviceId: library.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Images className="size-3.5" /> 海报</Link>
+              {library.libraryKind !== "content_source_live" && <Link to={admin ? "/admin/libraries/$serviceId/catalog" : "/app/libraries/$serviceId/catalog"} params={{ serviceId: library.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Images className="size-3.5" /> 海报</Link>}
               <Link to={admin ? "/admin/libraries/$serviceId/settings" : "/app/libraries/$serviceId/settings"} params={{ serviceId: library.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Settings2 className="size-3.5" /> 设置</Link>
             </footer>
           </article>

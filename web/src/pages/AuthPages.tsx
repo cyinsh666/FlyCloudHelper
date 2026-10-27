@@ -76,7 +76,7 @@ function AuthIntroduction() {
     <div className="min-w-0">
       <div className="flex items-center gap-3">
         <img
-          src="/flycloud-helper-icon.png"
+          src="/flycloud-helper-icon.png?v=20261027"
           alt="FlyCloudHelper"
           className="size-10 shrink-0 rounded-xl object-cover"
         />

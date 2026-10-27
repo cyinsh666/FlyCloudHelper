@@ -20,6 +20,11 @@ export default defineConfig({
     host: "0.0.0.0",
     port: 9935,
     proxy: {
+      "/live/": {
+        target: "http://127.0.0.1:9934",
+        // M3U 与直播资源沿用开发页 Host，订阅地址可直接使用开发端口。
+        changeOrigin: false,
+      },
       "/fab/": {
         target: "http://127.0.0.1:9934",
         // FlyAudioBook 使用固定一级路径，保留请求 Host 生成当前可访问的媒体地址。

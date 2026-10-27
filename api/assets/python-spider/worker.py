@@ -146,6 +146,44 @@ def class_statements(selected, classes, visited=None):
     return statements
 
 
+def inspect_live_source(tree):
+    """只静态识别有具体运行适配的 YSP 服务，不执行入口、设备注册或网络代码。"""
+    classes = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+    functions = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+    literals = {}
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                if isinstance(target, ast.Name):
+                    try:
+                        literals[target.id] = ast.literal_eval(statement.value)
+                    except (ValueError, TypeError, SyntaxError):
+                        pass
+    if not ({"Handler", "Resolver", "ChannelDirectory"} <= classes
+            and {"main", "start_companion_engine", "jce_timeshift_url", "bk_playurls"} <= functions):
+        return None
+    channels = literals.get("DEFAULT_CHANNELS")
+    if not isinstance(channels, list) or not 1 <= len(channels) <= 256:
+        return None
+    backend = literals.get("BACKEND_CHANNELS", set())
+    catchup = literals.get("TIMESHIFT_SUPPORTED", set())
+    tvg = literals.get("TVG_IDS", {})
+    logo = literals.get("LOGO_BASE", "")
+    output = []
+    for channel in channels:
+        if not isinstance(channel, (tuple, list)) or len(channel) != 5:
+            return None
+        slug, name = channel[:2]
+        if not isinstance(slug, str) or not isinstance(name, str):
+            return None
+        output.append({"id": slug, "name": name, "group": "央视" if slug.startswith(("cctv", "cgtn")) else "卫视",
+                       "tvgId": tvg.get(slug, slug), "logo": str(logo).rstrip("/") + "/" + slug + ".png" if logo else "",
+                       "catchup": slug in catchup, "requiresRelay": slug in backend})
+    return {"name": "央视频直播", "mediaType": "video", "methods": [], "sourceType": "ysp_live",
+            "liveConfig": {"engine": "ysp", "channels": output,
+                           "epgUrls": ["https://epg.zsdc.eu.org/t.xml.gz", "https://epg.pw/xmltv/epg_CN.xml.gz"]}}
+
+
 def inspect_script(script_path):
     """只解析 AST；名称来自 display_name 或 getName 的静态字符串。"""
     try:
@@ -160,6 +198,9 @@ def inspect_script(script_path):
         raise WorkerFailure("python_source_syntax_invalid") from None
     except OSError:
         raise WorkerFailure("python_source_script_unavailable") from None
+    live = inspect_live_source(tree)
+    if live is not None:
+        return live
     selected, classes = source_class(tree)
     statements = class_statements(selected, classes) if selected is not None else tree.body
     functions = [node for node in statements if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]

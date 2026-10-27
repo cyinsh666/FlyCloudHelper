@@ -1,3 +1,4 @@
+import type { LiveSourceDefinition } from "../live/types.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -64,7 +65,7 @@ function sourceError(code: string): ApiError {
     python_source_cancelled: [499, "Python 源调用已取消"],
     python_source_message_too_large: [413, "Python 源调用或返回内容超过大小限制"],
     python_source_invalid_method: [422, "Python 源方法名称无效"],
-    python_source_method_missing: [422, "Python 源没有提供所需接口"],
+    python_source_method_missing: [422, "无法识别为支持的 Python 源：需要 Spider 接口，或已适配的独立直播服务"],
     python_source_paging_unsupported: [422, "此 Python 源搜索只支持首页，无法读取后续搜索页"],
     python_source_syntax_invalid: [422, "Python 源脚本语法无效"],
     python_source_script_unavailable: [422, "Python 源脚本无法读取"],
@@ -120,7 +121,7 @@ export class PythonSpiderRuntime {
   }
 
   /** 在独立进程中解析脚本 AST，不导入脚本，不创建 Spider，也不调用 getName。 */
-  public async inspect(scriptPath: string): Promise<{ name: string; methods: string[]; mediaType: "video" | "audiobook" }> {
+  public async inspect(scriptPath: string, allowLive = false): Promise<{ name: string; methods: string[]; mediaType: "video" | "audiobook"; sourceType?: "ysp_live"; liveConfig?: LiveSourceDefinition }> {
     const worker = this.startWorker(`inspect-${randomUUID()}`, scriptPath);
     try {
       const value = await this.enqueue(worker, "__inspect__", []);
@@ -129,6 +130,7 @@ export class PythonSpiderRuntime {
       if (typeof result.name !== "string" || !Array.isArray(result.methods) || result.methods.some((method) => typeof method !== "string")) {
         throw sourceError("python_source_result_invalid");
       }
+      if (allowLive && result.sourceType === "ysp_live") return { name: result.name, methods: [], mediaType: "video", sourceType: "ysp_live", liveConfig: result.liveConfig as LiveSourceDefinition };
       const methods = new Set(result.methods as string[]);
       if (REQUIRED_SOURCE_METHODS.some((method) => !methods.has(method))) throw sourceError("python_source_method_missing");
       if (result.mediaType !== undefined && result.mediaType !== "video" && result.mediaType !== "audiobook") throw sourceError("python_source_result_invalid");

@@ -109,7 +109,7 @@ function readExpectedRevision(value: unknown): number | undefined {
 
 /** 在线内容由源插件同步目录，不能进入网盘路径、刮削和文件规格任务。 */
 export function requireDriveLibrary(libraryKind: string): void {
-  if (["content_source_video", "content_source_music", "content_source_audiobook"].includes(libraryKind)) {
+  if (["content_source_video", "content_source_music", "content_source_audiobook", "content_source_live"].includes(libraryKind)) {
     throw new ApiError(409, "content_source_requires_catalog_sync", "在线内容库请在内容源设置中同步目录");
   }
 }
@@ -538,6 +538,7 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     if (Object.keys(patch).length === 0) throw validationError("library", "没有可更新的媒体库字段");
     // 关键变量：先沿用仓储的同步任务与停用校验，成功提交 disabled 后再停止在线视频请求。
     const library = await runtime.repository.updateLibrary(request.params.libraryId, user.id, patch);
+    if (patch.status === "disabled" && library.libraryKind === "content_source_live") await runtime.liveLibraries.stopLibrary(library.id);
     if (patch.status === "disabled" && library.libraryKind === "content_source_audiobook") {
       await runtime.contentAudiobooks.withLibraryCatalogChange(library.id, async () => undefined);
     }
@@ -568,7 +569,7 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     }
     // 关键变量：管理员读取库的真实归属，再按所属用户调用更新，不扩展其他编辑权限。
     const library = await runtime.repository.getLibrary(request.params.libraryId);
-    if (!["content_source_video", "content_source_music", "content_source_audiobook"].includes(library.libraryKind)) {
+    if (!["content_source_video", "content_source_music", "content_source_audiobook", "content_source_live"].includes(library.libraryKind)) {
       throw new ApiError(409, "content_library_name_only", "此接口仅支持修改在线媒体库名称");
     }
     const updated = await runtime.repository.updateLibrary(library.id, library.userId, { displayName });
@@ -878,6 +879,7 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     requireConfirmation(request.body, request.params.libraryId);
     const library = await runtime.repository.getLibrary(request.params.libraryId, user.id);
     // 关键变量：在线库清空前暂停动态入库并清理窗口，避免旧分页缓存或正在写入的内容回填。
+    if (library.libraryKind === "content_source_live") throw new ApiError(409, "live_no_catalog", "直播频道请在直播设置中选择，无需清空影视目录");
     const cleared = library.libraryKind === "content_source_video"
       ? await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, user.id))
       : library.libraryKind === "content_source_music"
@@ -902,6 +904,7 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     requireConfirmation(request.body, request.params.libraryId);
     const library = await runtime.repository.getLibrary(request.params.libraryId);
     // 管理员清空在线库也等待该库动态写入收尾，再沿用原目录清空流程。
+    if (library.libraryKind === "content_source_live") throw new ApiError(409, "live_no_catalog", "直播频道请在直播设置中选择，无需清空影视目录");
     const cleared = library.libraryKind === "content_source_video"
       ? await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, library.userId))
       : library.libraryKind === "content_source_music"
@@ -926,7 +929,10 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     requireConfirmation(request.body, request.params.libraryId);
     const library = await runtime.repository.getLibrary(request.params.libraryId, user.id);
     // 删除在线库前暂停新分页并等待已有动态请求，避免删除后继续使用旧库写入。
-    if (library.libraryKind === "content_source_video") {
+    if (library.libraryKind === "content_source_live") {
+      await runtime.liveLibraries.stopLibrary(library.id);
+      await runtime.repository.deleteLibrary(library.id, user.id);
+    } else if (library.libraryKind === "content_source_video") {
       await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id, user.id));
     } else if (library.libraryKind === "content_source_music") {
       await runtime.contentMusic.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id, user.id));
@@ -950,7 +956,10 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     requireConfirmation(request.body, request.params.libraryId);
     const library = await runtime.repository.getLibrary(request.params.libraryId);
     // 管理员删除在线库与个人入口使用相同的动态浏览生命周期。
-    if (library.libraryKind === "content_source_video") {
+    if (library.libraryKind === "content_source_live") {
+      await runtime.liveLibraries.stopLibrary(library.id);
+      await runtime.repository.deleteLibrary(library.id);
+    } else if (library.libraryKind === "content_source_video") {
       await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id));
     } else if (library.libraryKind === "content_source_music") {
       await runtime.contentMusic.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id));

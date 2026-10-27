@@ -5,9 +5,11 @@ export interface ContentSourceManifest {
   version: string;
   displayName: string;
   description: string;
-  adapter: "cms_json" | "python_spider" | "catvod_js" | "netease_http";
+  adapter: "cms_json" | "python_spider" | "python_live" | "catvod_js" | "netease_http";
   /** Python 听书源显式声明有声书；未声明的既有 Python 源仍按视频处理。 */
   mediaType?: "video" | "music" | "audiobook";
+  /** 独立直播服务使用静态导入的频道清单，不执行 Spider 方法。 */
+  liveConfig?: import("../live/types.js").LiveSourceDefinition;
   endpoint: string;
   headers?: Record<string, string>;
   /** 指定电影父分类；其他已选分类按节目分集。 */

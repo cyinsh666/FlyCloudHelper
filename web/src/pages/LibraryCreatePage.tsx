@@ -14,7 +14,7 @@ export function LibraryCreatePage({ serviceId = "" }: { serviceId?: string }) {
     const result = await listServices(false);
     return result.items;
   }, [serviceId]);
-  const [libraryKind, setLibraryKind] = useState<"legacy_single_source" | "cloud_aggregate_video" | "content_source_video">("cloud_aggregate_video");
+  const [libraryKind, setLibraryKind] = useState<"legacy_single_source" | "cloud_aggregate_video" | "content_source_video" | "content_source_live">("cloud_aggregate_video");
   const [selectedServiceId, setSelectedServiceId] = useState(serviceId);
   const [selectedSourceServiceIds, setSelectedSourceServiceIds] = useState<string[]>(serviceId ? [serviceId] : []);
   const [displayName, setDisplayName] = useState("");
@@ -99,14 +99,15 @@ export function LibraryCreatePage({ serviceId = "" }: { serviceId?: string }) {
     }
   }
 
-  const modeSelection = !serviceId && <fieldset><legend className="text-xs text-muted-foreground">媒体库模式</legend><div className="mt-1.5 grid gap-2 sm:grid-cols-3">
+  const modeSelection = !serviceId && <fieldset><legend className="text-xs text-muted-foreground">媒体库模式</legend><div className="mt-1.5 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
     <button type="button" onClick={() => { setLibraryKind("cloud_aggregate_video"); setDataType("video"); }} className={`rounded-lg border px-3 py-2.5 text-left ${libraryKind === "cloud_aggregate_video" ? "border-foreground" : "border-border"}`}><span className="block text-sm font-medium">云聚合视频库</span><span className="mt-0.5 block text-xs text-muted-foreground">多个网盘来源，共用一个影视海报墙。</span></button>
     <button type="button" onClick={() => setLibraryKind("legacy_single_source")} className={`rounded-lg border px-3 py-2.5 text-left ${libraryKind === "legacy_single_source" ? "border-foreground" : "border-border"}`}><span className="block text-sm font-medium">旧单源媒体库</span><span className="mt-0.5 block text-xs text-muted-foreground">保留现有单个服务对应一个媒体库的模式。</span></button>
     <button type="button" onClick={() => { setLibraryKind("content_source_video"); setDataType("video"); }} className={`rounded-lg border px-3 py-2.5 text-left ${libraryKind === "content_source_video" ? "border-foreground" : "border-border"}`}><span className="block text-sm font-medium">在线内容源媒体库</span><span className="mt-0.5 block text-xs text-muted-foreground">选择独立的影视、音乐或听书源插件，创建在线媒体库。</span></button>
+    <button type="button" onClick={() => { setLibraryKind("content_source_live"); setDataType("video"); }} className={`rounded-lg border px-3 py-2.5 text-left ${libraryKind === "content_source_live" ? "border-foreground" : "border-border"}`}><span className="block text-sm font-medium">直播媒体库</span><span className="mt-0.5 block text-xs text-muted-foreground">选择直播源插件，提供频道 M3U 订阅。</span></button>
   </div></fieldset>;
   const availableLegacyServices = services.data?.filter((service) => service.canCreateLibrary) ?? [];
   return <><PageHeader title="创建媒体库" /><Panel className="p-4 sm:p-4"><div className="grid gap-3">{modeSelection}
-    {libraryKind === "content_source_video" ? <ContentSourceLibraryCreate /> : !services.data ? <div>{services.error ? <p role="alert" className="text-sm text-destructive">{services.error}</p> : <div aria-label="来源服务加载中" className="animate-pulse space-y-3"><div className="h-4 w-48 rounded bg-muted" /><div className="h-9 rounded bg-muted" /><div className="h-9 rounded bg-muted" /></div>}</div> : <form onSubmit={(event) => void submit(event)} className="grid gap-3">
+    {libraryKind === "content_source_video" || libraryKind === "content_source_live" ? <ContentSourceLibraryCreate key={libraryKind} liveOnly={libraryKind === "content_source_live"} /> : !services.data ? <div>{services.error ? <p role="alert" className="text-sm text-destructive">{services.error}</p> : <div aria-label="来源服务加载中" className="animate-pulse space-y-3"><div className="h-4 w-48 rounded bg-muted" /><div className="h-9 rounded bg-muted" /><div className="h-9 rounded bg-muted" /></div>}</div> : <form onSubmit={(event) => void submit(event)} className="grid gap-3">
     {libraryKind === "cloud_aggregate_video" ? <fieldset><legend className="text-xs text-muted-foreground">初始网盘来源（可稍后添加）</legend><div className="mt-1.5 grid gap-1.5 sm:grid-cols-2 lg:grid-cols-3">
       {services.data.map((service) => <button key={service.id} type="button" onClick={() => toggleAggregateSource(service.id)} className={`min-w-0 rounded-lg border px-3 py-2 text-left ${selectedSourceServiceIds.includes(service.id) ? "border-foreground" : "border-border"}`}><span className="block truncate text-sm">{service.displayName}</span><span className="mt-0.5 block text-xs text-muted-foreground">{service.providerType} · {service.connectionStatus === "valid" ? "连接正常" : "需要重新登录"}</span></button>)}
       {services.data.length === 0 && <p className="text-xs text-muted-foreground">当前没有可添加的网盘服务，也可以先创建空的云聚合库。</p>}

@@ -76,10 +76,10 @@ export async function importPythonSource(runtime: ApiRuntime, filename: string, 
   if (repairingInstalledPlugin && !createdFile) {
     throw new ApiError(409, "content_plugin_already_exists", "脚本已补回，不要重复导入");
   }
-  let inspection: { name: string; methods: string[]; mediaType: "video" | "audiobook" };
+  let inspection: Awaited<ReturnType<typeof runtime.contentSources.pythonRuntime.inspect>>;
   try {
     // 关键变量：inspect 使用 AST 识别 Spider 和基础方法，导入管理端不运行源的初始化逻辑。
-    inspection = await runtime.contentSources.pythonRuntime.inspect(absolutePath);
+    inspection = await runtime.contentSources.pythonRuntime.inspect(absolutePath, true);
   } catch (error) {
     if (createdFile) await fs.rm(absolutePath, { force: true });
     throw error;
@@ -100,10 +100,11 @@ export async function importPythonSource(runtime: ApiRuntime, filename: string, 
     pluginId,
     version,
     displayName: sourceDisplayName(filename, inspection.name),
-    description: inspection.mediaType === "audiobook"
+    description: inspection.sourceType === "ysp_live" ? "Python 独立直播服务 · YSP，提供频道订阅、HLS 播放和回看；通过直播媒体库管理。" : inspection.mediaType === "audiobook"
       ? "Python Spider 有声书源，提供目录、实时搜索、章节和音频播放；原生听书协议支持未知时长，标准 ABS 播放需要真实章节时长。"
       : "Python Spider 视频内容源，通过 Jellyfin、Emby 提供目录、搜索和播放，实际能力以源站解析结果为准。",
-    adapter: "python_spider",
+    adapter: inspection.sourceType === "ysp_live" ? "python_live" : "python_spider",
+    ...(inspection.liveConfig ? { liveConfig: inspection.liveConfig } : {}),
     ...(inspection.mediaType === "audiobook" ? { mediaType: "audiobook" as const } : {}),
     endpoint: "",
     scriptFile,

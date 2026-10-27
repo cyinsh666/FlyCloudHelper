@@ -27,6 +27,7 @@ function getPluginKey(entry: PluginEntry): string {
 
 /** 在详情中说明内容源对外提供的协议能力。 */
 function describeSourceCapabilities(plugin: ContentSourcePlugin): string {
+  if (plugin.adapter === "python_live") return "电视直播 · M3U / HLS";
   if (plugin.mediaType === "audiobook") return "有声书内容 · Audiobookshelf（ABS）";
   const adapter = plugin.adapter;
   if (adapter === "netease_http") return "网易云音乐 · Navidrome";
@@ -38,6 +39,7 @@ function describeSourceCapabilities(plugin: ContentSourcePlugin): string {
 
 /** 详情使用运行时名称，便于区分声明式配置与脚本源。 */
 function describeSourceAdapter(adapter: ContentSourcePlugin["adapter"]): string {
+  if (adapter === "python_live") return "Python 独立直播服务（YSP）";
   if (adapter === "python_spider") return "Python Spider";
   if (adapter === "catvod_js") return "CatVod JavaScript";
   return adapter;
@@ -132,6 +134,8 @@ export function AdminPluginsPanel() {
         setMessage(`${plugin.displayName} ${plugin.version} 已导入，请启用后创建在线媒体库。`);
       } else if (fileName.endsWith(".py")) {
         const plugin = await importPythonContentSourcePlugin(file);
+        if (plugin.adapter === "python_live") setMessage(`${plugin.displayName} 已识别为 Python 独立直播服务，请启用后创建直播媒体库。`);
+        else
         setMessage(plugin.status === "enabled"
           ? `${plugin.displayName} ${plugin.version} 已安装并启用，可以创建在线媒体库。`
           : `${plugin.displayName} ${plugin.version} 已导入，请启用后创建在线媒体库。`);

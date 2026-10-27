@@ -1,3 +1,4 @@
+import { LibraryLiveSettingsPage } from "./LibraryLiveSettingsPage";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { Bell, CalendarClock, Copy, FolderOpen, Images, Pencil, Plus, ScanLine, Settings2, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
@@ -137,7 +138,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   const resource = useApiResource(async () => {
     const libraryResult = await getLibrary(serviceId, admin);
     // 有声书只使用独立 ABS 设置，不读取旧视频/音乐协议或隐式创建其账号。
-    const settings = libraryResult.library.dataType === "audiobook" ? null : await getServiceAccessSettings(serviceId, admin);
+    const settings = libraryResult.library.dataType === "audiobook" || libraryResult.library.libraryKind === "content_source_live" ? null : await getServiceAccessSettings(serviceId, admin);
     return {
       service: { ...libraryResult.library, libraryId: libraryResult.library.id },
       scanProfile: libraryResult.scanProfile,
@@ -147,7 +148,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   }, [serviceId, admin]);
   // 关键变量：AI 模型单独读取；模型接口异常时仍允许用户管理媒体库的其他配置。
   const aiModelsResource = useApiResource(
-    async () => resource.data?.service.dataType === "video" && resource.data.service.libraryKind !== "content_source_video"
+    async () => resource.data?.service.dataType === "video" && !["content_source_video", "content_source_live"].includes(resource.data.service.libraryKind)
       ? listAvailableAiModels(serviceId) : { items: [] },
     [serviceId, resource.data?.service.libraryKind, resource.data?.service.dataType],
   );
@@ -185,7 +186,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   const metadataProfile = resource.data?.metadataProfile ?? {};
   const isCloudAggregate = service?.libraryKind === "cloud_aggregate_video";
   const isMusicContentSource = service?.libraryKind === "content_source_music";
-  const isContentSource = service?.libraryKind === "content_source_video" || isMusicContentSource || service?.libraryKind === "content_source_audiobook";
+  const isContentSource = service?.libraryKind === "content_source_live" || service?.libraryKind === "content_source_video" || isMusicContentSource || service?.libraryKind === "content_source_audiobook";
   // 关键变量：聚合扫描只计入状态正常且已配置当前模式路径的来源。
   const readyAggregateSources = service?.sources.filter(isReadyAggregateSource) ?? [];
   const fullAggregateScanSources = readyAggregateSources.filter((source) => hasAggregateSourceRoots(source, "full"));
@@ -495,6 +496,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
     }
   }
 
+  if (service?.libraryKind === "content_source_live") return <LibraryLiveSettingsPage state={{ library: service, admin, message, onDelete: deleteCurrentLibrary }} />;
   if (service?.libraryKind === "content_source_audiobook") {
     return <LibraryContentAudiobookSettingsPage state={{
       library: service, admin, loading: resource.loading, clearingCatalog, message,

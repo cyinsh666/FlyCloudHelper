@@ -58,7 +58,8 @@ export class ServiceAccessService {
   public async ensureExistingLibraries(): Promise<number> {
     const libraries = await this.database.query("media_libraries as l")
       .leftJoin("library_access_accounts as a", "a.library_id", "l.id")
-      .select("l.id", "l.library_kind", "l.jellyfin_enabled").whereNot("l.data_type", "audiobook").whereNull("a.id");
+      .select("l.id", "l.library_kind", "l.jellyfin_enabled").whereNot("l.data_type", "audiobook")
+      .whereNot("l.library_kind", "content_source_live").whereNull("a.id");
     // 关键变量：未开启协议的在线影视库保持无账号，重启不能替用户提前完成协议配置。
     const services = libraries.filter((library) => library.library_kind !== "content_source_video" || Number(library.jellyfin_enabled) === 1);
     for (const service of services) await this.createForLibrary(String(service.id));

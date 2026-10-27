@@ -38,6 +38,7 @@ export async function registerContentSourceRoutes(server: FastifyInstance, runti
   server.get<{ Params: { pluginId: string; version: string } }>("/api/v1/content-source-plugins/:pluginId/:version/categories", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     const manifest = await runtime.contentSources.manifestForPlugin(request.params.pluginId, request.params.version);
+    if (manifest.adapter === "python_live") return { items: (await runtime.liveLibraries.preview(manifest.pluginId, manifest.version)).map((channel) => ({ id: channel.id, name: channel.name, parentId: null })) };
     if (manifest.mediaType === "audiobook") {
       return { items: await runtime.contentAudiobooks.previewPluginCategories(manifest.pluginId, manifest.version, user.id) };
     }
@@ -49,6 +50,10 @@ export async function registerContentSourceRoutes(server: FastifyInstance, runti
     const user = await requireRequestUser(request, runtime.database);
     const manifest = await runtime.contentSources.manifestForPlugin(request.params.pluginId, request.params.version);
     const displayName = requireString(request.body, "displayName", "媒体库名称", 100);
+    if (manifest.adapter === "python_live") {
+      const source = await runtime.contentSources.createInstance(user.id, { pluginId: manifest.pluginId, pluginVersion: manifest.version, displayName: manifest.displayName });
+      return reply.code(201).send(await runtime.liveLibraries.create(source.id, user.id, displayName, request.body.channelIds ?? request.body.categoryIds));
+    }
     if (manifest.adapter === "netease_http") {
       const input = {
         displayName,
@@ -157,6 +162,7 @@ export async function registerContentSourceRoutes(server: FastifyInstance, runti
   server.get<{ Params: { id: string } }>("/api/v1/content-sources/:id/categories", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     const manifest = await runtime.contentSources.manifestForInstance(request.params.id, user.id);
+    if (manifest.adapter === "python_live") throw new ApiError(409, "live_use_plugin_entry", "请从直播插件入口预览频道和创建媒体库");
     if (manifest.mediaType === "audiobook") return { items: await runtime.contentAudiobooks.categories(request.params.id, user.id) };
     return { items: await runtime.contentSources.categories(request.params.id, user.id) };
   });
@@ -164,6 +170,7 @@ export async function registerContentSourceRoutes(server: FastifyInstance, runti
   server.post<{ Params: { id: string }; Body: Record<string, unknown> }>("/api/v1/content-sources/:id/libraries", async (request, reply) => {
     const user = await requireRequestUser(request, runtime.database);
     const manifest = await runtime.contentSources.manifestForInstance(request.params.id, user.id);
+    if (manifest.adapter === "python_live") throw new ApiError(409, "live_use_plugin_entry", "请从直播插件入口预览频道和创建媒体库");
     if (manifest.mediaType === "audiobook") {
       const result = await runtime.contentAudiobooks.createLibrary(request.params.id, user.id, {
         displayName: requireString(request.body, "displayName", "媒体库名称", 100),

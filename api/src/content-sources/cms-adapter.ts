@@ -1,3 +1,4 @@
+import { validateLiveManifest } from "../live/types.js";
 import { createHash } from "node:crypto";
 import { ApiError, validationError } from "../errors.js";
 import { providerFetch } from "../providers/network.js";
@@ -215,10 +216,11 @@ export class CmsJsonAdapter {
 export function validateContentManifest(value: unknown): ContentSourceManifest {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw validationError("manifest", "插件清单必须是 JSON 对象");
   const raw = value as Record<string, unknown>;
-  if (raw.protocolVersion !== 1 || !["cms_json", "python_spider", "catvod_js", "netease_http"].includes(String(raw.adapter))) throw validationError("manifest", "只支持 protocolVersion 1 的 CMS、Python Spider、CatVod JS 或网易音乐内容源插件");
+  if (raw.protocolVersion !== 1 || !["cms_json", "python_spider", "python_live", "catvod_js", "netease_http"].includes(String(raw.adapter))) throw validationError("manifest", "只支持 protocolVersion 1 的 CMS、Python Spider、Python 直播服务、CatVod JS 或网易音乐内容源插件");
   if (raw.mediaType !== undefined && !["video", "music", "audiobook"].includes(String(raw.mediaType))) throw validationError("mediaType", "内容源类型无效");
   if (raw.mediaType === "audiobook" && raw.adapter !== "python_spider") throw validationError("mediaType", "当前有声书内容源需要 Python Spider 适配器");
   if (raw.adapter === "python_spider" && raw.mediaType === "music") throw validationError("mediaType", "Python 内容源当前只支持视频和有声书");
+  if (raw.adapter === "python_live" && raw.mediaType !== undefined && raw.mediaType !== "video") throw validationError("mediaType", "Python 直播服务只支持电视直播内容");
   if (raw.adapter === "catvod_js" && raw.mediaType !== undefined && raw.mediaType !== "video") throw validationError("mediaType", "CatVod JS 当前只支持视频内容源");
   const readText = (field: string, maximum: number): string => {
     const text = typeof raw[field] === "string" ? String(raw[field]).trim() : "";
@@ -242,6 +244,7 @@ export function validateContentManifest(value: unknown): ContentSourceManifest {
       movieCategoryIds: Array.isArray(raw.movieCategoryIds) ? raw.movieCategoryIds.map(String) : [], excludedCategoryIds: Array.isArray(raw.excludedCategoryIds) ? raw.excludedCategoryIds.map(String) : [],
       jsConfig: { extend: String(config.extend ?? ""), pageSize } };
   }
+  if (raw.adapter === "python_live") return validateLiveManifest(raw, { protocolVersion: 1, pluginId, version, displayName: readText("displayName", 100), description: String(raw.description ?? "").slice(0, 2000) });
   if (raw.adapter === "python_spider") {
     const scriptFile = readText("scriptFile", 200);
     const scriptHash = readText("scriptHash", 64);
