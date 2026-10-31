@@ -13,7 +13,7 @@ export function toEmbyMediaSourceId(
 
 /** 仅为已支持播放器 UA 签名的网盘传递当前取流请求的 UA。 */
 export function supportsEmbyPlaybackUserAgent(providerType: string): boolean {
-  return providerType === "cloud115" || providerType === "cloud123";
+  return providerType === "cloud115" || providerType === "cloud123" || providerType === "baidupan";
 }
 
 /** 播放器已使用相同 UA 时允许直连，其他鉴权及固定请求头仍要求中转。 */

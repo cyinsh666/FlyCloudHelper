@@ -1,4 +1,7 @@
 import { refreshBaiduOfficialToken } from "./baidupan-official-refresh.js";
+import { readBaiduOAuthIdentity, resolveBaiduWebPlayback, supportsBaiduWebPlayback,
+  validateBaiduWebCookie } from "./baidupan-web-playback.js";
+import path from "node:path";
 import { loadEnumerationPage } from "./types.js";
 import { ApiError } from "../errors.js";
 import { CredentialRefreshCoordinator } from "./credential-refresh-coordinator.js";
@@ -23,6 +26,8 @@ import {
   type ProviderFileAccess,
   type ProviderValidationResult,
   type ProviderFileStreamAccess,
+  type ProviderFileOrganizer,
+  type ProviderMutationResult,
   type ScanRoot,
   createProviderRecommendedScanSettings,
   requireConnectionString,
@@ -54,6 +59,18 @@ const BAIDUPAN_AUTHENTICATION_ERROR_CODES = new Set([2, 110, 111, -6, 401]);
 
 /** 百度网盘开放接口 Provider。 */
 export class BaiduPanProvider implements ProviderAdapter {
+  /** 百度写接口使用路径；每次操作前按 fs_id 查询实时路径。 */
+  public readonly fileOrganizer: ProviderFileOrganizer = {
+    supports: (connection) => typeof connection.accessToken === "string" && Boolean(connection.accessToken.trim())
+      && typeof connection.refreshToken === "string" && Boolean(connection.refreshToken.trim())
+      && ["openlist", "flymby_server", "baidu_official"].includes(String(connection.authSource || "openlist")),
+    createDirectory: (connection, parentId, name, context) => this.createOrganizeDirectory(connection, parentId, name, context),
+    rename: (connection, resourceId, name, context) => this.renameOrganizeFile(connection, resourceId, name, context),
+    move: (connection, resourceId, parentId, context) => this.transferOrganizeFile(connection, "move", resourceId, parentId, context),
+    copy: (connection, resourceId, parentId, context) => this.transferOrganizeFile(connection, "copy", resourceId, parentId, context),
+    remove: (connection, resourceId, context) => this.removeOrganizeFile(connection, resourceId, context),
+    taskStatus: async () => "completed",
+  };
   public readonly descriptor: ProviderDescriptor = {
     type: "baidupan",
     displayName: "百度网盘",
@@ -79,6 +96,159 @@ export class BaiduPanProvider implements ProviderAdapter {
   /** 创建百度请求适配器，官方应用密钥始终由 FlymbyServer 保存。 */
   public constructor(networkOptions: ProviderNetworkOptions) {
     this.networkOptions = networkOptions;
+  }
+
+  /** 从现有 OAuth 连接读取网盘账号，供独立网页登录核对。 */
+  public async readWebLoginIdentity(connection: Record<string, unknown>,
+    persistConnection?: (connection: Record<string, unknown>) => Promise<void>): Promise<{ userId: string; vipType: number | null }> {
+    await this.ensureValidToken(connection, persistConnection);
+    return readBaiduOAuthIdentity(requireConnectionString(connection, "accessToken", "Access Token"), this.networkOptions);
+  }
+
+  /** 校验浏览器取得的 Cookie 与当前网盘服务为同一账号。 */
+  public async validateWebLoginCookie(cookie: string, userId: string): Promise<void> {
+    await validateBaiduWebCookie(cookie, userId, this.networkOptions);
+  }
+
+  /** 网页补充凭据只作用于视频取链，失败后保持原有 OAuth 播放路径。 */
+  private async tryWebPlaybackAccess(
+    connection: Record<string, unknown>, locator: Record<string, unknown>, signal?: AbortSignal,
+    context?: ProviderConnectionContext,
+  ): Promise<ProviderFileAccess | null> {
+    const cookie = typeof connection.webPlaybackCookie === "string" ? connection.webPlaybackCookie.trim() : "";
+    const userId = typeof connection.webPlaybackUserId === "string" ? connection.webPlaybackUserId.trim() : "";
+    const filePath = typeof locator.path === "string" ? locator.path : "";
+    if (!cookie || !/^\d+$/u.test(userId) || !supportsBaiduWebPlayback(filePath)) return null;
+    const fsId = requireConnectionString(locator, "fsId", "文件 ID");
+    const currentPath = await this.organizePath(connection, fsId, context);
+    return resolveBaiduWebPlayback(currentPath, cookie, userId,
+      typeof context?.playbackUserAgent === "string" ? context.playbackUserAgent : undefined,
+      this.networkOptions, signal);
+  }
+
+  /** 读取实时文件路径；根目录在百度 API 中没有 fs_id。 */
+  private async organizePath(
+    connection: Record<string, unknown>, resourceId: string, context?: ProviderConnectionContext,
+    retriedAuthentication = false,
+  ): Promise<string> {
+    if (resourceId === "/") return "/";
+    if (!/^\d+$/u.test(resourceId)) throw new ApiError(422, "baidupan_organize_id_invalid", "百度网盘资源编号无效");
+    await this.ensureValidToken(connection, context?.persistConnection);
+    const accessToken = requireConnectionString(connection, "accessToken", "Access Token");
+    const apiBase = typeof connection.apiBaseUrl === "string" && connection.apiBaseUrl ? connection.apiBaseUrl : "https://pan.baidu.com";
+    const baseUrl = await validateProviderUrl(apiBase, this.networkOptions);
+    const url = new URL("/rest/2.0/xpan/multimedia", baseUrl);
+    url.searchParams.set("method", "filemetas");
+    url.searchParams.set("access_token", accessToken);
+    // 关键变量：百度 fs_id 可能超过安全整数，直接放入 JSON 数组文本，不经过 Number。
+    url.searchParams.set("fsids", `[${resourceId}]`);
+    url.searchParams.set("dlink", "0");
+    const payload = await this.requestBaiduJsonWithRateLimitRetry<{ errno?: number; list?: BaiduFileItem[] }>(url);
+    const businessCode = Number(payload.errno ?? -1);
+    if (BAIDUPAN_AUTHENTICATION_ERROR_CODES.has(businessCode) && !retriedAuthentication) {
+      await this.refreshAfterAuthenticationFailure(connection, accessToken, context?.persistConnection);
+      return this.organizePath(connection, resourceId, context, true);
+    }
+    if (BAIDUPAN_AUTHENTICATION_ERROR_CODES.has(businessCode)) {
+      throw new ApiError(410, "baidupan_authentication_expired", "百度网盘登录已失效，请重新登录");
+    }
+    if (businessCode !== 0) throw new ApiError(502, "baidupan_organize_metadata_failed", `百度网盘文件信息查询失败（业务码：${businessCode}）`);
+    const item = payload.list?.[0];
+    if (String(item?.fs_id ?? "") !== resourceId || typeof item?.path !== "string" || !item.path.startsWith("/")) {
+      throw new ApiError(404, "baidupan_organize_file_missing", "百度网盘文件已变化，请重新预览");
+    }
+    return item.path;
+  }
+
+  /** 提交百度表单写接口，并检查顶层及逐项业务结果。 */
+  private async organizeMutation(
+    connection: Record<string, unknown>, method: "create" | "filemanager", fields: Record<string, string>,
+    context?: ProviderConnectionContext, operation?: "copy" | "move" | "rename" | "delete",
+    retriedAuthentication = false,
+  ): Promise<ProviderMutationResult> {
+    await this.ensureValidToken(connection, context?.persistConnection);
+    const accessToken = requireConnectionString(connection, "accessToken", "Access Token");
+    const apiBase = typeof connection.apiBaseUrl === "string" && connection.apiBaseUrl ? connection.apiBaseUrl : "https://pan.baidu.com";
+    const baseUrl = await validateProviderUrl(apiBase, this.networkOptions);
+    const url = new URL("/rest/2.0/xpan/file", baseUrl);
+    url.searchParams.set("method", method);
+    url.searchParams.set("access_token", accessToken);
+    if (operation) url.searchParams.set("opera", operation);
+    const body = new URLSearchParams(fields);
+    for (let retryCount = 0; ; retryCount += 1) {
+      const response = await providerFetch(url, {
+        method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body,
+      }, this.networkOptions);
+      const payload = await response.json() as { errno?: number; info?: Array<{ errno?: number }>; taskid?: number | string };
+      const businessCode = Number(payload.errno ?? -1);
+      if (businessCode === 31034) {
+        if (retryCount >= PROVIDER_RATE_LIMIT_MAX_RETRIES) {
+          throw new ApiError(503, "provider_rate_limited", "百度网盘访问频率受限，请稍后继续整理");
+        }
+        registerProviderSharedRateLimit(url, readProviderRateLimitDelayMs(null, retryCount));
+        await waitForProviderSharedRateLimit(url);
+        continue;
+      }
+      if (BAIDUPAN_AUTHENTICATION_ERROR_CODES.has(businessCode) && !retriedAuthentication) {
+        await this.refreshAfterAuthenticationFailure(connection, accessToken, context?.persistConnection);
+        return this.organizeMutation(connection, method, fields, context, operation, true);
+      }
+      if (BAIDUPAN_AUTHENTICATION_ERROR_CODES.has(businessCode)) {
+        throw new ApiError(410, "baidupan_authentication_expired", "百度网盘登录已失效，请重新登录");
+      }
+      if (businessCode !== 0) throw new ApiError(502, "baidupan_organize_failed", `百度网盘文件操作失败（业务码：${businessCode}）`);
+      const failedItem = payload.info?.find((item) => Number(item.errno ?? 0) !== 0);
+      if (failedItem) throw new ApiError(502, "baidupan_organize_item_failed", `百度网盘文件操作失败（业务码：${Number(failedItem.errno)}）`);
+      // 当前调用明确要求同步完成；若上游意外改为异步，不能把任务提交当成文件已落盘。
+      if (payload.taskid) throw new ApiError(502, "baidupan_organize_async_unexpected", "百度网盘返回了未预期的异步任务，请稍后检查目录");
+      return {};
+    }
+  }
+
+  /** 创建目录前把父级资源 ID 转为百度路径，目录是否落盘由公共层再次列出确认。 */
+  private async createOrganizeDirectory(
+    connection: Record<string, unknown>, parentId: string, name: string, context?: ProviderConnectionContext,
+  ): Promise<ProviderMutationResult> {
+    if (!name || name === "." || name === ".." || name.includes("/")) {
+      throw new ApiError(422, "baidupan_organize_name_invalid", "百度网盘目录名称无效");
+    }
+    const parentPath = await this.organizePath(connection, parentId, context);
+    return this.organizeMutation(connection, "create", {
+      path: path.posix.join(parentPath, name), size: "0", isdir: "1", rtype: "0",
+    }, context);
+  }
+
+  /** 百度重命名只接受文件当前路径和新名称。 */
+  private async renameOrganizeFile(
+    connection: Record<string, unknown>, resourceId: string, name: string, context?: ProviderConnectionContext,
+  ): Promise<ProviderMutationResult> {
+    const sourcePath = await this.organizePath(connection, resourceId, context);
+    return this.organizeMutation(connection, "filemanager", {
+      async: "0", filelist: JSON.stringify([{ path: sourcePath, newname: name }]), ondup: "fail",
+    }, context, "rename");
+  }
+
+  /** 复制和移动都使用实时源路径及目标目录路径。 */
+  private async transferOrganizeFile(
+    connection: Record<string, unknown>, operation: "copy" | "move", resourceId: string, parentId: string,
+    context?: ProviderConnectionContext,
+  ): Promise<ProviderMutationResult> {
+    const sourcePath = await this.organizePath(connection, resourceId, context);
+    const targetPath = await this.organizePath(connection, parentId, context);
+    return this.organizeMutation(connection, "filemanager", {
+      async: "0", filelist: JSON.stringify([{ path: sourcePath, dest: targetPath,
+        newname: path.posix.basename(sourcePath) }]), ondup: "fail",
+    }, context, operation);
+  }
+
+  /** 仅删除传入资源 ID 实时对应的文件或空目录。 */
+  private async removeOrganizeFile(
+    connection: Record<string, unknown>, resourceId: string, context?: ProviderConnectionContext,
+  ): Promise<ProviderMutationResult> {
+    const sourcePath = await this.organizePath(connection, resourceId, context);
+    return this.organizeMutation(connection, "filemanager", {
+      async: "0", filelist: JSON.stringify([sourcePath]), ondup: "fail",
+    }, context, "delete");
   }
 
   /** 官方与原来源显式区分，未知来源不能静默退回 OpenList。 */
@@ -243,6 +413,16 @@ export class BaiduPanProvider implements ProviderAdapter {
     signal?: AbortSignal,
     context?: ProviderConnectionContext,
   ): Promise<ProviderFileAccess> {
+    try {
+      const webAccess = await this.tryWebPlaybackAccess(connection, locator, signal, context);
+      if (webAccess) return webAccess;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      this.networkOptions.logConnectionFailure?.({
+        日志关键字: "codex-baidupan-web-playback", 事件: "补充网页登录取链失败，使用原有播放",
+        错误码: error instanceof ApiError ? error.code : "upstream_unavailable",
+      });
+    }
     return this.resolvePlaybackAccess(connection, locator, signal, context);
   }
 
@@ -253,7 +433,7 @@ export class BaiduPanProvider implements ProviderAdapter {
     signal?: AbortSignal,
     context?: ProviderConnectionContext,
   ): Promise<ProviderFileStreamAccess> {
-    return this.resolvePlaybackAccess(connection, locator, signal, context);
+    return this.resolveFileAccess(connection, locator, signal, context);
   }
 
   /** 统一解析百度网盘直连和中转播放需要的临时访问数据。 */

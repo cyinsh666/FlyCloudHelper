@@ -10,16 +10,29 @@ import {
   type ProviderNetworkOptions,
   type ProviderStreamResponse,
 } from "./network.js";
-import { type ProviderConnectionContext, type ProviderDescriptor, type ProviderEntry, type ProviderFileAccess, createProviderRecommendedScanSettings, requireConnectionString } from "./types.js";
+import { type ProviderConnectionContext, type ProviderDescriptor, type ProviderEntry, type ProviderFileAccess, type ProviderFileOrganizer, type ProviderMutationResult, createProviderRecommendedScanSettings, requireConnectionString } from "./types.js";
 
 const CLOUD123_API = "https://www.123pan.cn";
 const CLOUD123_DOWNLOAD_PROBE_MAX_BYTES = 64 * 1024;
 /** 与 APP 保持一致的123业务接口最小请求间隔，避免扫描并发形成瞬时突发。 */
 const CLOUD123_REQUEST_INTERVAL_MS = 150;
 
-/** 123云盘 Android 客户端协议只读 Provider。 */
+/** 123云盘 Android 客户端协议 Provider。 */
 export class Cloud123Provider extends CloudDriveProviderBase {
   protected readonly rootResourceId = "0";
+  /** 123 的复制返回异步任务，整理流程会等待任务完成后再核对目录。 */
+  public readonly fileOrganizer: ProviderFileOrganizer = {
+    supports: (connection) => typeof connection.accessToken === "string" && Boolean(connection.accessToken.trim()),
+    createDirectory: (connection, parentId, name) => this.createOrganizeDirectory(connection, parentId, name),
+    rename: (connection, resourceId, name) => this.mutateOrganizeFile(connection, "/a/api/file/rename",
+      { driveId: 0, fileId: this.organizeNumericId(resourceId), fileName: name }),
+    move: (connection, resourceId, parentId) => this.mutateOrganizeFile(connection, "/b/api/file/mod_pid",
+      { fileIdList: [{ FileId: this.organizeNumericId(resourceId) }],
+        parentFileId: this.organizeNumericId(parentId), event: "fileMove", operatePlace: "bottom", RequestSource: null }),
+    copy: (connection, resourceId, parentId) => this.copyOrganizeFile(connection, resourceId, parentId),
+    remove: (connection, resourceId) => this.removeOrganizeFile(connection, resourceId),
+    taskStatus: (connection, taskId) => this.organizeTaskStatus(connection, taskId),
+  };
   /** FlyCloudHelper 实例内所有123请求共享下一次允许发出的时间。 */
   private nextRequestAtMs = 0;
   public readonly descriptor: ProviderDescriptor = {
@@ -32,6 +45,111 @@ export class Cloud123Provider extends CloudDriveProviderBase {
   };
 
   public constructor(private readonly networkOptions: ProviderNetworkOptions) { super(); }
+
+  /** 123 写接口要求数值 ID；超过 JS 安全整数的 ID 不提交，防止操作错文件。 */
+  private organizeNumericId(resourceId: string): number {
+    const value = Number(resourceId);
+    if (!/^\d+$/u.test(resourceId) || !Number.isSafeInteger(value)) {
+      throw new ApiError(422, "cloud123_organize_id_invalid", "123网盘文件编号无法安全提交，请停止整理");
+    }
+    return value;
+  }
+
+  /** 整理写操作必须以业务码 0 确认，不能沿用只读接口的特殊成功码。 */
+  private async requestOrganizeMutation(
+    connection: Record<string, unknown>, path: string, body: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const payload = await this.request(connection, path, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    if (Number(payload.code) !== 0) {
+      throw new ApiError(502, "cloud123_organize_failed", "123网盘文件操作未完成，请稍后重试");
+    }
+    return payload;
+  }
+
+  /** 不返回新 ID 的同步操作由整理流程重新读取目标目录确认。 */
+  private async mutateOrganizeFile(
+    connection: Record<string, unknown>, path: string, body: Record<string, unknown>,
+  ): Promise<ProviderMutationResult> {
+    await this.requestOrganizeMutation(connection, path, body);
+    return {};
+  }
+
+  /** 使用已验证的建目录接口，返回资源 ID 供调用方核对。 */
+  private async createOrganizeDirectory(
+    connection: Record<string, unknown>, parentId: string, name: string,
+  ): Promise<ProviderMutationResult> {
+    const payload = await this.requestOrganizeMutation(connection, "/a/api/file/upload_request", {
+      driveId: 0, etag: "", fileName: name, parentFileId: this.organizeNumericId(parentId),
+      size: 0, type: 1, duplicate: 1, NotReuse: true, event: "newCreateFolder", operateType: 1,
+    });
+    const resourceId = readCloudText(readCloudRecord(readCloudRecord(payload.data).Info), ["FileId"]);
+    return resourceId ? { resourceId } : {};
+  }
+
+  /** 按文件 ID 实时取得复制和回收站操作需要的原始元数据。 */
+  private async loadOrganizeFile(connection: Record<string, unknown>, resourceId: string): Promise<Record<string, unknown>> {
+    const payload = await this.requestOrganizeMutation(connection, "/b/api/file/info", {
+      fileIdList: [{ fileId: this.organizeNumericId(resourceId) }],
+    });
+    const data = readCloudRecord(payload.data);
+    const items = Array.isArray(data.InfoList) ? data.InfoList : Array.isArray(data.infoList) ? data.infoList : [];
+    const file = readCloudRecord(items[0]);
+    if (readCloudText(file, ["FileId", "fileId"]) !== resourceId) {
+      throw new ApiError(404, "cloud123_organize_file_missing", "123网盘文件已变化，请重新预览");
+    }
+    return file;
+  }
+
+  /** 提交异步复制任务；必须带文件名、大小和来源父目录。 */
+  private async copyOrganizeFile(
+    connection: Record<string, unknown>, resourceId: string, parentId: string,
+  ): Promise<ProviderMutationResult> {
+    const file = await this.loadOrganizeFile(connection, resourceId);
+    const fileName = readCloudText(file, ["FileName", "fileName"]);
+    const sourceParentId = readCloudText(file, ["ParentFileId", "parentFileId"]);
+    if (!fileName || !sourceParentId) throw new ApiError(502, "cloud123_organize_file_invalid", "123网盘文件信息不完整，无法复制");
+    const payload = await this.requestOrganizeMutation(connection, "/b/api/restful/goapi/v1/file/copy/async", {
+      fileList: [{ fileId: this.organizeNumericId(resourceId), size: readCloudNumber(file.Size),
+        etag: readCloudText(file, ["Etag", "etag"]), type: Number(file.Type ?? 0),
+        parentFileId: this.organizeNumericId(sourceParentId), fileName, driveId: 0 }],
+      targetFileId: this.organizeNumericId(parentId),
+    });
+    const taskId = readCloudText(readCloudRecord(payload.data), ["taskId"]);
+    if (!taskId) throw new ApiError(502, "cloud123_organize_task_missing", "123网盘复制任务未返回编号");
+    return { taskId };
+  }
+
+  /** 123 删除使用回收站接口，参数必须包含实时文件名、类型和父目录。 */
+  private async removeOrganizeFile(
+    connection: Record<string, unknown>, resourceId: string,
+  ): Promise<ProviderMutationResult> {
+    const file = await this.loadOrganizeFile(connection, resourceId);
+    const fileName = readCloudText(file, ["FileName", "fileName"]);
+    const parentId = readCloudText(file, ["ParentFileId", "parentFileId"]);
+    if (!fileName || !parentId) throw new ApiError(502, "cloud123_organize_file_invalid", "123网盘文件信息不完整，无法删除");
+    return this.mutateOrganizeFile(connection, "/a/api/file/trash", {
+      driveId: 0, fileTrashInfoList: [{ FileId: this.organizeNumericId(resourceId), FileName: fileName,
+        Type: Number(file.Type ?? 0), ParentFileId: this.organizeNumericId(parentId) }], operation: true,
+    });
+  }
+
+  /** 只有复制任务明确完成且无业务错误时才允许整理流程继续。 */
+  private async organizeTaskStatus(
+    connection: Record<string, unknown>, taskId: string,
+  ): Promise<"pending" | "running" | "completed" | "failed"> {
+    const path = `/b/api/restful/goapi/v1/file/copy/task?taskId=${encodeURIComponent(taskId)}`;
+    const payload = await this.request(connection, path, { method: "GET" });
+    if (Number(payload.code) !== 0) throw new ApiError(502, "cloud123_organize_task_failed", "123网盘复制任务状态查询失败");
+    const data = readCloudRecord(payload.data);
+    const status = Number(data.status);
+    if (status === 0) return "pending";
+    if (status === 1) return "running";
+    if (status === 2) return Number(data.errorCode ?? 0) === 0 ? "completed" : "failed";
+    if (status === 3) return "failed";
+    throw new ApiError(502, "cloud123_organize_task_unknown", "123网盘复制任务状态无法识别");
+  }
 
   /** 验证123账号并保存稳定 UID。 */
   protected async loadAccountLabel(connection: Record<string, unknown>, signal?: AbortSignal, context?: ProviderConnectionContext): Promise<string | null> {

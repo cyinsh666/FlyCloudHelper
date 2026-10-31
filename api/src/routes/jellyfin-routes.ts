@@ -111,7 +111,7 @@ function buildJellyfinStreamUrl(
 
 /** 判断网盘是否支持使用当前 Jellyfin 播放器 UA 申请直连地址。 */
 function supportsPlaybackUserAgent(providerType: string): boolean {
-  return providerType === "cloud115" || providerType === "cloud123";
+  return providerType === "cloud115" || providerType === "cloud123" || providerType === "baidupan";
 }
 
 /** 115、123取址 UA 或百度固定 UA 与当前播放器一致时无需额外请求头；认证头仍保持原限制。 */
@@ -331,9 +331,9 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
     }
     if (selectedRoute === "origin" && !originAccess) continue;
     const directStreamUrl = buildJellyfinStreamUrl(protocolItemId, protocolMediaSourceId, preference);
-    // 关键变量：百度直链要求固定 UA；只在原始路线声明给播放器，中转路线不改变客户端请求头。
+    // 关键变量：百度网页取链与原开放接口使用不同 UA；声明本次实际地址需要的标准请求头。
     const requiredHttpHeaders = selectedRoute === "origin" && String(file.providerType ?? "") === "baidupan"
-      ? { "User-Agent": "pan.baidu.com" }
+      ? originAccess?.headers ?? {}
       : {};
     routeNames.add(selectedRoute === "origin" ? "Jellyfin原始跳转" : "服务器中转");
     mediaSources.push({

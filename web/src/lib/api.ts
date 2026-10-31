@@ -781,6 +781,72 @@ export interface ProviderDirectoryListing {
   items: ProviderDirectory[];
 }
 
+/** 服务级整理预览与执行任务只使用网盘资源编号，不依赖媒体库。 */
+export interface OrganizePlanItem {
+  sourceId: string;
+  sourcePath: string;
+  sourceName: string;
+  isDirectory?: boolean;
+  action?: "organize" | "unrecognized";
+  targetParts: string[];
+  targetName: string;
+  willOverwrite: boolean;
+  status: "ready" | "skipped";
+  reason: string | null;
+}
+
+export interface OrganizePlan {
+  id: string;
+  serviceId: string;
+  mode: "move" | "copy";
+  unrecognizedTransferEnabled?: boolean;
+  unrecognizedDirectory?: ProviderDirectory | null;
+  aiAssistEnabled?: boolean;
+  aiModelId?: string | null;
+  aiFailureCount?: number;
+  status: "preparing" | "ready" | "failed";
+  error: string | null;
+  items: OrganizePlanItem[];
+  scannedDirectories: ProviderDirectory[];
+  directoryCount: number;
+  itemCount: number;
+  readyCount: number;
+  overwriteCount: number;
+  nextOffset: number | null;
+  createdAt: string;
+}
+
+export interface OrganizeJob {
+  id: string;
+  planId: string;
+  serviceId: string;
+  status: "queued" | "running" | "paused" | "completed" | "failed" | "cancelled";
+  items: Array<{ index: number; stage: string; error: string | null }>;
+  itemCount: number;
+  completedCount: number;
+  error: string | null;
+  createdAt: string;
+}
+
+/** 服务级影片整理计划沿用媒体库定时扫描的时间配置。 */
+export interface OrganizeSchedule extends Omit<ScanSchedule, "id" | "libraryId" | "scanMode" | "createdAt"> {
+  serviceId: string;
+  sources: ProviderDirectory[];
+  target: ProviderDirectory | null;
+  mode: "move" | "copy";
+  unrecognizedTransferEnabled?: boolean;
+  unrecognizedDirectory?: ProviderDirectory | null;
+  aiAssistEnabled?: boolean;
+  aiModelId?: string | null;
+  pendingPlanId: string | null;
+}
+
+export type UpdateOrganizeScheduleInput = Pick<OrganizeSchedule,
+  "enabled" | "scheduleType" | "intervalMinutes" | "timeOfDay" | "dayOfWeek" | "dayOfMonth" |
+  "timezoneOffsetMinutes" | "quietPeriodEnabled" | "quietStartTime" | "quietEndTime" |
+  "sources" | "target" | "mode" | "unrecognizedTransferEnabled" | "unrecognizedDirectory" |
+  "aiAssistEnabled" | "aiModelId">;
+
 /** 视频媒体库文件浏览的当前目录条目。 */
 export interface LibraryBrowseEntry extends ProviderDirectory {
   parentResourceId: string;
@@ -1082,6 +1148,77 @@ export function browseServiceDirectories(
     driveId: parent?.driveId,
     cacheKey,
   }));
+}
+
+/** 读取当前服务的文件整理能力与登录方式限制。 */
+export function getServiceOrganizeCapabilities(serviceId: string, admin = false): Promise<{ supported: boolean; mode: string; reason: string | null }> {
+  return requestJson<{ supported: boolean; mode: string; reason: string | null }>(
+    `${admin ? "/api/v1/admin" : "/api/v1"}/services/${serviceId}/organize/capabilities`);
+}
+
+/** 返回整理页可选的已启用 AI 模型，不返回凭据。 */
+export function getServiceOrganizeAiModels(serviceId: string, admin = false): Promise<{ items: AvailableAiModel[] }> {
+  return requestJson<{ items: AvailableAiModel[] }>(
+    `${admin ? "/api/v1/admin" : "/api/v1"}/services/${serviceId}/organize/ai-models`);
+}
+
+/** 启动后台识别预览，页面无需等待整棵目录扫描。 */
+export async function createServiceOrganizePlan(serviceId: string, input: {
+  sources: ProviderDirectory[]; target: ProviderDirectory; mode: "move" | "copy";
+  unrecognizedTransferEnabled?: boolean; unrecognizedDirectory?: ProviderDirectory | null;
+  aiAssistEnabled?: boolean; aiModelId?: string | null;
+}, admin = false): Promise<OrganizePlan> {
+  const result = await requestJson<{ plan: OrganizePlan }>(`${admin ? "/api/v1/admin" : "/api/v1"}/services/${serviceId}/organize/plans`,
+    { method: "POST", body: JSON.stringify(input) });
+  return result.plan;
+}
+
+/** 轮询识别预览。 */
+export async function getServiceOrganizePlan(serviceId: string, planId: string, admin = false, offset = 0): Promise<OrganizePlan> {
+  const result = await requestJson<{ plan: OrganizePlan }>(`${admin ? "/api/v1/admin" : "/api/v1"}/services/${serviceId}/organize/plans/${planId}?offset=${offset}`);
+  return result.plan;
+}
+
+/** 启动已确认预览的文件执行任务。 */
+export async function createServiceOrganizeJob(serviceId: string, planId: string, admin = false): Promise<OrganizeJob> {
+  const result = await requestJson<{ job: OrganizeJob }>(`${admin ? "/api/v1/admin" : "/api/v1"}/services/${serviceId}/organize/jobs`,
+    { method: "POST", body: JSON.stringify({ planId }) });
+  return result.job;
+}
+
+/** 刷新页面时找回服务的历史任务。 */
+export function listServiceOrganizeJobs(serviceId: string, admin = false): Promise<{ items: OrganizeJob[] }> {
+  return requestJson<{ items: OrganizeJob[] }>(`${admin ? "/api/v1/admin" : "/api/v1"}/services/${serviceId}/organize/jobs`);
+}
+
+/** 读取当前网盘服务的整理定时任务。 */
+export async function getServiceOrganizeSchedule(serviceId: string, admin = false): Promise<OrganizeSchedule> {
+  const result = await requestJson<{ schedule: OrganizeSchedule }>(
+    `${admin ? "/api/v1/admin" : "/api/v1"}/services/${serviceId}/organize/schedule`);
+  return result.schedule;
+}
+
+/** 保存定时规则与本服务的来源、目标目录。 */
+export async function updateServiceOrganizeSchedule(serviceId: string, input: UpdateOrganizeScheduleInput,
+  admin = false): Promise<OrganizeSchedule> {
+  const result = await requestJson<{ schedule: OrganizeSchedule }>(
+    `${admin ? "/api/v1/admin" : "/api/v1"}/services/${serviceId}/organize/schedule`,
+    { method: "PUT", body: JSON.stringify(input) });
+  return result.schedule;
+}
+
+/** 读取后台执行阶段。 */
+export async function getServiceOrganizeJob(serviceId: string, jobId: string, admin = false): Promise<OrganizeJob> {
+  const result = await requestJson<{ job: OrganizeJob }>(`${admin ? "/api/v1/admin" : "/api/v1"}/services/${serviceId}/organize/jobs/${jobId}`);
+  return result.job;
+}
+
+/** 在文件边界暂停、继续或取消整理任务。 */
+export async function controlServiceOrganizeJob(serviceId: string, jobId: string,
+  action: "pause" | "resume" | "cancel", admin = false): Promise<OrganizeJob> {
+  const result = await requestJson<{ job: OrganizeJob }>(`${admin ? "/api/v1/admin" : "/api/v1"}/services/${serviceId}/organize/jobs/${jobId}/control`,
+    { method: "POST", body: JSON.stringify({ action }) });
+  return result.job;
 }
 
 /** 将已有网盘服务关联为云聚合库来源；连接状态和凭据继续由服务统一管理。 */
@@ -1522,6 +1659,42 @@ export async function reconnectServiceConnection(
     { method: "POST", body: JSON.stringify({}) },
   );
   return result.service;
+}
+
+export interface BaiduWebLoginStatus {
+  state: "waiting" | "authorized" | "failed";
+  message: string;
+  imageDataUrl: string | null;
+}
+
+/** 百度补充网页登录只更新已有服务的加密连接，不替换 OAuth。 */
+function baiduWebLoginPath(serviceId: string, admin: boolean): string {
+  return `${admin ? "/api/v1/admin" : "/api/v1"}/services/${encodeURIComponent(serviceId)}/baidu-web-login`;
+}
+
+/** 读取百度补充网页登录是否已配置，永不返回 Cookie。 */
+export function getBaiduWebLoginConfiguration(serviceId: string, admin = false): Promise<{ configured: boolean }> {
+  return requestJson<{ configured: boolean }>(baiduWebLoginPath(serviceId, admin));
+}
+
+/** 启动云助手独立的百度官网扫码会话。 */
+export function startBaiduWebLogin(serviceId: string, admin = false): Promise<{ sessionId: string; expiresAt: number }> {
+  return requestJson<{ sessionId: string; expiresAt: number }>(`${baiduWebLoginPath(serviceId, admin)}/sessions`, { method: "POST" });
+}
+
+/** 读取扫码页面截图和状态，不包含浏览器 Cookie。 */
+export function getBaiduWebLoginStatus(serviceId: string, sessionId: string, admin = false): Promise<BaiduWebLoginStatus> {
+  return requestJson<BaiduWebLoginStatus>(`${baiduWebLoginPath(serviceId, admin)}/sessions/${encodeURIComponent(sessionId)}`);
+}
+
+/** 用户关闭页面时释放服务端浏览器会话。 */
+export function cancelBaiduWebLogin(serviceId: string, sessionId: string, admin = false): Promise<{ cancelled: boolean }> {
+  return requestJson<{ cancelled: boolean }>(`${baiduWebLoginPath(serviceId, admin)}/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+}
+
+/** 清除补充网页登录凭据，保留原百度网盘 OAuth 连接。 */
+export function clearBaiduWebLogin(serviceId: string, admin = false): Promise<{ configured: boolean }> {
+  return requestJson<{ configured: boolean }>(baiduWebLoginPath(serviceId, admin), { method: "DELETE" });
 }
 
 /** 保存新的扫描配置修订。 */

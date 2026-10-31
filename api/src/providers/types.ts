@@ -149,6 +149,24 @@ export interface ProviderConnectionContext {
   playbackUserAgent?: string;
 }
 
+/** 服务级文件整理的写操作结果；异步任务未完成前不能更新本地执行状态为成功。 */
+export interface ProviderMutationResult {
+  /** 写入后资源 ID 变化的 Provider 必须返回新 ID。 */
+  resourceId?: string;
+  taskId?: string;
+}
+
+/** 可选的网盘文件整理能力，只有明确实现的 Provider 才开放写入入口。 */
+export interface ProviderFileOrganizer {
+  supports(connection: Record<string, unknown>): boolean;
+  createDirectory(connection: Record<string, unknown>, parentId: string, name: string, context?: ProviderConnectionContext): Promise<ProviderMutationResult>;
+  rename(connection: Record<string, unknown>, resourceId: string, name: string, context?: ProviderConnectionContext): Promise<ProviderMutationResult>;
+  move(connection: Record<string, unknown>, resourceId: string, parentId: string, context?: ProviderConnectionContext): Promise<ProviderMutationResult>;
+  copy(connection: Record<string, unknown>, resourceId: string, parentId: string, context?: ProviderConnectionContext): Promise<ProviderMutationResult>;
+  remove(connection: Record<string, unknown>, resourceId: string, context?: ProviderConnectionContext): Promise<ProviderMutationResult>;
+  taskStatus(connection: Record<string, unknown>, taskId: string, context?: ProviderConnectionContext): Promise<"pending" | "running" | "completed" | "failed">;
+}
+
 export interface ProviderDescriptor {
   type: string;
   displayName: string;
@@ -184,6 +202,8 @@ export interface ProviderDescriptor {
 
 export interface ProviderAdapter {
   readonly descriptor: ProviderDescriptor;
+  /** 未实现时，服务级影片整理对该 Provider 不可用。 */
+  readonly fileOrganizer?: ProviderFileOrganizer;
   validateConnection(
     connection: Record<string, unknown>,
     signal?: AbortSignal,

@@ -1,10 +1,10 @@
 import { Link } from "@tanstack/react-router";
-import { Database, KeyRound, Pencil, Plus } from "lucide-react";
+import { Database, FolderOutput, KeyRound, Pencil, Plus } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel } from "@/components/ui-kit";
 import { ServiceProfileEditDialog } from "@/components/ServiceProfileEditDialog";
-import { getService, type ServiceDetail } from "@/lib/api";
+import { getService, getServiceOrganizeCapabilities, type ServiceDetail } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
 
 /** 展示网盘服务基础信息、登录状态和重新登录入口。 */
@@ -13,10 +13,20 @@ export function ServiceBasicDetailPage({ serviceId, admin = false }: { serviceId
   // 关键变量：直接使用保存接口返回的新资料，标题和描述立即刷新。
   const [savedService, setSavedService] = useState<ServiceDetail | null>(null);
   const [editing, setEditing] = useState(false);
+  const [organizeSupported, setOrganizeSupported] = useState(false);
   useEffect(() => {
     setSavedService(null);
     setEditing(false);
+    setOrganizeSupported(false);
   }, [serviceId, admin]);
+  /** 入口以当前 Provider 和当前登录凭据的真实写能力为准。 */
+  useEffect(() => {
+    let alive = true;
+    void getServiceOrganizeCapabilities(serviceId, admin).then((result) => {
+      if (alive) setOrganizeSupported(result.supported);
+    }).catch(() => { if (alive) setOrganizeSupported(false); });
+    return () => { alive = false; };
+  }, [serviceId, admin, resource.data?.credentialRevision]);
   const service = savedService ?? resource.data;
   /** 关闭资料弹窗，草稿随弹窗销毁。 */
   const closeEditor = useCallback(() => setEditing(false), []);
@@ -29,13 +39,14 @@ export function ServiceBasicDetailPage({ serviceId, admin = false }: { serviceId
   if (!service) return <div aria-label="服务详情加载中" className="animate-pulse space-y-4"><div className="h-7 w-48 rounded bg-muted" /><div className="h-4 w-72 max-w-full rounded bg-muted" /><div className="grid gap-4 lg:grid-cols-2">{[0, 1].map((index) => <Panel key={index}><div className="h-40 rounded bg-muted" /></Panel>)}</div></div>;
   const servicesPath = admin ? "/admin/services" : "/app/services";
   const connectionPath = admin ? "/admin/services/$serviceId/connection" : "/app/services/$serviceId/connection";
+  const organizePath = admin ? "/admin/services/$serviceId/organize" : "/app/services/$serviceId/organize";
   return <>
     <header className="mb-6 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
       <div className="min-w-0">
         <div className="flex items-center gap-2"><h1 className="min-w-0 break-words text-xl font-semibold sm:text-2xl">{service.displayName}</h1><button type="button" aria-label="编辑服务名称和描述" title="编辑服务" onClick={() => setEditing(true)} className="grid size-8 shrink-0 cursor-pointer place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"><Pencil className="size-4" /></button></div>
         {service.description && <p className="mt-2 whitespace-pre-line break-words text-sm text-muted-foreground">{service.description}</p>}
       </div>
-      <div className="flex flex-wrap gap-2 sm:justify-end"><Link to={servicesPath}><SecondaryButton>返回服务</SecondaryButton></Link>{service.canCreateLibrary && !admin && <Link to="/app/libraries/new/$serviceId" params={{ serviceId: service.id }}><PrimaryButton><Plus className="size-4" /> 创建媒体库</PrimaryButton></Link>}</div>
+      <div className="flex flex-wrap gap-2 sm:justify-end"><Link to={servicesPath}><SecondaryButton>返回服务</SecondaryButton></Link>{organizeSupported && <Link to={organizePath} params={{ serviceId: service.id }}><SecondaryButton><FolderOutput className="size-4" /> 影片整理</SecondaryButton></Link>}{service.canCreateLibrary && !admin && <Link to="/app/libraries/new/$serviceId" params={{ serviceId: service.id }}><PrimaryButton><Plus className="size-4" /> 创建媒体库</PrimaryButton></Link>}</div>
     </header>
     {editing && <ServiceProfileEditDialog service={service} admin={admin} onClose={closeEditor} onSaved={handleSaved} />}
     <div className="grid gap-4 lg:grid-cols-2">

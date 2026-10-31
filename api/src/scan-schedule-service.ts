@@ -161,7 +161,7 @@ function readClockMinutes(timeOfDay: string | null): number {
  * 如果候选执行时间落入每日禁扫时段，则顺延到本次禁扫结束。
  * 开始时间大于结束时间表示跨零点，例如 23:00 至 07:00。
  */
-function postponeQuietCandidate(candidateMilliseconds: number, configuration: ScanScheduleConfiguration): number {
+export function postponeQuietCandidate(candidateMilliseconds: number, configuration: ScanScheduleConfiguration): number {
   if (!configuration.quietPeriodEnabled || !configuration.quietStartTime || !configuration.quietEndTime) {
     return candidateMilliseconds;
   }

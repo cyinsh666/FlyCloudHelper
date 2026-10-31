@@ -1,7 +1,7 @@
 import { ApiError } from "../errors.js";
 import { CloudDriveProviderBase, type CloudDrivePage } from "./cloud-drive-base.js";
 import { parseCloudApiObject, readCloudNumber, readCloudRecord, readCloudText, readCloudTextFile, requestCloudApiText } from "./cloud-api.js";
-import { type ProviderConnectionContext, type ProviderDescriptor, type ProviderEntry, type ProviderFileAccess, createProviderRecommendedScanSettings, requireConnectionString } from "./types.js";
+import { type ProviderConnectionContext, type ProviderDescriptor, type ProviderEntry, type ProviderFileAccess, type ProviderFileOrganizer, type ProviderMutationResult, createProviderRecommendedScanSettings, requireConnectionString } from "./types.js";
 import { CLOUD115_CLIENT_TYPES } from "./auth/cloud115-client-types.js";
 import { waitForProviderRateLimit, type ProviderNetworkOptions } from "./network.js";
 
@@ -28,9 +28,25 @@ interface Cloud115RecentRefresh {
   retainUntilMs: number;
 }
 
-/** 115网盘 OpenAPI 只读 Provider。 */
+/** 115网盘 OpenAPI Provider。 */
 export class Cloud115Provider extends CloudDriveProviderBase {
   protected readonly rootResourceId = "0";
+  /** 复用现有 OpenAPI 鉴权、刷新和限流执行服务级影片整理。 */
+  public readonly fileOrganizer: ProviderFileOrganizer = {
+    supports: (connection) => typeof connection.accessToken === "string" && Boolean(connection.accessToken.trim())
+      && typeof connection.refreshToken === "string" && Boolean(connection.refreshToken.trim()),
+    createDirectory: (connection, parentId, name, context) => this.mutateOrganizeFile(connection,
+      "/open/folder/add", { pid: parentId, file_name: name }, context),
+    rename: (connection, resourceId, name, context) => this.mutateOrganizeFile(connection,
+      "/open/ufile/update", { file_id: resourceId, file_name: name }, context),
+    move: (connection, resourceId, parentId, context) => this.mutateOrganizeFile(connection,
+      "/open/ufile/move", { file_ids: resourceId, to_cid: parentId }, context),
+    copy: (connection, resourceId, parentId, context) => this.mutateOrganizeFile(connection,
+      "/open/ufile/copy", { file_id: resourceId, pid: parentId, nodupli: "0" }, context),
+    remove: (connection, resourceId, context) => this.mutateOrganizeFile(connection,
+      "/open/ufile/delete", { file_ids: resourceId }, context),
+    taskStatus: async () => "completed",
+  };
   /** 下一次允许发出115业务请求的时间；共享给本实例所有115服务。 */
   private nextRequestAtMs = 0;
   /** 业务码770004触发的共享冷却截止时间，已在排队的请求也必须遵守。 */
@@ -50,6 +66,19 @@ export class Cloud115Provider extends CloudDriveProviderBase {
   };
 
   public constructor(private readonly networkOptions: ProviderNetworkOptions) { super(); }
+
+  /** 115 写接口为同步操作；返回后由整理流程重新读取目录确认结果。 */
+  private async mutateOrganizeFile(
+    connection: Record<string, unknown>, path: string, fields: Record<string, string>,
+    context?: ProviderConnectionContext,
+  ): Promise<ProviderMutationResult> {
+    await this.request(connection, path, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(fields),
+    }, undefined, context);
+    return {};
+  }
 
   /** 读取115稳定用户身份。 */
   protected async loadAccountLabel(connection: Record<string, unknown>, signal?: AbortSignal, context?: ProviderConnectionContext): Promise<string | null> {

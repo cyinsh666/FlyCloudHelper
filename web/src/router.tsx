@@ -21,6 +21,7 @@ import {
   UserServicesPage,
 } from "@/pages/ServicePages";
 import { AdminServiceBasicDetailPage, UserServiceBasicDetailPage } from "@/pages/ServiceBasicDetailPage";
+import { ServiceOrganizePage } from "@/pages/ServiceOrganizePage";
 import { LibraryCreatePage } from "@/pages/LibraryCreatePage";
 import { LibraryFileBrowsePage } from "@/pages/LibraryFileBrowsePage";
 import { LibraryAbsSettingsPage } from "@/pages/LibraryAbsSettingsPage";
@@ -178,6 +179,18 @@ function GuangyaCaptchaCallbackPage() {
 function UserServiceDetailRouteComponent() {
   const { serviceId } = userServiceDetailRoute.useParams();
   return <UserServiceBasicDetailPage serviceId={serviceId} />;
+}
+
+/** 普通用户的服务级影片整理页面。 */
+function UserServiceOrganizeRouteComponent() {
+  const { serviceId } = userServiceOrganizeRoute.useParams();
+  return <ServiceOrganizePage serviceId={serviceId} />;
+}
+
+/** 管理员的服务级影片整理页面。 */
+function AdminServiceOrganizeRouteComponent() {
+  const { serviceId } = adminServiceOrganizeRoute.useParams();
+  return <ServiceOrganizePage serviceId={serviceId} admin />;
 }
 
 /** 处理普通用户服务连接管理路由参数。 */
@@ -394,6 +407,12 @@ const userServiceDetailRoute = createRoute({
   component: UserServiceDetailRouteComponent,
 });
 
+const userServiceOrganizeRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "services/$serviceId/organize",
+  component: UserServiceOrganizeRouteComponent,
+});
+
 const userServiceConnectionRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "services/$serviceId/connection",
@@ -522,6 +541,12 @@ const adminServiceDetailRoute = createRoute({
   component: AdminServiceDetailRouteComponent,
 });
 
+const adminServiceOrganizeRoute = createRoute({
+  getParentRoute: () => adminRoute,
+  path: "services/$serviceId/organize",
+  component: AdminServiceOrganizeRouteComponent,
+});
+
 const adminServiceConnectionRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "services/$serviceId/connection",
@@ -647,6 +672,7 @@ const appRouteTree = appRoute.addChildren([
   userServicesRoute,
   userServiceCreateRoute,
   userServiceDetailRoute,
+  userServiceOrganizeRoute,
   userServiceConnectionRoute,
   userJobsRoute,
   userCatalogRoute,
@@ -670,6 +696,7 @@ const adminRouteTree = adminRoute.addChildren([
   adminServicesRoute,
   adminServiceCreateRoute,
   adminServiceDetailRoute,
+  adminServiceOrganizeRoute,
   adminServiceConnectionRoute,
   adminJobsRoute,
   adminCatalogRoute,

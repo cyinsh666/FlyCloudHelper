@@ -415,6 +415,31 @@ export class GuangyaWebApiClient {
     return connection;
   }
 
+  /** 执行网页文件写操作，沿用列表请求的令牌刷新、限频与业务错误处理。 */
+  public async mutateFile(
+    connection: Record<string, unknown>,
+    path: string,
+    body: JsonRecord,
+    persistConnection?: PersistGuangyaConnection,
+    signal?: AbortSignal,
+  ): Promise<JsonRecord> {
+    const allowedPaths = new Set([
+      "/userres/v1/file/create_dir", "/userres/v1/file/rename",
+      "/userres/v1/file/move_file", "/userres/v1/file/copy_file",
+      "/userres/v1/file/delete_file", "/userres/v1/get_task_status",
+    ]);
+    if (!allowedPaths.has(path)) throw new ApiError(422, "guangya_file_mutation_invalid", "不支持的光鸭文件操作");
+    await this.ensureValidToken(connection, persistConnection, signal);
+    const requestAccessToken = typeof connection.accessToken === "string" ? connection.accessToken.trim() : "";
+    let response = await this.requestBusinessJsonWithRateLimitRetry(path, body, connection, signal);
+    if (this.requiresTokenRefresh(response)) {
+      await this.refreshConnection(connection, persistConnection, signal, true, requestAccessToken);
+      response = await this.requestBusinessJsonWithRateLimitRetry(path, body, connection, signal);
+    }
+    this.requireSuccessfulBusinessResponse(response, path);
+    return resolveDataRecord(response.body);
+  }
+
   /** 列出光鸭目录；请求起始时间全局限制在每秒五次以内。 */
   public async listChildren(
     connection: Record<string, unknown>,

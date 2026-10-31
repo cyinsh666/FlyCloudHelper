@@ -260,6 +260,15 @@ export function requireSameBaiduPanLoginSource(
   if (currentSource !== nextSource) {
     throw new ApiError(409, "baidupan_auth_source_locked", "已有百度服务不能切换登录方式；官方应用连接请在 Flymby 中使用原方式重新登录后同步");
   }
+  // 关键变量：同一网盘账号重新授权时保留独立网页会话；切换账号时绝不沿用旧 Cookie。
+  const oldUserId = readConnectionIdentityText(currentConnection, "userId");
+  const nextUserId = readConnectionIdentityText(nextConnection, "userId");
+  const webUserId = readConnectionIdentityText(currentConnection, "webPlaybackUserId");
+  if (oldUserId && oldUserId === nextUserId && webUserId === oldUserId
+    && typeof currentConnection.webPlaybackCookie === "string" && currentConnection.webPlaybackCookie) {
+    nextConnection.webPlaybackCookie = currentConnection.webPlaybackCookie;
+    nextConnection.webPlaybackUserId = webUserId;
+  }
 }
 
 /** 替换连接时核对稳定账号标识，缺少历史标识则允许本次验证结果补齐。 */

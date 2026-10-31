@@ -781,18 +781,42 @@ export class EmbyCompatibilityService {
     if (requested && selectedFiles.length === 0) throw new ApiError(404, "emby_media_source_not_found", "指定媒体源不存在");
     const playSessionId = input.playSessionId || randomUUID(); const protocolId = encodeItemId(item.id);
     const probes = selectedFiles.map((file) => parseCompletedMediaProbeResult(file.mediaProbeStatus, file.mediaProbeResult)); const ready = probes.every(Boolean); const duration = ready ? readJellyfinRunTimeTicks(probes) : 0;
-    const sources = selectedFiles.map((file, index) => {
+    const sources = await Promise.all(selectedFiles.map(async (file, index) => {
       const sourceId = toEmbyMediaSourceId(protocolId, String(file.fileId), primaryFileId,
         String(service.library_kind) === "cloud_aggregate_video");
       const probe = probes[index]; const route = input.route ?? "auto";
       const relayEnabled = Number(service.emby_relay_playback_enabled) === 1 || service.emby_relay_playback_enabled === true;
       const originPlayback = route === "origin" || (route === "auto" && !relayEnabled);
+      // 关键变量：只为当前 Emby 媒体源读取网页登录状态，Cookie 不进入协议响应。
+      let requiredPlaybackHeaders = readEmbyPlaybackRequiredHeaders(String(file.providerType ?? ""), originPlayback);
+      if (originPlayback && String(file.providerType ?? "") === "baidupan") {
+        const sourceRuntime = await this.runtime.repository.getLibrarySourceRuntimeConfiguration(
+          String(file.librarySourceId), context.ownerUserId);
+        const sourceConnection = this.runtime.vault.decrypt(sourceRuntime.encryptedConnection);
+        if (sourceConnection.webPlaybackCookie && sourceConnection.webPlaybackUserId) {
+          try {
+            const locator = file.playbackLocator && typeof file.playbackLocator === "object"
+              ? file.playbackLocator as Record<string, unknown> : {};
+            const access = await this.runtime.providers.get("baidupan").resolveFileAccess?.(
+              sourceConnection, locator, undefined, {
+                persistConnection: (nextConnection) => this.runtime.repository.refreshLibrarySourceEncryptedConnection({
+                  librarySourceId: sourceRuntime.source.id, userId: context.ownerUserId,
+                  credentialRevision: sourceRuntime.credentialRevision,
+                  encryptedConnection: this.runtime.vault.encrypt(nextConnection),
+                }),
+              });
+            if (access) requiredPlaybackHeaders = access.headers;
+          } catch {
+            // 仅媒体源提示读取失败；真实播放仍通过原有取流流程返回明确错误。
+          }
+        }
+      }
       // 关键变量：部分播放器不会处理 AddApiKeyToDirectStreamUrl，直放地址必须自行携带当前 Emby 会话令牌。
       const query = new URLSearchParams({ static: "true", MediaSourceId: sourceId, PlaySessionId: playSessionId, FlyCloudPlaybackRoute: route, api_key: context.accessToken });
       // 关键变量：Emby 客户端会将相对 /Videos 地址拼接到当前服务器根路径；不能重复写入 /e/{路径}，否则部分播放器会产生双重路径并返回 404。
       const container = probe?.container || "mp4";
-      return { Protocol: "File", Id: sourceId, Path: String(file.name ?? "video.mp4"), Name: `${String(file.sourceName ?? "网盘来源")}（${String(file.providerType ?? "未知网盘")}） · ${String(file.name ?? "video.mp4")}`, Type: "Default", Container: probe?.container || undefined, Size: Number(file.size ?? 0) || undefined, Bitrate: probe?.bitRate || undefined, RunTimeTicks: probe?.runTimeTicks || duration || undefined, MediaStreams: probe?.mediaStreams ?? [], SupportsTranscoding: false, SupportsDirectStream: true, SupportsDirectPlay: true, IsRemote: false, DirectStreamUrl: `/Videos/${protocolId}/stream.${container}?${query.toString()}`, AddApiKeyToDirectStreamUrl: false, RequiredHttpHeaders: readEmbyPlaybackRequiredHeaders(String(file.providerType ?? ""), originPlayback) };
-    });
+      return { Protocol: "File", Id: sourceId, Path: String(file.name ?? "video.mp4"), Name: `${String(file.sourceName ?? "网盘来源")}（${String(file.providerType ?? "未知网盘")}） · ${String(file.name ?? "video.mp4")}`, Type: "Default", Container: probe?.container || undefined, Size: Number(file.size ?? 0) || undefined, Bitrate: probe?.bitRate || undefined, RunTimeTicks: probe?.runTimeTicks || duration || undefined, MediaStreams: probe?.mediaStreams ?? [], SupportsTranscoding: false, SupportsDirectStream: true, SupportsDirectPlay: true, IsRemote: false, DirectStreamUrl: `/Videos/${protocolId}/stream.${container}?${query.toString()}`, AddApiKeyToDirectStreamUrl: false, RequiredHttpHeaders: requiredPlaybackHeaders };
+    }));
     const now = new Date().toISOString(); const selectedId = this.toInternalMediaSourceId(item.id, String(sources[0]?.Id ?? ""));
     await this.runtime.database.query("library_emby_playback_sessions").insert({ id: playSessionId, library_id: context.libraryId, account_id: context.accountId, item_id: item.id, media_source_id: selectedId || null, status: "created", position_ticks: 0, paused: 0, started_at: now, updated_at: now, stopped_at: null }).onConflict("id").ignore();
     this.runtime.logBusinessEvent("info", { 日志关键字: "codex-emby-playback", 事件: "生成Emby直放信息", 服务ID: context.serviceId, 账号ID: context.accountId, 媒体条目ID: item.id, 媒体源数量: sources.length, 请求播放路由: input.route ?? "auto", 直放相对路径: String(sources[0]?.DirectStreamUrl ?? "").split("?", 1)[0] ?? "", 地址是否携带鉴权: true, 是否允许中转: Number(service.emby_relay_playback_enabled) === 1 });

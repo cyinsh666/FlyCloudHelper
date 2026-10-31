@@ -14,6 +14,8 @@ import {
   type ProviderEnumerationOptions,
   type ProviderEnumerationWarning,
   type ProviderFileStreamAccess,
+  type ProviderFileOrganizer,
+  type ProviderMutationResult,
   type ProviderValidationResult,
   type ScanRoot,
   createProviderRecommendedScanSettings,
@@ -177,6 +179,30 @@ function readGuangyaCheckpoint(value: Record<string, unknown> | null | undefined
 
 /** 光鸭 Provider 按登录类型分流官方开放平台与网页文件 API。 */
 export class GuangyaProvider implements ProviderAdapter {
+  /** 光鸭网页扫码和短信连接的服务级写能力；官方开放平台连接不开放。 */
+  public readonly fileOrganizer: ProviderFileOrganizer = {
+    supports: (connection) => this.isWebOrganizeConnection(connection),
+    createDirectory: (connection, parentId, name, context) => this.mutateOrganizeFile(connection, "/userres/v1/file/create_dir",
+      { dirName: name, parentId: toWebApiParentId(parentId), failIfNameExist: true }, context),
+    rename: (connection, resourceId, name, context) => this.mutateOrganizeFile(connection, "/userres/v1/file/rename",
+      { fileId: resourceId, newName: name }, context),
+    move: (connection, resourceId, parentId, context) => this.mutateOrganizeFile(connection, "/userres/v1/file/move_file",
+      { fileIds: [resourceId], parentId: toWebApiParentId(parentId) }, context),
+    copy: (connection, resourceId, parentId, context) => this.mutateOrganizeFile(connection, "/userres/v1/file/copy_file",
+      { fileIds: [resourceId], parentId: toWebApiParentId(parentId) }, context),
+    remove: (connection, resourceId, context) => this.mutateOrganizeFile(connection, "/userres/v1/file/delete_file",
+      { fileIds: [resourceId] }, context),
+    taskStatus: async (connection, taskId, context) => {
+      this.requireWebOrganizeConnection(connection);
+      const result = await this.webClient.mutateFile(connection, "/userres/v1/get_task_status", { taskId }, context?.persistConnection);
+      const status = Number(result.status ?? result.taskStatus ?? -1);
+      if (status === 0) return "pending";
+      if (status === 1) return "running";
+      if (status === 2) return "completed";
+      if (status === 3) return "failed";
+      throw new ApiError(503, "guangya_task_status_unknown", "光鸭文件任务状态无法识别");
+    },
+  };
   public readonly descriptor: ProviderDescriptor = {
     type: "guangya",
     displayName: "光鸭云盘",
@@ -205,6 +231,29 @@ export class GuangyaProvider implements ProviderAdapter {
     private readonly webClient: GuangyaWebApiClient,
     private readonly openApiClient: GuangyaOpenApiClient,
   ) {}
+
+  /** 仅允许已验证的网页扫码／短信连接使用文件写接口。 */
+  private isWebOrganizeConnection(connection: Record<string, unknown>): boolean {
+    return connection.authMode === "web_qr" || connection.authMode === "web_sms";
+  }
+
+  /** 对不支持的连接明确拒绝，防止官方模式误走网页文件接口。 */
+  private requireWebOrganizeConnection(connection: Record<string, unknown>): void {
+    if (!this.isWebOrganizeConnection(connection)) {
+      throw new ApiError(422, "organize_auth_mode_unsupported", "当前光鸭登录方式不支持影片整理");
+    }
+  }
+
+  /** 将光鸭网页写响应转换为公共文件操作结果。 */
+  private async mutateOrganizeFile(
+    connection: Record<string, unknown>, path: string, body: JsonRecord, context?: ProviderConnectionContext,
+  ): Promise<ProviderMutationResult> {
+    this.requireWebOrganizeConnection(connection);
+    const result = await this.webClient.mutateFile(connection, path, body, context?.persistConnection);
+    const resourceId = readFirstText(result, ["fileId", "id"]);
+    const taskId = readFirstText(result, ["taskId", "task_id"]);
+    return { ...(resourceId ? { resourceId } : {}), ...(taskId ? { taskId } : {}) };
+  }
 
   /** 使用对应登录类型的根目录列表验证连接。 */
   public async validateConnection(

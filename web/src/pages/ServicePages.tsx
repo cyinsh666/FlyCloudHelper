@@ -6,6 +6,7 @@ import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/Console
 import { AdminServiceFilters } from "@/components/AdminServiceFilters";
 import { GuangyaAuthorizationPanel } from "@/components/GuangyaAuthorizationPanel";
 import { CloudAuthorizationPanel } from "@/components/CloudAuthorizationPanel";
+import { BaiduWebLoginPanel } from "@/components/BaiduWebLoginPanel";
 import { ProviderConnectionGuide } from "@/components/ProviderConnectionGuide";
 import { getProviderSelectionDescription, ProviderSelectionIcon, SelectableServiceOption } from "@/components/ServiceCreateSelection";
 import { ServiceConnectionAlert, ServiceStateDot, ServiceStatePill, getServiceConnectionIssue } from "@/components/ServiceConnectionStatus";
@@ -421,6 +422,7 @@ export function ServiceConnectionPage({ serviceId, admin = false }: { serviceId:
           ) : !providers.loading && <p className="text-sm text-destructive">当前网盘类型缺少连接描述</p>}
         </Panel>
       </div>
+      {service.providerType === "baidupan" && <div className="mt-4"><BaiduWebLoginPanel serviceId={service.id} admin={admin} /></div>}
     </>
   );
 }
