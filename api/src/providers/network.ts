@@ -1,7 +1,8 @@
 import { acquireMusicBudget } from "./request-budget.js";
 import dns from "node:dns/promises";
-import http, { type IncomingHttpHeaders, type IncomingMessage } from "node:http";
+import http, { type ClientRequest, type IncomingHttpHeaders, type IncomingMessage } from "node:http";
 import https from "node:https";
+import { pipeline } from "node:stream/promises";
 import type { LookupFunction } from "node:net";
 import { ApiError } from "../errors.js";
 
@@ -232,6 +233,31 @@ export async function validateProviderUrl(
   return (await resolveProviderUrl(rawUrl, options)).url;
 }
 
+/** WebDAV 不支持服务端 COPY 时，以背压流上传文件，目标仍固定到已校验的 DNS 地址。 */
+export async function providerUploadStream(
+  url: string | URL, source: IncomingMessage, headers: Record<string, string>, options: ProviderNetworkOptions,
+): Promise<void> {
+  const target = await resolveProviderUrl(url, options);
+  const transport = target.url.protocol === "https:" ? https : http;
+  let request: ClientRequest;
+  const response = new Promise<number>((resolve, reject) => {
+    request = transport.request(target.url, {
+      method: "PUT", headers, lookup: createPinnedProviderLookup(target),
+    }, (incoming) => {
+      const status = incoming.statusCode ?? 500;
+      incoming.resume();
+      incoming.once("end", () => resolve(status));
+      incoming.once("error", reject);
+    });
+    request.setTimeout(30_000, () => request.destroy(new Error("provider_upload_idle_timeout")));
+    request.once("error", reject);
+  });
+  const [status] = await Promise.all([response, pipeline(source, request!)]);
+  if (status < 200 || status >= 300) {
+    throw new ApiError(502, "provider_upload_failed", `WebDAV 流式复制失败，状态码 ${status}`);
+  }
+}
+
 /** 把当前内置 Provider 支持的请求体转换为原生 HTTP 可写数据。 */
 function toRequestBody(body: RequestInit["body"]): string | Uint8Array | undefined {
   if (body === undefined || body === null) {
@@ -373,11 +399,12 @@ export async function providerFetch(
   init: RequestInit,
   options: ProviderNetworkOptions,
   parentSignal?: AbortSignal,
+  timeoutMs = 30_000,
 ): Promise<Response> {
   const timeoutController = new AbortController();
   const startedAt = Date.now();
   let resolvedTarget: ResolvedProviderUrl | null = null;
-  const timeout = setTimeout(() => timeoutController.abort(), 30_000);
+  const timeout = setTimeout(() => timeoutController.abort(), timeoutMs);
   const abortParent = () => timeoutController.abort();
   parentSignal?.addEventListener("abort", abortParent, { once: true });
   if (parentSignal?.aborted) abortParent();
@@ -529,6 +556,7 @@ export async function providerProbeStream(
   init: RequestInit,
   options: ProviderNetworkOptions,
   parentSignal?: AbortSignal,
+  timeoutMs = 30_000,
 ): Promise<ProviderStreamResponse> {
   const requestController = new AbortController();
   let resolvedTarget: ResolvedProviderUrl | null = null;
@@ -537,7 +565,7 @@ export async function providerProbeStream(
   const timeout = setTimeout(() => {
     connectionTimedOut = true;
     requestController.abort();
-  }, 30_000);
+  }, timeoutMs);
   const abortParent = () => requestController.abort();
   parentSignal?.addEventListener("abort", abortParent, { once: true });
   if (parentSignal?.aborted) abortParent();

@@ -70,6 +70,7 @@ import {
 } from "./scan-failure-report-service.js";
 import { CredentialVault } from "./secrets.js";
 import { loadMusicSourceSettings } from "./system-settings.js";
+import type { ProtocolImageCache } from "./media/image-cache.js";
 import {
   buildAggregateScanCompletionMessage,
   buildScanCompletionMessage,
@@ -508,6 +509,7 @@ export class ScanWorker {
   private readonly providers: ProviderRegistry;
   private readonly vault: CredentialVault;
   private readonly tmdb: TmdbKeyPool;
+  private readonly imageCache: ProtocolImageCache;
   private readonly musicBrainz: MusicBrainzClient;
   private readonly musicPlatforms: MusicPlatformAggregator;
   private readonly plugins: MetadataPluginManager;
@@ -526,6 +528,7 @@ export class ScanWorker {
     providers: ProviderRegistry;
     vault: CredentialVault;
     tmdb: TmdbKeyPool;
+    imageCache: ProtocolImageCache;
     musicBrainz: MusicBrainzClient;
     plugins: MetadataPluginManager;
     aiModels: AiModelManager;
@@ -538,6 +541,7 @@ export class ScanWorker {
     this.providers = input.providers;
     this.vault = input.vault;
     this.tmdb = input.tmdb;
+    this.imageCache = input.imageCache;
     this.musicBrainz = input.musicBrainz;
     this.musicPlatforms = new MusicPlatformAggregator(input.musicBrainz, input.logger, input.config.musicbrainzUserAgent);
     this.plugins = input.plugins;
@@ -3336,6 +3340,16 @@ export class ScanWorker {
       });
     }
     const matched = metadata.matchState === "matched";
+    if (input.descriptor.mediaType === "video") {
+      // 图片预取不阻塞扫描；父作品和当前条目共用协议图片缓存。
+      const parentLogoUrl = metadata.parent?.metadata.logoUrl; // 关键变量：父作品 Logo 可能只存在于父条目元数据中。
+      this.imageCache.warm([
+        metadata.posterUrl, metadata.backdropUrl,
+        typeof metadata.metadata.logoUrl === "string" ? metadata.metadata.logoUrl : null,
+        metadata.parent?.posterUrl, metadata.parent?.backdropUrl,
+        typeof parentLogoUrl === "string" ? parentLogoUrl : null,
+      ]);
+    }
     return {
       changedItemIds,
       matched,

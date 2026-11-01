@@ -6,6 +6,7 @@ import { hashSessionToken } from "./auth.js";
 import { parseJsonObject, type MediaItemRecord, type VideoRegionGroup } from "./domain.js";
 import { ApiError } from "./errors.js";
 import type { ApiRuntime } from "./runtime.js";
+import type { CollageLibrary } from "./media/protocol-collage.js";
 import { hydrateRealtimeVideoDetails } from "./media/realtime-video-details.js";
 import { getProtocolUserImageTag } from "./media/protocol-user-image.js";
 import { prepareNextEpisodeResume } from "./media/episode-resume.js";
@@ -330,9 +331,38 @@ export class EmbyCompatibilityService {
     const items = await Promise.all(definitions.map(async (library) => {
       const result = await this.readLibraryCatalog(context, library);
       const cover = result.items.find((item) => Boolean(item.posterUrl)) ?? result.items.find((item) => Boolean(item.backdropUrl));
-      return this.mapLibrary(context, library, result.total, cover);
+      const mapped = this.mapLibrary(context, library, result.total, cover);
+      const collageTag = await this.runtime.protocolCollage.getCoverTag(context.libraryId, "emby", library.id);
+      if (collageTag) {
+        mapped.ImageTags = { Primary: collageTag };
+        mapped.PrimaryImageTag = collageTag;
+        mapped.PrimaryImageItemId = library.id;
+      }
+      return mapped;
     }));
     return { Items: items, TotalRecordCount: items.length, StartIndex: 0 };
+  }
+
+  /** 拼贴只读取当前虚拟库前 60 部作品；普通 Views 查询仍保持原来的轻量读取。 */
+  public async listCollageLibraries(context: EmbyLibraryContext): Promise<CollageLibrary[]> {
+    const definitions = this.libraryDefinitions(context);
+    const results = await Promise.allSettled(definitions.map(async (library): Promise<CollageLibrary> => {
+      const catalog = await this.readLibraryCatalog(context, library, 60);
+      const seen = new Set<string>();
+      const posterUrls = catalog.items.filter((item) => item.itemType !== "video.episode" && Boolean(item.posterUrl))
+        .filter((item) => {
+          const identity = item.externalIds.tmdb ? `${item.itemType}:${item.externalIds.tmdb}` : item.id;
+          if (seen.has(identity)) return false;
+          seen.add(identity);
+          return true;
+        }).map((item) => item.posterUrl as string);
+      return { id: library.id, title: library.name, subtitle: library.collectionType === "movies" ? "MOVIES" : "TV SHOWS", posterUrls };
+    }));
+    return results.flatMap((result, index) => {
+      if (result.status === "fulfilled") return [result.value];
+      console.error("Emby 媒体库拼贴候选读取失败", { 媒体库ID: context.libraryId, 虚拟库ID: definitions[index]?.id, 错误: result.reason });
+      return [];
+    });
   }
 
   /** 源分类与普通搜索按源窗口分页；用户状态、复杂筛选和最新内容保留本地目录。 */
@@ -468,7 +498,14 @@ export class EmbyCompatibilityService {
     if (library && isContentSourceLibrary(context.libraryKind)) {
       const result = await this.readLibraryCatalog(context, library);
       const cover = result.items.find((item) => Boolean(item.posterUrl)) ?? result.items.find((item) => Boolean(item.backdropUrl));
-      return this.mapLibrary(context, library, result.total, cover);
+      const mapped = this.mapLibrary(context, library, result.total, cover);
+      const collageTag = await this.runtime.protocolCollage.getCoverTag(context.libraryId, "emby", library.id);
+      if (collageTag) {
+        mapped.ImageTags = { Primary: collageTag };
+        mapped.PrimaryImageTag = collageTag;
+        mapped.PrimaryImageItemId = library.id;
+      }
+      return mapped;
     }
     const person = await this.getPersonItem(context, itemId);
     return person ?? this.getItem(context, itemId);
@@ -1033,11 +1070,11 @@ export class EmbyCompatibilityService {
   }
 
   /** 只读取已建立目录的分类统计与封面，Views 和图片不会触发源站分页。 */
-  private async readLibraryCatalog(context: EmbyLibraryContext, library: EmbyLibraryDefinition): Promise<{ total: number; items: MediaItemRecord[] }> {
+  private async readLibraryCatalog(context: EmbyLibraryContext, library: EmbyLibraryDefinition, limit = 1): Promise<{ total: number; items: MediaItemRecord[] }> {
     if (!isContentSourceLibrary(context.libraryKind)) {
       return this.runtime.repository.listCatalogItems({ userId: context.ownerUserId, libraryId: context.libraryId,
         mediaType: "video", itemType: library.itemType, regionGroup: library.regionGroup,
-        sort: "updated_desc", limit: 1, offset: 0, includeFileCounts: false });
+        sort: "updated_desc", limit, offset: 0, includeFileCounts: false });
     }
     const entries = await this.catalogSort.load({ ...context, accountId: "", accessToken: "" }, {
       stateProtocol: "emby",

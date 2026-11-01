@@ -5,6 +5,8 @@ import { buildJellyfinPath, validateJellyfinPathSuffix } from "../jellyfin-path.
 import { buildEmbyPath, validateEmbyPathSuffix } from "../emby-path.js";
 import { buildNavidromePath, validateNavidromePathSuffix } from "../navidrome-path.js";
 import type { ApiRuntime } from "../runtime.js";
+import { JellyfinCompatibilityService, type JellyfinLibraryContext } from "../jellyfin-service.js";
+import { EmbyCompatibilityService, type EmbyLibraryContext } from "../emby-service.js";
 
 /** 校验媒体库归属；聚合库和在线库使用库本身作为协议配置日志主体。 */
 async function requireManagedLibrary(runtime: ApiRuntime, request: FastifyRequest, libraryId: string, admin: boolean) {
@@ -82,6 +84,7 @@ async function buildLibraryAccessSettings(runtime: ApiRuntime, libraryId: string
     jellyfinRelayPlaybackEnabled: Number(library.jellyfin_relay_playback_enabled) === 1,
     jellyfinDownloadEnabled: library.jellyfin_download_enabled === undefined || Number(library.jellyfin_download_enabled) === 1,
     jellyfinRegionLibrariesEnabled: Number(library.jellyfin_region_libraries_enabled) === 1,
+    jellyfinCollageCoverEnabled: await runtime.protocolCollage.isEnabled(libraryId, "jellyfin"),
     jellyfinEnabled: Number(library.jellyfin_enabled) === 1,
     jellyfinUrl: await runtime.publicAccess.buildJellyfinUrl(jellyfinPathSuffix),
     jellyfinPath: buildJellyfinPath(jellyfinPathSuffix),
@@ -93,6 +96,7 @@ async function buildLibraryAccessSettings(runtime: ApiRuntime, libraryId: string
     embyRelayPlaybackEnabled: Number(library.emby_relay_playback_enabled) === 1,
     embyDownloadEnabled: library.emby_download_enabled === undefined || Number(library.emby_download_enabled) === 1,
     embyRegionLibrariesEnabled: Number(library.emby_region_libraries_enabled) === 1,
+    embyCollageCoverEnabled: await runtime.protocolCollage.isEnabled(libraryId, "emby"),
     embyAccounts,
     navidromeSupported,
     navidromeRelayPlaybackEnabled: Number(library.navidrome_relay_playback_enabled ?? 1) === 1,
@@ -102,6 +106,24 @@ async function buildLibraryAccessSettings(runtime: ApiRuntime, libraryId: string
     navidromePathSuffix,
     account,
     accounts,
+  };
+}
+
+/** 设置保存时按当前协议分组构造媒体库上下文，协议尚未开启时也能预先制作封面。 */
+async function collageLibraryContext(runtime: ApiRuntime, libraryId: string, protocol: "jellyfin" | "emby"):
+  Promise<JellyfinLibraryContext | EmbyLibraryContext> {
+  const library = await runtime.repository.getLibrary(libraryId);
+  const row = await runtime.database.query("media_libraries")
+    .select("jellyfin_region_libraries_enabled", "emby_region_libraries_enabled").where({ id: libraryId }).first();
+  const categoryDefinitions = library.libraryKind === "content_source_video"
+    ? await runtime.contentSources.listLibraryCategoryDefinitions(libraryId, library.userId) : undefined;
+  return {
+    serviceId: library.sourceServiceId || library.id,
+    ownerUserId: library.userId,
+    libraryId,
+    libraryKind: library.libraryKind,
+    regionLibrariesEnabled: Number(protocol === "jellyfin" ? row?.jellyfin_region_libraries_enabled : row?.emby_region_libraries_enabled) === 1,
+    sourceCategoryDefinitions: categoryDefinitions,
   };
 }
 
@@ -229,6 +251,16 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
 
     server.patch<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(`${prefix}/:libraryId/jellyfin-settings`, async (request) => {
       const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
+      if (request.body.jellyfinCollageCoverEnabled !== undefined) {
+        if (typeof request.body.jellyfinCollageCoverEnabled !== "boolean" || Object.keys(request.body).length !== 1) {
+          throw new ApiError(422, "jellyfin_collage_setting_invalid", "拼贴封面开关必须单独提交布尔值");
+        }
+        const enabled = request.body.jellyfinCollageCoverEnabled;
+        await runtime.protocolCollage.setEnabled(library.id, "jellyfin", enabled,
+          async () => new JellyfinCompatibilityService(runtime).listCollageLibraries(
+            await collageLibraryContext(runtime, library.id, "jellyfin")));
+        return { settings: await buildLibraryAccessSettings(runtime, library.id) };
+      }
       if (library.libraryKind === "content_source_music" && request.body.jellyfinEnabled === true) throw new ApiError(422, "content_music_navidrome_only", "在线音乐源请使用 Navidrome 协议");
       const changesJellyfinEnabled = request.body.jellyfinEnabled !== undefined;
       const changesPathSuffix = request.body.jellyfinPathSuffix !== undefined;
@@ -314,6 +346,16 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
     /** 保存独立 Emby 协议开关、地址、下载和地区虚拟媒体库设置。 */
     server.patch<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(`${prefix}/:libraryId/emby-settings`, async (request) => {
       const { operator, service, library } = await requireManagedLibrary(runtime, request, request.params.libraryId, admin);
+      if (request.body.embyCollageCoverEnabled !== undefined) {
+        if (typeof request.body.embyCollageCoverEnabled !== "boolean" || Object.keys(request.body).length !== 1) {
+          throw new ApiError(422, "emby_collage_setting_invalid", "拼贴封面开关必须单独提交布尔值");
+        }
+        const enabled = request.body.embyCollageCoverEnabled;
+        await runtime.protocolCollage.setEnabled(library.id, "emby", enabled,
+          async () => new EmbyCompatibilityService(runtime).listCollageLibraries(
+            await collageLibraryContext(runtime, library.id, "emby")));
+        return { settings: await buildLibraryAccessSettings(runtime, library.id) };
+      }
       if (library.libraryKind === "content_source_music" && request.body.embyEnabled === true) throw new ApiError(422, "content_music_navidrome_only", "在线音乐源请使用 Navidrome 协议");
       const changesEnabled = request.body.embyEnabled !== undefined;
       const changesPathSuffix = request.body.embyPathSuffix !== undefined;

@@ -1,8 +1,9 @@
 import { loadEnumerationPage } from "./types.js";
+import path from "node:path";
 import { XMLParser } from "fast-xml-parser";
 import { ApiError } from "../errors.js";
 import { isFlymbyExcludedFolderName } from "../media/flymby-scan-exclusions.js";
-import { providerFetch, validateProviderUrl, type ProviderNetworkOptions } from "./network.js";
+import { providerFetch, providerProbeStream, providerStream, providerUploadStream, validateProviderUrl, type ProviderNetworkOptions } from "./network.js";
 import {
   type ProviderAdapter,
   type ProviderBrowseListing,
@@ -13,7 +14,9 @@ import {
   type ProviderEnumerationCheckpoint,
   type ProviderEnumerationWarning,
   type ProviderFileAccess,
+  type ProviderFileOrganizer,
   type ProviderFileStreamAccess,
+  type ProviderMutationResult,
   type ProviderValidationResult,
   type ScanRoot,
   createProviderRecommendedScanSettings,
@@ -98,6 +101,17 @@ function readWebDavCheckpoint(value: Record<string, unknown> | null | undefined)
 
 /** 标准 RFC 4918 WebDAV Provider。 */
 export class WebDavProvider implements ProviderAdapter {
+  /** WebDAV 使用相对连接根的路径作为资源 ID；写入后返回新路径供整理器核验。 */
+  public readonly fileOrganizer: ProviderFileOrganizer = {
+    supports: (connection) => typeof connection.baseUrl === "string" && Boolean(connection.baseUrl.trim()),
+    createDirectory: (connection, parentId, name) => this.organizeCreateDirectory(connection, parentId, name),
+    rename: (connection, resourceId, name) => this.organizeTransfer(connection, "MOVE", resourceId,
+      path.posix.dirname(resourceId), name),
+    move: (connection, resourceId, parentId) => this.organizeTransfer(connection, "MOVE", resourceId, parentId),
+    copy: (connection, resourceId, parentId) => this.organizeTransfer(connection, "COPY", resourceId, parentId),
+    remove: (connection, resourceId) => this.organizeRemove(connection, resourceId),
+    taskStatus: async () => "completed",
+  };
   public readonly descriptor: ProviderDescriptor = {
     type: "webdav",
     displayName: "WebDAV",
@@ -129,6 +143,109 @@ export class WebDavProvider implements ProviderAdapter {
 
   public constructor(networkOptions: ProviderNetworkOptions) {
     this.networkOptions = networkOptions;
+  }
+
+  /** 校验写入路径并转换成配置根目录内的 WebDAV URL。 */
+  private organizeUrl(baseUrl: URL, resourceId: string): URL {
+    const segments = resourceId.split("/").filter(Boolean);
+    if (!resourceId.startsWith("/") || resourceId.startsWith("//") || resourceId.includes("\\")
+      || segments.some((segment) => segment === "." || segment === ".." || /[\u0000-\u001f]/u.test(segment))) {
+      throw new ApiError(422, "webdav_organize_path_invalid", "WebDAV 整理路径无效");
+    }
+    const basePath = decodePath(baseUrl.pathname).replace(/\/+$/u, "");
+    return this.resolveEnumeratedPath(baseUrl, `${basePath}/${segments.join("/")}`);
+  }
+
+  /** 创建单个目录；已有目录由公共整理流程通过目录列表复用。 */
+  private async organizeCreateDirectory(connection: Record<string, unknown>, parentId: string, name: string): Promise<ProviderMutationResult> {
+    this.requireOrganizeName(name);
+    const baseUrl = await validateProviderUrl(requireConnectionString(connection, "baseUrl", "WebDAV 地址"), this.networkOptions);
+    const resourceId = path.posix.join(parentId, name);
+    await providerFetch(this.organizeUrl(baseUrl, resourceId), {
+      method: "MKCOL", headers: this.createAuthorizationHeaders(connection),
+    }, this.networkOptions);
+    return { resourceId };
+  }
+
+  /** MOVE 和 COPY 均使用同源 Destination；COPY 不受支持时按 LitePan 的顺序流式复制。 */
+  private async organizeTransfer(connection: Record<string, unknown>, method: "MOVE" | "COPY",
+    resourceId: string, parentId: string, newName?: string): Promise<ProviderMutationResult> {
+    if (resourceId === "/") throw new ApiError(422, "webdav_organize_root_invalid", "不能整理 WebDAV 根目录");
+    const name = newName ?? path.posix.basename(resourceId);
+    this.requireOrganizeName(name);
+    const targetId = path.posix.join(parentId, name);
+    if (targetId === resourceId) throw new ApiError(422, "webdav_organize_same_path", "来源和目标路径相同");
+    const baseUrl = await validateProviderUrl(requireConnectionString(connection, "baseUrl", "WebDAV 地址"), this.networkOptions);
+    const sourceUrl = this.organizeUrl(baseUrl, resourceId);
+    const targetUrl = this.organizeUrl(baseUrl, targetId);
+    if (method === "COPY") {
+      const response = await providerProbeStream(sourceUrl, { method, headers: {
+        ...this.createAuthorizationHeaders(connection), Destination: targetUrl.href, Overwrite: "F",
+      } }, this.networkOptions, undefined, 300_000);
+      const status = response.statusCode;
+      response.body.destroy();
+      if (status === 405 || status === 501) {
+        // 405 也可能表示目标已存在；流式回退前再次确认，PUT 也要求目标不存在。
+        try {
+          await this.propfind(targetUrl, connection, "0");
+          throw new ApiError(409, "webdav_organize_target_exists", "WebDAV 目标已有同名内容");
+        } catch (error) {
+          if (!(error instanceof ApiError) || error.statusCode !== 404) throw error;
+        }
+        await this.organizeCopyByStream(connection, baseUrl, resourceId, targetId);
+      } else if (status < 200 || status >= 300 || status === 207) {
+        throw new ApiError(502, "webdav_organize_copy_failed", `WebDAV 复制失败，状态码 ${status}`);
+      }
+    } else {
+      const response = await providerFetch(sourceUrl, { method, headers: {
+        ...this.createAuthorizationHeaders(connection), Destination: targetUrl.href, Overwrite: "F",
+      } }, this.networkOptions, undefined, 300_000);
+      if (response.status === 207) throw new ApiError(502, "webdav_organize_move_partial", "WebDAV 移动返回了部分结果，请检查目标目录");
+    }
+    return { resourceId: targetId };
+  }
+
+  /** COPY 被服务端拒绝时逐文件流式搬运，目录递归创建，视频内容不进入内存缓冲。 */
+  private async organizeCopyByStream(connection: Record<string, unknown>, baseUrl: URL,
+    sourceId: string, targetId: string): Promise<void> {
+    const sourceUrl = this.organizeUrl(baseUrl, sourceId);
+    const entries = await this.propfind(sourceUrl, connection, "0");
+    if (entries[0]?.isDirectory) {
+      await providerFetch(this.organizeUrl(baseUrl, targetId), {
+        method: "MKCOL", headers: this.createAuthorizationHeaders(connection),
+      }, this.networkOptions);
+      const children = await this.browseEntries(connection, { resourceId: sourceId, displayPath: sourceId });
+      for (const child of children.items) {
+        await this.organizeCopyByStream(connection, baseUrl, child.resourceId, path.posix.join(targetId, child.name));
+      }
+      return;
+    }
+    const source = await providerStream(sourceUrl, { method: "GET", headers: {
+      ...this.createAuthorizationHeaders(connection), "Accept-Encoding": "identity",
+    } }, this.networkOptions);
+    try {
+      await providerUploadStream(this.organizeUrl(baseUrl, targetId), source.body,
+        { ...this.createAuthorizationHeaders(connection), "Content-Type": "application/octet-stream",
+          "If-None-Match": "*",
+          ...(source.headers["content-length"] ? { "Content-Length": String(source.headers["content-length"]) } : {}) }, this.networkOptions);
+    } finally { source.body.destroy(); }
+  }
+
+  /** 删除单项 WebDAV 资源，来源目录清理仍由公共流程先检查为空。 */
+  private async organizeRemove(connection: Record<string, unknown>, resourceId: string): Promise<ProviderMutationResult> {
+    if (resourceId === "/") throw new ApiError(422, "webdav_organize_root_invalid", "不能删除 WebDAV 根目录");
+    const baseUrl = await validateProviderUrl(requireConnectionString(connection, "baseUrl", "WebDAV 地址"), this.networkOptions);
+    await providerFetch(this.organizeUrl(baseUrl, resourceId), {
+      method: "DELETE", headers: this.createAuthorizationHeaders(connection),
+    }, this.networkOptions);
+    return {};
+  }
+
+  /** 文件名保持单段，避免 Destination 越过已选择的目标目录。 */
+  private requireOrganizeName(name: string): void {
+    if (!name || name === "." || name === ".." || /[/\\\u0000-\u001f]/u.test(name)) {
+      throw new ApiError(422, "webdav_organize_name_invalid", "WebDAV 文件名无效");
+    }
   }
 
   /** 使用 Depth:0 PROPFIND 验证连接和根目录访问。 */

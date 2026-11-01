@@ -12,6 +12,8 @@ import { FlyCloudHelperDatabase } from "./database.js";
 import { ApiError } from "./errors.js";
 import { MusicBrainzClient } from "./metadata/musicbrainz.js";
 import { TmdbMetadataCache } from "./metadata/tmdb-cache.js";
+import { ProtocolImageCache } from "./media/image-cache.js";
+import { ProtocolCollageService } from "./media/protocol-collage.js";
 import { TmdbKeyPool } from "./metadata/tmdb.js";
 import { MetadataPluginManager } from "./plugin-manager.js";
 import { ContentSourceManager } from "./content-sources/manager.js";
@@ -197,6 +199,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     });
   }
   const tmdbCache = new TmdbMetadataCache(database, logger);
+  const imageCache = new ProtocolImageCache(config.imageCacheDirectory);
+  const protocolCollage = new ProtocolCollageService(path.join(path.dirname(config.imageCacheDirectory), "protocol-collage"), imageCache);
   const tmdbBaseUrls = await loadTmdbBaseUrls(database); // 关键变量：启动时一次读取当前 TMDB API 与图片地址。
   const tmdb = new TmdbKeyPool(
     config,
@@ -232,6 +236,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     providers,
     vault,
     tmdb,
+    imageCache,
     musicBrainz,
     plugins,
     aiModels,
@@ -263,6 +268,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     providers,
     vault,
     tmdbCache,
+    imageCache,
+    protocolCollage,
     tmdb,
     musicBrainz,
     worker,

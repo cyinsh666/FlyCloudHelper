@@ -68,6 +68,7 @@ ENV NODE_ENV=production \
     FLYCLOUDHELPER_PLUGIN_DIR=/data/plugins \
     FLYCLOUDHELPER_PYTHON_PATH=python3 \
     FLYCLOUDHELPER_EXPORT_DIR=/data/exports \
+    FLYCLOUDHELPER_IMAGE_CACHE_DIR=/data/image-cache \
     FLYCLOUDHELPER_MIGRATION_DIR=/data/migrations \
     FLYCLOUDHELPER_MUSIC_ARTWORK_DIR=/data/music-artwork \
     FLYCLOUDHELPER_WEB_DIST_DIR=/app/web/dist \
@@ -96,7 +97,7 @@ RUN sed -i \
         -e 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g' \
         /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates chromium ffmpeg gosu python3 python3-requests python3-bs4 python3-pycryptodome python3-lxml python3-pyquery \
+    && apt-get install -y --no-install-recommends ca-certificates chromium ffmpeg fonts-noto-cjk gosu python3 python3-requests python3-bs4 python3-pycryptodome python3-lxml python3-pyquery \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /data/database /data/secrets /data/plugins /data/exports /data/migrations /data/music-artwork \
     && chown -R node:node /data

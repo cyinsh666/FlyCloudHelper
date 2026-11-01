@@ -7,6 +7,7 @@ import { parseJsonObject, type MediaItemRecord, type VideoRegionGroup } from "./
 import { JellyfinCatalogSort, readJellyfinSortQuery, type JellyfinSortEntry, type JellyfinSortFilters } from "./jellyfin-catalog-sort.js";
 import { ApiError } from "./errors.js";
 import type { ApiRuntime } from "./runtime.js";
+import type { CollageLibrary } from "./media/protocol-collage.js";
 import { hydrateRealtimeVideoDetails } from "./media/realtime-video-details.js";
 import { getProtocolUserImageTag } from "./media/protocol-user-image.js";
 import { prepareNextEpisodeResume } from "./media/episode-resume.js";
@@ -930,7 +931,17 @@ export class JellyfinCompatibilityService {
       if (library) {
         const catalog = await this.readLibraryCatalog(context, library);
         const cover = catalog.items.find((item) => Boolean(item.posterUrl)) ?? catalog.items.find((item) => Boolean(item.backdropUrl));
-        return this.mapLibrary(context, library, catalog.total, cover);
+        const mapped = this.mapLibrary(context, library, catalog.total, cover);
+        const collageTag = await this.runtime.protocolCollage.getCoverTag(context.libraryId, "jellyfin", library.id);
+        if (collageTag) {
+          mapped.ImageTags = { Primary: collageTag };
+          mapped.PrimaryImageTag = collageTag;
+          mapped.PrimaryImageItemId = library.id;
+          // 拼贴封面是横向图片；不再声明旧背景图，避免客户端优先展示旧图。
+          mapped.BackdropImageTags = [];
+          mapped.ParentBackdropItemId = undefined;
+        }
+        return mapped;
       }
     }
     const sourceItem = await this.runtime.repository.getCatalogItem(
@@ -974,14 +985,46 @@ export class JellyfinCompatibilityService {
   public async listLibraries(context: JellyfinContext) {
     const libraries = this.getLibraryDefinitions(context);
     const counts = await Promise.all(libraries.map((library) => this.readLibraryCatalog(context, library)));
-    const items = libraries.map((library, index) => {
+    const items = await Promise.all(libraries.map(async (library, index) => {
       const result = counts[index];
       // 关键变量：虚拟媒体库使用最近更新且真实拥有海报的条目作为封面，不生成无效的虚拟图片地址。
       const coverItem = result?.items.find((item) => Boolean(item.posterUrl))
         ?? result?.items.find((item) => Boolean(item.backdropUrl));
-      return this.mapLibrary(context, library, result?.total ?? 0, coverItem);
-    });
+      const mapped = this.mapLibrary(context, library, result?.total ?? 0, coverItem);
+      const collageTag = await this.runtime.protocolCollage.getCoverTag(context.libraryId, "jellyfin", library.id);
+      if (collageTag) {
+        mapped.ImageTags = { Primary: collageTag };
+        mapped.PrimaryImageTag = collageTag;
+        mapped.PrimaryImageItemId = library.id;
+        // 拼贴封面是横向图片；不再声明旧背景图，避免客户端优先展示旧图。
+        mapped.BackdropImageTags = [];
+        mapped.ParentBackdropItemId = undefined;
+      }
+      return mapped;
+    }));
     return { Items: items, TotalRecordCount: items.length, StartIndex: 0 };
+  }
+
+  /** 从每个标准虚拟媒体库读取封面候选，不访问客户端，也不改变列表条目。 */
+  public async listCollageLibraries(context: JellyfinLibraryContext): Promise<CollageLibrary[]> {
+    const definitions = this.getLibraryDefinitions(context);
+    const results = await Promise.allSettled(definitions.map(async (library): Promise<CollageLibrary> => {
+      const catalog = await this.readLibraryCatalog(context, library);
+      const seen = new Set<string>();
+      const posterUrls = catalog.items.filter((item) => item.itemType !== "video.episode" && Boolean(item.posterUrl))
+        .filter((item) => {
+          const identity = item.externalIds.tmdb ? `${item.itemType}:${item.externalIds.tmdb}` : item.id;
+          if (seen.has(identity)) return false;
+          seen.add(identity);
+          return true;
+        }).map((item) => item.posterUrl as string);
+      return { id: library.id, title: library.name, subtitle: library.collectionType === "movies" ? "MOVIES" : "TV SHOWS", posterUrls };
+    }));
+    return results.flatMap((result, index) => {
+      if (result.status === "fulfilled") return [result.value];
+      console.error("Jellyfin 媒体库拼贴候选读取失败", { 媒体库ID: context.libraryId, 虚拟库ID: definitions[index]?.id, 错误: result.reason });
+      return [];
+    });
   }
 
   /** 源分类浏览和普通搜索按需查源；账号筛选、复杂条件与最新内容仍使用本地目录。 */

@@ -6,7 +6,7 @@ import { buildJellyfinPath } from "../jellyfin-path.js";
 import { parseCompletedMediaProbeResult, readJellyfinRunTimeTicks } from "../media/media-probe.js";
 import { sendProtocolUserImage } from "../media/protocol-user-image.js";
 import { JellyfinCompatibilityService, type JellyfinContext, type JellyfinLibraryContext } from "../jellyfin-service.js";
-import { providerFetch, providerStream } from "../providers/network.js";
+import { providerStream } from "../providers/network.js";
 import type { ProviderConnectionContext, ProviderFileAccess } from "../providers/types.js";
 import type { ApiRuntime } from "../runtime.js";
 import { enqueueProtocolScan, listProtocolVirtualFolders } from "../protocol-scan-service.js";
@@ -397,6 +397,15 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
 
 /** 通过 Jellyfin 图片接口代理媒体库已经保存的公开 HTTP 图片。 */
 async function sendItemImage(runtime: ApiRuntime, compatibility: JellyfinCompatibilityService, context: JellyfinLibraryContext, request: FastifyRequest, reply: FastifyReply, itemId: string, imageType: string) {
+  if (imageType.toLowerCase() === "primary") {
+    const collage = await runtime.protocolCollage.getCover(context.libraryId, "jellyfin", itemId);
+    if (collage) {
+      reply.header("ETag", `"${collage.tag}"`).header("Content-Type", "image/jpeg").header("Cache-Control", "private, max-age=86400");
+      if (request.headers["if-none-match"] === `"${collage.tag}"`) return reply.status(304).send();
+      reply.header("Content-Length", collage.body.length);
+      return request.method === "HEAD" ? reply.send() : reply.send(collage.body);
+    }
+  }
   const imageSource = await compatibility.resolveImageSource(context, itemId, imageType);
   const rawUrl = imageSource.url;
   let imageUrl: URL;
@@ -410,26 +419,12 @@ async function sendItemImage(runtime: ApiRuntime, compatibility: JellyfinCompati
   if (request.headers["if-none-match"] === responseEtag) return reply.status(304).send();
   if (isSpiderProxyUrl(rawUrl)) return sendSpiderSourceImage(runtime, context, request, reply, imageSource);
   if (context.libraryKind === "content_source_video" && imageSource.sourceType === "media") return sendContentSourceHttpImage(request, reply, imageUrl);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10_000);
-  try {
-    const response = await providerFetch(imageUrl, { method: request.method === "HEAD" ? "HEAD" : "GET" }, {
-      // 图片 URL 已经是媒体库元数据的一部分；协议层同时兼容 NFO 中常见的 HTTP 图片地址。
-      allowInsecureHttp: true,
-    }, controller.signal);
-    if (!response.ok) throw new ApiError(502, "jellyfin_image_upstream_failed", "图片服务暂时不可用");
-    const length = Number(response.headers.get("content-length") ?? 0);
-    if (length > 20 * 1024 * 1024) throw new ApiError(413, "jellyfin_image_too_large", "图片文件过大");
-    const contentType = response.headers.get("content-type") ?? "image/jpeg";
-    if (!contentType.toLowerCase().startsWith("image/")) throw new ApiError(502, "jellyfin_image_content_invalid", "图片服务返回了非图片内容");
-    reply.header("Content-Type", contentType);
-    reply.header("Cache-Control", "private, max-age=86400");
-    if (length > 0) reply.header("Content-Length", length);
-    if (request.method === "HEAD") return reply.send();
-    const body = Buffer.from(await response.arrayBuffer());
-    if (body.length > 20 * 1024 * 1024) throw new ApiError(413, "jellyfin_image_too_large", "图片文件过大");
-    return reply.send(body);
-  } finally { clearTimeout(timer); }
+  // 旧媒体首次请求时写入本地；以后 Jellyfin 与 Emby 都直接读取同一张缓存图片。
+  const image = await runtime.imageCache.getOrFetch(rawUrl);
+  reply.header("Content-Type", image.contentType);
+  reply.header("Cache-Control", "private, max-age=86400");
+  reply.header("Content-Length", image.body.length);
+  return request.method === "HEAD" ? reply.send() : reply.send(image.body);
 }
 
 /** 将 Provider 原始媒体流转发给 Jellyfin 客户端，用途决定播放路线或强制原文件下载。 */

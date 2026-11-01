@@ -29,8 +29,13 @@ export class Cloud123Provider extends CloudDriveProviderBase {
     move: (connection, resourceId, parentId) => this.mutateOrganizeFile(connection, "/b/api/file/mod_pid",
       { fileIdList: [{ FileId: this.organizeNumericId(resourceId) }],
         parentFileId: this.organizeNumericId(parentId), event: "fileMove", operatePlace: "bottom", RequestSource: null }),
+    moveMany: (connection, resourceIds, parentId) => this.mutateOrganizeFile(connection, "/b/api/file/mod_pid",
+      { fileIdList: resourceIds.map((resourceId) => ({ FileId: this.organizeNumericId(resourceId) })),
+        parentFileId: this.organizeNumericId(parentId), event: "fileMove", operatePlace: "bottom", RequestSource: null }),
     copy: (connection, resourceId, parentId) => this.copyOrganizeFile(connection, resourceId, parentId),
+    copyMany: (connection, resourceIds, parentId) => this.copyOrganizeFiles(connection, resourceIds, parentId),
     remove: (connection, resourceId) => this.removeOrganizeFile(connection, resourceId),
+    removeMany: (connection, resourceIds) => this.removeOrganizeFiles(connection, resourceIds),
     taskStatus: (connection, taskId) => this.organizeTaskStatus(connection, taskId),
   };
   /** FlyCloudHelper 实例内所有123请求共享下一次允许发出的时间。 */
@@ -100,6 +105,56 @@ export class Cloud123Provider extends CloudDriveProviderBase {
       throw new ApiError(404, "cloud123_organize_file_missing", "123网盘文件已变化，请重新预览");
     }
     return file;
+  }
+
+  /** 一次读取同批文件的原始元数据，复制和回收站请求都需要这些字段。 */
+  private async loadOrganizeFiles(connection: Record<string, unknown>, resourceIds: string[]): Promise<Record<string, unknown>[]> {
+    const payload = await this.requestOrganizeMutation(connection, "/b/api/file/info", {
+      fileIdList: resourceIds.map((resourceId) => ({ fileId: this.organizeNumericId(resourceId) })),
+    });
+    const data = readCloudRecord(payload.data);
+    const items = Array.isArray(data.InfoList) ? data.InfoList : Array.isArray(data.infoList) ? data.infoList : [];
+    const files = new Map(items.map((value) => {
+      const file = readCloudRecord(value);
+      return [readCloudText(file, ["FileId", "fileId"]), file] as const;
+    }));
+    return resourceIds.map((resourceId) => {
+      const file = files.get(resourceId);
+      if (!file) throw new ApiError(404, "cloud123_organize_file_missing", "123网盘文件已变化，请重新预览");
+      return file;
+    });
+  }
+
+  /** 同目标目录批量复制；任务编号交由公共整理流程等待并核验。 */
+  private async copyOrganizeFiles(connection: Record<string, unknown>, resourceIds: string[], parentId: string): Promise<ProviderMutationResult> {
+    const files = await this.loadOrganizeFiles(connection, resourceIds);
+    const fileList = files.map((file, index) => {
+      const fileName = readCloudText(file, ["FileName", "fileName"]);
+      const sourceParentId = readCloudText(file, ["ParentFileId", "parentFileId"]);
+      if (!fileName || !sourceParentId) throw new ApiError(502, "cloud123_organize_file_invalid", "123网盘文件信息不完整，无法复制");
+      return { fileId: this.organizeNumericId(resourceIds[index]!), size: readCloudNumber(file.Size),
+        etag: readCloudText(file, ["Etag", "etag"]), type: Number(file.Type ?? 0),
+        parentFileId: this.organizeNumericId(sourceParentId), fileName, driveId: 0 };
+    });
+    const payload = await this.requestOrganizeMutation(connection, "/b/api/restful/goapi/v1/file/copy/async", {
+      fileList, targetFileId: this.organizeNumericId(parentId),
+    });
+    const taskId = readCloudText(readCloudRecord(payload.data), ["taskId"]);
+    if (!taskId) throw new ApiError(502, "cloud123_organize_task_missing", "123网盘复制任务未返回编号");
+    return { taskId };
+  }
+
+  /** 同批目标旧文件一次送入回收站。 */
+  private async removeOrganizeFiles(connection: Record<string, unknown>, resourceIds: string[]): Promise<ProviderMutationResult> {
+    const files = await this.loadOrganizeFiles(connection, resourceIds);
+    const fileTrashInfoList = files.map((file, index) => {
+      const fileName = readCloudText(file, ["FileName", "fileName"]);
+      const parentId = readCloudText(file, ["ParentFileId", "parentFileId"]);
+      if (!fileName || !parentId) throw new ApiError(502, "cloud123_organize_file_invalid", "123网盘文件信息不完整，无法删除");
+      return { FileId: this.organizeNumericId(resourceIds[index]!), FileName: fileName,
+        Type: Number(file.Type ?? 0), ParentFileId: this.organizeNumericId(parentId) };
+    });
+    return this.mutateOrganizeFile(connection, "/a/api/file/trash", { driveId: 0, fileTrashInfoList, operation: true });
   }
 
   /** 提交异步复制任务；必须带文件名、大小和来源父目录。 */

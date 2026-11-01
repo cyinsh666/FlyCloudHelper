@@ -65,12 +65,14 @@ export function LibraryEmbySettingsPage({ serviceId, admin = false }: { serviceI
   useEffect(() => { if (settings?.embyPathSuffix) setPathSuffix(settings.embyPathSuffix); }, [settings?.embyPathSuffix]);
 
   /** 保存一个布尔型 Emby 子配置，刷新后避免页面持有过期状态。 */
-  async function saveEmbySwitch(key: "embyDownloadEnabled" | "embyRegionLibrariesEnabled", title: string): Promise<void> {
+  async function saveEmbySwitch(key: "embyDownloadEnabled" | "embyRegionLibrariesEnabled" | "embyCollageCoverEnabled", title: string): Promise<void> {
     if (!settings || saving) return;
     setSaving(true);
     try {
       await updateServiceEmbySettings(serviceId, { [key]: !settings[key] }, admin);
-      setMessage(`${title}已${settings[key] ? "关闭" : "启用"}`);
+      setMessage(key === "embyCollageCoverEnabled" && !settings[key]
+        ? "拼贴封面已开启，正在后台生成；不足 8 部作品的媒体库将保留原封面"
+        : `${title}已${settings[key] ? "关闭" : "启用"}`);
       await resource.refresh();
     } catch (error) { setMessage(error instanceof Error ? error.message : `${title}保存失败`); } finally { setSaving(false); }
   }
@@ -184,7 +186,7 @@ export function LibraryEmbySettingsPage({ serviceId, admin = false }: { serviceI
     <Panel title="Emby 设置" description={isContentSource ? "在线内容支持自动、直连和中转，管理节目分类和协议服务地址。" : "协议播放、下载、分类和服务地址集中管理。"}>
       {isContentSource && <div className="mb-3"><ContentSourcePlaybackModeSettings key={`${serviceId}:${admin}:emby`} state={{ libraryId: serviceId, admin, protocol: "emby" }} /></div>}
       <div className="grid gap-2 md:grid-cols-3">
-        {[["中转播放", "关闭后优先使用网盘原始地址", settings.embyRelayPlaybackEnabled, toggleRelay], ["允许下载", "通过标准 Download 接口下载", settings.embyDownloadEnabled, () => saveEmbySwitch("embyDownloadEnabled", "Emby 影片下载")], ["节目地区分组", "拆分为国语、日韩、欧美和其他", settings.embyRegionLibrariesEnabled, () => saveEmbySwitch("embyRegionLibrariesEnabled", "Emby 节目地区分组")]].filter(([title]) => !isContentSource || title === "节目地区分组").map(([title, description, checked, action]) => <div key={String(title)} className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/35 px-3 py-2.5"><div className="min-w-0"><p className="text-sm font-medium">{String(title)}</p><p className="mt-0.5 truncate text-[11px] text-muted-foreground">{String(description)}</p></div><button type="button" role="switch" aria-checked={Boolean(checked)} disabled={saving} onClick={() => void (action as () => Promise<void>)()} className={`relative h-7 w-12 shrink-0 rounded-full border ${checked ? "border-primary bg-primary" : "border-border bg-secondary"}`}><span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white transition-transform ${checked ? "translate-x-5" : "translate-x-0"}`} /></button></div>)}
+        {[["中转播放", "关闭后优先使用网盘原始地址", settings.embyRelayPlaybackEnabled, toggleRelay], ["允许下载", "通过标准 Download 接口下载", settings.embyDownloadEnabled, () => saveEmbySwitch("embyDownloadEnabled", "Emby 影片下载")], ["节目地区分组", "拆分为国语、日韩、欧美和其他", settings.embyRegionLibrariesEnabled, () => saveEmbySwitch("embyRegionLibrariesEnabled", "Emby 节目地区分组")], ["使用拼贴封面图", "每库随机选取 8 部作品；关闭再开启会重新生成", settings.embyCollageCoverEnabled, () => saveEmbySwitch("embyCollageCoverEnabled", "Emby 拼贴封面")]].filter(([title]) => !isContentSource || title === "节目地区分组" || title === "使用拼贴封面图").map(([title, description, checked, action]) => <div key={String(title)} className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/35 px-3 py-2.5"><div className="min-w-0"><p className="text-sm font-medium">{String(title)}</p><p className="mt-0.5 truncate text-[11px] text-muted-foreground">{String(description)}</p></div><button type="button" role="switch" aria-checked={Boolean(checked)} disabled={saving} onClick={() => void (action as () => Promise<void>)()} className={`relative h-7 w-12 shrink-0 rounded-full border ${checked ? "border-primary bg-primary" : "border-border bg-secondary"}`}><span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white transition-transform ${checked ? "translate-x-5" : "translate-x-0"}`} /></button></div>)}
       </div>
       <div className="mt-3 grid gap-3 border-t border-border pt-3 xl:grid-cols-[minmax(0,3fr)_minmax(260px,2fr)]">
         <form className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center" onSubmit={(event) => void savePath(event)}>

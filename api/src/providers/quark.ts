@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { ApiError } from "../errors.js";
 import { CloudDriveProviderBase, type CloudDrivePage } from "./cloud-drive-base.js";
 import { parseCloudApiObject, readCloudNumber, readCloudRecord, readCloudText, readCloudTextFile, requestCloudApiText } from "./cloud-api.js";
@@ -9,14 +10,27 @@ import {
   waitForProviderSharedRateLimit,
   type ProviderNetworkOptions,
 } from "./network.js";
-import { type ProviderConnectionContext, type ProviderDescriptor, type ProviderEntry, type ProviderFileAccess, createProviderRecommendedScanSettings, requireConnectionString } from "./types.js";
+import { type ProviderConnectionContext, type ProviderDescriptor, type ProviderEntry, type ProviderFileAccess, type ProviderFileOrganizer, type ProviderMutationResult, createProviderRecommendedScanSettings, requireConnectionString } from "./types.js";
 
 const QUARK_API = "https://drive.quark.cn/1/clouddrive";
 const QUARK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4";
 
-/** 夸克网盘 Cookie 只读 Provider。 */
+/** 夸克网盘 Cookie Provider，目录浏览与文件整理共用凭据轮换。 */
 export class QuarkProvider extends CloudDriveProviderBase {
   protected readonly rootResourceId = "0";
+  /** 写接口与读取接口共用 Cookie 更新和业务错误处理。 */
+  public readonly fileOrganizer: ProviderFileOrganizer = {
+    supports: (connection) => typeof connection.cookie === "string" && Boolean(connection.cookie.trim()),
+    createDirectory: (connection, parentId, name, context) => this.createOrganizeDirectory(connection, parentId, name, context),
+    rename: (connection, resourceId, name, context) => this.renameOrganizeFile(connection, resourceId, name, context),
+    move: (connection, resourceId, parentId, context) => this.moveOrganizeFiles(connection, [resourceId], parentId, context),
+    moveMany: (connection, resourceIds, parentId, context) => this.moveOrganizeFiles(connection, resourceIds, parentId, context),
+    copy: (connection, resourceId, parentId, context) => this.copyOrganizeFiles(connection, [resourceId], parentId, context),
+    copyMany: (connection, resourceIds, parentId, context) => this.copyOrganizeFiles(connection, resourceIds, parentId, context),
+    remove: (connection, resourceId, context) => this.removeOrganizeFiles(connection, [resourceId], context),
+    removeMany: (connection, resourceIds, context) => this.removeOrganizeFiles(connection, resourceIds, context),
+    taskStatus: (connection, taskId, context) => this.organizeTaskStatus(connection, taskId, context),
+  };
   /** 同一账号的 Cookie 更新按响应到达顺序执行，避免连接副本互相覆盖。 */
   private readonly cookieMergeQueues = new Map<string, Promise<void>>();
   /** 保存进程内最新 Cookie，后续从旧密文解出的连接会先追上该快照。 */
@@ -31,6 +45,103 @@ export class QuarkProvider extends CloudDriveProviderBase {
   };
 
   public constructor(private readonly networkOptions: ProviderNetworkOptions) { super(); }
+
+  /** 夸克文件 ID 为稳定字符串，整理写入不能针对根目录。 */
+  private organizeIds(resourceIds: string[]): string[] {
+    if (!resourceIds.length || resourceIds.some((id) => !id || ["0", "/", "root"].includes(id))) {
+      throw new ApiError(422, "quark_organize_id_invalid", "夸克整理文件编号无效");
+    }
+    return resourceIds;
+  }
+
+  /** 对已有业务请求加上 PC 文件接口固定查询参数。 */
+  private async organizeRequest(connection: Record<string, unknown>, route: string, body: Record<string, unknown>,
+    context?: ProviderConnectionContext): Promise<Record<string, unknown>> {
+    const query = new URLSearchParams({ pr: "ucpro", fr: "pc" });
+    if (route === "/file/rename") query.set("uc_param_str", "");
+    return this.request(connection, `${QUARK_API}${route}?${query}`, {
+      method: "POST", body: JSON.stringify(body),
+    }, undefined, context);
+  }
+
+  /** 创建目录后稍等上游目录列表收敛，最终仍由整理器核对名称。 */
+  private async createOrganizeDirectory(connection: Record<string, unknown>, parentId: string, name: string,
+    context?: ProviderConnectionContext): Promise<ProviderMutationResult> {
+    if (!name || name === "." || name === ".." || /[/\\\u0000-\u001f]/u.test(name)) {
+      throw new ApiError(422, "quark_organize_name_invalid", "夸克目录名称无效");
+    }
+    const payload = await this.organizeRequest(connection, "/file", {
+      pdir_fid: parentId || "0", file_name: name, dir_init_lock: false, dir_path: "",
+    }, context);
+    await delay(500);
+    const resourceId = readCloudText(readCloudRecord(payload.data), ["fid"]);
+    return resourceId ? { resourceId } : {};
+  }
+
+  /** 通过批量接口移动文件，并等待目标目录出现全部文件 ID。 */
+  private async moveOrganizeFiles(connection: Record<string, unknown>, resourceIds: string[], parentId: string,
+    context?: ProviderConnectionContext): Promise<ProviderMutationResult> {
+    const ids = this.organizeIds(resourceIds);
+    await this.organizeRequest(connection, "/file/move", {
+      action_type: 1, exclude_fids: [], filelist: ids, to_pdir_fid: parentId || "0",
+    }, context);
+    await delay(500);
+    const expected = new Set(ids);
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const listing = await this.browseEntries(connection, { resourceId: parentId, displayPath: "/" }, undefined, context);
+      for (const entry of listing.items) expected.delete(entry.resourceId);
+      if (expected.size === 0) return {};
+      await delay(250);
+    }
+    throw new ApiError(503, "quark_organize_move_pending", "夸克移动已提交，目标目录尚未同步，请稍后继续整理任务");
+  }
+
+  /** 复制返回异步任务编号，由公共整理器等待任务完成。 */
+  private async copyOrganizeFiles(connection: Record<string, unknown>, resourceIds: string[], parentId: string,
+    context?: ProviderConnectionContext): Promise<ProviderMutationResult> {
+    const payload = await this.organizeRequest(connection, "/file/copy", {
+      filelist: this.organizeIds(resourceIds), to_pdir_fid: parentId || "0",
+    }, context);
+    const taskId = readCloudText(readCloudRecord(payload.data), ["task_id"]);
+    if (!taskId) throw new ApiError(502, "quark_organize_task_missing", "夸克复制任务未返回编号");
+    return { taskId };
+  }
+
+  /** 删除默认进入回收站，避免因整理覆盖而永久删除用户文件。 */
+  private async removeOrganizeFiles(connection: Record<string, unknown>, resourceIds: string[],
+    context?: ProviderConnectionContext): Promise<ProviderMutationResult> {
+    await this.organizeRequest(connection, "/file/delete", {
+      filelist: this.organizeIds(resourceIds), action_type: 1,
+    }, context);
+    await delay(500);
+    return {};
+  }
+
+  /** 改名后稍等上游目录列表收敛，文件身份仍由稳定 fid 定位。 */
+  private async renameOrganizeFile(connection: Record<string, unknown>, resourceId: string, name: string,
+    context?: ProviderConnectionContext): Promise<ProviderMutationResult> {
+    if (!name || name === "." || name === ".." || /[/\\\u0000-\u001f]/u.test(name)) {
+      throw new ApiError(422, "quark_organize_name_invalid", "夸克文件名称无效");
+    }
+    await this.organizeRequest(connection, "/file/rename", {
+      fid: this.organizeIds([resourceId])[0], file_name: name,
+    }, context);
+    await delay(500);
+    return {};
+  }
+
+  /** 读取复制任务状态，完成后由整理器按真实目标目录继续核验。 */
+  private async organizeTaskStatus(connection: Record<string, unknown>, taskId: string,
+    context?: ProviderConnectionContext): Promise<"pending" | "running" | "completed" | "failed"> {
+    const query = new URLSearchParams({ pr: "ucpro", fr: "pc", task_id: taskId, retry_index: "0" });
+    const payload = await this.request(connection, `${QUARK_API}/task?${query}`, { method: "GET" }, undefined, context);
+    const status = Number(readCloudRecord(payload.data).status);
+    if (status === 0) return "pending";
+    if (status === 1) return "running";
+    if (status === 2) return "completed";
+    if (status === 3) return "failed";
+    throw new ApiError(502, "quark_organize_task_invalid", "夸克复制任务状态无法识别");
+  }
 
   /** 验证夸克账号；UID 缺失时由根目录访问继续确认凭据。 */
   protected async loadAccountLabel(connection: Record<string, unknown>, signal?: AbortSignal, context?: ProviderConnectionContext): Promise<string | null> {

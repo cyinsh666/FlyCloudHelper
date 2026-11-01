@@ -162,8 +162,14 @@ export interface ProviderFileOrganizer {
   createDirectory(connection: Record<string, unknown>, parentId: string, name: string, context?: ProviderConnectionContext): Promise<ProviderMutationResult>;
   rename(connection: Record<string, unknown>, resourceId: string, name: string, context?: ProviderConnectionContext): Promise<ProviderMutationResult>;
   move(connection: Record<string, unknown>, resourceId: string, parentId: string, context?: ProviderConnectionContext): Promise<ProviderMutationResult>;
+  /** 支持同一目标目录批量移动的网盘可选实现；未实现者仍逐项处理。 */
+  moveMany?(connection: Record<string, unknown>, resourceIds: string[], parentId: string, context?: ProviderConnectionContext): Promise<ProviderMutationResult>;
   copy(connection: Record<string, unknown>, resourceId: string, parentId: string, context?: ProviderConnectionContext): Promise<ProviderMutationResult>;
+  /** 支持同一目标目录批量复制的网盘可选实现。 */
+  copyMany?(connection: Record<string, unknown>, resourceIds: string[], parentId: string, context?: ProviderConnectionContext): Promise<ProviderMutationResult>;
   remove(connection: Record<string, unknown>, resourceId: string, context?: ProviderConnectionContext): Promise<ProviderMutationResult>;
+  /** 支持一次删除多个同目录文件的网盘可选实现。 */
+  removeMany?(connection: Record<string, unknown>, resourceIds: string[], context?: ProviderConnectionContext): Promise<ProviderMutationResult>;
   taskStatus(connection: Record<string, unknown>, taskId: string, context?: ProviderConnectionContext): Promise<"pending" | "running" | "completed" | "failed">;
 }
 

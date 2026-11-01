@@ -1,8 +1,8 @@
-import { CalendarClock, Save } from "lucide-react";
+import { Play, Save } from "lucide-react";
 import { useState } from "react";
 import { PrimaryButton } from "@/components/ConsoleShell";
 import { Panel } from "@/components/ui-kit";
-import { updateServiceOrganizeSchedule, type OrganizeSchedule, type ProviderDirectory,
+import { runServiceOrganizeNow, updateServiceOrganizeSchedule, type OrganizeSchedule, type ProviderDirectory,
   type ScanScheduleType } from "@/lib/api";
 
 type IntervalUnit = "minute" | "hour" | "day";
@@ -45,7 +45,7 @@ function showTime(value: string | null): string { return value ? new Date(value)
 
 /** 与媒体库扫描一致的整理定时任务编辑卡片。 */
 export function ServiceOrganizeSchedule({ serviceId, admin, schedule, sources, target, mode,
-  unrecognizedTransferEnabled, unrecognizedDirectory, aiAssistEnabled, aiModelId, onSaved }: {
+  unrecognizedTransferEnabled, unrecognizedDirectory, aiAssistEnabled, aiModelId, activeJob, onSaved }: {
   serviceId: string;
   admin: boolean;
   schedule: OrganizeSchedule;
@@ -56,10 +56,12 @@ export function ServiceOrganizeSchedule({ serviceId, admin, schedule, sources, t
   unrecognizedDirectory: ProviderDirectory | null;
   aiAssistEnabled: boolean;
   aiModelId: string;
+  activeJob: boolean;
   onSaved: (next: OrganizeSchedule) => void;
 }) {
   const [form, setForm] = useState<ScheduleForm>(() => readForm(schedule));
   const [saving, setSaving] = useState(false);
+  const [starting, setStarting] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
   /** 保存来源、目标及周期；后台会在下次时间先识别再执行。 */
@@ -89,6 +91,19 @@ export function ServiceOrganizeSchedule({ serviceId, admin, schedule, sources, t
       setMessage("整理计划已保存");
     } catch (error) { setMessage(error instanceof Error ? error.message : "整理计划保存失败"); }
     finally { setSaving(false); }
+  }
+
+  /** 只使用已保存的目录与选项执行，避免未保存表单与后台任务配置不一致。 */
+  async function runNow(): Promise<void> {
+    if (starting || saving) return;
+    setStarting(true);
+    setMessage("正在启动整理…");
+    try {
+      const next = await runServiceOrganizeNow(serviceId, admin);
+      onSaved(next);
+      setMessage("已开始识别，完成后自动整理");
+    } catch (error) { setMessage(error instanceof Error ? error.message : "启动整理失败"); }
+    finally { setStarting(false); }
   }
 
   return <Panel title="影片整理定时任务" description="到点后自动识别来源目录，并整理可确认的影片；手动预览和执行不受暂停时段影响。">
@@ -143,9 +158,14 @@ export function ServiceOrganizeSchedule({ serviceId, admin, schedule, sources, t
       <p>执行时区：UTC{(() => { const offset = -new Date().getTimezoneOffset(); return `${offset >= 0 ? "+" : "-"}${String(Math.floor(Math.abs(offset) / 60)).padStart(2, "0")}:${String(Math.abs(offset) % 60).padStart(2, "0")}`; })()}</p>
       <p>下次执行：{showTime(schedule.nextRunAt)}</p><p>最近触发：{showTime(schedule.lastTriggeredAt)}</p>
       <p>最近任务：{schedule.lastJobId ?? "暂无"}</p>
+      {schedule.pendingPlanId && <p className="sm:col-span-2">正在识别，完成后自动整理</p>}
+      {!schedule.pendingPlanId && schedule.lastRunMessage && <p className="sm:col-span-2">最近结果：{schedule.lastRunMessage}</p>}
       {schedule.lastError && <p className="sm:col-span-2 text-destructive">最近错误：{schedule.lastError}</p>}
     </div>
-    <div className="mt-4 flex items-center gap-3"><PrimaryButton disabled={saving} onClick={() => void save()}><Save className="size-4" />{saving ? "正在保存…" : "保存计划"}</PrimaryButton>
+    <div className="mt-4 flex flex-wrap items-center gap-3"><PrimaryButton disabled={saving || starting} onClick={() => void save()}><Save className="size-4" />{saving ? "正在保存…" : "保存计划"}</PrimaryButton>
+      <PrimaryButton disabled={saving || starting || activeJob || Boolean(schedule.pendingPlanId) || !schedule.sources.length || !schedule.target}
+        onClick={() => void runNow()}><Play className="size-4" />{starting ? "正在启动…" : "立即执行整理"}</PrimaryButton>
+      <span className="text-xs text-muted-foreground">使用已保存的目录和选项；不受暂停时段影响。</span>
       {message && <span className="text-xs text-muted-foreground">{message}</span>}</div>
   </Panel>;
 }

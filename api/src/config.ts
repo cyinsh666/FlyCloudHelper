@@ -45,6 +45,8 @@ export interface ApiConfig {
   /** Python Spider 解释器路径；未配置时使用运行环境的 python3。 */
   pythonPath?: string;
   exportDirectory: string;
+  /** Jellyfin 与 Emby 共用的持久图片缓存目录。 */
+  imageCacheDirectory: string;
   /** 音频内嵌封面的内容寻址缓存目录。 */
   musicArtworkDirectory: string;
   webDistDirectory: string;
@@ -358,6 +360,7 @@ export function loadApiConfig(): ApiConfig {
     pluginDirectory: resolveProjectPath(readEnvironmentValue("FLYCLOUDHELPER_PLUGIN_DIR"), "data/plugins"),
     pythonPath: readEnvironmentValue("FLYCLOUDHELPER_PYTHON_PATH") || "python3",
     exportDirectory: resolveProjectPath(readEnvironmentValue("FLYCLOUDHELPER_EXPORT_DIR"), "data/exports"),
+    imageCacheDirectory: resolveProjectPath(readEnvironmentValue("FLYCLOUDHELPER_IMAGE_CACHE_DIR"), "data/image-cache"),
     musicArtworkDirectory: resolveProjectPath(
       readEnvironmentValue("FLYCLOUDHELPER_MUSIC_ARTWORK_DIR"),
       "data/music-artwork",

@@ -66,6 +66,16 @@ export interface OrganizeJobItem {
   backupParentId: string | null;
   /** 已提交给网盘、尚未确认完成的异步写任务。 */
   pendingTaskId: string | null;
+  /** 光鸭按 LitePan 执行链路直接提交到目标；旧任务没有该字段，继续走原流程。 */
+  directOperation?: "move" | "copy";
+  /** 同一次远端批量操作的文件共用标识，暂停时也要完成这一组的改名。 */
+  directBatchId?: string;
+  /** 删除旧目标、提交传输、改名三个阶段可在进程重启后继续。 */
+  directPhase?: "delete" | "transfer" | "rename";
+  /** 异步任务明确失败后最多逐项重试一次。 */
+  directRetryCount?: number;
+  /** 只有上游明确报告删除失败时才允许重试，避免网络未知状态下重复删除。 */
+  directDeleteFailed?: boolean;
   error: string | null;
 }
 
@@ -80,6 +90,19 @@ export interface OrganizeJob {
   stageDirectoryId: string | null;
   backupDirectoryId: string | null;
   items: OrganizeJobItem[];
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 后台任务页使用的精简整理任务，不传文件级流水和网盘凭据。 */
+export interface OrganizeTaskSummary {
+  id: string;
+  serviceId: string;
+  status: "preparing" | OrganizeJob["status"];
+  completedCount: number;
+  failedCount: number;
+  totalCount: number | null;
   error: string | null;
   createdAt: string;
   updatedAt: string;

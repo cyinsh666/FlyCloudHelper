@@ -40,7 +40,7 @@ export function ServiceOrganizePage({ serviceId, admin = false }: { serviceId: s
       .then(([result, jobs, savedSchedule, models]) => {
         if (!alive) return;
         setCapability(result);
-        setJob(jobs.items.find((item) => ["queued", "running", "paused", "failed"].includes(item.status)) ?? jobs.items[0] ?? null);
+        setJob(jobs.items.find((item) => ["queued", "running", "paused"].includes(item.status)) ?? jobs.items[0] ?? null);
         setSchedule(savedSchedule);
         setSources(savedSchedule.sources);
         setTargets(savedSchedule.target ? [savedSchedule.target] : []);
@@ -57,19 +57,19 @@ export function ServiceOrganizePage({ serviceId, admin = false }: { serviceId: s
 
   /** 自动任务在后台创建，页面显示时定期读取最近任务和下一次执行时间。 */
   useEffect(() => {
-    if (!schedule?.enabled) return undefined;
+    if (!schedule?.enabled && !schedule?.pendingPlanId) return undefined;
     let alive = true;
     const timer = window.setInterval(() => {
       void Promise.all([getServiceOrganizeSchedule(serviceId, admin), listServiceOrganizeJobs(serviceId, admin)])
         .then(([nextSchedule, jobs]) => {
           if (!alive) return;
           setSchedule(nextSchedule);
-          const latest = jobs.items.find((item) => ["queued", "running", "paused", "failed"].includes(item.status)) ?? jobs.items[0];
+          const latest = jobs.items.find((item) => ["queued", "running", "paused"].includes(item.status)) ?? jobs.items[0];
           if (latest) setJob(latest);
         }).catch((failure) => { if (alive) setError(failure instanceof Error ? failure.message : "刷新定时任务失败"); });
-    }, 30_000);
+    }, schedule.pendingPlanId ? 2500 : 30_000);
     return () => { alive = false; window.clearInterval(timer); };
-  }, [serviceId, admin, schedule?.enabled]);
+  }, [serviceId, admin, schedule?.enabled, schedule?.pendingPlanId]);
 
   /** 仅在后台预览仍运行时轮询；离开页面后立即停止。 */
   useEffect(() => {
@@ -198,7 +198,8 @@ export function ServiceOrganizePage({ serviceId, admin = false }: { serviceId: s
       {schedule && <ServiceOrganizeSchedule key={serviceId} serviceId={serviceId} admin={admin} schedule={schedule}
         sources={sources} target={targets[0] ?? null} mode={mode}
         unrecognizedTransferEnabled={unrecognizedTransferEnabled} unrecognizedDirectory={unrecognizedDirectories[0] ?? null}
-        aiAssistEnabled={aiAssistEnabled} aiModelId={aiModelId} onSaved={setSchedule} />}
+        aiAssistEnabled={aiAssistEnabled} aiModelId={aiModelId}
+        activeJob={Boolean(job && ["queued", "running", "paused"].includes(job.status))} onSaved={setSchedule} />}
       {plan && <Panel title="识别预览">
         {plan.status === "preparing" && <p className="flex items-center gap-2 text-sm text-muted-foreground"><LoaderCircle className="size-4 animate-spin" />正在扫描目录并匹配影片…</p>}
         {plan.status === "failed" && <p role="alert" className="text-sm text-destructive">{plan.error}</p>}
@@ -215,7 +216,7 @@ export function ServiceOrganizePage({ serviceId, admin = false }: { serviceId: s
             </div>)}
           </div>
           {plan.nextOffset !== null && <div className="mt-3"><SecondaryButton disabled={loadingMore} onClick={() => void loadMore()}>{loadingMore ? "读取中…" : "加载更多预览"}</SecondaryButton></div>}
-          <div className="mt-4"><PrimaryButton onClick={() => void execute()} disabled={busy || readyCount === 0 || Boolean(job && ["queued", "running", "paused", "failed"].includes(job.status))}>开始整理</PrimaryButton></div>
+          <div className="mt-4"><PrimaryButton onClick={() => void execute()} disabled={busy || readyCount === 0 || Boolean(job && ["queued", "running", "paused"].includes(job.status))}>开始整理</PrimaryButton></div>
         </>}
       </Panel>}
       {job && <Panel title="整理任务">

@@ -41,10 +41,16 @@ export class Cloud115Provider extends CloudDriveProviderBase {
       "/open/ufile/update", { file_id: resourceId, file_name: name }, context),
     move: (connection, resourceId, parentId, context) => this.mutateOrganizeFile(connection,
       "/open/ufile/move", { file_ids: resourceId, to_cid: parentId }, context),
+    moveMany: (connection, resourceIds, parentId, context) => this.mutateOrganizeFile(connection,
+      "/open/ufile/move", { file_ids: resourceIds.join(","), to_cid: parentId }, context),
     copy: (connection, resourceId, parentId, context) => this.mutateOrganizeFile(connection,
       "/open/ufile/copy", { file_id: resourceId, pid: parentId, nodupli: "0" }, context),
+    copyMany: (connection, resourceIds, parentId, context) => this.mutateOrganizeFile(connection,
+      "/open/ufile/copy", { file_id: resourceIds.join(","), pid: parentId, nodupli: "0" }, context),
     remove: (connection, resourceId, context) => this.mutateOrganizeFile(connection,
       "/open/ufile/delete", { file_ids: resourceId }, context),
+    removeMany: (connection, resourceIds, context) => this.mutateOrganizeFile(connection,
+      "/open/ufile/delete", { file_ids: resourceIds.join(",") }, context),
     taskStatus: async () => "completed",
   };
   /** 下一次允许发出115业务请求的时间；共享给本实例所有115服务。 */

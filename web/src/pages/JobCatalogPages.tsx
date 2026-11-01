@@ -32,6 +32,7 @@ import {
 } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
 import { formatJobDateTime, formatJobDuration, getJobDurationLabel } from "@/lib/job-duration";
+import { OrganizeTasksPanel } from "./OrganizeTasksPanel";
 
 // 关键变量：后台任务页固定每 5 秒读取一次进度，避免轮询和 SSE 同时触发重复请求。
 const JOB_PROGRESS_REFRESH_INTERVAL_MS = 5_000;
@@ -72,7 +73,7 @@ const backgroundJobTypeLabels = {
 } as const;
 
 type JobStatusFilter = "all" | "active" | JobStatus;
-type JobTypeFilter = "all" | keyof typeof backgroundJobTypeLabels;
+type JobTypeFilter = "all" | keyof typeof backgroundJobTypeLabels | "organize";
 
 // 关键变量：状态筛选按展示顺序平铺，“全部”固定为第一项。
 const jobStatusFilterOptions: Array<{ value: JobStatusFilter; label: string }> = [
@@ -92,6 +93,7 @@ const jobTypeFilterOptions: Array<{ value: JobTypeFilter; label: string }> = [
   { value: "all", label: "全部" },
   { value: "scan", label: "扫描刮削" },
   { value: "media_probe", label: "视频规格分析" },
+  { value: "organize", label: "影片整理" },
 ];
 
 /** 区分普通扫描和手动 AI 补充任务，避免任务列表只显示为全量扫描。 */
@@ -337,7 +339,7 @@ function JobsView({ admin }: { admin: boolean }) {
   const [jobTypeFilter, setJobTypeFilter] = useState<JobTypeFilter>("all");
   const [jobPageOffset, setJobPageOffset] = useState(0);
   const resource = useApiResource(
-    () => listJobs(admin, {
+    () => jobTypeFilter === "organize" ? Promise.resolve({ items: [] as ScanJob[], total: 0 }) : listJobs(admin, {
       status: statusFilter === "all" ? undefined : statusFilter,
       jobType: jobTypeFilter === "all" ? undefined : jobTypeFilter,
       groupParentJobs: true,
@@ -630,10 +632,10 @@ function JobsView({ admin }: { admin: boolean }) {
     }
   }
 
-  /** 二次确认后清除权限范围内全部已完成和失败任务，保留其他状态任务。 */
+  /** 二次确认后只清除扫描和规格任务，整理任务继续保留。 */
   async function clearCompletedJobs(): Promise<void> {
     if (clearingCompletedJobsRef.current) return;
-    if (!window.confirm("确定清除全部已完成和失败任务吗？这些任务的进度、错误记录及失败报告将一并删除；已取消、排队、运行、等待重试和暂停任务都会保留。")) return;
+    if (!window.confirm("确定清除已完成和失败的扫描、规格任务吗？这些任务的进度、错误记录及失败报告将一并删除；影片整理任务和其他状态任务会保留。")) return;
     clearingCompletedJobsRef.current = true;
     setClearingCompletedJobs(true);
     setMessage("正在清除已完成和失败任务…");
@@ -779,7 +781,8 @@ function JobsView({ admin }: { admin: boolean }) {
           </div>
         </div>
       </Panel>
-      {!activeJob ? <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? (statusFilter === "all" && jobTypeFilter === "all" ? "还没有后台任务" : "当前筛选条件下没有任务")}</div></Panel> : (
+      {(jobTypeFilter === "all" || jobTypeFilter === "organize") && <div className="mb-4"><OrganizeTasksPanel admin={admin} statusFilter={statusFilter} /></div>}
+      {jobTypeFilter !== "organize" && (!activeJob ? <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? (jobTypeFilter === "all" ? "暂无扫描或规格任务" : "当前筛选条件下没有任务")}</div></Panel> : (
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
           <Panel className="p-4 sm:p-4 xl:h-[calc(100vh-14rem)] xl:min-h-[560px] xl:max-h-[720px] xl:overflow-y-auto" title="任务详情" description={`${activeJob.serviceName} · ${getBackgroundJobLabel(activeJob)}${admin ? ` · ${activeJob.ownerUsername}` : ""} · 任务 ${activeJob.id.slice(0, 8)}`}>
             <div className="rounded-xl border border-primary/25 bg-primary/8 p-4">
@@ -872,7 +875,7 @@ function JobsView({ admin }: { admin: boolean }) {
             className="overflow-hidden p-4 sm:p-4 xl:flex xl:h-[calc(100vh-14rem)] xl:min-h-[560px] xl:max-h-[720px] xl:flex-col"
             title="任务列表"
             description={`当前页 ${jobGroups.length} 组 · ${jobs.length} 个底层任务 · 共 ${jobTotal} 组 · 第 ${currentJobPage}/${jobPageCount} 页`}
-            action={<button type="button" title="清除已完成和失败的任务" onClick={() => void clearCompletedJobs()} disabled={clearingCompletedJobs} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/8 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /> {clearingCompletedJobs ? "正在清除…" : "清除已完成和失败"}</button>}
+            action={<button type="button" title="仅清除已完成和失败的扫描、规格任务" onClick={() => void clearCompletedJobs()} disabled={clearingCompletedJobs} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/8 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /> {clearingCompletedJobs ? "正在清除…" : "清除扫描/规格已结束任务"}</button>}
           >
             <ul className="grid max-h-[560px] grid-cols-1 content-start gap-1.5 overflow-y-auto pr-1 sm:grid-cols-2 xl:min-h-0 xl:flex-1 xl:max-h-none">
               {jobGroups.map((group) => {
@@ -963,7 +966,7 @@ function JobsView({ admin }: { admin: boolean }) {
             </div>
           </Panel>
         </div>
-      )}
+      ))}
       <AiSupplementDialog state={{
         open: aiSupplementDialogOpen,
         loading: aiSupplementLoading,

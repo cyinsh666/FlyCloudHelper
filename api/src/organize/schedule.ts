@@ -23,7 +23,9 @@ export interface OrganizeSchedule extends ScanScheduleConfiguration {
   lastTriggeredAt: string | null;
   lastJobId: string | null;
   lastError: string | null;
+  lastRunMessage?: string | null;
   pendingPlanId: string | null;
+  pendingRunKind?: "scheduled" | "manual";
   updatedAt: string;
 }
 
@@ -43,7 +45,7 @@ function defaultSchedule(serviceId: string, userId: string): OrganizeSchedule {
     scheduleType: "interval", intervalMinutes: 24 * 60, timeOfDay: "03:00", dayOfWeek: 1,
     dayOfMonth: 1, timezoneOffsetMinutes: -new Date().getTimezoneOffset(), quietPeriodEnabled: false,
     quietStartTime: "00:00", quietEndTime: "07:00", nextRunAt: null, lastTriggeredAt: null,
-    lastJobId: null, lastError: null, pendingPlanId: null, updatedAt: new Date().toISOString(),
+    lastJobId: null, lastError: null, lastRunMessage: null, pendingPlanId: null, updatedAt: new Date().toISOString(),
   };
 }
 
@@ -119,6 +121,7 @@ export function readOrganizeScheduleInput(body: Record<string, unknown>): Pick<O
 export class ServiceOrganizeScheduler {
   private readonly directory: string;
   private readonly busy = new Set<string>();
+  private readonly pendingTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private stopping = false;
 
@@ -159,9 +162,67 @@ export class ServiceOrganizeScheduler {
     } finally { this.busy.delete(serviceId); }
   }
 
+  /** 使用已保存配置立即生成预览，完成后由轮询器自动启动整理；不改定时触发时间。 */
+  public async runNow(serviceId: string, actorUserId?: string): Promise<OrganizeSchedule> {
+    if (this.busy.has(serviceId)) throw new ApiError(409, "organize_schedule_busy", "整理计划正在处理，请稍后重试");
+    this.busy.add(serviceId);
+    try {
+      const schedule = await this.get(serviceId, actorUserId);
+      if (!schedule.sources.length || !schedule.target) {
+        throw new ApiError(422, "organize_schedule_paths_missing", "请先保存来源目录和目标目录");
+      }
+      if (schedule.pendingPlanId) throw new ApiError(409, "organize_schedule_pending", "已有整理预览正在准备");
+      const active = (await this.manager.listJobs(serviceId, actorUserId))
+        .find((job) => ["queued", "running", "paused"].includes(job.status));
+      if (active) throw new ApiError(409, "organize_job_active", "当前服务已有排队、运行或暂停的整理任务");
+      if (!(await this.manager.capabilities(serviceId, actorUserId)).supported) {
+        throw new ApiError(409, "organize_service_unavailable", "网盘服务当前不支持影片整理");
+      }
+      if (schedule.aiAssistEnabled) await prepareOrganizeAi(this.runtime, schedule.aiModelId ?? "");
+      const plan = await this.manager.createPlan(serviceId, actorUserId, {
+        sources: schedule.sources, target: schedule.target, mode: schedule.mode,
+        unrecognizedTransferEnabled: schedule.unrecognizedTransferEnabled,
+        unrecognizedDirectory: schedule.unrecognizedDirectory,
+        aiAssistEnabled: schedule.aiAssistEnabled, aiModelId: schedule.aiModelId,
+      });
+      const now = new Date().toISOString();
+      schedule.pendingPlanId = plan.id;
+      schedule.pendingRunKind = "manual";
+      schedule.lastTriggeredAt = now;
+      schedule.lastError = null;
+      schedule.lastRunMessage = null;
+      schedule.updatedAt = now;
+      await saveSchedule(this.fileName(serviceId), schedule);
+      this.schedulePendingProcess(serviceId);
+      return schedule;
+    } finally { this.busy.delete(serviceId); }
+  }
+
   /** 进程启动后开始轮询，关闭服务时不再创建新任务。 */
   public start(): void { this.stopping = false; this.schedulePoll(2000); }
-  public stop(): void { this.stopping = true; if (this.timer) clearTimeout(this.timer); this.timer = null; }
+  public stop(): void {
+    this.stopping = true;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    for (const timer of this.pendingTimers.values()) clearTimeout(timer);
+    this.pendingTimers.clear();
+  }
+
+  /** 待预览完成时只加速该服务的检查，不提高所有定时计划的轮询频率。 */
+  private schedulePendingProcess(serviceId: string): void {
+    if (this.stopping || this.pendingTimers.has(serviceId)) return;
+    const timer = setTimeout(() => {
+      this.pendingTimers.delete(serviceId);
+      if (this.stopping) return;
+      if (this.busy.has(serviceId)) { this.schedulePendingProcess(serviceId); return; }
+      this.busy.add(serviceId);
+      void this.process(serviceId).catch((error) => this.runtime.logBusinessEvent("warn", {
+        日志关键字: "codex-flycloud-organize-schedule", 事件: "整理预览进度检查失败",
+        服务ID: serviceId, 错误信息: error instanceof Error ? error.message : String(error),
+      })).finally(() => this.busy.delete(serviceId));
+    }, 2500);
+    this.pendingTimers.set(serviceId, timer);
+  }
 
   /** 固定 30 秒轮询一次，不在 HTTP 请求线程中扫描网盘。 */
   private schedulePoll(delay: number): void {
@@ -197,9 +258,10 @@ export class ServiceOrganizeScheduler {
   /** 待执行预览优先完成；进程重启后继续同一计划，避免重复整理。 */
   private async process(serviceId: string): Promise<void> {
     const schedule = await this.get(serviceId);
-    if (!schedule.enabled) {
+    if (!schedule.enabled && schedule.pendingRunKind !== "manual") {
       if (schedule.pendingPlanId) {
         schedule.pendingPlanId = null;
+        schedule.pendingRunKind = undefined;
         await saveSchedule(this.fileName(serviceId), schedule);
       }
       return;
@@ -213,8 +275,8 @@ export class ServiceOrganizeScheduler {
         await saveSchedule(this.fileName(serviceId), schedule);
         return;
       }
-      const active = (await this.manager.listJobs(serviceId)).find((job) => ["queued", "running", "paused", "failed"].includes(job.status));
-      if (active) { await this.retry(schedule, "已有未结束的整理任务，请先继续或取消"); return; }
+      const active = (await this.manager.listJobs(serviceId)).find((job) => ["queued", "running", "paused"].includes(job.status));
+      if (active) { await this.retry(schedule, "当前服务已有排队、运行或暂停的整理任务"); return; }
       try {
         const plan = await this.manager.createPlan(serviceId, schedule.userId, {
           sources: schedule.sources, target: schedule.target!, mode: schedule.mode,
@@ -224,19 +286,24 @@ export class ServiceOrganizeScheduler {
         schedule.lastTriggeredAt = now.toISOString();
         schedule.nextRunAt = calculateNextScanRunAt(schedule, now);
         schedule.pendingPlanId = plan.id;
+        schedule.pendingRunKind = "scheduled";
         schedule.lastError = null;
+        schedule.lastRunMessage = null;
         schedule.updatedAt = now.toISOString();
         await saveSchedule(this.fileName(serviceId), schedule);
+        this.schedulePendingProcess(serviceId);
       } catch (error) { await this.retry(schedule, error instanceof Error ? error.message : "生成预览失败"); }
       return;
     }
     try {
       const plan = await this.manager.getPlan(serviceId, schedule.pendingPlanId, schedule.userId);
-      if (plan.status === "preparing") return;
+      if (plan.status === "preparing") { this.schedulePendingProcess(serviceId); return; }
       if (plan.status === "failed") throw new Error(plan.error ?? "识别预览失败");
       if (!plan.items.some((item) => item.status === "ready")) {
         schedule.pendingPlanId = null;
+        schedule.pendingRunKind = undefined;
         schedule.lastError = null;
+        schedule.lastRunMessage = "本次没有可整理的内容";
         schedule.updatedAt = new Date().toISOString();
         await saveSchedule(this.fileName(serviceId), schedule);
         return;
@@ -246,7 +313,9 @@ export class ServiceOrganizeScheduler {
       const job = existing ?? await this.manager.createJob(serviceId, plan.id, schedule.userId);
       schedule.lastJobId = job.id;
       schedule.lastError = null;
+      schedule.lastRunMessage = "已启动整理任务";
       schedule.pendingPlanId = null;
+      schedule.pendingRunKind = undefined;
       schedule.updatedAt = new Date().toISOString();
       await saveSchedule(this.fileName(serviceId), schedule);
     } catch (error) {
@@ -256,9 +325,13 @@ export class ServiceOrganizeScheduler {
 
   /** 保留失败原因，并在五分钟后尝试下一次；失败预览需要重新生成。 */
   private async retry(schedule: OrganizeSchedule, message: string): Promise<void> {
+    // 关键变量：手动任务失败不应改变原有定时任务的下次执行时间。
+    const manualRun = schedule.pendingRunKind === "manual";
     schedule.lastError = message;
+    schedule.lastRunMessage = null;
     schedule.pendingPlanId = null;
-    schedule.nextRunAt = schedule.enabled ? new Date(Date.now() + 5 * 60_000).toISOString() : null;
+    schedule.pendingRunKind = undefined;
+    if (!manualRun) schedule.nextRunAt = schedule.enabled ? new Date(Date.now() + 5 * 60_000).toISOString() : null;
     schedule.updatedAt = new Date().toISOString();
     await saveSchedule(this.fileName(schedule.serviceId), schedule);
   }

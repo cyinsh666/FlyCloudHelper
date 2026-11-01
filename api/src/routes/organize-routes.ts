@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { validationError } from "../errors.js";
+import { ApiError, validationError } from "../errors.js";
 import { requireRequestUser, requireSuperAdmin } from "../http.js";
 import { ServiceOrganizeManager } from "../organize/manager.js";
 import { ServiceOrganizeScheduler } from "../organize/schedule.js";
@@ -43,6 +43,36 @@ export async function registerOrganizeRoutes(server: FastifyInstance, runtime: A
       await runtime.repository.getServiceDetail(request.params.serviceId, await actorId(request));
       return { items: await runtime.aiModels.listAvailableModels() };
     });
+    server.get<{ Querystring: { status?: string; limit?: string; offset?: string } }>(
+      `${admin ? "/api/v1/admin" : "/api/v1"}/organize/tasks`, async (request) => {
+        const ownerId = await actorId(request);
+        const status = request.query.status ?? "all";
+        const supportedStatuses = ["all", "active", "preparing", "queued", "running", "paused", "completed", "failed", "cancelled"];
+        if (!supportedStatuses.includes(status)) throw validationError("status", "整理任务状态筛选值无效");
+        const limit = Number(request.query.limit ?? 8);
+        const offset = Number(request.query.offset ?? 0);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 100 || !Number.isInteger(offset) || offset < 0) {
+          throw validationError("pagination", "整理任务分页参数无效");
+        }
+        const all = await manager.listTaskSummaries(ownerId);
+        const filtered = all.filter((task) => {
+          if (status === "all") return true;
+          if (status === "active") return ["preparing", "queued", "running", "paused"].includes(task.status);
+          return task.status === status;
+        });
+        const page = filtered.slice(offset, offset + limit);
+        // 关键变量：仅查询当前页的服务名称，避免历史任务增加数据库读取量。
+        const serviceNames = new Map<string, string>();
+        for (const serviceId of new Set(page.map((task) => task.serviceId))) {
+          const service = await runtime.repository.getServiceDetail(serviceId, ownerId).catch((error: unknown) => {
+            if (error instanceof ApiError && error.statusCode === 404) return null;
+            throw error;
+          });
+          serviceNames.set(serviceId, service?.displayName ?? "已删除的网盘服务");
+        }
+        return { items: page.map((task) => ({ ...task,
+          serviceName: serviceNames.get(task.serviceId) ?? "网盘服务" })), total: filtered.length };
+      });
     server.get<{ Params: { serviceId: string } }>(`${prefix}/:serviceId/organize/schedule`, async (request) =>
       ({ schedule: await scheduler.get(request.params.serviceId, await actorId(request)) }));
     server.put<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(
@@ -50,6 +80,8 @@ export async function registerOrganizeRoutes(server: FastifyInstance, runtime: A
         if (!request.body || typeof request.body !== "object") throw validationError("schedule", "定时计划无效");
         return { schedule: await scheduler.update(request.params.serviceId, await actorId(request), request.body) };
       });
+    server.post<{ Params: { serviceId: string } }>(`${prefix}/:serviceId/organize/schedule/run-now`, async (request, reply) =>
+      reply.status(202).send({ schedule: await scheduler.runNow(request.params.serviceId, await actorId(request)) }));
     server.post<{ Params: { serviceId: string }; Body: { sources: OrganizeDirectory[]; target: OrganizeDirectory; mode: OrganizeMode;
       unrecognizedTransferEnabled?: boolean; unrecognizedDirectory?: OrganizeDirectory | null;
       aiAssistEnabled?: boolean; aiModelId?: string | null } }>(

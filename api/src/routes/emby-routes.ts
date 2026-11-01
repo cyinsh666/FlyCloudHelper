@@ -6,7 +6,7 @@ import { readProtocolContentFilters } from "../media/protocol-content-filters.js
 import { buildEmbyPath } from "../emby-path.js";
 import { EmbyCompatibilityService, type EmbyContext, type EmbyLibraryContext } from "../emby-service.js";
 import { hasRequiredEmbyPlaybackHeaders, supportsEmbyPlaybackUserAgent } from "../emby-playback.js";
-import { providerFetch, providerStream } from "../providers/network.js";
+import { providerStream } from "../providers/network.js";
 import type { ProviderConnectionContext, ProviderFileAccess } from "../providers/types.js";
 import type { ApiRuntime } from "../runtime.js";
 import { enqueueProtocolScan, listProtocolVirtualFolders } from "../protocol-scan-service.js";
@@ -108,6 +108,15 @@ function toRelayLibrary(service: Record<string, unknown>, file: Record<string, u
 
 /** 代理 Emby 项目图片，图片接口可不带令牌以兼容海报组件。 */
 async function sendImage(runtime: ApiRuntime, compatibility: EmbyCompatibilityService, context: EmbyLibraryContext, request: FastifyRequest, reply: FastifyReply, itemId: string, imageType: string) {
+  if (imageType.toLowerCase() === "primary") {
+    const collage = await runtime.protocolCollage.getCover(context.libraryId, "emby", itemId);
+    if (collage) {
+      reply.header("ETag", `"${collage.tag}"`).header("Content-Type", "image/jpeg").header("Cache-Control", "private, max-age=86400");
+      if (request.headers["if-none-match"] === `"${collage.tag}"`) return reply.status(304).send();
+      reply.header("Content-Length", collage.body.length);
+      return request.method === "HEAD" ? reply.send() : reply.send(collage.body);
+    }
+  }
   const source = await compatibility.resolveImageSource(context, itemId, imageType);
   let url: URL;
   try { url = new URL(source.url); } catch { throw new ApiError(404, "emby_image_not_found", "图片地址不可用"); }
@@ -117,19 +126,11 @@ async function sendImage(runtime: ApiRuntime, compatibility: EmbyCompatibilitySe
   if (request.headers["if-none-match"] === etag) return reply.status(304).send();
   if (isSpiderProxyUrl(source.url)) return sendSpiderSourceImage(runtime, context, request, reply, source);
   if (context.libraryKind === "content_source_video" && source.sourceType === "media") return sendContentSourceHttpImage(request, reply, url);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10_000);
-  try {
-    const response = await providerFetch(url, { method: request.method === "HEAD" ? "HEAD" : "GET" }, { allowInsecureHttp: true }, controller.signal);
-    if (!response.ok) throw new ApiError(502, "emby_image_upstream_failed", "图片服务暂时不可用");
-    const length = Number(response.headers.get("content-length") ?? 0);
-    if (length > 20 * 1024 * 1024) throw new ApiError(413, "emby_image_too_large", "图片文件过大");
-    const contentType = response.headers.get("content-type") ?? "image/jpeg";
-    if (!contentType.toLowerCase().startsWith("image/")) throw new ApiError(502, "emby_image_content_invalid", "图片服务返回了非图片内容");
-    reply.header("Content-Type", contentType).header("Cache-Control", "private, max-age=86400");
-    if (length > 0) reply.header("Content-Length", length);
-    return request.method === "HEAD" ? reply.send() : reply.send(Buffer.from(await response.arrayBuffer()));
-  } finally { clearTimeout(timer); }
+  // 旧媒体首次请求时写入本地；以后 Emby 与 Jellyfin 都直接读取同一张缓存图片。
+  const image = await runtime.imageCache.getOrFetch(source.url);
+  reply.header("Content-Type", image.contentType).header("Cache-Control", "private, max-age=86400");
+  reply.header("Content-Length", image.body.length);
+  return request.method === "HEAD" ? reply.send() : reply.send(image.body);
 }
 
 /** 输出 Emby 视频直放或原文件下载；保留 Range 和 Provider 所需请求头。 */

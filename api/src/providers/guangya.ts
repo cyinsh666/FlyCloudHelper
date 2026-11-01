@@ -188,10 +188,16 @@ export class GuangyaProvider implements ProviderAdapter {
       { fileId: resourceId, newName: name }, context),
     move: (connection, resourceId, parentId, context) => this.mutateOrganizeFile(connection, "/userres/v1/file/move_file",
       { fileIds: [resourceId], parentId: toWebApiParentId(parentId) }, context),
+    moveMany: (connection, resourceIds, parentId, context) => this.mutateOrganizeFile(connection, "/userres/v1/file/move_file",
+      { fileIds: resourceIds, parentId: toWebApiParentId(parentId) }, context),
     copy: (connection, resourceId, parentId, context) => this.mutateOrganizeFile(connection, "/userres/v1/file/copy_file",
       { fileIds: [resourceId], parentId: toWebApiParentId(parentId) }, context),
+    copyMany: (connection, resourceIds, parentId, context) => this.mutateOrganizeFile(connection, "/userres/v1/file/copy_file",
+      { fileIds: resourceIds, parentId: toWebApiParentId(parentId) }, context),
     remove: (connection, resourceId, context) => this.mutateOrganizeFile(connection, "/userres/v1/file/delete_file",
       { fileIds: [resourceId] }, context),
+    removeMany: (connection, resourceIds, context) => this.mutateOrganizeFile(connection, "/userres/v1/file/delete_file",
+      { fileIds: resourceIds }, context),
     taskStatus: async (connection, taskId, context) => {
       this.requireWebOrganizeConnection(connection);
       const result = await this.webClient.mutateFile(connection, "/userres/v1/get_task_status", { taskId }, context?.persistConnection);

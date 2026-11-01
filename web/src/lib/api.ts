@@ -421,6 +421,8 @@ export interface ServiceAccessSettings {
   jellyfinDownloadEnabled: boolean;
   /** 是否将 Jellyfin 节目媒体库按地区拆分。 */
   jellyfinRegionLibrariesEnabled: boolean;
+  /** 各虚拟媒体库是否使用八张海报生成拼贴封面。 */
+  jellyfinCollageCoverEnabled: boolean;
   jellyfinEnabled: boolean;
   jellyfinUrl: string | null;
   jellyfinPath: string;
@@ -434,6 +436,7 @@ export interface ServiceAccessSettings {
   embyRelayPlaybackEnabled: boolean;
   embyDownloadEnabled: boolean;
   embyRegionLibrariesEnabled: boolean;
+  embyCollageCoverEnabled: boolean;
   embyAccounts: ServiceAccessAccount[];
   /** 仅音乐类型服务支持公开 Navidrome/Subsonic 协议。 */
   navidromeSupported: boolean;
@@ -828,6 +831,20 @@ export interface OrganizeJob {
   createdAt: string;
 }
 
+/** 后台任务页中的整理任务摘要；识别阶段尚无可计算的文件总数。 */
+export interface OrganizeTaskSummary {
+  id: string;
+  serviceId: string;
+  serviceName: string;
+  status: "preparing" | OrganizeJob["status"];
+  completedCount: number;
+  failedCount: number;
+  totalCount: number | null;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 /** 服务级影片整理计划沿用媒体库定时扫描的时间配置。 */
 export interface OrganizeSchedule extends Omit<ScanSchedule, "id" | "libraryId" | "scanMode" | "createdAt"> {
   serviceId: string;
@@ -839,6 +856,8 @@ export interface OrganizeSchedule extends Omit<ScanSchedule, "id" | "libraryId" 
   aiAssistEnabled?: boolean;
   aiModelId?: string | null;
   pendingPlanId: string | null;
+  pendingRunKind?: "scheduled" | "manual";
+  lastRunMessage?: string | null;
 }
 
 export type UpdateOrganizeScheduleInput = Pick<OrganizeSchedule,
@@ -1191,6 +1210,14 @@ export function listServiceOrganizeJobs(serviceId: string, admin = false): Promi
   return requestJson<{ items: OrganizeJob[] }>(`${admin ? "/api/v1/admin" : "/api/v1"}/services/${serviceId}/organize/jobs`);
 }
 
+/** 按当前用户或管理员权限读取整理任务及识别中的预览。 */
+export function listOrganizeTasks(admin = false, filters: { status?: string; limit?: number; offset?: number } = {}):
+  Promise<{ items: OrganizeTaskSummary[]; total: number }> {
+  const query = new URLSearchParams({ status: filters.status ?? "all", limit: String(filters.limit ?? 8),
+    offset: String(filters.offset ?? 0) });
+  return requestJson(`${admin ? "/api/v1/admin" : "/api/v1"}/organize/tasks?${query.toString()}`);
+}
+
 /** 读取当前网盘服务的整理定时任务。 */
 export async function getServiceOrganizeSchedule(serviceId: string, admin = false): Promise<OrganizeSchedule> {
   const result = await requestJson<{ schedule: OrganizeSchedule }>(
@@ -1204,6 +1231,14 @@ export async function updateServiceOrganizeSchedule(serviceId: string, input: Up
   const result = await requestJson<{ schedule: OrganizeSchedule }>(
     `${admin ? "/api/v1/admin" : "/api/v1"}/services/${serviceId}/organize/schedule`,
     { method: "PUT", body: JSON.stringify(input) });
+  return result.schedule;
+}
+
+/** 以已保存配置立即启动后台识别，识别完成后自动整理。 */
+export async function runServiceOrganizeNow(serviceId: string, admin = false): Promise<OrganizeSchedule> {
+  const result = await requestJson<{ schedule: OrganizeSchedule }>(
+    `${admin ? "/api/v1/admin" : "/api/v1"}/services/${serviceId}/organize/schedule/run-now`,
+    { method: "POST" });
   return result.schedule;
 }
 
@@ -1853,6 +1888,7 @@ export async function updateServiceJellyfinSettings(
     jellyfinPathSuffix?: string;
     jellyfinDownloadEnabled?: boolean;
     jellyfinRegionLibrariesEnabled?: boolean;
+    jellyfinCollageCoverEnabled?: boolean;
   },
   admin = false,
 ): Promise<ServiceAccessSettings> {
@@ -1868,6 +1904,7 @@ export async function updateServiceEmbySettings(
     embyPathSuffix?: string;
     embyDownloadEnabled?: boolean;
     embyRegionLibrariesEnabled?: boolean;
+    embyCollageCoverEnabled?: boolean;
   },
   admin = false,
 ): Promise<ServiceAccessSettings> {

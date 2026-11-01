@@ -23,6 +23,8 @@ import type { ContentMusicManager } from "./content-sources/music-manager.js";
 import type { ContentAudiobookManager } from "./content-sources/audiobook-manager.js";
 import type { ContentSourceAutoSyncWorker } from "./content-sources/auto-sync.js";
 import type { ContentSourceDiagnostics } from "./content-sources/diagnostics.js";
+import type { ProtocolImageCache } from "./media/image-cache.js";
+import type { ProtocolCollageService } from "./media/protocol-collage.js";
 
 /** 后台路由共享的已初始化运行时依赖。 */
 export interface ApiRuntime {
@@ -32,6 +34,10 @@ export interface ApiRuntime {
   providers: ProviderRegistry;
   vault: CredentialVault;
   tmdbCache: TmdbMetadataCache;
+  /** 协议图片共用的本地文件缓存。 */
+  imageCache: ProtocolImageCache;
+  /** Jellyfin、Emby 的虚拟媒体库拼贴封面开关及文件。 */
+  protocolCollage: ProtocolCollageService;
   tmdb: TmdbKeyPool;
   musicBrainz: MusicBrainzClient;
   worker: ScanWorker;

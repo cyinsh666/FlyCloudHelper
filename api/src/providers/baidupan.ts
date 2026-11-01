@@ -67,8 +67,11 @@ export class BaiduPanProvider implements ProviderAdapter {
     createDirectory: (connection, parentId, name, context) => this.createOrganizeDirectory(connection, parentId, name, context),
     rename: (connection, resourceId, name, context) => this.renameOrganizeFile(connection, resourceId, name, context),
     move: (connection, resourceId, parentId, context) => this.transferOrganizeFile(connection, "move", resourceId, parentId, context),
+    moveMany: (connection, resourceIds, parentId, context) => this.transferOrganizeFiles(connection, "move", resourceIds, parentId, context),
     copy: (connection, resourceId, parentId, context) => this.transferOrganizeFile(connection, "copy", resourceId, parentId, context),
+    copyMany: (connection, resourceIds, parentId, context) => this.transferOrganizeFiles(connection, "copy", resourceIds, parentId, context),
     remove: (connection, resourceId, context) => this.removeOrganizeFile(connection, resourceId, context),
+    removeMany: (connection, resourceIds, context) => this.removeOrganizeFiles(connection, resourceIds, context),
     taskStatus: async () => "completed",
   };
   public readonly descriptor: ProviderDescriptor = {
@@ -241,6 +244,19 @@ export class BaiduPanProvider implements ProviderAdapter {
     }, context, operation);
   }
 
+  /** 百度写接口以路径提交文件列表；先逐项确认实时路径，再一次提交同目录文件。 */
+  private async transferOrganizeFiles(
+    connection: Record<string, unknown>, operation: "copy" | "move", resourceIds: string[], parentId: string,
+    context?: ProviderConnectionContext,
+  ): Promise<ProviderMutationResult> {
+    const targetPath = await this.organizePath(connection, parentId, context);
+    const sourcePaths = await this.organizePaths(connection, resourceIds, context);
+    return this.organizeMutation(connection, "filemanager", {
+      async: "0", filelist: JSON.stringify(sourcePaths.map((sourcePath) => ({ path: sourcePath,
+        dest: targetPath, newname: path.posix.basename(sourcePath) }))), ondup: "fail",
+    }, context, operation);
+  }
+
   /** 仅删除传入资源 ID 实时对应的文件或空目录。 */
   private async removeOrganizeFile(
     connection: Record<string, unknown>, resourceId: string, context?: ProviderConnectionContext,
@@ -249,6 +265,28 @@ export class BaiduPanProvider implements ProviderAdapter {
     return this.organizeMutation(connection, "filemanager", {
       async: "0", filelist: JSON.stringify([sourcePath]), ondup: "fail",
     }, context, "delete");
+  }
+
+  /** 批量删除前逐项核对 fs_id 的实时路径，避免移动后误删旧路径上的新文件。 */
+  private async removeOrganizeFiles(
+    connection: Record<string, unknown>, resourceIds: string[], context?: ProviderConnectionContext,
+  ): Promise<ProviderMutationResult> {
+    const sourcePaths = await this.organizePaths(connection, resourceIds, context);
+    return this.organizeMutation(connection, "filemanager", {
+      async: "0", filelist: JSON.stringify(sourcePaths), ondup: "fail",
+    }, context, "delete");
+  }
+
+  /** 限制批量写入前的元数据查询并发，避免一次发出几十个百度请求。 */
+  private async organizePaths(
+    connection: Record<string, unknown>, resourceIds: string[], context?: ProviderConnectionContext,
+  ): Promise<string[]> {
+    const paths: string[] = [];
+    for (let index = 0; index < resourceIds.length; index += 4) {
+      const group = resourceIds.slice(index, index + 4);
+      paths.push(...await Promise.all(group.map((resourceId) => this.organizePath(connection, resourceId, context))));
+    }
+    return paths;
   }
 
   /** 官方与原来源显式区分，未知来源不能静默退回 OpenList。 */

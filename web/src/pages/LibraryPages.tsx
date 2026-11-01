@@ -699,6 +699,7 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
   const [updatingPlayback, setUpdatingPlayback] = useState(false);
   const [updatingDownload, setUpdatingDownload] = useState(false);
   const [updatingRegionLibraries, setUpdatingRegionLibraries] = useState(false);
+  const [updatingCollageCover, setUpdatingCollageCover] = useState(false);
   const [savingJellyfinPath, setSavingJellyfinPath] = useState(false);
   const [jellyfinPathSuffix, setJellyfinPathSuffix] = useState("");
   const [savingNavidromePath, setSavingNavidromePath] = useState(false);
@@ -789,6 +790,22 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
       setMessage(error instanceof Error ? error.message : "Jellyfin 节目地区分组设置保存失败");
     } finally {
       setUpdatingRegionLibraries(false);
+    }
+  }
+
+  /** 开启时重新随机生成各虚拟库封面；关闭时立即停用已有拼贴图。 */
+  async function toggleCollageCover(): Promise<void> {
+    if (!settings || updatingCollageCover) return;
+    const nextEnabled = !settings.jellyfinCollageCoverEnabled;
+    setUpdatingCollageCover(true);
+    try {
+      await updateServiceJellyfinSettings(serviceId, { jellyfinCollageCoverEnabled: nextEnabled }, admin);
+      setMessage(nextEnabled ? "拼贴封面已开启，正在后台生成；不足 8 部作品的媒体库将保留原封面" : "拼贴封面已关闭");
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Jellyfin 拼贴封面设置保存失败");
+    } finally {
+      setUpdatingCollageCover(false);
     }
   }
 
@@ -1000,6 +1017,10 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
           <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/35 px-3 py-2.5">
             <div className="min-w-0"><p className="text-sm font-medium">节目地区分组</p><p className="mt-0.5 truncate text-[11px] text-muted-foreground">拆分为华语、日韩、欧美和其他</p></div>
             <button type="button" role="switch" aria-checked={settings.jellyfinRegionLibrariesEnabled} aria-label="启用 Jellyfin 节目地区分组" disabled={updatingRegionLibraries} onClick={() => void toggleRegionLibraries()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.jellyfinRegionLibrariesEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}><span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.jellyfinRegionLibrariesEnabled ? "translate-x-5" : "translate-x-0"}`} /></button>
+          </div>
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/35 px-3 py-2.5">
+            <div className="min-w-0"><p className="text-sm font-medium">使用拼贴封面图</p><p className="mt-0.5 text-[11px] text-muted-foreground">每库随机选取 8 部作品；关闭再开启会重新生成</p></div>
+            <button type="button" role="switch" aria-checked={settings.jellyfinCollageCoverEnabled} aria-label="使用 Jellyfin 拼贴封面图" disabled={updatingCollageCover} onClick={() => void toggleCollageCover()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.jellyfinCollageCoverEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}><span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.jellyfinCollageCoverEnabled ? "translate-x-5" : "translate-x-0"}`} /></button>
           </div>
         </div>
         {!isContentSource && !settings.relayPlaybackSupported && <p className="mt-2 text-[11px] text-muted-foreground">当前网盘类型暂不支持中转播放。</p>}

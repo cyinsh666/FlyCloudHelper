@@ -4,12 +4,27 @@ import { parseCloudApiObject, readCloudRecord, readCloudText, readCloudTextFile,
 import { cloud139Headers, CLOUD139_ORIGIN, CLOUD139_UA, parseCloud139Credential } from "./cloud139-protocol.js";
 import { registerProviderSharedRateLimit, waitForProviderSharedRateLimit, type ProviderNetworkOptions } from "./network.js";
 import { setTimeout as delay } from "node:timers/promises";
-import { createProviderRecommendedScanSettings, requireConnectionString, type ProviderConnectionContext, type ProviderDescriptor, type ProviderEntry, type ProviderFileAccess } from "./types.js";
+import { createProviderRecommendedScanSettings, requireConnectionString, type ProviderConnectionContext, type ProviderDescriptor, type ProviderEntry, type ProviderFileAccess, type ProviderFileOrganizer, type ProviderMutationResult } from "./types.js";
 
-/** 移动个人云只读文件适配，音乐、协议播放与目录浏览共用同一取址。 */
+/** 移动个人云文件适配，音乐、协议播放、目录浏览与整理共用同一连接。 */
 export class Cloud139Provider extends CloudDriveProviderBase {
   protected readonly rootResourceId = "/";
   private readonly routes = new Map<string, Promise<string>>(); // 账号凭据版本隔离路由查询。
+  /** 写接口按 LitePan 的 300 毫秒节奏错峰，扫描读请求保持原有限流策略。 */
+  private nextOrganizeRequestAt = 0;
+  /** 个人云写接口与现有扫码凭据、路由和签名请求共用同一连接。 */
+  public readonly fileOrganizer: ProviderFileOrganizer = {
+    supports: (connection) => typeof connection.authorization === "string" && Boolean(connection.authorization.trim()),
+    createDirectory: (connection, parentId, name) => this.createOrganizeDirectory(connection, parentId, name),
+    rename: (connection, resourceId, name) => this.renameOrganizeFile(connection, resourceId, name),
+    move: (connection, resourceId, parentId) => this.transferOrganizeFiles(connection, "move", [resourceId], parentId),
+    moveMany: (connection, resourceIds, parentId) => this.transferOrganizeFiles(connection, "move", resourceIds, parentId),
+    copy: (connection, resourceId, parentId) => this.transferOrganizeFiles(connection, "copy", [resourceId], parentId),
+    copyMany: (connection, resourceIds, parentId) => this.transferOrganizeFiles(connection, "copy", resourceIds, parentId),
+    remove: (connection, resourceId) => this.removeOrganizeFiles(connection, [resourceId]),
+    removeMany: (connection, resourceIds) => this.removeOrganizeFiles(connection, resourceIds),
+    taskStatus: async () => "completed",
+  };
   public readonly descriptor: ProviderDescriptor = {
     type: "cloud139", displayName: "移动云盘", adapterVersion: "1.0.0", credentialSchemaVersion: 1,
     supportedDataTypes: ["video", "music", "audiobook"], capabilities: ["list", "stableResourceId", "playbackLocator", "directDownload", "relay"],
@@ -19,6 +34,59 @@ export class Cloud139Provider extends CloudDriveProviderBase {
 
   /** 使用实例网络策略，保留既有 HTTP 与日志配置。 */
   public constructor(private readonly networkOptions: ProviderNetworkOptions) { super(); }
+
+  /** 检查整理文件 ID，避免个人云根目录被作为普通文件写入。 */
+  private organizeIds(resourceIds: string[]): string[] {
+    if (!resourceIds.length || resourceIds.some((id) => !id || ["/", "0", "root"].includes(id))) {
+      throw new ApiError(422, "cloud139_organize_id_invalid", "移动云盘整理文件编号无效");
+    }
+    return resourceIds;
+  }
+
+  /** 仅整理写操作使用固定间隔，避免同一批任务形成瞬时突发。 */
+  private async organizeRequest(connection: Record<string, unknown>, route: string,
+    body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const scheduledAt = Math.max(Date.now(), this.nextOrganizeRequestAt);
+    this.nextOrganizeRequestAt = scheduledAt + 300;
+    if (scheduledAt > Date.now()) await delay(scheduledAt - Date.now());
+    return this.request(connection, route, body);
+  }
+
+  /** 个人云创建目录返回稳定文件 ID，最终名称仍由公共整理流程核对。 */
+  private async createOrganizeDirectory(connection: Record<string, unknown>, parentId: string, name: string): Promise<ProviderMutationResult> {
+    if (!name || name === "." || name === ".." || /[/\\\u0000-\u001f]/u.test(name)) {
+      throw new ApiError(422, "cloud139_organize_name_invalid", "移动云盘目录名称无效");
+    }
+    const data = await this.organizeRequest(connection, "/file/create", {
+      parentFileId: parentId || "/", name, description: "", type: "folder", fileRenameMode: "force_rename",
+    });
+    const resourceId = readCloudText(data, ["fileId"]);
+    return resourceId ? { resourceId } : {};
+  }
+
+  /** 通过个人云批量接口移动或复制同一目标目录的文件。 */
+  private async transferOrganizeFiles(connection: Record<string, unknown>, operation: "move" | "copy",
+    resourceIds: string[], parentId: string): Promise<ProviderMutationResult> {
+    await this.organizeRequest(connection, operation === "move" ? "/file/batchMove" : "/file/batchCopy", {
+      fileIds: this.organizeIds(resourceIds), toParentFileId: parentId || "/",
+    });
+    return {};
+  }
+
+  /** 删除进入回收站，公共整理流程随后重新读取目标目录确认。 */
+  private async removeOrganizeFiles(connection: Record<string, unknown>, resourceIds: string[]): Promise<ProviderMutationResult> {
+    await this.organizeRequest(connection, "/recyclebin/batchTrash", { fileIds: this.organizeIds(resourceIds) });
+    return {};
+  }
+
+  /** 同一资源的改名由稳定文件 ID 定位，不改变整理命名规则。 */
+  private async renameOrganizeFile(connection: Record<string, unknown>, resourceId: string, name: string): Promise<ProviderMutationResult> {
+    if (!name || name === "." || name === ".." || /[/\\\u0000-\u001f]/u.test(name)) {
+      throw new ApiError(422, "cloud139_organize_name_invalid", "移动云盘文件名称无效");
+    }
+    await this.organizeRequest(connection, "/file/update", { fileId: this.organizeIds([resourceId])[0], name, description: "" });
+    return {};
+  }
 
   /** 凭据内真实账号必须与连接账号一致。 */
   private credential(connection: Record<string, unknown>) {
