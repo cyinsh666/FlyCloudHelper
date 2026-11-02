@@ -47,6 +47,7 @@ import { ContentAudiobookManager } from "./content-sources/audiobook-manager.js"
 import { registerScanFailureReportRoutes } from "./routes/scan-failure-report-routes.js";
 import { registerServiceRoutes } from "./routes/service-routes.js";
 import { registerOrganizeRoutes } from "./routes/organize-routes.js";
+import { registerVideoRecognitionRoutes } from "./routes/video-recognition-routes.js";
 import { registerLibraryRoutes } from "./routes/library-routes.js";
 import { registerLibraryFileRoutes } from "./routes/library-file-routes.js";
 import { registerServiceAccessRoutes } from "./routes/service-access-routes.js";
@@ -488,6 +489,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerBaiduPanWebLoginRoutes(server, runtime);
   await registerServiceRoutes(server, runtime);
   await registerOrganizeRoutes(server, runtime);
+  await registerVideoRecognitionRoutes(server, runtime);
   await registerLibraryRoutes(server, runtime);
   await registerLibraryFileRoutes(server, runtime);
   await registerScanScheduleRoutes(server, runtime, scanSchedules);

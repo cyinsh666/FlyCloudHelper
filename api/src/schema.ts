@@ -6,6 +6,7 @@ import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
 import { createMusicScanTables } from "./music/scan-state.js";
 import { initializeAbsSchema } from "./abs/schema.js";
+import { createVideoRecognitionKnowledgeTable } from "./media/video-recognition/knowledge.js";
 import {
   allowHistoricalServiceIdNull,
   backfillHistoricalProtocolPaths,
@@ -16,7 +17,7 @@ import {
   requireHistoricalLibrary,
 } from "./schema-upgrade-compatibility.js";
 
-export const currentSchemaVersion = 65;
+export const currentSchemaVersion = 66;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -2217,6 +2218,7 @@ export async function migrateDatabase(database: Knex, exportDirectory: string): 
   await createOperationTables(database);
   await createMusicScanTables(database);
   await initializeAbsSchema(database);
+  await createVideoRecognitionKnowledgeTable(database);
 
   const now = new Date().toISOString();
   if (!existingState) {

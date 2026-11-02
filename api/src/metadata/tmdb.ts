@@ -107,6 +107,22 @@ export interface TmdbPersonMetadata {
   order: number;
 }
 
+/** 识别工具专用的轻量身份资料，不读取演职员和图片集合。 */
+export interface TmdbRecognitionIdentity {
+  id: number;
+  mediaType: "movie" | "tv";
+  title: string;
+  originalTitle: string;
+  year: number | null;
+  alternativeTitles: string[];
+  /** 不同地区或电影节的官方发行年份，仅用于有依据的年份冲突核验。 */
+  releaseYears?: number[];
+  episodeCount: number;
+  status: string;
+  /** 身份详情已附带的季摘要，供日期定位选季使用，不另发搜索请求。 */
+  seasons?: Array<{ seasonNumber: number; airDate: string; episodeCount: number; title?: string }>;
+}
+
 export interface TmdbVideoMetadata {
   id: number;
   mediaType: "movie" | "tv";
@@ -565,6 +581,45 @@ export class TmdbKeyPool {
       rating: candidate.voteAverage,
       popularity: candidate.popularity,
     }));
+  }
+
+  /** 只在显式编号或候选歧义时读取身份与官方别名，避免扫描重复拉取大详情。 */
+  public async readRecognitionIdentity(mediaType: "movie" | "tv", id: number): Promise<TmdbRecognitionIdentity | null> {
+    if (id <= 0 || this.states.length === 0) return null;
+    const payload = await this.requestJson<Record<string, unknown>>(`/${mediaType}/${id}`,
+      { language: "zh-CN", append_to_response: mediaType === "movie"
+        ? "alternative_titles,translations,release_dates" : "alternative_titles,translations" });
+    if (!payload) return null;
+    const alternativePayload = asRecord(payload.alternative_titles);
+    const rawTitles = mediaType === "movie" ? alternativePayload.titles : alternativePayload.results;
+    const alternativeTitles = Array.isArray(rawTitles) ? rawTitles.map((entry) => toText(asRecord(entry).title)).filter(Boolean) : [];
+    const translations = asRecord(payload.translations).translations;
+    // 官方地区译名与替代片名分开提供，识别时均可作为有来源的别名核验。
+    if (Array.isArray(translations)) {
+      for (const translation of translations) {
+        const data = asRecord(asRecord(translation).data);
+        const title = toText(mediaType === "movie" ? data.title : data.name);
+        if (title && !alternativeTitles.includes(title)) alternativeTitles.push(title);
+      }
+    }
+    const releaseYears = new Set<number>();
+    const releaseCountries = asRecord(payload.release_dates).results;
+    if (Array.isArray(releaseCountries)) for (const country of releaseCountries) {
+      const dates = asRecord(country).release_dates;
+      if (Array.isArray(dates)) for (const date of dates) {
+        const year = extractDateYear(toText(asRecord(date).release_date));
+        if (year) releaseYears.add(year);
+      }
+    }
+    return { id, mediaType, title: toText(mediaType === "movie" ? payload.title : payload.name),
+      originalTitle: toText(mediaType === "movie" ? payload.original_title : payload.original_name),
+      year: extractDateYear(toText(mediaType === "movie" ? payload.release_date : payload.first_air_date)),
+      alternativeTitles, releaseYears: [...releaseYears], episodeCount: toPositiveNumber(payload.number_of_episodes), status: toText(payload.status),
+      seasons: Array.isArray(payload.seasons) ? payload.seasons.map((raw) => {
+        const season = asRecord(raw);
+        return { seasonNumber: toNonNegativeNumber(season.season_number, 0), airDate: toText(season.air_date), title: toText(season.name),
+          episodeCount: toPositiveNumber(season.episode_count) };
+      }) : [] };
   }
 
   /** 重新读取用户选中的 TMDB 条目详情，避免信任浏览器回传的元数据内容。 */
