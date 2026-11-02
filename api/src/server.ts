@@ -182,6 +182,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   const absAccess = new AbsAccessService(database, config);
   const repository = new ServiceRepository(database, serviceAccess, logger, {
     mediaProbeConcurrency: config.mediaProbeConcurrency,
+    organizeExportDirectory: config.exportDirectory,
   });
   const publicAccess = new PublicAccessService(database, config);
   const backfilledServiceAccessAccounts = await serviceAccess.ensureExistingLibraries();

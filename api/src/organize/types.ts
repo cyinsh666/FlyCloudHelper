@@ -91,6 +91,10 @@ export interface OrganizeJob {
   backupDirectoryId: string | null;
   items: OrganizeJobItem[];
   error: string | null;
+  /** 临时网盘故障的自动继续次数；旧任务没有该字段时视为零。 */
+  autoRetryCount?: number;
+  /** 下次自动继续时间；为空时失败任务只允许人工继续。 */
+  nextRetryAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -104,6 +108,8 @@ export interface OrganizeTaskSummary {
   failedCount: number;
   totalCount: number | null;
   error: string | null;
+  autoRetryCount?: number;
+  nextRetryAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }

@@ -57,6 +57,14 @@ function createCloudAggregateMetadataProfile(): Record<string, unknown> {
   };
 }
 
+/** 备注允许清空，只用于管理界面，长度与数据库字段保持一致。 */
+function readLibraryDescription(value: unknown): string {
+  if (typeof value !== "string") throw validationError("description", "媒体库备注必须是文本");
+  const description = value.trim();
+  if ([...description].length > 500) throw validationError("description", "媒体库备注不能超过 500 个字符");
+  return description;
+}
+
 /** 队列中的全部来源被直接取消时，由请求线程补发唯一的父任务汇总通知。 */
 export async function notifyFinishedLibraryScanJob(runtime: ApiRuntime, parentJobId: string, userId: string): Promise<void> {
   const parentJob = await runtime.repository.claimLibraryScanJobCompletionNotification(parentJobId, userId);
@@ -518,10 +526,11 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
 
   server.patch<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/libraries/:libraryId", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    const patch: { displayName?: string; dataType?: MediaType; status?: "active" | "disabled"; notificationEnabled?: boolean } = {};
+    const patch: { displayName?: string; description?: string; dataType?: MediaType; status?: "active" | "disabled"; notificationEnabled?: boolean } = {};
     if (request.body.displayName !== undefined) {
       patch.displayName = requireString(request.body, "displayName", "媒体库名称", 100);
     }
+    if (request.body.description !== undefined) patch.description = readLibraryDescription(request.body.description);
     if (request.body.dataType !== undefined) patch.dataType = validateServiceDataType(request.body.dataType);
     if (request.body.status !== undefined) {
       if (request.body.status !== "active" && request.body.status !== "disabled") {
@@ -560,28 +569,26 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     return { library };
   });
 
-  /** 管理员仅修改独立在线库名称，沿用所属用户的媒体库更新入口和管理审计。 */
+  /** 管理员修改任意媒体库名称及备注，沿用所属用户的媒体库更新入口和管理审计。 */
   server.patch<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/admin/libraries/:libraryId/name", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const displayName = requireString(request.body, "displayName", "媒体库名称", 100);
-    if (Object.keys(request.body).some((field) => field !== "displayName")) {
-      throw validationError("library", "此接口只支持修改媒体库名称");
+    const description = request.body.description === undefined ? undefined : readLibraryDescription(request.body.description);
+    if (Object.keys(request.body).some((field) => field !== "displayName" && field !== "description")) {
+      throw validationError("library", "此接口只支持修改媒体库名称和备注");
     }
     // 关键变量：管理员读取库的真实归属，再按所属用户调用更新，不扩展其他编辑权限。
     const library = await runtime.repository.getLibrary(request.params.libraryId);
-    if (!["content_source_video", "content_source_music", "content_source_audiobook", "content_source_live"].includes(library.libraryKind)) {
-      throw new ApiError(409, "content_library_name_only", "此接口仅支持修改在线媒体库名称");
-    }
-    const updated = await runtime.repository.updateLibrary(library.id, library.userId, { displayName });
+    const updated = await runtime.repository.updateLibrary(library.id, library.userId, { displayName, description });
     await runtime.database.addAudit({
       id: randomUUID(),
       operatorUserId: operator.id,
       operatorUsername: operator.username,
-      operationType: "update_library_name",
+      operationType: description === undefined ? "update_library_name" : "update_library_profile",
       targetType: "library",
       targetId: library.id,
       result: "success",
-      detail: { 原媒体库名称: library.displayName, 媒体库名称: updated.displayName, 目标用户ID: library.userId },
+      detail: { 原媒体库名称: library.displayName, 媒体库名称: updated.displayName, 原媒体库备注: library.description, 媒体库备注: updated.description, 目标用户ID: library.userId },
     });
     return { library: updated };
   });

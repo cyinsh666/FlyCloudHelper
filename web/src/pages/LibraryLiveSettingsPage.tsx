@@ -7,7 +7,7 @@ import { type MediaLibrary } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
 
 /** 直播沿用媒体库详情样式；设置、频道及免账号订阅地址在同一页面展示。 */
-export function LibraryLiveSettingsPage({ state }: { state: { library: MediaLibrary; admin: boolean; message: string | null; onDelete: () => Promise<void> } }) {
+export function LibraryLiveSettingsPage({ state }: { state: { library: MediaLibrary; admin: boolean; message: string | null; onRefresh: () => Promise<void>; onDelete: () => Promise<void> } }) {
   const { library, admin } = state;
   const resource = useApiResource(() => liveApi<LiveLibraryState>(library.id, admin), [library.id, admin]);
   const [enabled, setEnabled] = useState(false);
@@ -61,12 +61,17 @@ export function LibraryLiveSettingsPage({ state }: { state: { library: MediaLibr
   /** 频道选择只更新本地草稿，由保存按钮一次性提交。 */
   function toggleChannel(id: string): void { setChannelIds((current) => current.includes(id) ? current.filter((value) => value !== id) : [...current, id]); }
 
+  /** 资料保存后分别刷新媒体库摘要与直播运行资料。 */
+  async function refreshLibraryProfile(): Promise<void> {
+    await Promise.all([state.onRefresh(), resource.refresh()]);
+  }
+
   if (!data) return <Panel>{resource.error ? <div><p role="alert" className="text-sm text-destructive">{resource.error}</p><SecondaryButton onClick={() => void resource.refresh()}>重新读取</SecondaryButton></div>
     : <div aria-label="直播设置加载中" className="animate-pulse space-y-3"><div className="h-7 w-48 rounded bg-muted" /><div className="h-28 rounded bg-muted" /><div className="h-48 rounded bg-muted" /></div>}</Panel>;
   const visibleChannels = data.channels.filter((channel) => `${channel.name} ${channel.group}`.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()));
   const inputClass = "mt-1.5 w-full rounded-lg border border-input bg-background/50 px-3 py-2 text-sm";
   return <div className="grid gap-4">
-    <ContentSourceLibraryNameEditor state={{ libraryId: library.id, displayName: data.displayName, admin, loading: pending, onSaved: resource.refresh }} />
+    <ContentSourceLibraryNameEditor state={{ libraryId: library.id, displayName: data.displayName, description: library.description, admin, loading: pending, onSaved: refreshLibraryProfile }} />
     {(message || state.message || resource.error) && <p role="status" className="text-sm text-muted-foreground">{message || state.message || resource.error}</p>}
     <Panel className="p-4"><form onSubmit={(event) => void save(event)} className="grid gap-4"><div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="text-sm font-medium">直播订阅设置</h2><p className="mt-1 text-xs text-muted-foreground">来源：{data.source.displayName} · {data.source.pluginStatus === "enabled" ? "插件已启用" : "插件未启用"} · 服务{data.runtimeStatus === "running" ? "运行中" : data.runtimeStatus === "starting" ? "启动中" : "未运行"}</p></div><SecondaryButton disabled={pending} onClick={() => void resource.refresh()}>刷新状态</SecondaryButton></div>
       <div className="rounded-lg border border-border p-3"><label><span className="text-sm font-medium">M3U 订阅地址</span><input readOnly aria-label="M3U 订阅地址" value={data.subscriptionUrl} onFocus={(event) => event.target.select()} className={`${inputClass} font-mono text-xs`} /></label><div className="mt-2"><SecondaryButton disabled={pending} onClick={() => void resetSubscription()}>重置地址</SecondaryButton></div><p className="mt-2 text-xs text-muted-foreground">无需账号和密码，点击地址全选后复制到 IPTV 客户端。{data.configuration.enabled ? "订阅已开启，首次播放会自动启动服务。" : "请先开启订阅并保存设置。"} 持有地址即可访问；重置后旧地址失效，关闭订阅后停止提供内容。</p></div>

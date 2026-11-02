@@ -233,6 +233,8 @@ export class ServiceOrganizeScheduler {
   /** 逐服务处理到期计划；单个源失败不阻塞其他服务。 */
   private async poll(): Promise<void> {
     try {
+      // 失败任务优先沿原文件阶段继续，避免定时计划再次生成预览并重复搬运。
+      await this.manager.resumeDueFailedJobs();
       const names = await fs.readdir(this.directory).catch((error: NodeJS.ErrnoException) => {
         if (error.code === "ENOENT") return [] as string[];
         throw error;
@@ -275,8 +277,11 @@ export class ServiceOrganizeScheduler {
         await saveSchedule(this.fileName(serviceId), schedule);
         return;
       }
-      const active = (await this.manager.listJobs(serviceId)).find((job) => ["queued", "running", "paused"].includes(job.status));
+      const jobs = await this.manager.listJobs(serviceId);
+      const active = jobs.find((job) => ["queued", "running", "paused"].includes(job.status));
       if (active) { await this.retry(schedule, "当前服务已有排队、运行或暂停的整理任务"); return; }
+      // 最新任务失败时先恢复原任务；更早的历史失败不阻断已经成功运行的计划。
+      if (jobs[0]?.status === "failed") { await this.retry(schedule, "上次整理任务待自动重试或人工处理"); return; }
       try {
         const plan = await this.manager.createPlan(serviceId, schedule.userId, {
           sources: schedule.sources, target: schedule.target!, mode: schedule.mode,

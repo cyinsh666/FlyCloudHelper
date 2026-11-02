@@ -1,14 +1,20 @@
 import { Link } from "@tanstack/react-router";
-import { ArrowUpRight, Plus, TriangleAlert } from "lucide-react";
+import { ArrowUpRight, FolderOutput, Plus, ScanLine, TriangleAlert } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { PageHeader, PrimaryButton } from "@/components/ConsoleShell";
 import { Panel, PosterCard, ProgressMeter, StatCard, StatusPill } from "@/components/ui-kit";
 import {
   getOverview,
+  getServiceOrganizeCapabilities,
+  runServiceOrganizeNow,
+  createScanJob,
   listJobs,
   listLibraryItems,
   listLibraries,
   listServices,
   type JobStatus,
+  type CloudService,
+  type MediaLibrary,
   type ServiceStatus,
 } from "@/lib/api";
 import { formatJobDateTime } from "@/lib/job-duration";
@@ -30,6 +36,103 @@ const jobStatusLabels: Record<JobStatus, string> = {
   failed: "失败",
   cancelled: "已取消",
 };
+
+/** 概览服务卡片仅在网盘当前具备整理写能力时展示快捷入口。 */
+function OverviewServiceCard({ service }: { service: CloudService }) {
+  const [organizeSupported, setOrganizeSupported] = useState(false);
+  const [organizing, setOrganizing] = useState(false);
+  const [organizeMessage, setOrganizeMessage] = useState<{ text: string; failed: boolean } | null>(null);
+  // 关键变量：同步阻止重复点击触发两份整理预览。
+  const organizingRef = useRef(false);
+
+  /** 服务连接或凭据变化时重新读取实际整理能力。 */
+  useEffect(() => {
+    let alive = true;
+    setOrganizeSupported(false);
+    void getServiceOrganizeCapabilities(service.id).then((result) => {
+      if (alive) setOrganizeSupported(result.supported);
+    }).catch(() => { if (alive) setOrganizeSupported(false); });
+    return () => { alive = false; };
+  }, [service.id, service.status, service.connectionStatus, service.credentialRevision, service.connectionAuthMode]);
+
+  /** 从概览服务卡片调用已保存配置的一次性整理任务。 */
+  async function triggerOrganize(): Promise<void> {
+    if (organizingRef.current) return;
+    organizingRef.current = true;
+    setOrganizing(true);
+    setOrganizeMessage(null);
+    try {
+      await runServiceOrganizeNow(service.id);
+      setOrganizeMessage({ text: "已开始识别来源文件，完成后自动整理", failed: false });
+    } catch (error) {
+      setOrganizeMessage({ text: error instanceof Error ? error.message : "启动整理失败", failed: true });
+    } finally {
+      organizingRef.current = false;
+      setOrganizing(false);
+    }
+  }
+
+  return <div className="rounded-xl border border-border bg-secondary/40 p-4">
+    <div className="flex items-start justify-between gap-3">
+      <p className="truncate text-sm font-medium">{service.displayName}</p>
+      <StatusPill tone={service.status === "active" ? "success" : "warning"}>{serviceStatusLabels[service.status]}</StatusPill>
+    </div>
+    <p className="mt-1 font-mono text-[11px] text-muted-foreground">{service.providerType} · {service.id}</p>
+    <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
+      <span>连接 r{service.credentialRevision}</span>
+      <div className="flex flex-wrap items-center gap-3">
+        {organizeSupported && <button type="button" onClick={() => void triggerOrganize()} disabled={organizing}
+          className="inline-flex items-center gap-1 text-primary-soft disabled:cursor-not-allowed disabled:opacity-40">
+          <FolderOutput className="size-3.5" />{organizing ? "启动中…" : "整理"}
+        </button>}
+        <Link to="/app/services/$serviceId" params={{ serviceId: service.id }} className="text-primary-soft">服务设置</Link>
+      </div>
+    </div>
+    {organizeMessage && <p role={organizeMessage.failed ? "alert" : "status"}
+      className={`mt-2 text-xs ${organizeMessage.failed ? "text-destructive" : "text-muted-foreground"}`}>
+      {organizeMessage.text}
+    </p>}
+  </div>;
+}
+
+/** 概览媒体库卡片直接创建增量扫描，并保留服务端返回的错误提示。 */
+function OverviewLibraryCard({ library }: { library: MediaLibrary }) {
+  const [creating, setCreating] = useState(false);
+  const [feedback, setFeedback] = useState<{ message: string; failed: boolean } | null>(null);
+  // 关键变量：请求发出时同步占位，防止重复点击。
+  const creatingRef = useRef(false);
+  const canScan = library.libraryKind === "legacy_single_source" || library.libraryKind === "cloud_aggregate_video";
+
+  /** 使用媒体库设置页相同的增量扫描接口，路径和任务互斥交给服务端核验。 */
+  async function triggerIncrementalScan(): Promise<void> {
+    if (creatingRef.current) return;
+    creatingRef.current = true;
+    setCreating(true);
+    setFeedback(null);
+    try {
+      const job = await createScanJob(library.id, "incremental");
+      setFeedback({ message: `增量扫描任务已创建：${job.id}`, failed: false });
+    } catch (error) {
+      setFeedback({ message: error instanceof Error ? error.message : "创建增量扫描任务失败", failed: true });
+    } finally {
+      creatingRef.current = false;
+      setCreating(false);
+    }
+  }
+
+  return <div className="rounded-xl border border-border bg-secondary/40 p-4">
+    <div className="flex items-center justify-between gap-3"><p className="truncate text-sm font-medium">{library.displayName}</p><StatusPill>{library.dataType === "music" ? "音乐" : "影视"}</StatusPill></div>
+    {library.description && <p className="mt-1 truncate text-xs text-muted-foreground" title={library.description}>{library.description}</p>}
+    <p className="mt-1 text-[11px] text-muted-foreground">来源：{library.sourceServiceName} · 条目 {library.itemCount.toLocaleString()}</p>
+    {canScan && <div className="mt-3 flex justify-end border-t border-border/70 pt-3">
+      <button type="button" onClick={() => void triggerIncrementalScan()} disabled={creating || library.status !== "active"}
+        className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40">
+        <ScanLine className="size-3.5" />{creating ? "创建中…" : "增量扫描"}
+      </button>
+    </div>}
+    {feedback && <p role={feedback.failed ? "alert" : "status"} className={`mt-2 break-all text-xs ${feedback.failed ? "text-destructive" : "text-muted-foreground"}`}>{feedback.message}</p>}
+  </div>;
+}
 
 /** 普通用户个人概览页面。 */
 export function OverviewPage() {
@@ -115,24 +218,12 @@ export function OverviewPage() {
 
       <Panel title="我的服务" className="mt-4" action={<Link to="/app/services" className="inline-flex items-center gap-1 text-xs text-primary-soft">管理服务 <ArrowUpRight className="size-3.5" /></Link>}>
         <div className="grid gap-3 sm:grid-cols-2">
-          {services.map((service) => (
-            <div key={service.id} className="rounded-xl border border-border bg-secondary/40 p-4">
-              <div className="flex items-start justify-between gap-3">
-                <p className="truncate text-sm font-medium">{service.displayName}</p>
-                <StatusPill tone={service.status === "active" ? "success" : "warning"}>{serviceStatusLabels[service.status]}</StatusPill>
-              </div>
-              <p className="mt-1 font-mono text-[11px] text-muted-foreground">{service.providerType} · {service.id}</p>
-              <div className="mt-3 flex items-center justify-between text-[11px] text-muted-foreground">
-                <span>连接 r{service.credentialRevision}</span>
-                <Link to="/app/services/$serviceId" params={{ serviceId: service.id }} className="text-primary-soft">服务设置</Link>
-              </div>
-            </div>
-          ))}
+          {services.map((service) => <OverviewServiceCard key={service.id} service={service} />)}
         </div>
       </Panel>
 
       <Panel title="我的媒体库" className="mt-4" action={<Link to="/app/catalog" className="inline-flex items-center gap-1 text-xs text-primary-soft">管理媒体库 <ArrowUpRight className="size-3.5" /></Link>}>
-        <div className="grid gap-3 sm:grid-cols-2">{libraries.map((library) => <div key={library.id} className="rounded-xl border border-border bg-secondary/40 p-4"><div className="flex items-center justify-between gap-3"><p className="truncate text-sm font-medium">{library.displayName}</p><StatusPill>{library.dataType === "music" ? "音乐" : "影视"}</StatusPill></div><p className="mt-1 text-[11px] text-muted-foreground">来源：{library.sourceServiceName} · 条目 {library.itemCount.toLocaleString()}</p></div>)}</div>
+        <div className="grid gap-3 sm:grid-cols-2">{libraries.map((library) => <OverviewLibraryCard key={library.id} library={library} />)}</div>
       </Panel>
 
       <Panel title="最近入库" description="只展示服务端媒体目录，不提供播放与下载" className="mt-4">

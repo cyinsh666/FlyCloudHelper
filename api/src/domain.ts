@@ -118,6 +118,8 @@ export interface MediaLibraryRecord {
   userId: string;
   ownerUsername: string;
   displayName: string;
+  /** 媒体库备注，只用于管理界面，不参与媒体识别和协议名称。 */
+  description: string;
   dataType: MediaType;
   libraryKind: MediaLibraryKind;
   status: "active" | "disabled";

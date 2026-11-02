@@ -18,7 +18,7 @@ export function LibraryContentAudiobookSettingsPage({ state }: { state: {
 
   return <>
     <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-      <ContentSourceLibraryNameEditor state={{ libraryId: library.id, displayName: library.displayName, admin, loading: state.loading, onSaved: state.onRefresh }} />
+      <ContentSourceLibraryNameEditor state={{ libraryId: library.id, displayName: library.displayName, description: library.description, admin, loading: state.loading, onSaved: state.onRefresh }} />
       <div className="flex flex-wrap gap-2"><Link to={librariesPath}><SecondaryButton>返回媒体库</SecondaryButton></Link><Link to={catalogPath} params={{ serviceId: library.id }}><PrimaryButton><LibraryBig className="size-4" />书库</PrimaryButton></Link></div>
     </div>
     {state.message && <Panel className="mb-3 p-3 sm:p-3"><p role="status" className="text-sm text-muted-foreground">{state.message}</p></Panel>}

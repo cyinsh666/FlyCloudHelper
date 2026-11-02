@@ -282,6 +282,7 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("id", 64).primary();
       table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
       table.string("display_name", 255).notNullable();
+      table.string("description", 500).notNullable().defaultTo("");
       table.string("data_type", 32).notNullable();
       table.string("library_kind", 64).notNullable().defaultTo("legacy_single_source");
       table.string("singleton_key", 64).nullable();
@@ -318,6 +319,9 @@ async function createServiceTables(database: Knex): Promise<void> {
   } else {
     await addColumnIfMissing(database, "media_libraries", "display_name", (table) => {
       table.string("display_name", 255).notNullable().defaultTo("");
+    });
+    await addColumnIfMissing(database, "media_libraries", "description", (table) => {
+      table.string("description", 500).notNullable().defaultTo("");
     });
     await addColumnIfMissing(database, "media_libraries", "data_type", (table) => {
       table.string("data_type", 32).notNullable().defaultTo("video");

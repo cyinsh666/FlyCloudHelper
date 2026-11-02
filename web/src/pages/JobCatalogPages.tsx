@@ -1,6 +1,6 @@
 import { MusicScanStages } from "../components/MusicScanStages";
 import { Link } from "@tanstack/react-router";
-import { BookOpen, Download, Images, Layers3, Music2, Pause, Play, Plus, Radio, RefreshCw, RotateCcw, Settings2, Sparkles, Square, Trash2 } from "lucide-react";
+import { BookOpen, Download, Images, Layers3, Music2, Pause, Play, Plus, Radio, RefreshCw, RotateCcw, ScanLine, Settings2, Sparkles, Square, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { AdminServiceFilters } from "@/components/AdminServiceFilters";
@@ -11,12 +11,12 @@ import {
   cancelScanJob,
   clearCompletedAndFailedScanJobs,
   controlLibraryScanJob,
+  createScanJob,
   createManualAiSupplementJob,
   deleteLibraryScanJob,
   deleteScanJob,
   downloadScanFailureReport,
   getJobAiSupplements,
-  listJobs,
   listAdminUsers,
   listMediaProbeJobFailures,
   listProviders,
@@ -27,12 +27,14 @@ import {
   type JobStatus,
   type JobAiSupplementResult,
   type MediaProbeFailure,
+  type MediaLibrary,
   type ScanJob,
   type ServiceListFilters,
 } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
 import { formatJobDateTime, formatJobDuration, getJobDurationLabel } from "@/lib/job-duration";
-import { OrganizeTasksPanel } from "./OrganizeTasksPanel";
+import { OrganizeTaskDetail, OrganizeTaskListCard } from "./OrganizeTasksPanel";
+import { loadJobRecordPrefix } from "./job-records";
 
 // 关键变量：后台任务页固定每 5 秒读取一次进度，避免轮询和 SSE 同时触发重复请求。
 const JOB_PROGRESS_REFRESH_INTERVAL_MS = 5_000;
@@ -339,13 +341,8 @@ function JobsView({ admin }: { admin: boolean }) {
   const [jobTypeFilter, setJobTypeFilter] = useState<JobTypeFilter>("all");
   const [jobPageOffset, setJobPageOffset] = useState(0);
   const resource = useApiResource(
-    () => jobTypeFilter === "organize" ? Promise.resolve({ items: [] as ScanJob[], total: 0 }) : listJobs(admin, {
-      status: statusFilter === "all" ? undefined : statusFilter,
-      jobType: jobTypeFilter === "all" ? undefined : jobTypeFilter,
-      groupParentJobs: true,
-      limit: JOB_LIST_PAGE_SIZE,
-      offset: jobPageOffset,
-    }),
+    () => loadJobRecordPrefix({ admin, status: statusFilter, jobType: jobTypeFilter,
+      count: jobPageOffset + JOB_LIST_PAGE_SIZE }),
     [admin, statusFilter, jobTypeFilter, jobPageOffset],
   );
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
@@ -376,9 +373,19 @@ function JobsView({ admin }: { admin: boolean }) {
   const aiSupplementRequestJobIdRef = useRef<string | null>(null);
   // 关键变量：同步占用手动补充请求，阻止按钮状态刷新前的连续点击。
   const aiSupplementTriggeringRef = useRef(false);
-  const jobs = resource.data?.items ?? [];
+  const jobs = resource.data?.scanItems ?? [];
   const jobGroups = useMemo(() => groupJobList(jobs), [jobs]);
-  const activeJob = jobs.find((job) => job.id === selectedJobId) ?? jobs[0];
+  // 关键变量：两种任务各取当前页之前的前缀，按创建时间混排后只展示本页 8 条。
+  const jobRecords = useMemo(() => [
+    ...jobGroups.map((group) => ({ kind: "scan" as const, group, createdAt: group.jobs[0]?.createdAt ?? "" })),
+    ...(resource.data?.organizeItems ?? []).map((task) => ({ kind: "organize" as const, task, createdAt: task.createdAt })),
+  ].sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+    .slice(jobPageOffset, jobPageOffset + JOB_LIST_PAGE_SIZE), [jobGroups, resource.data?.organizeItems, jobPageOffset]);
+  const activeRecord = jobRecords.find((record) => record.kind === "organize"
+    ? record.task.id === selectedJobId : record.group.jobs.some((job) => job.id === selectedJobId)) ?? jobRecords[0];
+  const activeOrganizeTask = activeRecord?.kind === "organize" ? activeRecord.task : undefined;
+  const activeJob = activeRecord?.kind === "scan"
+    ? activeRecord.group.jobs.find((job) => job.id === selectedJobId) ?? activeRecord.group.jobs[0] : undefined;
   const activeJobGroup = activeJob ? jobGroups.find((group) => group.jobs.some((job) => job.id === activeJob.id)) : undefined;
   const activeParentJobId = activeJobGroup?.parentJobId ?? null;
   const pendingActiveJobOperation = activeJob ? pendingJobOperations[activeJob.id] : undefined;
@@ -399,7 +406,7 @@ function JobsView({ admin }: { admin: boolean }) {
   const canDownloadFailureReport = Boolean(activeJob && activeJob.jobType === "scan" && activeJob.status !== "queued");
   const snapshotFields = activeJob ? getJobSnapshotFields(activeJob.snapshot) : [];
   const pluginSnapshots = activeJob ? getJobPluginSnapshots(activeJob.snapshot) : [];
-  const jobTotal = resource.data?.total ?? 0;
+  const jobTotal = (resource.data?.scanTotal ?? 0) + (resource.data?.organizeTotal ?? 0);
   const jobPageCount = Math.max(1, Math.ceil(jobTotal / JOB_LIST_PAGE_SIZE));
   const currentJobPage = Math.floor(jobPageOffset / JOB_LIST_PAGE_SIZE) + 1;
 
@@ -781,9 +788,10 @@ function JobsView({ admin }: { admin: boolean }) {
           </div>
         </div>
       </Panel>
-      {(jobTypeFilter === "all" || jobTypeFilter === "organize") && <div className="mb-4"><OrganizeTasksPanel admin={admin} statusFilter={statusFilter} /></div>}
-      {jobTypeFilter !== "organize" && (!activeJob ? <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? (jobTypeFilter === "all" ? "暂无扫描或规格任务" : "当前筛选条件下没有任务")}</div></Panel> : (
+      {!activeRecord ? <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "当前筛选条件下没有任务"}</div></Panel> : (
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
+          {activeOrganizeTask && <OrganizeTaskDetail task={activeOrganizeTask} admin={admin} onRefresh={resource.refresh} />}
+          {activeJob && <>
           <Panel className="p-4 sm:p-4 xl:h-[calc(100vh-14rem)] xl:min-h-[560px] xl:max-h-[720px] xl:overflow-y-auto" title="任务详情" description={`${activeJob.serviceName} · ${getBackgroundJobLabel(activeJob)}${admin ? ` · ${activeJob.ownerUsername}` : ""} · 任务 ${activeJob.id.slice(0, 8)}`}>
             <div className="rounded-xl border border-primary/25 bg-primary/8 p-4">
               <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3"><div><p className="text-[11px] text-muted-foreground">当前阶段</p><p className="font-display mt-0.5 text-xl font-semibold">{getJobStageLabel(activeJob.stage)}</p><p className="mt-0.5 text-[11px] text-muted-foreground">{getJobDurationLabel(activeJob.status)}：{formatJobDuration(activeJob.elapsedMs)}</p></div><StatusPill tone={getJobTone(activeJob.status)}>{getJobStatusLabel(activeJob)}</StatusPill></div>
@@ -871,14 +879,19 @@ function JobsView({ admin }: { admin: boolean }) {
             )}
             {activeJob.status !== "retry_waiting" && (activeJob.errorCode || activeJob.errorMessage) && <div className="mt-4 rounded-xl border border-destructive/30 bg-destructive/8 p-4"><p className="font-mono text-xs text-destructive">{activeJob.errorCode}</p><p className="mt-2 text-sm">{activeJob.errorMessage}</p></div>}
           </Panel>
+          </>}
           <Panel
             className="overflow-hidden p-4 sm:p-4 xl:flex xl:h-[calc(100vh-14rem)] xl:min-h-[560px] xl:max-h-[720px] xl:flex-col"
             title="任务列表"
-            description={`当前页 ${jobGroups.length} 组 · ${jobs.length} 个底层任务 · 共 ${jobTotal} 组 · 第 ${currentJobPage}/${jobPageCount} 页`}
-            action={<button type="button" title="仅清除已完成和失败的扫描、规格任务" onClick={() => void clearCompletedJobs()} disabled={clearingCompletedJobs} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/8 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /> {clearingCompletedJobs ? "正在清除…" : "清除扫描/规格已结束任务"}</button>}
+            description={`当前页 ${jobRecords.length} 条 · 共 ${jobTotal} 条 · 第 ${currentJobPage}/${jobPageCount} 页`}
+            action={jobTypeFilter !== "organize" ? <button type="button" title="仅清除已完成和失败的扫描、规格任务" onClick={() => void clearCompletedJobs()} disabled={clearingCompletedJobs} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/8 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /> {clearingCompletedJobs ? "正在清除…" : "清除扫描/规格已结束任务"}</button> : undefined}
           >
             <ul className="grid max-h-[560px] grid-cols-1 content-start gap-1.5 overflow-y-auto pr-1 sm:grid-cols-2 xl:min-h-0 xl:flex-1 xl:max-h-none">
-              {jobGroups.map((group) => {
+              {jobRecords.map((record) => {
+                if (record.kind === "organize") return <OrganizeTaskListCard key={record.task.id}
+                  task={record.task} selected={activeOrganizeTask?.id === record.task.id}
+                  onSelect={() => setSelectedJobId(record.task.id)} />;
+                const group = record.group;
                 if (group.parentJobId) {
                   const firstSourceJob = group.jobs[0];
                   if (!firstSourceJob) return null;
@@ -966,7 +979,7 @@ function JobsView({ admin }: { admin: boolean }) {
             </div>
           </Panel>
         </div>
-      ))}
+      )}
       <AiSupplementDialog state={{
         open: aiSupplementDialogOpen,
         loading: aiSupplementLoading,
@@ -988,6 +1001,10 @@ export function AdminJobsPage() { return <JobsView admin />; }
 /** 按服务选择独立媒体库，不把不同服务的条目合并到同一个海报墙。 */
 function CatalogServiceSelector({ admin }: { admin: boolean }) {
   const [filters, setFilters] = useState<ServiceListFilters>({});
+  const [creatingScanLibraryId, setCreatingScanLibraryId] = useState<string | null>(null);
+  const [scanFeedback, setScanFeedback] = useState<{ libraryId: string; message: string; failed: boolean } | null>(null);
+  // 关键变量：请求发出时立即占位，避免状态更新前连续点击创建重复任务。
+  const creatingScanLibraryIdRef = useRef<string | null>(null);
   const resource = useApiResource(
     () => listLibraries(admin, admin ? filters : {}),
     [admin, filters.search, filters.userId, filters.providerType, filters.dataType, filters.status],
@@ -998,6 +1015,25 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
     return { users: users.items, providers };
   }, [admin]);
   const libraries = resource.data?.items ?? [];
+
+  /** 从媒体库卡片创建增量扫描，沿用设置页的接口和服务端路径校验。 */
+  async function triggerIncrementalScan(library: MediaLibrary): Promise<void> {
+    if (creatingScanLibraryIdRef.current) return;
+    creatingScanLibraryIdRef.current = library.id;
+    setCreatingScanLibraryId(library.id);
+    setScanFeedback(null);
+    try {
+      const job = await createScanJob(library.id, "incremental", admin);
+      setScanFeedback({ libraryId: library.id, message: `增量扫描任务已创建：${job.id}`, failed: false });
+    } catch (error) {
+      setScanFeedback({ libraryId: library.id,
+        message: error instanceof Error ? error.message : "创建增量扫描任务失败", failed: true });
+    } finally {
+      creatingScanLibraryIdRef.current = null;
+      setCreatingScanLibraryId(null);
+    }
+  }
+
   return (
     <>
       <PageHeader
@@ -1022,6 +1058,7 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
                 <div className="min-w-0">
                   <h2 className="truncate text-sm font-semibold">{library.displayName}</h2>
                   <p className="truncate text-[11px] text-muted-foreground">{library.libraryKind === "content_source_live" ? `电视直播源 · ${library.sourceServiceName}` : library.libraryKind === "content_source_audiobook" ? `在线听书源 · ${library.sourceServiceName}` : library.libraryKind === "content_source_music" ? `在线音乐源 · ${library.sourceServiceName}` : library.libraryKind === "content_source_video" ? `在线内容源 · ${library.sourceServiceName}` : library.libraryKind === "cloud_aggregate_video" ? `云聚合视频库 · ${library.sourceCount} 个来源` : `${library.sourceServiceName} · ${library.providerType}`}{admin ? ` · ${library.ownerUsername}` : ""}</p>
+                  {library.description && <p className="mt-1 truncate text-[11px] text-muted-foreground" title={library.description}>{library.description}</p>}
                 </div>
               </div>
               <span className={`mt-1 size-2.5 rounded-full ${library.status === "active" && library.sourceConnectionStatus === "valid" ? "bg-success" : "bg-warning"}`} title={library.status === "active" ? "媒体库已启用" : "媒体库已停用"} />
@@ -1035,7 +1072,17 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
             <footer className="mt-3 flex flex-wrap gap-2 border-t border-border/70 pt-3">
               {library.libraryKind !== "content_source_live" && <Link to={admin ? "/admin/libraries/$serviceId/catalog" : "/app/libraries/$serviceId/catalog"} params={{ serviceId: library.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Images className="size-3.5" /> 海报</Link>}
               <Link to={admin ? "/admin/libraries/$serviceId/settings" : "/app/libraries/$serviceId/settings"} params={{ serviceId: library.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Settings2 className="size-3.5" /> 设置</Link>
+              {(library.libraryKind === "legacy_single_source" || library.libraryKind === "cloud_aggregate_video") &&
+                <button type="button" onClick={() => void triggerIncrementalScan(library)}
+                  disabled={library.status !== "active" || creatingScanLibraryId !== null}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40">
+                  <ScanLine className="size-3.5" /> {creatingScanLibraryId === library.id ? "创建中…" : "增量扫描"}
+                </button>}
             </footer>
+            {scanFeedback?.libraryId === library.id && <p role={scanFeedback.failed ? "alert" : "status"}
+              className={`mt-2 break-all text-xs ${scanFeedback.failed ? "text-destructive" : "text-muted-foreground"}`}>
+              {scanFeedback.message}
+            </p>}
           </article>
         ))}
       </div>

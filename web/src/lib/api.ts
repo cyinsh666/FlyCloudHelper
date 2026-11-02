@@ -331,6 +331,8 @@ export interface MediaLibrary {
   userId: string;
   ownerUsername: string;
   displayName: string;
+  /** 媒体库备注，不影响客户端协议名称。 */
+  description: string;
   dataType: MediaType;
   status: "active" | "disabled";
   libraryKind: MediaLibraryKind;
@@ -828,6 +830,8 @@ export interface OrganizeJob {
   itemCount: number;
   completedCount: number;
   error: string | null;
+  autoRetryCount?: number;
+  nextRetryAt?: string | null;
   createdAt: string;
 }
 
@@ -841,6 +845,8 @@ export interface OrganizeTaskSummary {
   failedCount: number;
   totalCount: number | null;
   error: string | null;
+  autoRetryCount?: number;
+  nextRetryAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -1085,12 +1091,12 @@ export function getLibrary(libraryId: string, admin = false): Promise<LibraryDet
   return requestJson(admin ? `/api/v1/admin/libraries/${libraryId}` : `/api/v1/libraries/${libraryId}`);
 }
 
-/** 修改在线媒体库名称，管理员使用仅允许改名的专属接口。 */
-export async function updateContentLibraryName(libraryId: string, displayName: string, admin = false): Promise<MediaLibrary> {
+/** 修改媒体库名称和备注，管理员使用媒体库资料专属接口。 */
+export async function updateContentLibraryName(libraryId: string, displayName: string, description: string, admin = false): Promise<MediaLibrary> {
   const encodedId = encodeURIComponent(libraryId);
   const result = await requestJson<{ library: MediaLibrary }>(
     admin ? `/api/v1/admin/libraries/${encodedId}/name` : `/api/v1/libraries/${encodedId}`,
-    { method: "PATCH", body: JSON.stringify({ displayName: displayName.trim() }) },
+    { method: "PATCH", body: JSON.stringify({ displayName: displayName.trim(), description: description.trim() }) },
   );
   return result.library;
 }

@@ -496,7 +496,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
     }
   }
 
-  if (service?.libraryKind === "content_source_live") return <LibraryLiveSettingsPage state={{ library: service, admin, message, onDelete: deleteCurrentLibrary }} />;
+  if (service?.libraryKind === "content_source_live") return <LibraryLiveSettingsPage state={{ library: service, admin, message, onRefresh: resource.refresh, onDelete: deleteCurrentLibrary }} />;
   if (service?.libraryKind === "content_source_audiobook") {
     return <LibraryContentAudiobookSettingsPage state={{
       library: service, admin, loading: resource.loading, clearingCatalog, message,
@@ -530,13 +530,10 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
 
   return (
     <>
-      {isContentSource ? <div className="mb-6 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
-        <ContentSourceLibraryNameEditor key={`${serviceId}:${admin}`} state={{ libraryId: serviceId, displayName: service.displayName, admin, loading: resource.loading, onSaved: resource.refresh }} />
+      <div className="mb-6 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
+        <ContentSourceLibraryNameEditor key={`${serviceId}:${admin}`} state={{ libraryId: serviceId, displayName: service.displayName, description: service.description, admin, loading: resource.loading, onSaved: resource.refresh }} />
         <div className="flex flex-wrap gap-2 sm:justify-end">{headerActions}</div>
-      </div> : <PageHeader
-        title={`${service.displayName} · 媒体库设置`}
-        actions={headerActions}
-      />}
+      </div>
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
       {isMusicContentSource ? <ContentMusicLibraryPanel key={`${serviceId}:${admin}`} state={{ libraryId: serviceId, admin, onChanged: resource.refresh }} /> : isContentSource ? <ContentSourceLibraryPanel key={`${serviceId}:${admin}`} libraryId={serviceId} admin={admin} onChanged={resource.refresh} /> : isCloudAggregate ? <><CloudAggregateSourcesPanel library={service} admin={admin} onChanged={resource.refresh} onMessage={setMessage} /><CloudAggregateScanPathsPanel library={service} admin={admin} onChanged={resource.refresh} onMessage={setMessage} /></> : <Panel title="关联服务" description="当前媒体库使用这个网盘服务的登录凭据读取和扫描文件。" className="mb-4">
         <div className="flex flex-wrap items-center justify-between gap-3">

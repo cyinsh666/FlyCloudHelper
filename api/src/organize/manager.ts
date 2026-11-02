@@ -13,6 +13,26 @@ const VIDEO_EXTENSION = /\.(?:mp4|mkv|avi|mov|wmv|flv|m4v|ts|m2ts|mpg|mpeg|rmvb|
 const MAX_FILES = 5000;
 const MAX_DIRECTORIES = 2000;
 const MAX_ENTRIES = 20_000;
+/** 临时网盘故障最多自动继续三次，间隔逐步增加，避免故障期间反复写网盘。 */
+const AUTO_RETRY_DELAYS_MS = [5, 15, 30].map((minutes) => minutes * 60_000);
+/** 只接受明确表示连接中断或限流的稳定错误码，不把凭据、冲突和文件变化列入自动重试。 */
+const RETRYABLE_PROVIDER_CODES = new Set([
+  "provider_connection_timeout", "provider_connection_refused", "provider_network_unreachable",
+  "provider_dns_resolution_failed", "provider_unavailable", "provider_rate_limited",
+  "cloud139_rate_limited", "quark_organize_move_pending",
+]);
+
+/** 仅临时网络、限流及已持久化的远端任务等待超时可自动继续。 */
+function isRetryableOrganizeFailure(error: unknown): boolean {
+  if (error instanceof ApiError) {
+    if (RETRYABLE_PROVIDER_CODES.has(error.code)) return true;
+    return error.code === "provider_request_failed" && /状态码 (?:429|502|503|504)$/u.test(error.message);
+  }
+  if (!(error instanceof Error)) return false;
+  return error.message === "网盘文件任务等待超时，可稍后继续任务"
+    || error.message === "传输结果尚未确认，请稍后继续任务"
+    || error.message === "批量覆盖删除尚未完成，请稍后继续任务";
+}
 
 /** 从文件名提取可重复验证的命名标签，不读取媒体字节。 */
 function readNameTags(name: string, resolution: string, source: string): string[] {
@@ -196,7 +216,7 @@ export class ServiceOrganizeManager {
       unrecognizedTransferEnabled: Boolean(input.unrecognizedTransferEnabled), unrecognizedDirectory,
       aiAssistEnabled: Boolean(input.aiAssistEnabled), aiModelId,
       aiFailureCount: 0, status: "preparing", error: null, items: [], createdAt: now, updatedAt: now };
-    await saveJson(this.planPath(plan.id), plan);
+    await this.withExclusiveScanSlot(serviceId, () => saveJson(this.planPath(plan.id), plan));
     this.activePlans.add(plan.id);
     void this.preparePlan(plan, context).catch(() => {
       console.error("影片整理预览保存失败");
@@ -579,7 +599,8 @@ export class ServiceOrganizeManager {
       tasks.push({ id: job.id, serviceId: job.serviceId, status: job.status,
         completedCount: job.items.filter((item) => item.stage === "completed").length,
         failedCount: job.items.filter((item) => item.stage === "failed").length,
-        totalCount: job.items.length, error: job.error, createdAt: job.createdAt, updatedAt: job.updatedAt });
+        totalCount: job.items.length, error: job.error, autoRetryCount: job.autoRetryCount,
+        nextRetryAt: job.nextRetryAt, createdAt: job.createdAt, updatedAt: job.updatedAt });
     }
     // 关键变量：已创建执行任务的预览不再作为第二条“识别中”任务展示。
     for (const name of names) {
@@ -623,26 +644,44 @@ export class ServiceOrganizeManager {
       const now = new Date().toISOString();
       const job: OrganizeJob = { id: randomUUID(), planId, serviceId, userId: context.userId,
         credentialRevision: context.credentialRevision, status: "queued", workDirectoryId: null,
-        stageDirectoryId: null, backupDirectoryId: null, error: null,
+        stageDirectoryId: null, backupDirectoryId: null, error: null, autoRetryCount: 0, nextRetryAt: null,
         items: plan.items.map((item, index): OrganizeJobItem => ({ index, stage: "pending", sourceId: item.sourceId, stageRequested: false,
           stagedId: null, replacedId: null, targetParentId: null, stageParentId: null,
           backupParentId: null, pendingTaskId: null, error: null })).filter((item) => plan.items[item.index]?.status === "ready"),
         createdAt: now, updatedAt: now };
-      await this.saveJob(job);
+      await this.withExclusiveScanSlot(serviceId, () => this.saveJob(job));
+      // 新计划由用户主动创建时，旧失败任务不再自动继续，避免两份计划先后写同一目标。
+      for (const oldJob of previous) {
+        if (oldJob.status !== "failed" || !oldJob.nextRetryAt) continue;
+        oldJob.nextRetryAt = null;
+        await this.saveJob(oldJob);
+      }
       this.startJob(job.id);
       return job;
     } finally { this.creatingServices.delete(serviceId); }
   }
 
+  /** 共用服务行锁检查扫描状态，并在锁内落盘整理任务，避免双方同时创建。 */
+  private async withExclusiveScanSlot<T>(serviceId: string, action: () => Promise<T>): Promise<T> {
+    return this.runtime.database.query.transaction(async (transaction) => {
+      let serviceLock = transaction("cloud_services").where({ id: serviceId }).select("id");
+      if (this.runtime.database.databaseType !== "sqlite") serviceLock = serviceLock.forUpdate();
+      await serviceLock.first();
+      await this.requireNoActiveScan(serviceId, transaction);
+      return action();
+    });
+  }
+
   /** 文件移动期间不与同服务正在排队或运行的扫描任务交叉。 */
-  private async requireNoActiveScan(serviceId: string): Promise<void> {
-    const scan = await this.runtime.database.query("scan_jobs").select("id")
+  private async requireNoActiveScan(serviceId: string, query = this.runtime.database.query): Promise<void> {
+    const scan = await query("scan_jobs").select("id")
       .where({ service_id: serviceId }).whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first();
     if (scan) throw new ApiError(409, "organize_scan_active", "当前网盘服务有未结束的扫描任务，请稍后整理");
   }
 
-  /** 暂停和取消只在当前文件完成后生效，避免把覆盖过程停在备份阶段。 */
-  public async controlJob(serviceId: string, jobId: string, action: "pause" | "resume" | "cancel", actorUserId?: string): Promise<OrganizeJob> {
+  /** 暂停和取消只在当前文件完成后生效；automatic 只供到期轮询继续失败任务。 */
+  public async controlJob(serviceId: string, jobId: string, action: "pause" | "resume" | "cancel",
+    actorUserId?: string, automatic = false): Promise<OrganizeJob> {
     await this.getJob(serviceId, jobId, actorUserId);
     // 关键变量：控制操作与执行阶段共用串行写队列，避免暂停覆盖刚保存的文件进度。
     const previousWrite = this.jobWrites.get(jobId) ?? Promise.resolve();
@@ -656,13 +695,23 @@ export class ServiceOrganizeManager {
           || (await this.listJobs(serviceId, actorUserId)).some((other) => other.id !== jobId
             && ["queued", "running", "paused"].includes(other.status));
         if (occupied) throw new ApiError(409, "organize_job_exists", "当前服务已有排队、运行或暂停的整理任务");
+        if (automatic && (!job.nextRetryAt || job.nextRetryAt > new Date().toISOString()
+          || (job.autoRetryCount ?? 0) >= AUTO_RETRY_DELAYS_MS.length)) {
+          throw new ApiError(409, "organize_retry_not_due", "整理任务尚未到自动重试时间");
+        }
         job.status = "queued";
         job.error = null;
+        job.autoRetryCount = automatic ? (job.autoRetryCount ?? 0) + 1 : 0;
+        job.nextRetryAt = null;
         for (const item of job.items) if (item.stage === "failed") { item.stage = "pending"; item.error = null; }
-      } else if (action === "cancel" && ["queued", "running", "paused", "failed"].includes(job.status)) job.status = "cancelled";
+      } else if (action === "cancel" && ["queued", "running", "paused", "failed"].includes(job.status)) {
+        job.status = "cancelled";
+        job.nextRetryAt = null;
+      }
       else throw new ApiError(409, "organize_job_action_invalid", "当前任务状态不支持此操作");
       job.updatedAt = new Date().toISOString();
-      await saveJson(this.jobPath(jobId), job);
+      if (action === "resume") await this.withExclusiveScanSlot(serviceId, () => saveJson(this.jobPath(jobId), job));
+      else await saveJson(this.jobPath(jobId), job);
       return job;
     });
     const write = update.then(() => undefined, () => undefined);
@@ -672,6 +721,37 @@ export class ServiceOrganizeManager {
     finally { if (this.jobWrites.get(jobId) === write) this.jobWrites.delete(jobId); }
     if (action === "resume") this.startJob(job.id);
     return job;
+  }
+
+  /** 定时轮询只继续当前任务，不重建预览；进程重启后仍读取持久化的重试时间。 */
+  public async resumeDueFailedJobs(): Promise<void> {
+    const names = await fs.readdir(this.directory).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [] as string[];
+      throw error;
+    });
+    // 关键变量：每个服务只看最新任务，旧失败任务不会在新计划完成后重新启动。
+    const latestByService = new Map<string, OrganizeJob>();
+    for (const name of names) {
+      if (!/^job-[0-9a-f-]{36}\.json$/iu.test(name)) continue;
+      const job = await readJson<OrganizeJob>(path.join(this.directory, name));
+      if (!job) continue;
+      const previous = latestByService.get(job.serviceId);
+      if (!previous || job.createdAt > previous.createdAt) latestByService.set(job.serviceId, job);
+    }
+    for (const job of latestByService.values()) {
+      if (!job || job.status !== "failed" || !job.nextRetryAt || job.nextRetryAt > new Date().toISOString()
+        || this.activeServices.has(job.serviceId) || this.creatingServices.has(job.serviceId)) continue;
+      try {
+        await this.requireNoActiveScan(job.serviceId);
+        await this.controlJob(job.serviceId, job.id, "resume", job.userId, true);
+      } catch (error) {
+        // 其它任务和扫描暂时占用服务时保留原重试时间，下次轮询再尝试。
+        if (error instanceof ApiError && ["organize_job_exists", "organize_scan_active", "organize_retry_not_due"].includes(error.code)) continue;
+        this.runtime.logBusinessEvent("warn", { 日志关键字: "codex-flycloud-organize-retry",
+          事件: "整理任务自动继续失败", 任务ID: job.id,
+          错误信息: error instanceof Error ? error.message : "未知错误" });
+      }
+    }
   }
 
   /** 服务启动后恢复之前正在运行的任务，暂停和失败任务由用户明确继续。 */
@@ -729,6 +809,15 @@ export class ServiceOrganizeManager {
     this.jobWrites.set(job.id, write);
     try { await write; }
     finally { if (this.jobWrites.get(job.id) === write) this.jobWrites.delete(job.id); }
+  }
+
+  /** 保留失败文件阶段，仅为可恢复故障记录下一次自动继续时间。 */
+  private async failJob(job: OrganizeJob, error: unknown): Promise<void> {
+    job.status = "failed";
+    const attempts = job.autoRetryCount ?? 0;
+    job.nextRetryAt = isRetryableOrganizeFailure(error) && attempts < AUTO_RETRY_DELAYS_MS.length
+      ? new Date(Date.now() + AUTO_RETRY_DELAYS_MS[attempts]!).toISOString() : null;
+    await this.saveJob(job);
   }
 
   /** 远端任务必须完成才允许进入下一阶段。 */
@@ -1092,9 +1181,8 @@ export class ServiceOrganizeManager {
       catch (error) {
         state.stage = "failed";
         state.error = error instanceof Error ? error.message : "批量移动失败";
-        job.status = "failed";
         job.error = `${plan.items[state.index]?.sourceName ?? "文件"}：${state.error}`;
-        await this.saveJob(job);
+        await this.failJob(job, error);
         return false;
       }
     }
@@ -1367,9 +1455,8 @@ export class ServiceOrganizeManager {
         catch (error) {
           current.stage = "failed";
           current.error = error instanceof Error ? error.message : "文件整理失败";
-          job.status = "failed";
           job.error = `${plan.items[current.index]?.sourceName ?? "文件"}：${current.error}`;
-          await this.saveJob(job);
+          await this.failJob(job, error);
           return;
         }
       }
@@ -1388,9 +1475,8 @@ export class ServiceOrganizeManager {
     } catch (error) {
       const latest = await readJson<OrganizeJob>(this.jobPath(jobId));
       if (latest && ["queued", "running"].includes(latest.status)) {
-        latest.status = "failed";
         latest.error = error instanceof Error ? error.message : "影片整理失败";
-        await this.saveJob(latest);
+        await this.failJob(latest, error);
       }
     }
   }

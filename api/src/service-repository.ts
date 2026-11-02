@@ -26,6 +26,7 @@ import {
   parseJsonObject,
 } from "./domain.js";
 import { ApiError, toSafeErrorMessage } from "./errors.js";
+import { hasActiveOrganizeTask } from "./organize/activity.js";
 import { isFlymbyExcludedPath } from "./media/flymby-scan-exclusions.js";
 import { createStableId } from "./media/filename.js";
 import type { FlymbyNfoMetadata } from "./media/flymby-nfo-parser.js";
@@ -121,6 +122,7 @@ interface LibraryRow {
   user_id: string;
   owner_username: string;
   display_name: string;
+  description: string;
   data_type: MediaType;
   library_kind: MediaLibraryKind;
   status: "active" | "disabled";
@@ -354,6 +356,7 @@ function mapLibrary(row: LibraryRow, sources: LibrarySourceRecord[] = []): Media
     userId: row.user_id,
     ownerUsername: row.owner_username,
     displayName: row.display_name,
+    description: row.description,
     dataType: row.data_type,
     libraryKind: row.library_kind,
     status: row.status,
@@ -785,6 +788,7 @@ export class ServiceRepository {
   private readonly database: FlyCloudHelperDatabase;
   private readonly logger?: ServiceRepositoryLogger;
   private readonly mediaProbeConcurrency: number;
+  private readonly organizeExportDirectory?: string;
   private readonly serviceAccess: ServiceAccessService;
   // 关键变量：阻止同一 API 实例同时执行同一服务的多次清空，跨实例仍由数据库服务行锁兜底。
   private readonly clearingCatalogServiceIds = new Set<string>();
@@ -798,13 +802,14 @@ export class ServiceRepository {
     database: FlyCloudHelperDatabase,
     serviceAccess: ServiceAccessService,
     logger?: ServiceRepositoryLogger,
-    queueLimits: { mediaProbeConcurrency: number } = {
+    queueLimits: { mediaProbeConcurrency: number; organizeExportDirectory?: string } = {
       mediaProbeConcurrency: 2,
     },
   ) {
     this.database = database;
     this.logger = logger;
     this.mediaProbeConcurrency = queueLimits.mediaProbeConcurrency;
+    this.organizeExportDirectory = queueLimits.organizeExportDirectory;
     this.serviceAccess = serviceAccess;
   }
 
@@ -979,6 +984,7 @@ export class ServiceRepository {
         "l.user_id",
         "u.username as owner_username",
         "l.display_name",
+        "l.description",
         "l.data_type",
         "l.library_kind",
         "l.status",
@@ -997,7 +1003,7 @@ export class ServiceRepository {
       .countDistinct({ item_count: "m.id" })
       .countDistinct({ source_count: "source_count_rows.id" })
       .groupBy(
-        "l.id", "l.user_id", "u.username", "l.display_name", "l.data_type", "l.status",
+        "l.id", "l.user_id", "u.username", "l.display_name", "l.description", "l.data_type", "l.status",
         "l.library_kind",
         "l.notification_enabled", "l.jellyfin_enabled", "l.emby_enabled", "l.navidrome_enabled", "l.abs_enabled",
         "l.scan_profile_revision", "l.metadata_profile_revision", "l.catalog_version",
@@ -1931,11 +1937,11 @@ export class ServiceRepository {
     };
   }
 
-  /** 更新媒体库本身的名称、类型、通知或启停状态，不修改来源服务。 */
+  /** 更新媒体库本身的名称、备注、类型、通知或启停状态，不修改来源服务。 */
   public async updateLibrary(
     libraryId: string,
     userId: string,
-    patch: { displayName?: string; dataType?: MediaType; status?: "active" | "disabled"; notificationEnabled?: boolean },
+    patch: { displayName?: string; description?: string; dataType?: MediaType; status?: "active" | "disabled"; notificationEnabled?: boolean },
   ): Promise<MediaLibraryRecord> {
     await this.database.query.transaction(async (transaction) => {
       const library = await transaction("media_libraries")
@@ -1977,6 +1983,7 @@ export class ServiceRepository {
       }
       const changes: Record<string, unknown> = { updated_at: new Date().toISOString() };
       if (patch.displayName !== undefined) changes.display_name = patch.displayName;
+      if (patch.description !== undefined) changes.description = patch.description;
       if (patch.dataType !== undefined) changes.data_type = patch.dataType;
       if (patch.status !== undefined) changes.status = patch.status;
       if (patch.notificationEnabled !== undefined) changes.notification_enabled = patch.notificationEnabled ? 1 : 0;
@@ -2671,6 +2678,20 @@ export class ServiceRepository {
         if (conflicting) {
           throw new ApiError(409, "scan_job_conflict", "当前网盘服务已有未结束的扫描任务，不能重复创建");
         }
+        if (source.source_mode === "linked_service" && source.service_id && this.organizeExportDirectory) {
+          // 关键变量：同一物理网盘上的整理预览和执行也占用扫描写入时段。
+          let serviceLock = transaction("cloud_services").where({ id: source.service_id }).select("id");
+          if (this.database.databaseType !== "sqlite") serviceLock = serviceLock.forUpdate();
+          await serviceLock.first();
+          // 多个媒体库来源指向同一服务时，锁后再读一次，避免两个并发请求同时通过锁前检查。
+          if (await transaction("scan_jobs").where({ service_id: source.service_id })
+            .whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first()) {
+            throw new ApiError(409, "scan_job_conflict", "当前网盘服务已有未结束的扫描任务，不能重复创建");
+          }
+          if (await hasActiveOrganizeTask(this.organizeExportDirectory, String(source.service_id))) {
+            throw new ApiError(409, "organize_job_active", "当前网盘服务正在整理，不能同时扫描识别");
+          }
+        }
         const now = new Date().toISOString();
         const snapshot = {
           credentialRevision: Number(source.source_mode === "linked_service"
@@ -3150,6 +3171,8 @@ export class ServiceRepository {
           : transaction("library_sources").where({ id: queuedRow.library_source_id });
         if (this.database.databaseType !== "sqlite") lockQuery.forUpdate();
         if (!(await lockQuery.select("id").first())) continue;
+        if (queuedRow.service_id && this.organizeExportDirectory
+          && await hasActiveOrganizeTask(this.organizeExportDirectory, String(queuedRow.service_id))) continue;
         const sameSourceQuery = transaction("scan_jobs")
           .whereNot({ id: queuedRow.id })
           .whereIn("status", ["running", "retry_waiting", "paused"]);

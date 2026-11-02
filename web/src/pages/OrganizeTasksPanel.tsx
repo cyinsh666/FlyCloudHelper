@@ -26,6 +26,65 @@ function taskPercent(task: OrganizeTaskSummary): string {
   return `${Math.min(100, Math.round((task.completedCount + task.failedCount) / task.totalCount * 100))}%`;
 }
 
+/** 与扫描记录共用任务列表时展示整理任务的操作和进度。 */
+export function OrganizeTaskDetail({ task, admin, onRefresh }: {
+  task: OrganizeTaskSummary; admin: boolean; onRefresh: () => Promise<unknown>;
+}) {
+  const [operation, setOperation] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const detailPath = admin ? "/admin/services/$serviceId/organize" : "/app/services/$serviceId/organize";
+
+  /** 整理任务控制完成后刷新同一个任务列表。 */
+  async function control(action: "pause" | "resume" | "cancel"): Promise<void> {
+    if (operation) return;
+    setOperation(action);
+    setMessage(null);
+    try {
+      await controlServiceOrganizeJob(task.serviceId, task.id, action, admin);
+      await onRefresh();
+    } catch (error) { setMessage(error instanceof Error ? error.message : "操作整理任务失败"); }
+    finally { setOperation(null); }
+  }
+
+  return <Panel className="p-4 sm:p-4 xl:h-[calc(100vh-14rem)] xl:min-h-[560px] xl:max-h-[720px] xl:overflow-y-auto"
+    title="任务详情" description={`${task.serviceName} · 影片整理 · 任务 ${task.id.slice(0, 8)}`}>
+    <div className="rounded-xl border border-primary/25 bg-primary/8 p-4">
+      <div className="flex items-center justify-between gap-3"><div className="flex items-center gap-2"><FolderOutput className="size-4" /><p className="font-medium">影片整理</p></div>
+        <StatusPill tone={taskStatus(task).tone}>{taskStatus(task).label}</StatusPill></div>
+      <p className="mt-3 text-sm">{task.totalCount === null ? "正在扫描与识别来源文件" :
+        `已完成 ${task.completedCount} · 失败 ${task.failedCount} · 总计 ${task.totalCount} · ${taskPercent(task)}`}</p>
+      <div className="mt-3"><ProgressMeter value={task.completedCount + task.failedCount} total={task.totalCount} /></div>
+      {task.error && <p role="alert" className="mt-3 text-sm text-destructive">{task.error}</p>}
+      {message && <p role="alert" className="mt-3 text-sm text-destructive">{message}</p>}
+      {task.status === "failed" && task.nextRetryAt &&
+        <p className="mt-2 text-xs text-muted-foreground">临时故障将在 {new Date(task.nextRetryAt).toLocaleString("zh-CN")} 自动继续（第 {(task.autoRetryCount ?? 0) + 1}/3 次）</p>}
+      {task.status === "failed" && !task.nextRetryAt && task.autoRetryCount === 3 &&
+        <p className="mt-2 text-xs text-muted-foreground">已自动继续 3 次，请检查失败原因后手动继续或取消。</p>}
+      <p className="mt-3 text-xs text-muted-foreground">创建时间：{new Date(task.createdAt).toLocaleString("zh-CN")}</p>
+      <div className="mt-4 flex flex-wrap gap-2">
+        <Link to={detailPath} params={{ serviceId: task.serviceId }}><SecondaryButton>查看整理详情</SecondaryButton></Link>
+        {["queued", "running"].includes(task.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control("pause")}><Pause className="size-4" />暂停</SecondaryButton>}
+        {["paused", "failed"].includes(task.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control("resume")}><Play className="size-4" />继续</SecondaryButton>}
+        {["queued", "running", "paused", "failed"].includes(task.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control("cancel")}><Square className="size-4" />取消</SecondaryButton>}
+      </div>
+    </div>
+  </Panel>;
+}
+
+/** 整理任务在扫描记录旁使用相同尺寸的列表卡片。 */
+export function OrganizeTaskListCard({ task, selected, onSelect }: {
+  task: OrganizeTaskSummary; selected: boolean; onSelect: () => void;
+}) {
+  return <li><button type="button" aria-pressed={selected} onClick={onSelect}
+    className={`w-full rounded-xl border bg-secondary/40 px-3 py-2.5 text-left ${selected ? "border-foreground/45" : "border-border hover:border-foreground/25"}`}>
+    <div className="flex items-center justify-between gap-2"><span className="min-w-0 truncate text-sm font-semibold">{task.serviceName}</span>
+      <StatusPill tone={taskStatus(task).tone}>{taskStatus(task).label}</StatusPill></div>
+    <p className="mt-0.5 truncate text-[11px] text-muted-foreground">影片整理 · {task.totalCount === null ? "识别来源文件" : `已处理 ${task.completedCount + task.failedCount}/${task.totalCount}`} · {taskPercent(task)}</p>
+    <p className="mt-1 text-[11px] text-muted-foreground">创建时间 {new Date(task.createdAt).toLocaleString("zh-CN")}</p>
+    <div className="mt-1.5"><ProgressMeter value={task.completedCount + task.failedCount} total={task.totalCount} /></div>
+  </button></li>;
+}
+
 /** 后台任务页中的服务级影片整理列表与进度；不读取文件级任务流水。 */
 export function OrganizeTasksPanel({ admin, statusFilter }: { admin: boolean; statusFilter: string }) {
   const [offset, setOffset] = useState(0);
@@ -99,6 +158,10 @@ export function OrganizeTasksPanel({ admin, statusFilter }: { admin: boolean; st
             `已完成 ${selected.completedCount} · 失败 ${selected.failedCount} · 总计 ${selected.totalCount} · ${taskPercent(selected)}`}</p>
           <div className="mt-3"><ProgressMeter value={selected.completedCount + selected.failedCount} total={selected.totalCount} /></div>
           {selected.error && <p role="alert" className="mt-3 text-sm text-destructive">{selected.error}</p>}
+          {selected.status === "failed" && selected.nextRetryAt &&
+            <p className="mt-2 text-xs text-muted-foreground">临时故障将在 {new Date(selected.nextRetryAt).toLocaleString("zh-CN")} 自动继续（第 {(selected.autoRetryCount ?? 0) + 1}/3 次）</p>}
+          {selected.status === "failed" && !selected.nextRetryAt && selected.autoRetryCount === 3 &&
+            <p className="mt-2 text-xs text-muted-foreground">已自动继续 3 次，请检查失败原因后手动继续或取消。</p>}
           <p className="mt-3 text-xs text-muted-foreground">创建时间：{new Date(selected.createdAt).toLocaleString("zh-CN")}</p>
           <div className="mt-4 flex flex-wrap gap-2">
             <Link to={detailPath} params={{ serviceId: selected.serviceId }}><SecondaryButton>查看整理详情</SecondaryButton></Link>

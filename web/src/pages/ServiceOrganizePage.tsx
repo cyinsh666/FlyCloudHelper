@@ -222,6 +222,10 @@ export function ServiceOrganizePage({ serviceId, admin = false }: { serviceId: s
       {job && <Panel title="整理任务">
         <p className="text-sm">状态：{{ queued: "等待中", running: "整理中", paused: "已暂停", completed: "已完成", failed: "失败", cancelled: "已取消" }[job.status]} · 已完成 {completedCount}/{job.itemCount}</p>
         {job.error && <p role="alert" className="mt-2 text-sm text-destructive">{job.error}</p>}
+        {job.status === "failed" && job.nextRetryAt &&
+          <p className="mt-2 text-xs text-muted-foreground">临时故障将在 {new Date(job.nextRetryAt).toLocaleString("zh-CN")} 自动继续（第 {(job.autoRetryCount ?? 0) + 1}/3 次）</p>}
+        {job.status === "failed" && !job.nextRetryAt && job.autoRetryCount === 3 &&
+          <p className="mt-2 text-xs text-muted-foreground">已自动继续 3 次，请检查失败原因后手动继续或取消。</p>}
         <div className="mt-3 flex flex-wrap gap-2">
           {["queued", "running"].includes(job.status) && <SecondaryButton disabled={busy} onClick={() => void control("pause")}>暂停</SecondaryButton>}
           {["paused", "failed"].includes(job.status) && <SecondaryButton disabled={busy} onClick={() => void control("resume")}>继续</SecondaryButton>}
