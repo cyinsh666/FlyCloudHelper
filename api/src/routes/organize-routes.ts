@@ -27,8 +27,10 @@ function jobSummary(job: OrganizeJob) {
 export async function registerOrganizeRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
   const manager = new ServiceOrganizeManager(runtime);
   const scheduler = new ServiceOrganizeScheduler(runtime, manager);
-  void manager.resumePending().catch((error) => server.log.error({ err: error }, "恢复影片整理任务失败"))
-    .finally(() => scheduler.start());
+  if (runtime.config.workerEnabled) {
+    void manager.resumePending().catch((error) => server.log.error({ err: error }, "恢复影片整理任务失败"))
+      .finally(() => scheduler.start());
+  }
   server.addHook("onClose", async () => scheduler.stop());
   for (const admin of [false, true]) {
     const prefix = admin ? "/api/v1/admin/services" : "/api/v1/services";

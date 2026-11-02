@@ -47,6 +47,7 @@ import { ContentAudiobookManager } from "./content-sources/audiobook-manager.js"
 import { registerScanFailureReportRoutes } from "./routes/scan-failure-report-routes.js";
 import { registerServiceRoutes } from "./routes/service-routes.js";
 import { registerOrganizeRoutes } from "./routes/organize-routes.js";
+import { registerResourceSearchRoutes } from "./routes/resource-search-routes.js";
 import { registerVideoRecognitionRoutes } from "./routes/video-recognition-routes.js";
 import { registerLibraryRoutes } from "./routes/library-routes.js";
 import { registerLibraryFileRoutes } from "./routes/library-file-routes.js";
@@ -490,6 +491,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerBaiduPanWebLoginRoutes(server, runtime);
   await registerServiceRoutes(server, runtime);
   await registerOrganizeRoutes(server, runtime);
+  await registerResourceSearchRoutes(server, runtime);
   await registerVideoRecognitionRoutes(server, runtime);
   await registerLibraryRoutes(server, runtime);
   await registerLibraryFileRoutes(server, runtime);
@@ -529,11 +531,12 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     });
   }
 
-  const recoveredJobs = await repository.recoverInterruptedJobs();
+  // 关键变量：连接共用数据库的开发进程关闭 Worker 时，不能接管生产实例的任务。
+  const recoveredJobs = config.workerEnabled ? await repository.recoverInterruptedJobs() : 0;
   if (recoveredJobs > 0) {
     logger("warn", { 事件: "恢复中断扫描任务", 任务数量: recoveredJobs });
   }
-  const recoveredMediaProbes = await mediaProbeWorker.recoverInterrupted();
+  const recoveredMediaProbes = config.workerEnabled ? await mediaProbeWorker.recoverInterrupted() : 0;
   if (recoveredMediaProbes > 0) {
     logger("warn", {
       日志关键字: "codex-media-ffprobe",
@@ -543,7 +546,9 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   }
   worker.start();
   mediaProbeWorker.start();
-  scanScheduleWorker.start();
-  contentSourceAutoSync.start();
+  if (config.workerEnabled) {
+    scanScheduleWorker.start();
+    contentSourceAutoSync.start();
+  }
   return server;
 }

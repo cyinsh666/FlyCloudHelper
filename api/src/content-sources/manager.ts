@@ -132,6 +132,8 @@ export class ContentSourceManager {
   /** 创建内容表，不自动安装插件；保留已有插件记录并处理重启中断的同步。 */
   public async initialize(): Promise<void> {
     await initializeContentSourceSchema(this.database);
+    // 共用生产数据库的开发进程关闭 Worker 时，不将生产实例的运行中同步标为失败。
+    if (!this.config.workerEnabled) return;
     const now = new Date().toISOString();
     const interrupted = await this.database.query("content_source_libraries").whereIn("sync_status", ["queued", "running"]);
     for (const binding of interrupted) {

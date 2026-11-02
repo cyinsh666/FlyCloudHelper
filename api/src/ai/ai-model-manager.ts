@@ -542,6 +542,15 @@ export class AiModelManager {
     return this.getModel(modelId);
   }
 
+  /** 删除模型及关联的配置修订、清洗缓存；历史任务和审计记录保持原样。 */
+  public async deleteModel(modelId: string): Promise<void> {
+    const deletedRows = await this.database.query("ai_model_profiles").where({ id: modelId }).del();
+    if (deletedRows !== 1) throw new ApiError(404, "ai_model_not_found", "AI 模型不存在");
+    for (const key of this.requestSemaphores.keys()) {
+      if (key.startsWith(`${modelId}@`)) this.requestSemaphores.delete(key);
+    }
+  }
+
   /** 使用当前配置执行真实对话与 JSON 结构测试，并持久化最后一次结果。 */
   public async testAvailability(modelId: string): Promise<AiModelAvailabilityResult> {
     const current = await this.requireCurrentConfiguration(modelId);

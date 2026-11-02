@@ -148,6 +148,56 @@ export type CatalogSort = "created_desc" | "year_desc" | "premiere_date_desc" | 
 export type MatchState = "matched" | "needs_review" | "unmatched" | "processing";
 export type ServiceStatus = "active" | "scanning" | "disabled" | "reauthorization_required";
 export type JobStatus = "queued" | "running" | "retry_waiting" | "paused" | "completed" | "failed" | "cancelled";
+
+/** 搜索引擎的公开 Telegram 频道配置。 */
+export interface ResourceSearchSource { kind: string; key: string; enabled: boolean }
+/** 各网盘分享的统一搜索结果；目前仅光鸭支持站内转存。 */
+export interface ResourceSearchItem {
+  title: string; shareUrl: string; cloudType: string; password: string; source: string; sourceKind: string; sourceName: string;
+  postedAt: string | null; messageUrl: string;
+}
+/** 可转存服务及已保存的影片整理来源目录。 */
+export interface ResourceSearchTarget {
+  serviceId: string; serviceName: string; sources: Array<{ resourceId: string; displayPath: string }>; reason: string | null;
+}
+
+/** 搜索引擎接口前缀按当前控制台身份选择。 */
+function resourceSearchPath(admin: boolean): string {
+  return admin ? "/api/v1/admin/resource-search" : "/api/v1/resource-search";
+}
+
+/** 读取系统预置及自定义搜索来源。 */
+export async function getResourceSearchSources(admin = false): Promise<ResourceSearchSource[]> {
+  return (await requestJson<{ items: ResourceSearchSource[] }>(`${resourceSearchPath(admin)}/sources`)).items;
+}
+
+/** 保存频道和公开搜索站的启用状态及频道增删改。 */
+export async function saveResourceSearchSources(items: ResourceSearchSource[], admin = false): Promise<ResourceSearchSource[]> {
+  return (await requestJson<{ items: ResourceSearchSource[] }>(`${resourceSearchPath(admin)}/sources`,
+    { method: "PUT", body: JSON.stringify({ items }) })).items;
+}
+
+/** 从云助手内部来源适配器搜索各网盘分享。 */
+export function searchResources(keyword: string, admin = false): Promise<{ items: ResourceSearchItem[]; errors: string[] }> {
+  return requestJson(`${resourceSearchPath(admin)}/search?keyword=${encodeURIComponent(keyword)}`);
+}
+
+/** 读取已有光鸭服务与其影片整理来源目录。 */
+export async function getResourceSearchTargets(admin = false): Promise<ResourceSearchTarget[]> {
+  return (await requestJson<{ items: ResourceSearchTarget[] }>(`${resourceSearchPath(admin)}/targets`)).items;
+}
+
+/** 提交光鸭分享转存，收到任务编号后由页面继续查询。 */
+export function transferResource(input: { shareUrl: string; password: string; serviceId: string; sourceDirectoryId: string }, admin = false):
+  Promise<{ taskId: string; fileCount: number }> {
+  return requestJson(`${resourceSearchPath(admin)}/transfer`, { method: "POST", body: JSON.stringify(input) });
+}
+
+/** 查询已提交光鸭转存任务的执行状态。 */
+export function getResourceTransferStatus(serviceId: string, taskId: string, admin = false):
+  Promise<{ status: "pending" | "running" | "completed" | "failed" }> {
+  return requestJson(`${resourceSearchPath(admin)}/transfer-tasks/${encodeURIComponent(taskId)}?serviceId=${encodeURIComponent(serviceId)}`);
+}
 export type ScanScheduleType = "interval" | "daily" | "weekly" | "monthly";
 
 export interface OverviewResult {
@@ -2283,6 +2333,11 @@ export async function updateAdminAiModelStatus(modelId: string, status: AiModelS
     { method: "PATCH", body: JSON.stringify({ status }) },
   );
   return result.model;
+}
+
+/** 删除未被媒体库、整理计划或未完成扫描任务使用的 AI 模型。 */
+export async function deleteAdminAiModel(modelId: string): Promise<void> {
+  await requestJson<void>(`/api/v1/admin/ai-models/${encodeURIComponent(modelId)}`, { method: "DELETE" });
 }
 
 /** 使用模型当前配置执行真实对话与 JSON 结构化输出测试。 */

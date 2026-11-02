@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router";
-import { ArrowUpRight, FolderOutput, Plus, ScanLine, TriangleAlert } from "lucide-react";
+import { ArrowUpRight, FolderOutput, Plus, ScanLine } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { PageHeader, PrimaryButton } from "@/components/ConsoleShell";
 import { Panel, PosterCard, ProgressMeter, StatCard, StatusPill } from "@/components/ui-kit";
@@ -72,13 +72,13 @@ function OverviewServiceCard({ service }: { service: CloudService }) {
     }
   }
 
-  return <div className="rounded-xl border border-border bg-secondary/40 p-4">
-    <div className="flex items-start justify-between gap-3">
+  return <div className="rounded-xl border border-border bg-secondary/40 p-3">
+    <div className="flex items-start justify-between gap-2">
       <p className="truncate text-sm font-medium">{service.displayName}</p>
       <StatusPill tone={service.status === "active" ? "success" : "warning"}>{serviceStatusLabels[service.status]}</StatusPill>
     </div>
-    <p className="mt-1 font-mono text-[11px] text-muted-foreground">{service.providerType} · {service.id}</p>
-    <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
+    <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" title={service.id}>{service.providerType} · {service.id}</p>
+    <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
       <span>连接 r{service.credentialRevision}</span>
       <div className="flex flex-wrap items-center gap-3">
         {organizeSupported && <button type="button" onClick={() => void triggerOrganize()} disabled={organizing}
@@ -120,16 +120,16 @@ function OverviewLibraryCard({ library }: { library: MediaLibrary }) {
     }
   }
 
-  return <div className="rounded-xl border border-border bg-secondary/40 p-4">
-    <div className="flex items-center justify-between gap-3"><p className="truncate text-sm font-medium">{library.displayName}</p><StatusPill>{library.dataType === "music" ? "音乐" : "影视"}</StatusPill></div>
-    {library.description && <p className="mt-1 truncate text-xs text-muted-foreground" title={library.description}>{library.description}</p>}
-    <p className="mt-1 text-[11px] text-muted-foreground">来源：{library.sourceServiceName} · 条目 {library.itemCount.toLocaleString()}</p>
-    {canScan && <div className="mt-3 flex justify-end border-t border-border/70 pt-3">
-      <button type="button" onClick={() => void triggerIncrementalScan()} disabled={creating || library.status !== "active"}
-        className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40">
-        <ScanLine className="size-3.5" />{creating ? "创建中…" : "增量扫描"}
-      </button>
-    </div>}
+  return <div className="rounded-xl border border-border bg-secondary/40 p-3">
+    <div className="flex items-center justify-between gap-2"><p className="truncate text-sm font-medium">{library.displayName}</p><StatusPill>{library.dataType === "music" ? "音乐" : "影视"}</StatusPill></div>
+    {library.description && <p className="mt-0.5 truncate text-xs text-muted-foreground" title={library.description}>{library.description}</p>}
+    <div className="mt-1 flex flex-wrap items-center justify-between gap-2">
+      <p className="min-w-0 truncate text-[11px] text-muted-foreground" title={library.sourceServiceName}>来源：{library.sourceServiceName} · 条目 {library.itemCount.toLocaleString()}</p>
+      {canScan && <button type="button" onClick={() => void triggerIncrementalScan()} disabled={creating || library.status !== "active"}
+        className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-border px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40">
+        <ScanLine className="size-3" />{creating ? "创建中…" : "增量扫描"}
+      </button>}
+    </div>
     {feedback && <p role={feedback.failed ? "alert" : "status"} className={`mt-2 break-all text-xs ${feedback.failed ? "text-destructive" : "text-muted-foreground"}`}>{feedback.message}</p>}
   </div>;
 }
@@ -155,6 +155,8 @@ export function OverviewPage() {
 
   const { overview, services, libraries, jobs, recentItems } = resource.data;
   const abnormalServices = services.filter((service) => service.status !== "active" || service.connectionStatus !== "valid");
+  // 关键变量：顶部异常卡片汇总需要处理的服务与失败任务。
+  const alertCount = abnormalServices.length + overview.failedJobCount;
 
   return (
     <>
@@ -167,64 +169,55 @@ export function OverviewPage() {
         }
       />
 
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
         <StatCard label="云端服务" value={String(overview.serviceCount)} hint={`${services.filter((item) => item.status === "active").length} 个连接正常`} tone="primary" />
         <StatCard label="媒体总数" value={overview.mediaCount.toLocaleString()} hint="当前账户全部媒体" tone="info" />
         <StatCard label="运行中任务" value={String(overview.activeJobCount)} hint={`失败 ${overview.failedJobCount}`} tone="warning" />
         <StatCard label="待确认条目" value={overview.needsReviewCount.toLocaleString()} hint="等待人工确认元数据" tone="muted" />
+        <StatCard label="异常提醒" value={String(alertCount)} hint={`${abnormalServices.length} 个服务 · ${overview.failedJobCount} 个失败任务`} tone={alertCount > 0 ? "warning" : "muted"} />
       </div>
 
-      <div className="mt-4 grid gap-4 xl:grid-cols-3">
-        <Panel title="异常提醒" description="需要用户处理的服务和任务">
-          <div className="flex items-start gap-3 rounded-xl border border-warning/30 bg-warning/8 p-4">
-            <TriangleAlert className="mt-0.5 size-4 shrink-0 text-warning" />
-            <div>
-              <p className="text-sm">{abnormalServices.length > 0 ? `${abnormalServices.length} 个服务需要处理` : "暂无本人服务异常"}</p>
-              <p className="mt-1 text-xs text-muted-foreground">失败任务 {overview.failedJobCount} 个。</p>
-            </div>
-          </div>
-        </Panel>
-
-        <Panel
-          title="最近任务"
-          description="任务状态来自服务端，刷新页面可获取最新进度"
-          className="xl:col-span-2"
-          action={<Link to="/app/jobs" className="inline-flex items-center gap-1 text-xs text-primary-soft">全部任务 <ArrowUpRight className="size-3.5" /></Link>}
-        >
-          <ul className="divide-y divide-border">
+      <Panel
+        title="最近任务"
+        description="任务状态来自服务端，刷新页面可获取最新进度"
+        className="mt-4"
+        action={<Link to="/app/jobs" className="inline-flex items-center gap-1 text-xs text-primary-soft">全部任务 <ArrowUpRight className="size-3.5" /></Link>}
+      >
+          <ul className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 19rem), 1fr))" }}>
             {jobs.slice(0, 3).map((job) => (
-              <li key={job.id} className="py-3.5 first:pt-0 last:pb-0">
+              <li key={job.id} className="min-w-0 rounded-xl border border-border bg-secondary/40 p-3">
                 <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
                   <div className="min-w-0">
                     <p className="truncate text-sm font-medium">{job.serviceName}</p>
-                    <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">{job.id} · {job.jobType === "media_probe" ? "视频规格分析" : `${job.scanMode === "full" ? "全量" : "增量"}扫描刮削`} · {job.stage}</p>
+                    <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" title={job.id}>{job.id} · {job.jobType === "media_probe" ? "视频规格分析" : `${job.scanMode === "full" ? "全量" : "增量"}扫描刮削`} · {job.stage}</p>
                   </div>
                   <StatusPill tone={job.status === "completed" ? "success" : job.status === "failed" ? "danger" : job.status === "retry_waiting" || job.status === "paused" || job.status === "queued" ? "warning" : "primary"}>{job.status === "retry_waiting" && job.jobType === "media_probe" ? "等待重试" : jobStatusLabels[job.status]}</StatusPill>
                 </div>
-                <div className="mt-1.5 grid gap-1 text-[11px] text-muted-foreground sm:grid-cols-2">
+                <div className="mt-1.5 grid gap-1 text-[11px] text-muted-foreground">
                   <span>开始时间：{formatJobDateTime(job.startedAt)}</span>
                   <span>结束时间：{formatJobDateTime(job.finishedAt)}</span>
                 </div>
                 <div className="mt-2.5 flex items-center gap-3">
-                  <ProgressMeter value={job.processedCount} total={job.totalCount} />
+                  <div className="min-w-0 flex-1"><ProgressMeter value={job.processedCount} total={job.totalCount} /></div>
                   <span className="shrink-0 font-mono text-[11px] text-muted-foreground">已处理 {job.processedCount.toLocaleString()} 项</span>
                 </div>
               </li>
             ))}
-            {jobs.length === 0 && <li className="py-6 text-center text-sm text-muted-foreground">还没有后台任务</li>}
+            {jobs.length === 0 && <li className="col-span-full py-6 text-center text-sm text-muted-foreground">还没有后台任务</li>}
           </ul>
+      </Panel>
+
+      <div className="mt-4 grid gap-3 xl:grid-cols-2">
+        <Panel title="我的服务" className="p-4 sm:p-4" action={<Link to="/app/services" className="inline-flex items-center gap-1 text-xs text-primary-soft">管理服务 <ArrowUpRight className="size-3.5" /></Link>}>
+          <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-1">
+            {services.map((service) => <OverviewServiceCard key={service.id} service={service} />)}
+          </div>
+        </Panel>
+
+        <Panel title="我的媒体库" className="p-4 sm:p-4" action={<Link to="/app/catalog" className="inline-flex items-center gap-1 text-xs text-primary-soft">管理媒体库 <ArrowUpRight className="size-3.5" /></Link>}>
+          <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-1">{libraries.map((library) => <OverviewLibraryCard key={library.id} library={library} />)}</div>
         </Panel>
       </div>
-
-      <Panel title="我的服务" className="mt-4" action={<Link to="/app/services" className="inline-flex items-center gap-1 text-xs text-primary-soft">管理服务 <ArrowUpRight className="size-3.5" /></Link>}>
-        <div className="grid gap-3 sm:grid-cols-2">
-          {services.map((service) => <OverviewServiceCard key={service.id} service={service} />)}
-        </div>
-      </Panel>
-
-      <Panel title="我的媒体库" className="mt-4" action={<Link to="/app/catalog" className="inline-flex items-center gap-1 text-xs text-primary-soft">管理媒体库 <ArrowUpRight className="size-3.5" /></Link>}>
-        <div className="grid gap-3 sm:grid-cols-2">{libraries.map((library) => <OverviewLibraryCard key={library.id} library={library} />)}</div>
-      </Panel>
 
       <Panel title="最近入库" description="只展示服务端媒体目录，不提供播放与下载" className="mt-4">
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">

@@ -1,9 +1,12 @@
-import { Link } from "@tanstack/react-router";
-import { Bell, Music2, Plus, Puzzle, RefreshCw, Save, ServerCog, Trash2 } from "lucide-react";
+import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
+import { Music2, Plus, Puzzle, RefreshCw, Save, ServerCog, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, ProgressMeter, StatusPill } from "@/components/ui-kit";
 import { AdminPluginsPanel } from "@/components/AdminPluginsPanel";
+import { AdminTelegramNotificationSettingsPanel } from "@/pages/AdminNotificationSettingsPage";
+import { AdminTelegramSearchSourcesPanel } from "@/pages/AdminTelegramSearchSourcesPanel";
+import { AdminAiModelsPanel } from "@/pages/AiModelPages";
 import {
   clearAdminTmdbCache,
   createAdminUser,
@@ -166,7 +169,7 @@ export function AdminOverviewPage() {
   const attentionServices = services.filter((service) => service.status !== "active" || service.connectionStatus !== "valid");
   return (
     <>
-      <PageHeader title="管理概览" actions={<><Link to="/admin/users"><PrimaryButton><Plus className="size-4" /> 用户管理</PrimaryButton></Link><Link to="/admin/plugins"><SecondaryButton><Puzzle className="size-4" /> 插件管理</SecondaryButton></Link><Link to="/admin/system"><SecondaryButton><ServerCog className="size-4" /> 系统状态</SecondaryButton></Link></>} />
+      <PageHeader title="管理概览" actions={<><Link to="/admin/users"><PrimaryButton><Plus className="size-4" /> 用户管理</PrimaryButton></Link><Link to="/admin/plugins"><SecondaryButton><Puzzle className="size-4" /> 插件管理</SecondaryButton></Link><Link to="/admin/config" hash="status"><SecondaryButton><ServerCog className="size-4" /> 系统状态</SecondaryButton></Link></>} />
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         {overviewStats.map((item) => <article key={item.label} className="surface p-4">
           <p className="text-[11px] text-muted-foreground">{item.label}</p>
@@ -371,9 +374,21 @@ export function AdminPluginsPage() {
 
 /** 超级管理员系统配置页面；Secret 只允许整组替换，不回显已有原文。 */
 export function AdminConfigurationPage() {
+  const navigate = useNavigate();
+  const selectedHash = useRouterState({ select: (state) => state.location.hash });
   const resource = useApiResource(() => getAdminConfigStatus(), []);
+  const statusResource = useApiResource(() => getAdminStatus(), []);
+  // 关键变量：标签由 URL hash 决定，使旧页面地址跳转后能直接打开相应内容。
+  const activeTab = selectedHash === "sources" || selectedHash === "notifications" || selectedHash === "access"
+    || selectedHash === "status" || selectedHash === "audit" || selectedHash === "ai-models" ? selectedHash : "tmdb";
   const [message, setMessage] = useState<string | null>(null);
   const [clearingTmdbCache, setClearingTmdbCache] = useState(false);
+
+  /** 状态标签同时刷新运行状态和配置摘要，其他标签沿用原配置刷新。 */
+  async function refreshCurrentTab(): Promise<void> {
+    if (activeTab === "status") await Promise.all([resource.refresh(), statusResource.refresh()]);
+    else await resource.refresh();
+  }
 
   /** 保存 Jellyfin 等外部协议使用的可选对外地址覆盖值。 */
   async function savePublicBaseUrl(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -459,21 +474,26 @@ export function AdminConfigurationPage() {
 
   return (
     <>
-      <PageHeader title="系统设置" actions={<SecondaryButton onClick={() => void resource.refresh()}><RefreshCw className="size-4" /> 刷新状态</SecondaryButton>} />
+      <PageHeader title="系统设置" actions={activeTab !== "audit" && activeTab !== "ai-models" ? <SecondaryButton onClick={() => void refreshCurrentTab()}><RefreshCw className="size-4" /> 刷新状态</SecondaryButton> : undefined} />
+      <div role="tablist" aria-label="系统设置分类" className="mb-4 flex flex-wrap gap-2 border-b border-border pb-3">
+        {([
+          { id: "tmdb", label: "TMDB" }, { id: "sources", label: "数据源" },
+          { id: "notifications", label: "通知" }, { id: "access", label: "访问" },
+          { id: "status", label: "状态" },
+          { id: "audit", label: "审计日志" }, { id: "ai-models", label: "AI 模型" },
+        ] as const).map((tab) => <button key={tab.id} id={`system-tab-${tab.id}`} type="button" role="tab"
+          aria-selected={activeTab === tab.id} aria-controls={`system-panel-${tab.id}`}
+          onClick={() => { void navigate({ to: "/admin/config", hash: tab.id, replace: true }); setMessage(null); }}
+          className={`rounded-lg border px-4 py-2 text-sm transition-colors ${activeTab === tab.id
+            ? "border-border bg-secondary text-foreground" : "border-transparent text-muted-foreground hover:bg-secondary/50 hover:text-foreground"}`}>
+          {tab.label}
+        </button>)}
+      </div>
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
-      {resource.data && <Panel title="当前配置摘要" description="只显示数量和状态，不返回任何 Key 原文。"><SystemConfigurationSummary config={resource.data} /></Panel>}
-      <Panel title="通知设置" description="集中管理 Telegram 等系统通知渠道。" className="mt-4">
-        <div className="flex flex-wrap items-center justify-between gap-4">
-          <div className="flex min-w-0 items-center gap-3">
-            <div className="grid size-10 shrink-0 place-items-center rounded-xl border border-border bg-secondary/40"><Bell className="size-5" /></div>
-            <div>
-              <p className="text-sm font-medium">通知渠道</p>
-              <p className="mt-1 text-xs text-muted-foreground">配置 Telegram Bot、群聊或个人接收目标，并发送测试消息。</p>
-            </div>
-          </div>
-          <Link to="/admin/config/notifications"><SecondaryButton><Bell className="size-4" /> 进入通知设置</SecondaryButton></Link>
-        </div>
-      </Panel>
+      <div id="system-panel-notifications" role="tabpanel" aria-labelledby="system-tab-notifications" hidden={activeTab !== "notifications"}>
+        <AdminTelegramNotificationSettingsPanel />
+      </div>
+      <div id="system-panel-sources" role="tabpanel" aria-labelledby="system-tab-sources" hidden={activeTab !== "sources"}>
       <Panel title="音乐刮削源" description="管理哪些内置音乐平台可以参与歌曲、专辑、封面和艺术家信息补全。" className="mt-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -483,6 +503,9 @@ export function AdminConfigurationPage() {
           <Link to="/admin/config/music-sources"><SecondaryButton><Music2 className="size-4" /> 管理音乐刮削源</SecondaryButton></Link>
         </div>
       </Panel>
+      <AdminTelegramSearchSourcesPanel />
+      </div>
+      <div id="system-panel-access" role="tabpanel" aria-labelledby="system-tab-access" hidden={activeTab !== "access"}>
       <Panel title="Jellyfin 公开地址（可选）" description="不填写时直接使用云助手 API 地址；填写后使用该地址生成 Jellyfin 对外服务地址。" className="mt-4">
         <form onSubmit={(event) => void savePublicBaseUrl(event)} className="flex flex-col gap-3 md:flex-row md:items-end">
           <label className="min-w-0 flex-1"><span className="text-xs font-medium">对外地址覆盖值（可选）</span><input name="publicBaseUrl" type="url" defaultValue={resource.data?.publicAccess.publicBaseUrl ?? ""} disabled={resource.data?.publicAccess.editable === false} placeholder="选填，例如 https://media.example.com" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm disabled:opacity-60" /></label>
@@ -491,6 +514,23 @@ export function AdminConfigurationPage() {
         <p className="mt-3 text-xs text-muted-foreground">作用：仅当使用反向代理、HTTPS 域名，或外部端口与云助手 API 实际地址不一致时填写。系统会在该地址后自动追加媒体库设置中的 /j/{`{自定义后缀}`}；清空不会影响 Jellyfin 的启用和访问。</p>
         <p className="mt-2 text-xs text-muted-foreground">配置来源：{resource.data?.publicAccess.source === "environment" ? "环境变量（控制台只读）" : resource.data?.publicAccess.source === "database" ? "数据库" : "未设置（使用云助手 API 地址）"}</p>
       </Panel>
+      </div>
+      <div id="system-panel-status" role="tabpanel" aria-labelledby="system-tab-status" hidden={activeTab !== "status"}>
+        <div className="grid gap-4 xl:grid-cols-2">
+          {statusResource.error && <Panel className="xl:col-span-2"><p className="text-sm text-destructive">{statusResource.error}</p></Panel>}
+          {statusResource.data && resource.data ? <>
+            <Panel title="运行状态" description="实例、数据库、任务与媒体目录状态"><SystemRuntimeSummary status={statusResource.data} /></Panel>
+            <Panel title="配置状态" description="数据库、刮削源、凭据、插件与 Worker 配置"><SystemConfigurationSummary config={resource.data} /></Panel>
+          </> : !statusResource.error && <Panel className="xl:col-span-2"><p className="py-12 text-center text-sm text-muted-foreground">正在读取系统状态…</p></Panel>}
+        </div>
+      </div>
+      <div id="system-panel-audit" role="tabpanel" aria-labelledby="system-tab-audit" hidden={activeTab !== "audit"}>
+        {activeTab === "audit" && <AdminAuditPanel />}
+      </div>
+      <div id="system-panel-ai-models" role="tabpanel" aria-labelledby="system-tab-ai-models" hidden={activeTab !== "ai-models"}>
+        {activeTab === "ai-models" && <AdminAiModelsPanel />}
+      </div>
+      <div id="system-panel-tmdb" role="tabpanel" aria-labelledby="system-tab-tmdb" hidden={activeTab !== "tmdb"}>
       <Panel title="TMDB 代理地址" description="配置云助手服务端访问 TMDB API 和图片资源时使用的基础地址。" className="mt-4">
         <form
           key={`${resource.data?.tmdb.apiBaseUrl ?? "default"}|${resource.data?.tmdb.imageBaseUrl ?? "default"}`}
@@ -537,18 +577,13 @@ export function AdminConfigurationPage() {
           </button>
         </div>
       </Panel>
+      </div>
     </>
   );
 }
 
-/** 系统配置和依赖脱敏状态页面。 */
-export function AdminSystemPage() {
-  const resource = useApiResource(async () => ({ status: await getAdminStatus(), config: await getAdminConfigStatus() }), []);
-  return <><PageHeader title="系统状态" actions={<SecondaryButton onClick={() => void resource.refresh()}><RefreshCw className="size-4" /> 刷新</SecondaryButton>} />{resource.error && <Panel><p className="text-sm text-destructive">{resource.error}</p></Panel>}<div className="grid gap-4 xl:grid-cols-2">{resource.data ? <><Panel title="运行状态" description="实例、数据库、任务与媒体目录状态"><SystemRuntimeSummary status={resource.data.status} /></Panel><Panel title="配置状态" description="数据库、刮削源、凭据、插件与 Worker 配置"><SystemConfigurationSummary config={resource.data.config} /></Panel></> : <Panel className="xl:col-span-2"><p className="py-12 text-center text-sm text-muted-foreground">正在读取系统状态…</p></Panel>}</div></>;
-}
-
-/** 超级管理员脱敏审计日志页面。 */
-export function AdminAuditPage() {
+/** 系统设置中的超级管理员脱敏审计日志。 */
+function AdminAuditPanel() {
   const resource = useApiResource(() => listAuditEntries(), []);
-  return <><PageHeader title="审计日志" actions={<SecondaryButton onClick={() => void resource.refresh()}><RefreshCw className="size-4" /> 刷新</SecondaryButton>} /><Panel><ul className="divide-y divide-border">{resource.data?.items.map((entry) => <li key={entry.id} className="flex items-center justify-between gap-3 py-3.5"><div className="min-w-0"><p className="truncate text-sm">{entry.operationType} · {entry.targetType}{entry.targetId ? ` ${entry.targetId}` : ""}</p><p className="mt-0.5 font-mono text-[11px] text-muted-foreground">{new Date(entry.createdAt).toLocaleString("zh-CN")} · {entry.operatorUsername ?? "系统"}</p></div><StatusPill tone={entry.result === "success" ? "success" : "danger"}>{entry.result}</StatusPill></li>)}</ul></Panel></>;
+  return <><div className="mb-4 flex justify-end"><SecondaryButton onClick={() => void resource.refresh()}><RefreshCw className="size-4" /> 刷新</SecondaryButton></div>{resource.error && <Panel className="mb-4"><p className="text-sm text-destructive">{resource.error}</p></Panel>}<Panel><ul className="divide-y divide-border">{resource.data?.items.map((entry) => <li key={entry.id} className="flex items-center justify-between gap-3 py-3.5"><div className="min-w-0"><p className="truncate text-sm">{entry.operationType} · {entry.targetType}{entry.targetId ? ` ${entry.targetId}` : ""}</p><p className="mt-0.5 font-mono text-[11px] text-muted-foreground">{new Date(entry.createdAt).toLocaleString("zh-CN")} · {entry.operatorUsername ?? "系统"}</p></div><StatusPill tone={entry.result === "success" ? "success" : "danger"}>{entry.result}</StatusPill></li>)}</ul></Panel></>;
 }

@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import type { FastifyInstance } from "fastify";
 import type { CreateAiModelInput, UpdateAiModelInput } from "../ai/ai-model-manager.js";
 import { readAiCleaningSettings } from "../ai/ai-model-manager.js";
 import type { AiModelRecord } from "../domain.js";
+import { parseJsonObject } from "../domain.js";
 import { ApiError } from "../errors.js";
 import { requireRequestUser, requireString, requireSuperAdmin } from "../http.js";
 import type { ApiRuntime } from "../runtime.js";
@@ -43,6 +46,40 @@ function logModelConfiguration(
     模型状态: model.status,
     Key是否配置: model.apiKeyConfigured,
   });
+}
+
+/** 删除前检查当前媒体库配置、未完成扫描任务和影片整理计划是否仍引用模型。 */
+async function ensureAiModelUnused(runtime: ApiRuntime, modelId: string): Promise<void> {
+  const profiles = await runtime.database.query("library_metadata_profiles as p")
+    .join("media_libraries as l", function joinCurrentProfile() {
+      this.on("l.id", "=", "p.library_id").andOn("l.metadata_profile_revision", "=", "p.revision");
+    })
+    .select("p.configuration_json");
+  if (profiles.some((profile) => {
+    const settings = readAiCleaningSettings(parseJsonObject(profile.configuration_json));
+    return settings.enabled && settings.modelId === modelId;
+  })) throw new ApiError(409, "ai_model_in_use", "有媒体库正在使用此模型，请先修改媒体库元数据配置");
+
+  const jobs = await runtime.database.query("scan_jobs")
+    .whereIn("status", ["queued", "running", "retry_waiting", "paused"])
+    .select("snapshot_json");
+  if (jobs.some((job) => parseJsonObject(parseJsonObject(job.snapshot_json).aiModel).modelId === modelId)) {
+    throw new ApiError(409, "ai_model_in_use", "有未完成的扫描任务正在使用此模型，请等待任务结束");
+  }
+
+  // 关键变量：整理计划保存在导出目录的 JSON 文件中，与媒体库配置不在同一张表。
+  const scheduleDirectory = path.join(runtime.config.exportDirectory, "service-organize");
+  const scheduleFiles = await fs.readdir(scheduleDirectory).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
+  for (const fileName of scheduleFiles) {
+    if (!/^schedule-[0-9a-f-]{36}\.json$/iu.test(fileName)) continue;
+    const schedule = parseJsonObject(JSON.parse(await fs.readFile(path.join(scheduleDirectory, fileName), "utf8")));
+    if (schedule.aiAssistEnabled === true && schedule.aiModelId === modelId) {
+      throw new ApiError(409, "ai_model_in_use", "有影片整理计划正在使用此模型，请先修改整理计划");
+    }
+  }
 }
 
 /** 查询单个扫描任务采用 AI 查询词的总数和最近 20 条记录。 */
@@ -163,7 +200,7 @@ async function getAiSupplementLibraryContext(runtime: ApiRuntime, libraryId: str
   };
 }
 
-/** 注册超级管理员 AI 模型配置、启停和可用性测试接口。 */
+/** 注册超级管理员 AI 模型配置、启停、删除和可用性测试接口。 */
 export async function registerAiModelRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
   /** 返回服务配置页可选择的模型；已停用但仍被服务选中的模型仅用于回显。 */
   server.get<{ Querystring: { libraryId?: string } }>("/api/v1/ai-models/available", async (request) => {
@@ -256,6 +293,16 @@ export async function registerAiModelRoutes(server: FastifyInstance, runtime: Ap
       return { model };
     },
   );
+
+  server.delete<{ Params: { modelId: string } }>("/api/v1/admin/ai-models/:modelId", async (request, reply) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    const model = await runtime.aiModels.getModel(request.params.modelId);
+    await ensureAiModelUnused(runtime, model.id);
+    await runtime.aiModels.deleteModel(model.id);
+    logModelConfiguration(runtime, operator.id, "删除AI模型配置", model);
+    await auditAiModel(runtime, operator, "delete_ai_model", model.id, { 模型名称: model.displayName });
+    return reply.status(204).send();
+  });
 
   server.post<{ Params: { modelId: string } }>(
     "/api/v1/admin/ai-models/:modelId/test",

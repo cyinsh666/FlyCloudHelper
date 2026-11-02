@@ -22,6 +22,7 @@ import {
 } from "@/pages/ServicePages";
 import { AdminServiceBasicDetailPage, UserServiceBasicDetailPage } from "@/pages/ServiceBasicDetailPage";
 import { ServiceOrganizePage } from "@/pages/ServiceOrganizePage";
+import { ResourceSearchPage } from "@/pages/ResourceSearchPage";
 import { LibraryCreatePage } from "@/pages/LibraryCreatePage";
 import { LibraryFileBrowsePage } from "@/pages/LibraryFileBrowsePage";
 import { LibraryAbsSettingsPage } from "@/pages/LibraryAbsSettingsPage";
@@ -45,14 +46,11 @@ import {
   UserLibraryEmbySettingsPage,
 } from "@/pages/LibraryEmbySettingsPage";
 import {
-  AdminAuditPage,
   AdminConfigurationPage,
   AdminOverviewPage,
   AdminPluginsPage,
-  AdminSystemPage,
   AdminUsersPage,
 } from "@/pages/AdminPages";
-import { AdminAiModelsPage } from "@/pages/AiModelPages";
 import { AdminMusicSourcesPage } from "@/pages/MusicSourcePages";
 import { AdminNotificationSettingsPage } from "@/pages/AdminNotificationSettingsPage";
 import {
@@ -395,6 +393,13 @@ const userServicesRoute = createRoute({
   component: UserServicesPage,
 });
 
+/** 用户资源搜索页面。 */
+const userSearchRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "search",
+  component: ResourceSearchPage,
+});
+
 const userServiceCreateRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "services/new",
@@ -526,6 +531,13 @@ const adminServicesRoute = createRoute({
   component: AdminServicesPage,
 });
 
+/** 管理员资源搜索页面。 */
+const adminSearchRoute = createRoute({
+  getParentRoute: () => adminRoute,
+  path: "search",
+  component: () => <ResourceSearchPage admin />,
+});
+
 /** 旧管理员创建地址切换到个人模式，创建归属当前登录账户。 */
 const adminServiceCreateRoute = createRoute({
   getParentRoute: () => adminRoute,
@@ -630,16 +642,18 @@ const adminPluginsRoute = createRoute({
   component: AdminPluginsPage,
 });
 
+/** 旧 AI 模型地址跳转到系统设置对应标签。 */
 const adminAiModelsRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "ai-models",
-  component: AdminAiModelsPage,
+  beforeLoad: () => { throw redirect({ to: "/admin/config", hash: "ai-models", replace: true }); },
 });
 
+/** 旧系统状态地址跳转到系统设置对应标签。 */
 const adminSystemRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "system",
-  component: AdminSystemPage,
+  beforeLoad: () => { throw redirect({ to: "/admin/config", hash: "status", replace: true }); },
 });
 
 const adminConfigurationRoute = createRoute({
@@ -660,16 +674,18 @@ const adminNotificationSettingsRoute = createRoute({
   component: AdminNotificationSettingsPage,
 });
 
+/** 旧审计日志地址跳转到系统设置对应标签。 */
 const adminAuditRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "audit",
-  component: AdminAuditPage,
+  beforeLoad: () => { throw redirect({ to: "/admin/config", hash: "audit", replace: true }); },
 });
 
 /** 组合普通用户控制台子路由。 */
 const appRouteTree = appRoute.addChildren([
   appIndexRoute,
   userServicesRoute,
+  userSearchRoute,
   userServiceCreateRoute,
   userServiceDetailRoute,
   userServiceOrganizeRoute,
@@ -694,6 +710,7 @@ const adminRouteTree = adminRoute.addChildren([
   adminIndexRoute,
   adminUsersRoute,
   adminServicesRoute,
+  adminSearchRoute,
   adminServiceCreateRoute,
   adminServiceDetailRoute,
   adminServiceOrganizeRoute,

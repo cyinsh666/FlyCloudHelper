@@ -1,9 +1,10 @@
-import { BrainCircuit, CheckCircle2, Pencil, Plus, RefreshCw, TestTube2, X } from "lucide-react";
+import { BrainCircuit, CheckCircle2, Pencil, Plus, RefreshCw, TestTube2, Trash2, X } from "lucide-react";
 import { useRef, useState, type FormEvent } from "react";
-import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
+import { PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, StatusPill, type StatusTone } from "@/components/ui-kit";
 import {
   createAdminAiModel,
+  deleteAdminAiModel,
   listAdminAiModels,
   testAdminAiModel,
   updateAdminAiModel,
@@ -128,8 +129,8 @@ function AiModelForm({
   );
 }
 
-/** 超级管理员 AI 模型配置与可用性测试页面。 */
-export function AdminAiModelsPage() {
+/** 系统设置中的超级管理员 AI 模型配置与可用性测试内容。 */
+export function AdminAiModelsPanel() {
   const resource = useApiResource(() => listAdminAiModels(), []);
   const [formOpen, setFormOpen] = useState(false);
   const [editingModel, setEditingModel] = useState<AiModel | null>(null);
@@ -192,6 +193,17 @@ export function AdminAiModelsPage() {
     });
   }
 
+  /** 二次确认后删除未被使用的模型，并刷新列表。 */
+  async function deleteModel(model: AiModel): Promise<void> {
+    if (!window.confirm(`确定删除 AI 模型“${model.displayName}”吗？其配置修订和清洗缓存会一并删除，此操作不可撤销。`)) return;
+    await runAction(`delete:${model.id}`, "删除AI模型配置失败", model.id, async () => {
+      await deleteAdminAiModel(model.id);
+      if (editingModel?.id === model.id) { setEditingModel(null); setFormOpen(false); }
+      setMessage(`${model.displayName} 已删除`);
+      await resource.refresh();
+    });
+  }
+
   /** 执行真实模型对话和 JSON 输出测试。 */
   async function testModel(model: AiModel): Promise<void> {
     await runAction(`test:${model.id}`, "测试AI模型可用性失败", model.id, async () => {
@@ -207,15 +219,10 @@ export function AdminAiModelsPage() {
   const models = resource.data?.items ?? [];
   return (
     <>
-      <PageHeader
-        title="AI 模型"
-        actions={(
-          <>
-            <SecondaryButton onClick={() => void resource.refresh()} disabled={resource.loading}><RefreshCw className="size-4" /> 刷新</SecondaryButton>
-            <PrimaryButton onClick={openCreateForm}><Plus className="size-4" /> 添加模型</PrimaryButton>
-          </>
-        )}
-      />
+      <div className="mb-4 flex flex-wrap justify-end gap-2">
+        <SecondaryButton onClick={() => void resource.refresh()} disabled={resource.loading}><RefreshCw className="size-4" /> 刷新</SecondaryButton>
+        <PrimaryButton onClick={openCreateForm}><Plus className="size-4" /> 添加模型</PrimaryButton>
+      </div>
       {formOpen && (
         <AiModelForm
           key={editingModel?.id ?? "new"}
@@ -266,6 +273,7 @@ export function AdminAiModelsPage() {
               <button type="button" disabled={Boolean(activeAction)} onClick={() => void testModel(model)} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-secondary/30 px-3 py-2 text-xs hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"><TestTube2 className="size-3.5" /> {activeAction === `test:${model.id}` ? "测试中…" : "测试可用性"}</button>
               <button type="button" disabled={Boolean(activeAction)} onClick={() => openEditForm(model)} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-secondary/30 px-3 py-2 text-xs hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"><Pencil className="size-3.5" /> 编辑</button>
               <button type="button" disabled={Boolean(activeAction)} onClick={() => void toggleModelStatus(model)} className="rounded-lg border border-border bg-secondary/30 px-3 py-2 text-xs hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40">{activeAction === `status:${model.id}` ? "处理中…" : model.status === "enabled" ? "停用" : "启用"}</button>
+              <button type="button" disabled={Boolean(activeAction)} onClick={() => void deleteModel(model)} className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /> {activeAction === `delete:${model.id}` ? "删除中…" : "删除"}</button>
             </footer>
           </article>
         ))}

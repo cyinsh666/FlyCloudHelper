@@ -23,6 +23,8 @@ import { QuarkProvider } from "./quark.js";
 export class ProviderRegistry {
   private readonly adapters = new Map<string, ProviderAdapter>();
   public readonly guangyaAuthorization: GuangyaAuthorizationManager;
+  /** 搜索结果转存复用现有光鸭客户端的登录和令牌刷新。 */
+  public readonly guangyaWebClient: GuangyaWebApiClient;
   public readonly cloudAuthorization = new CloudAuthorizationManager();
 
   public constructor(
@@ -31,6 +33,7 @@ export class ProviderRegistry {
   ) {
     // 关键变量：扫码授权和 Provider 共用网页接口客户端，统一执行文件列表限频与 Token 刷新。
     const guangyaClient = new GuangyaWebApiClient(logConnectionFailure);
+    this.guangyaWebClient = guangyaClient;
     this.guangyaAuthorization = new GuangyaAuthorizationManager(guangyaClient);
     const networkOptions = {
       allowInsecureHttp: config.allowInsecureProviderHttp,

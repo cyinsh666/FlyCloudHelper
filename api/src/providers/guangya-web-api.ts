@@ -427,6 +427,8 @@ export class GuangyaWebApiClient {
       "/userres/v1/file/create_dir", "/userres/v1/file/rename",
       "/userres/v1/file/move_file", "/userres/v1/file/copy_file",
       "/userres/v1/file/delete_file", "/userres/v1/get_task_status",
+      "/userres/v1/get_share_access_token", "/userres/v1/get_share_page_files_list",
+      "/userres/v1/restore_share",
     ]);
     if (!allowedPaths.has(path)) throw new ApiError(422, "guangya_file_mutation_invalid", "不支持的光鸭文件操作");
     await this.ensureValidToken(connection, persistConnection, signal);
