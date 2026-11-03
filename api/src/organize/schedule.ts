@@ -304,21 +304,13 @@ export class ServiceOrganizeScheduler {
       const plan = await this.manager.getPlan(serviceId, schedule.pendingPlanId, schedule.userId);
       if (plan.status === "preparing") { this.schedulePendingProcess(serviceId); return; }
       if (plan.status === "failed") throw new Error(plan.error ?? "识别预览失败");
-      if (!plan.items.some((item) => item.status === "ready")) {
-        schedule.pendingPlanId = null;
-        schedule.pendingRunKind = undefined;
-        schedule.lastError = null;
-        schedule.lastRunMessage = "本次没有可整理的内容";
-        schedule.updatedAt = new Date().toISOString();
-        await saveSchedule(this.fileName(serviceId), schedule);
-        return;
-      }
+      const hasReadyItems = plan.items.some((item) => item.status === "ready");
       // 关键变量：任务创建后、计划保存前若重启，用 planId 找回已有任务。
       const existing = (await this.manager.listJobs(serviceId)).find((job) => job.planId === plan.id);
-      const job = existing ?? await this.manager.createJob(serviceId, plan.id, schedule.userId);
+      const job = existing ?? await this.manager.createJob(serviceId, plan.id, schedule.userId, !hasReadyItems);
       schedule.lastJobId = job.id;
       schedule.lastError = null;
-      schedule.lastRunMessage = "已启动整理任务";
+      schedule.lastRunMessage = hasReadyItems ? "已启动整理任务" : "本次没有可整理的内容";
       schedule.pendingPlanId = null;
       schedule.pendingRunKind = undefined;
       schedule.updatedAt = new Date().toISOString();

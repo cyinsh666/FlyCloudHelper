@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { ApiError, validationError } from "../errors.js";
 import { requireRequestUser, requireSuperAdmin } from "../http.js";
+import type { TmdbVideoMetadata } from "../metadata/tmdb.js";
 import type { ApiRuntime } from "../runtime.js";
 
 /** 只接受明确的正整数页码，避免无效参数落到本地数组切片。 */
@@ -11,6 +12,25 @@ function readPage(value: unknown, field: string, fallback: number, maximum: numb
     throw validationError(field, `${field} 必须是 1 到 ${maximum} 的整数`);
   }
   return number;
+}
+
+/** 将完整 TMDB 元数据裁剪成影视推荐详情页使用的字段。 */
+function readDetailMetadata(metadata: TmdbVideoMetadata) {
+  return {
+    id: metadata.id, mediaType: metadata.mediaType, title: metadata.title,
+    originalTitle: metadata.originalTitle, overview: metadata.overview, year: metadata.year,
+    releaseDate: metadata.releaseDate, rating: metadata.rating, genres: metadata.genres,
+    originCountries: metadata.originCountries, posterUrl: metadata.posterUrl,
+    backdropUrl: metadata.backdropUrl, episodeCount: metadata.episodeCount,
+    people: metadata.people.slice(0, 24).map((person) => ({ name: person.name, role: person.role,
+      type: person.type, profileUrl: person.profileUrl })),
+  };
+}
+
+/** 仅允许电影或剧集类型进入 TMDB 详情接口。 */
+function readMediaType(value: string): "movie" | "tv" {
+  if (value !== "movie" && value !== "tv") throw validationError("mediaType", "TMDB 类型必须是电影或剧集");
+  return value;
 }
 
 /** 为个人与管理员模式提供同一份本地榜单快照。 */
@@ -32,6 +52,59 @@ export async function registerRecommendationRoutes(server: FastifyInstance, runt
     server.post(`${prefix}/sync`, async (request) => {
       await requireActor(request);
       return runtime.recommendations.syncNow();
+    });
+
+    server.get<{ Querystring: { query?: string } }>(`${prefix}/tmdb/search`, async (request) => {
+      await requireActor(request);
+      const query = typeof request.query.query === "string" ? request.query.query.trim() : "";
+      if (!query || [...query].length > 100) throw validationError("query", "请输入不超过 100 字的影视名称");
+      const status = runtime.tmdb.getStatus();
+      if (status.configuredCount === 0) throw new ApiError(503, "tmdb_not_configured", "系统尚未配置 TMDB Key");
+      const temporaryError = runtime.tmdb.getTemporaryUnavailableError();
+      if (temporaryError) throw temporaryError;
+      if (status.healthyCount === 0) throw new ApiError(503, "tmdb_unavailable", "TMDB Key 当前不可用");
+      // 关键变量：电影和剧集并行查询；一类暂时失败时仍展示另一类的结果。
+      const [movies, series] = await Promise.allSettled([
+        runtime.tmdb.searchVideoCandidates({ mediaType: "movie", title: query, year: null, language: "zh-CN", region: "CN" }),
+        runtime.tmdb.searchVideoCandidates({ mediaType: "tv", title: query, year: null, language: "zh-CN", region: "CN" }),
+      ]);
+      if (movies.status === "rejected" && series.status === "rejected") {
+        throw movies.reason instanceof ApiError ? movies.reason : new ApiError(502, "tmdb_search_failed", "TMDB 搜索暂时不可用");
+      }
+      const movieItems = movies.status === "fulfilled" ? movies.value : [];
+      const seriesItems = series.status === "fulfilled" ? series.value : [];
+      const items = [] as Array<(typeof movieItems)[number]>;
+      for (let index = 0; index < Math.max(movieItems.length, seriesItems.length); index++) {
+        const movie = movieItems[index];
+        const seriesItem = seriesItems[index];
+        if (movie) items.push(movie);
+        if (seriesItem) items.push(seriesItem);
+      }
+      const errors = [movies.status === "rejected" ? "电影搜索暂时不可用" : null,
+        series.status === "rejected" ? "剧集搜索暂时不可用" : null].filter((message): message is string => Boolean(message));
+      return { items, errors };
+    });
+
+    server.get<{ Params: { mediaType: string; tmdbId: string } }>(`${prefix}/tmdb/:mediaType/:tmdbId/related`, async (request) => {
+      await requireActor(request);
+      const mediaType = readMediaType(request.params.mediaType);
+      const tmdbId = readPage(request.params.tmdbId, "tmdbId", 1, 1_000_000_000);
+      if (runtime.tmdb.getStatus().configuredCount === 0) return { items: [] };
+      return { items: await runtime.tmdb.readVideoRecommendations(mediaType, tmdbId, "zh-CN") };
+    });
+
+    server.get<{ Params: { mediaType: string; tmdbId: string } }>(`${prefix}/tmdb/:mediaType/:tmdbId`, async (request) => {
+      await requireActor(request);
+      const mediaType = readMediaType(request.params.mediaType);
+      const tmdbId = readPage(request.params.tmdbId, "tmdbId", 1, 1_000_000_000);
+      if (runtime.tmdb.getStatus().configuredCount === 0) return { tmdb: null, tmdbError: "系统尚未配置 TMDB Key" };
+      try {
+        const metadata = await runtime.tmdb.readVideoMetadata(mediaType, tmdbId, "zh-CN", "CN");
+        return metadata ? { tmdb: readDetailMetadata(metadata), tmdbError: null }
+          : { tmdb: null, tmdbError: "TMDB 暂未返回该作品详情" };
+      } catch (error) {
+        return { tmdb: null, tmdbError: error instanceof ApiError ? error.message : "TMDB 详情暂时无法读取" };
+      }
     });
 
     server.get<{ Params: { blockId: string; rank: string } }>(`${prefix}/:blockId/items/:rank/related`, async (request) => {
@@ -61,15 +134,7 @@ export async function registerRecommendationRoutes(server: FastifyInstance, runt
       try {
         const metadata = await runtime.tmdb.readVideoMetadata(mediaType, item.tmdbId, "zh-CN", "CN");
         if (!metadata) return { block, item, tmdb: null, tmdbError: "TMDB 暂未返回该作品详情" };
-        return { block, item, tmdb: {
-          id: metadata.id, mediaType: metadata.mediaType, title: metadata.title,
-          originalTitle: metadata.originalTitle, overview: metadata.overview, year: metadata.year,
-          releaseDate: metadata.releaseDate, rating: metadata.rating, genres: metadata.genres,
-          originCountries: metadata.originCountries, posterUrl: metadata.posterUrl,
-          backdropUrl: metadata.backdropUrl, episodeCount: metadata.episodeCount,
-          people: metadata.people.slice(0, 24).map((person) => ({ name: person.name, role: person.role,
-            type: person.type, profileUrl: person.profileUrl })),
-        }, tmdbError: null };
+        return { block, item, tmdb: readDetailMetadata(metadata), tmdbError: null };
       } catch (error) {
         const message = error instanceof ApiError ? error.message : "TMDB 详情暂时无法读取";
         return { block, item, tmdb: null, tmdbError: message };

@@ -52,8 +52,9 @@ export function OrganizeTaskDetail({ task, admin, onRefresh }: {
       <div className="flex items-center justify-between gap-3"><div className="flex items-center gap-2"><FolderOutput className="size-4" /><p className="font-medium">影片整理</p></div>
         <StatusPill tone={taskStatus(task).tone}>{taskStatus(task).label}</StatusPill></div>
       <p className="mt-3 text-sm">{task.totalCount === null ? "正在扫描与识别来源文件" :
-        `已完成 ${task.completedCount} · 失败 ${task.failedCount} · 总计 ${task.totalCount} · ${taskPercent(task)}`}</p>
-      <div className="mt-3"><ProgressMeter value={task.completedCount + task.failedCount} total={task.totalCount} /></div>
+        task.totalCount === 0 && task.status === "completed" ? "本次没有可整理的内容" :
+          `已完成 ${task.completedCount} · 失败 ${task.failedCount} · 总计 ${task.totalCount} · ${taskPercent(task)}`}</p>
+      {task.totalCount !== 0 && <div className="mt-3"><ProgressMeter value={task.completedCount + task.failedCount} total={task.totalCount} /></div>}
       {task.error && <p role="alert" className="mt-3 text-sm text-destructive">{task.error}</p>}
       {message && <p role="alert" className="mt-3 text-sm text-destructive">{message}</p>}
       {task.status === "failed" && task.nextRetryAt &&
@@ -79,9 +80,11 @@ export function OrganizeTaskListCard({ task, selected, onSelect }: {
     className={`w-full rounded-xl border bg-secondary/40 px-3 py-2.5 text-left ${selected ? "border-foreground/45" : "border-border hover:border-foreground/25"}`}>
     <div className="flex items-center justify-between gap-2"><span className="min-w-0 truncate text-sm font-semibold">{task.serviceName}</span>
       <StatusPill tone={taskStatus(task).tone}>{taskStatus(task).label}</StatusPill></div>
-    <p className="mt-0.5 truncate text-[11px] text-muted-foreground">影片整理 · {task.totalCount === null ? "识别来源文件" : `已处理 ${task.completedCount + task.failedCount}/${task.totalCount}`} · {taskPercent(task)}</p>
+    <p className="mt-0.5 truncate text-[11px] text-muted-foreground">影片整理 · {task.totalCount === null ? "识别来源文件" :
+      task.totalCount === 0 && task.status === "completed" ? "本次没有可整理的内容" :
+        `已处理 ${task.completedCount + task.failedCount}/${task.totalCount} · ${taskPercent(task)}`}</p>
     <p className="mt-1 text-[11px] text-muted-foreground">创建时间 {new Date(task.createdAt).toLocaleString("zh-CN")}</p>
-    <div className="mt-1.5"><ProgressMeter value={task.completedCount + task.failedCount} total={task.totalCount} /></div>
+    {task.totalCount !== 0 && <div className="mt-1.5"><ProgressMeter value={task.completedCount + task.failedCount} total={task.totalCount} /></div>}
   </button></li>;
 }
 
@@ -145,8 +148,10 @@ export function OrganizeTasksPanel({ admin, statusFilter }: { admin: boolean; st
                 className={`w-full rounded-xl border bg-secondary/40 p-3 text-left ${selected?.id === task.id ? "border-foreground/45" : "border-border hover:border-foreground/25"}`}>
                 <div className="flex items-center justify-between gap-2"><span className="min-w-0 truncate text-sm font-medium">{task.serviceName}</span>
                   <StatusPill tone={status.tone}>{status.label}</StatusPill></div>
-                <p className="mt-1 text-xs text-muted-foreground">影片整理 · {task.totalCount === null ? "正在识别来源文件" : `已处理 ${task.completedCount + task.failedCount}/${task.totalCount}`} · {taskPercent(task)}</p>
-                <div className="mt-2"><ProgressMeter value={task.completedCount + task.failedCount} total={task.totalCount} /></div>
+                <p className="mt-1 text-xs text-muted-foreground">影片整理 · {task.totalCount === null ? "正在识别来源文件" :
+                  task.totalCount === 0 && task.status === "completed" ? "本次没有可整理的内容" :
+                    `已处理 ${task.completedCount + task.failedCount}/${task.totalCount} · ${taskPercent(task)}`}</p>
+                {task.totalCount !== 0 && <div className="mt-2"><ProgressMeter value={task.completedCount + task.failedCount} total={task.totalCount} /></div>}
               </button>
             </li>;
           })}
@@ -155,8 +160,9 @@ export function OrganizeTasksPanel({ admin, statusFilter }: { admin: boolean; st
           <div className="flex items-center gap-2"><FolderOutput className="size-4" /><p className="font-medium">{selected.serviceName} · 影片整理</p></div>
           <p className="mt-2 text-sm">状态：{taskStatus(selected).label}</p>
           <p className="mt-1 text-sm">{selected.totalCount === null ? "正在扫描与识别，完成后显示文件总数" :
-            `已完成 ${selected.completedCount} · 失败 ${selected.failedCount} · 总计 ${selected.totalCount} · ${taskPercent(selected)}`}</p>
-          <div className="mt-3"><ProgressMeter value={selected.completedCount + selected.failedCount} total={selected.totalCount} /></div>
+            selected.totalCount === 0 && selected.status === "completed" ? "本次没有可整理的内容" :
+              `已完成 ${selected.completedCount} · 失败 ${selected.failedCount} · 总计 ${selected.totalCount} · ${taskPercent(selected)}`}</p>
+          {selected.totalCount !== 0 && <div className="mt-3"><ProgressMeter value={selected.completedCount + selected.failedCount} total={selected.totalCount} /></div>}
           {selected.error && <p role="alert" className="mt-3 text-sm text-destructive">{selected.error}</p>}
           {selected.status === "failed" && selected.nextRetryAt &&
             <p className="mt-2 text-xs text-muted-foreground">临时故障将在 {new Date(selected.nextRetryAt).toLocaleString("zh-CN")} 自动继续（第 {(selected.autoRetryCount ?? 0) + 1}/3 次）</p>}

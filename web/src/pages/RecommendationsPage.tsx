@@ -1,10 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ArrowLeft, Film, LoaderCircle, RefreshCw, Search } from "lucide-react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { ResourceSearchPage } from "@/pages/ResourceSearchPage";
-import { getRecommendationDetail, getRecommendationItemDetail, getRecommendationRelatedItems, listRecommendations, syncRecommendations,
+import { getRecommendationDetail, getRecommendationItemDetail, getRecommendationRelatedItems,
+  getRecommendationTmdbDetail, getRecommendationTmdbRelatedItems, listRecommendations, searchRecommendationTmdb, syncRecommendations,
   type RecommendationBlock, type RecommendationDetail, type RecommendationItem, type RecommendationItemDetail,
-  type RecommendationRelatedItem } from "@/lib/api";
+  type RecommendationRelatedItem, type RecommendationTmdbCandidate } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
 
 // 关键变量：优先保持与榜单上游相同的业务分组顺序，新增分组仍可自动显示。
@@ -53,9 +54,11 @@ function MovieCard({ item, onOpen }: { item: RecommendationItem; onOpen: () => v
   </button>;
 }
 
-/** 展示优先来自 TMDB 的作品详情，短剧等无 ID 条目沿用榜单快照信息。 */
+type DisplayMovieDetail = Omit<RecommendationItemDetail, "block"> & { block: RecommendationBlock | null };
+
+/** 榜单条目与 TMDB 搜索结果共用同一作品详情，短剧等无 ID 条目沿用快照。 */
 function MovieDetail({ detail, related, relatedLoading, relatedError, searchOpen, searchLoading, admin, onSearch, onSearchingChange }: {
-  detail: RecommendationItemDetail; related: RecommendationRelatedItem[]; relatedLoading: boolean;
+  detail: DisplayMovieDetail; related: RecommendationRelatedItem[]; relatedLoading: boolean;
   relatedError: string | null; searchOpen: boolean; searchLoading: boolean; admin: boolean;
   onSearch: () => void; onSearchingChange: (searching: boolean) => void;
 }) {
@@ -68,7 +71,8 @@ function MovieDetail({ detail, related, relatedLoading, relatedError, searchOpen
     <div className="surface grid gap-5 p-4 sm:grid-cols-[minmax(0,13rem)_minmax(0,1fr)] sm:p-5">
       <div className="w-full max-w-[13rem]"><RecommendationPoster url={poster} title={title} /></div>
       <div className="min-w-0">
-        <p className="text-xs text-muted-foreground">{detail.block.title} · 第 {item.rank} 名</p>
+        <p className="text-xs text-muted-foreground">{detail.block
+          ? `${detail.block.title} · 第 ${item.rank} 名` : `TMDB · ${item.mediaType === "tv" ? "剧集" : "电影"}`}</p>
         <h2 className="mt-1 text-2xl font-semibold">{title}</h2>
         {tmdb?.originalTitle && tmdb.originalTitle !== title &&
           <p className="mt-1 text-sm text-muted-foreground">{tmdb.originalTitle}</p>}
@@ -82,7 +86,7 @@ function MovieDetail({ detail, related, relatedLoading, relatedError, searchOpen
           <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-muted-foreground">{overview}</p></div>}
         {cast.length > 0 && <div className="mt-5"><h3 className="text-sm font-medium">主演</h3>
           <p className="mt-2 text-sm leading-6 text-muted-foreground">{cast.map((person) => person.name).join("、")}</p></div>}
-        {detail.tmdbError && <p className="mt-5 text-xs text-muted-foreground">TMDB 详情：{detail.tmdbError}，当前展示榜单资料。</p>}
+        {detail.tmdbError && <p className="mt-5 text-xs text-muted-foreground">TMDB 详情：{detail.tmdbError}，当前展示{detail.block ? "榜单资料" : "搜索结果摘要"}。</p>}
         <div className="mt-6 border-t border-border pt-4">
           <PrimaryButton type="button" onClick={onSearch}>
             {searchOpen && searchLoading ? <LoaderCircle className="size-4 animate-spin" />
@@ -112,10 +116,136 @@ function MovieDetail({ detail, related, relatedLoading, relatedError, searchOpen
   </div>;
 }
 
+/** 展示 Dialog 提交的 TMDB 搜索结果，并用榜单相同的详情组件展示所选作品。 */
+function TmdbSearchView({ admin, query, response, onBack }: {
+  admin: boolean; query: string; response: ReturnType<typeof searchRecommendationTmdb>; onBack: () => void;
+}) {
+  // 关键变量：选择其他搜索结果或返回列表时，旧详情请求不能覆盖当前页面。
+  const detailRequestRef = useRef(0);
+  const [results, setResults] = useState<RecommendationTmdbCandidate[] | null>(null);
+  const [searchErrors, setSearchErrors] = useState<string[]>([]);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [searching, setSearching] = useState(true);
+  const [selected, setSelected] = useState<RecommendationTmdbCandidate | null>(null);
+  const [detailData, setDetailData] = useState<Pick<RecommendationItemDetail, "tmdb" | "tmdbError"> | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [related, setRelated] = useState<RecommendationRelatedItem[]>([]);
+  const [relatedLoading, setRelatedLoading] = useState(false);
+  const [relatedError, setRelatedError] = useState<string | null>(null);
+  const [resourceSearchOpen, setResourceSearchOpen] = useState(false);
+  const [resourceSearchLoading, setResourceSearchLoading] = useState(false);
+
+  /** 同一次 Dialog 提交只发起一次请求；开发模式重复运行副作用时复用该请求。 */
+  useEffect(() => {
+    let active = true;
+    void response.then((found) => {
+      if (!active) return;
+      setResults(found.items);
+      setSearchErrors(found.errors);
+    }).catch((error) => {
+      if (active) setSearchError(error instanceof Error ? error.message : "TMDB 搜索失败");
+    }).finally(() => { if (active) setSearching(false); });
+    return () => { active = false; detailRequestRef.current += 1; };
+  }, [response]);
+
+  /** 分别加载作品详情与关联推荐，让已有详情先显示。 */
+  function openCandidate(candidate: RecommendationTmdbCandidate): void {
+    const requestId = ++detailRequestRef.current;
+    setSelected(candidate);
+    setDetailData(null);
+    setDetailLoading(true);
+    setRelated([]);
+    setRelatedLoading(true);
+    setRelatedError(null);
+    setResourceSearchOpen(false);
+    setResourceSearchLoading(false);
+    void getRecommendationTmdbDetail(candidate.mediaType, candidate.id, admin).then((value) => {
+      if (requestId === detailRequestRef.current) setDetailData(value);
+    }).catch((error) => {
+      if (requestId === detailRequestRef.current) setDetailData({ tmdb: null,
+        tmdbError: error instanceof Error ? error.message : "TMDB 详情暂时无法读取" });
+    }).finally(() => { if (requestId === detailRequestRef.current) setDetailLoading(false); });
+    void getRecommendationTmdbRelatedItems(candidate.mediaType, candidate.id, admin).then((items) => {
+      if (requestId === detailRequestRef.current) setRelated(items);
+    }).catch((error) => {
+      if (requestId === detailRequestRef.current) setRelatedError(error instanceof Error ? error.message : "关联推荐暂时无法读取");
+    }).finally(() => { if (requestId === detailRequestRef.current) setRelatedLoading(false); });
+  }
+
+  /** 从作品详情返回当前 TMDB 搜索结果。 */
+  function backToResults(): void {
+    detailRequestRef.current += 1;
+    setSelected(null);
+    setResourceSearchOpen(false);
+    setResourceSearchLoading(false);
+  }
+
+  /** 在所选 TMDB 作品详情内切换网盘资源与关联推荐。 */
+  function toggleResourceSearch(): void {
+    setResourceSearchLoading(!resourceSearchOpen);
+    setResourceSearchOpen(!resourceSearchOpen);
+  }
+
+  // 关键变量：TMDB 搜索候选先保留摘要，完整详情请求失败时仍能展示海报和片名。
+  const selectedItem: RecommendationItem | null = selected ? {
+    rank: 0, title: selected.title, overview: selected.overview, posterUrl: selected.posterUrl,
+    tmdbId: selected.id, mediaType: selected.mediaType, rating: selected.rating, releaseDate: selected.releaseDate,
+  } : null;
+  const displayDetail: DisplayMovieDetail | null = selectedItem && detailData
+    ? { block: null, item: selectedItem, tmdb: detailData.tmdb, tmdbError: detailData.tmdbError } : null;
+
+  return <div>
+    {!selected && searchError && <p role="alert" className="mb-4 text-sm text-destructive">{searchError}</p>}
+    {!selected && searchErrors.length > 0 && <p role="status" className="mb-4 text-xs text-muted-foreground">{searchErrors.join("；")}</p>}
+    {selected ? <>
+      <div className="mb-4"><SecondaryButton type="button" onClick={backToResults}>
+        <ArrowLeft className="size-4" /> 返回 TMDB 搜索结果
+      </SecondaryButton></div>
+      {detailLoading && <div className="surface animate-pulse p-5">
+        <div className="h-56 w-40 rounded-lg bg-secondary" /><div className="mt-4 h-6 w-56 rounded bg-secondary" /></div>}
+      {displayDetail && <MovieDetail detail={displayDetail} related={related} relatedLoading={relatedLoading}
+        relatedError={relatedError} searchOpen={resourceSearchOpen} searchLoading={resourceSearchLoading}
+        admin={admin} onSearch={toggleResourceSearch} onSearchingChange={setResourceSearchLoading} />}
+    </> : <>
+      <div className="mb-4"><SecondaryButton type="button" onClick={onBack}>
+        <ArrowLeft className="size-4" /> 返回影视推荐
+      </SecondaryButton></div>
+      {searching && <div className="grid gap-3" style={posterGridStyle}>
+        {Array.from({ length: 12 }, (_, index) => <div key={index} className="surface animate-pulse p-2.5">
+          <div className="aspect-[2/3] rounded-lg bg-secondary" /><div className="mt-2 h-4 rounded bg-secondary" />
+        </div>)}
+      </div>}
+      {!searching && results && <>
+        <p className="mb-3 text-xs text-muted-foreground">“{query}”找到 {results.length} 部电影或剧集</p>
+        <div className="grid gap-3" style={posterGridStyle}>
+          {results.map((candidate) => <button key={`${candidate.mediaType}:${candidate.id}`} type="button"
+            onClick={() => openCandidate(candidate)} className="surface min-w-0 p-2.5 text-left transition-colors hover:bg-secondary/50">
+            <RecommendationPoster url={candidate.posterUrl} title={candidate.title} />
+            <h3 className="mt-2 line-clamp-2 min-h-10 text-sm font-medium" title={candidate.title}>{candidate.title}</h3>
+            <p className="mt-1 truncate text-[11px] text-muted-foreground">
+              {candidate.mediaType === "tv" ? "剧集" : "电影"} · {candidate.year ?? "年份未知"}
+              {candidate.rating > 0 ? ` · 评分 ${candidate.rating.toFixed(1)}` : ""}
+            </p>
+          </button>)}
+        </div>
+        {results.length === 0 && <p className="py-8 text-center text-sm text-muted-foreground">TMDB 暂无匹配作品</p>}
+      </>}
+    </>}
+  </div>;
+}
+
 /** 个人与管理员共用的影视推荐页面，分组标签从已缓存榜单动态生成。 */
 export function RecommendationsPage({ admin = false }: { admin?: boolean }) {
   const resource = useApiResource(() => listRecommendations(admin), [admin]);
+  // 关键变量：Dialog 保留中文输入法组合状态，请求序号用于重复搜索同一片名。
+  const tmdbComposingRef = useRef(false);
+  const tmdbSearchVersionRef = useRef(0);
   const [activeGroup, setActiveGroup] = useState("全部");
+  const [tmdbDialogOpen, setTmdbDialogOpen] = useState(false);
+  // 关键变量：一次 Dialog 提交对应唯一请求，切换回榜单后仍能丢弃旧结果。
+  const [tmdbSearch, setTmdbSearch] = useState<{
+    query: string; response: ReturnType<typeof searchRecommendationTmdb>; version: number;
+  } | null>(null);
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
   const [selectedItemRank, setSelectedItemRank] = useState<number | null>(null);
   const [page, setPage] = useState(1);
@@ -186,6 +316,16 @@ export function RecommendationsPage({ admin = false }: { admin?: boolean }) {
     setSearchSelection(searchAlreadyOpen ? null : { blockId, rank });
   }
 
+  /** 从 Dialog 提交关键词，同时查询 TMDB 电影和剧集并切换到结果区。 */
+  function submitTmdbSearch(event: FormEvent<HTMLFormElement>): void {
+    event.preventDefault();
+    if (tmdbComposingRef.current) return;
+    const query = String(new FormData(event.currentTarget).get("query") ?? "").trim();
+    if (!query) return;
+    setTmdbSearch({ query, response: searchRecommendationTmdb(query, admin), version: ++tmdbSearchVersionRef.current });
+    setTmdbDialogOpen(false);
+  }
+
   /** 点击页面刷新时真正同步榜单上游，成功后重读列表和当前详情。 */
   async function syncNow(): Promise<void> {
     if (syncing) return;
@@ -224,28 +364,34 @@ export function RecommendationsPage({ admin = false }: { admin?: boolean }) {
   const searchOpen = searchSelection?.blockId === selectedBlockId && searchSelection.rank === selectedItemRank;
 
   return <div>
-    <PageHeader title="影视推荐" actions={<SecondaryButton type="button" disabled={syncing} onClick={() => void syncNow()}>
-      <RefreshCw className={`size-4 ${syncing ? "animate-spin" : ""}`} /> {syncing ? "正在同步…" : "立即同步"}
-    </SecondaryButton>} />
-    <p className="mb-3 text-xs text-muted-foreground">云助手定时同步影视榜单，页面显示本地缓存。
-      {resource.data?.updatedAt && ` 最近同步：${new Date(resource.data.updatedAt).toLocaleString("zh-CN")}`}</p>
-    {syncMessage && <p role="status" className="mb-3 text-sm text-muted-foreground">{syncMessage}</p>}
-    {syncError && <p role="alert" className="mb-3 text-sm text-destructive">{syncError}</p>}
+    <PageHeader title="影视推荐" actions={<div className="flex flex-wrap items-center gap-2">
+      <SecondaryButton type="button" onClick={() => { tmdbComposingRef.current = false; setTmdbDialogOpen(true); }}>
+        <Search className="size-4" /> TMDB搜索
+      </SecondaryButton>
+      <SecondaryButton type="button" disabled={syncing} onClick={() => void syncNow()}>
+        <RefreshCw className={`size-4 ${syncing ? "animate-spin" : ""}`} /> {syncing ? "正在同步…" : "立即同步"}
+      </SecondaryButton>
+    </div>} />
+    {!tmdbSearch && <p className="mb-3 text-xs text-muted-foreground">云助手定时同步影视榜单，页面显示本地缓存。
+      {resource.data?.updatedAt && ` 最近同步：${new Date(resource.data.updatedAt).toLocaleString("zh-CN")}`}</p>}
+    {!tmdbSearch && syncMessage && <p role="status" className="mb-3 text-sm text-muted-foreground">{syncMessage}</p>}
+    {!tmdbSearch && syncError && <p role="alert" className="mb-3 text-sm text-destructive">{syncError}</p>}
 
-    <div role="tablist" aria-label="榜单类型" className="mb-4 flex gap-2 overflow-x-auto border-b border-border pb-3">
+    {!tmdbSearch && <div role="tablist" aria-label="榜单类型" className="mb-4 flex gap-2 overflow-x-auto border-b border-border pb-3">
       {["全部", ...groups].map((group) => <button key={group} type="button" role="tab" aria-selected={activeGroup === group}
         onClick={() => { setActiveGroup(group); setSelectedBlockId(null); setSelectedItemRank(null); setPage(1); }}
         className={`shrink-0 rounded-lg border px-3 py-1.5 text-sm transition-colors ${activeGroup === group
           ? "border-border bg-secondary text-foreground" : "border-transparent text-muted-foreground hover:bg-secondary/50 hover:text-foreground"}`}>
         {group} <span className="text-xs text-muted-foreground">{group === "全部" ? blocks.length : groupCounts.get(group)}</span>
       </button>)}
-    </div>
+    </div>}
 
-    {resource.error && <div role="alert" className="mb-4 rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+    {!tmdbSearch && resource.error && <div role="alert" className="mb-4 rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
       {resource.error} <button type="button" className="underline" onClick={() => void resource.refresh()}>重试</button>
     </div>}
 
-    {selectedBlockId && selectedItemRank !== null ? <>
+    {tmdbSearch ? <TmdbSearchView key={tmdbSearch.version} admin={admin} query={tmdbSearch.query}
+      response={tmdbSearch.response} onBack={() => setTmdbSearch(null)} /> : selectedBlockId && selectedItemRank !== null ? <>
       <div className="mb-4"><SecondaryButton type="button" onClick={() => setSelectedItemRank(null)}>
         <ArrowLeft className="size-4" /> 返回{selectedBlock?.title ?? "榜单"}
       </SecondaryButton></div>
@@ -288,5 +434,26 @@ export function RecommendationsPage({ admin = false }: { admin?: boolean }) {
       </div>}
       {resource.data && visibleBlocks.length === 0 && <p className="py-10 text-center text-sm text-muted-foreground">当前分类没有榜单</p>}
     </>}
+
+    {tmdbDialogOpen && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      role="presentation" onClick={() => setTmdbDialogOpen(false)}>
+      <div role="dialog" aria-modal="true" aria-label="TMDB搜索" onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => { if (event.key === "Escape") setTmdbDialogOpen(false); }}
+        className="surface w-full max-w-lg p-5">
+        <h2 className="text-lg font-semibold">TMDB搜索</h2>
+        <form onSubmit={submitTmdbSearch} className="mt-4 space-y-4">
+          <label className="block space-y-2 text-sm">电影或剧集名称
+            <input autoFocus name="query" defaultValue={tmdbSearch?.query ?? ""} maxLength={100} required
+              onCompositionStart={() => { tmdbComposingRef.current = true; }}
+              onCompositionEnd={() => { tmdbComposingRef.current = false; }}
+              placeholder="输入搜索关键字" className="w-full rounded-lg border border-border bg-background px-3 py-2.5 text-sm" />
+          </label>
+          <div className="flex justify-end gap-2">
+            <SecondaryButton type="button" onClick={() => setTmdbDialogOpen(false)}>取消</SecondaryButton>
+            <PrimaryButton type="submit"><Search className="size-4" /> 搜索</PrimaryButton>
+          </div>
+        </form>
+      </div>
+    </div>}
   </div>;
 }

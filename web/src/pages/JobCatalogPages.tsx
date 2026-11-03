@@ -9,6 +9,7 @@ import { ProviderSelectionIcon } from "@/components/ServiceCreateSelection";
 import { FilterChip, Panel, ProgressMeter, StatusPill, type StatusTone } from "@/components/ui-kit";
 import {
   cancelScanJob,
+  clearFinishedOrganizeTasks,
   clearCompletedAndFailedScanJobs,
   controlLibraryScanJob,
   createScanJob,
@@ -639,19 +640,24 @@ function JobsView({ admin }: { admin: boolean }) {
     }
   }
 
-  /** 二次确认后只清除扫描和规格任务，整理任务继续保留。 */
+  /** 二次确认后清除扫描、规格和整理的终态记录，分别反馈清理结果。 */
   async function clearCompletedJobs(): Promise<void> {
     if (clearingCompletedJobsRef.current) return;
-    if (!window.confirm("确定清除已完成和失败的扫描、规格任务吗？这些任务的进度、错误记录及失败报告将一并删除；影片整理任务和其他状态任务会保留。")) return;
+    if (!window.confirm("确定清除已完成和失败的扫描、规格任务，以及已完成、失败和取消的影片整理任务吗？相关进度、错误记录、失败报告和整理预览将一并删除；未结束任务会保留。")) return;
     clearingCompletedJobsRef.current = true;
     setClearingCompletedJobs(true);
     setMessage("正在清除已完成和失败任务…");
     try {
-      const deletedCount = await clearCompletedAndFailedScanJobs(admin);
+      let deletedCount = 0;
+      const errors: string[] = [];
+      try { deletedCount += await clearFinishedOrganizeTasks(admin); }
+      catch (error) { errors.push(`整理任务：${error instanceof Error ? error.message : "清除失败"}`); }
+      try { deletedCount += await clearCompletedAndFailedScanJobs(admin); }
+      catch (error) { errors.push(`扫描/规格任务：${error instanceof Error ? error.message : "清除失败"}`); }
       setJobPageOffset(0);
       setSelectedJobId(null);
-      setMessage(`已清除 ${deletedCount.toLocaleString()} 个已完成或失败任务`);
       await resource.refresh();
+      setMessage(`${deletedCount > 0 ? `已清除 ${deletedCount.toLocaleString()} 个任务` : "没有可清除的任务"}${errors.length > 0 ? `；${errors.join("；")}` : ""}`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "清除已完成和失败任务失败");
     } finally {
@@ -885,7 +891,7 @@ function JobsView({ admin }: { admin: boolean }) {
             className="overflow-hidden p-4 sm:p-4 xl:flex xl:h-[calc(100vh-14rem)] xl:min-h-[560px] xl:max-h-[720px] xl:flex-col"
             title="任务列表"
             description={`当前页 ${jobRecords.length} 条 · 共 ${jobTotal} 条 · 第 ${currentJobPage}/${jobPageCount} 页`}
-            action={jobTypeFilter !== "organize" ? <button type="button" title="仅清除已完成和失败的扫描、规格任务" onClick={() => void clearCompletedJobs()} disabled={clearingCompletedJobs} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/8 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /> {clearingCompletedJobs ? "正在清除…" : "清除扫描/规格已结束任务"}</button> : undefined}
+            action={<button type="button" title="清除已完成和失败的扫描、规格任务及全部已结束的影片整理任务" onClick={() => void clearCompletedJobs()} disabled={clearingCompletedJobs} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/8 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /> {clearingCompletedJobs ? "正在清除…" : "清除已结束任务"}</button>}
           >
             <ul className="grid max-h-[560px] grid-cols-1 content-start gap-1.5 overflow-y-auto pr-1 sm:grid-cols-2 xl:min-h-0 xl:flex-1 xl:max-h-none">
               {jobRecords.map((record) => {

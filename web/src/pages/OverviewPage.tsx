@@ -242,9 +242,10 @@ export function OverviewPage() {
                   </div>
                   <div className="mt-1.5 grid gap-1 text-[11px] text-muted-foreground">
                     <span>创建时间：{formatJobDateTime(task.createdAt)}</span>
-                    <span>已处理：{(task.completedCount + task.failedCount).toLocaleString()} 项{task.totalCount !== null ? ` / ${task.totalCount.toLocaleString()} 项` : " · 正在识别"}</span>
+                    <span>{task.totalCount === 0 && task.status === "completed" ? "本次没有可整理的内容" :
+                      `已处理：${(task.completedCount + task.failedCount).toLocaleString()} 项${task.totalCount !== null ? ` / ${task.totalCount.toLocaleString()} 项` : " · 正在识别"}`}</span>
                   </div>
-                  <div className="mt-2.5"><ProgressMeter value={task.completedCount + task.failedCount} total={task.totalCount} /></div>
+                  {task.totalCount !== 0 && <div className="mt-2.5"><ProgressMeter value={task.completedCount + task.failedCount} total={task.totalCount} /></div>}
                 </li>;
               }
               const job = record.job;

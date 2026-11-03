@@ -618,8 +618,38 @@ export class ServiceOrganizeManager {
     return tasks.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   }
 
-  /** 从预览创建后台任务；同一服务只允许一个未结束的执行任务。 */
-  public async createJob(serviceId: string, planId: string, actorUserId?: string): Promise<OrganizeJob> {
+  /** 清除当前权限范围内已结束的整理记录及其预览，不触碰网盘文件和定时配置。 */
+  public async clearFinishedJobs(actorUserId?: string): Promise<number> {
+    const names = await fs.readdir(this.directory).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [] as string[];
+      throw error;
+    });
+    let deletedCount = 0;
+    for (const name of names) {
+      if (!/^job-[0-9a-f-]{36}\.json$/iu.test(name)) continue;
+      const fileName = path.join(this.directory, name);
+      const stored = await readJson<OrganizeJob>(fileName);
+      if (!stored || actorUserId && stored.userId !== actorUserId) continue;
+      // 关键变量：任务可能在等待文件写入或自动继续；删除前读取最终状态。
+      await this.jobWrites.get(stored.id);
+      const job = await readJson<OrganizeJob>(fileName);
+      if (!job || actorUserId && job.userId !== actorUserId
+        || !["completed", "failed", "cancelled"].includes(job.status)) continue;
+      // 计划刚落任务但调度器尚未清除待执行标记时，留给下一次清理，避免误删恢复依据。
+      const schedule = await readJson<{ pendingPlanId: string | null }>(path.join(this.directory, `schedule-${job.serviceId}.json`));
+      if (schedule?.pendingPlanId === job.planId) continue;
+      await fs.unlink(fileName);
+      await fs.unlink(this.planPath(job.planId)).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+      });
+      deletedCount += 1;
+    }
+    return deletedCount;
+  }
+
+  /** 从预览创建后台任务；定时或立即执行的空结果也保存为已完成的执行记录。 */
+  public async createJob(serviceId: string, planId: string, actorUserId?: string,
+    recordEmptyExecution = false): Promise<OrganizeJob> {
     if (this.creatingServices.has(serviceId)) throw new ApiError(409, "organize_job_creating", "当前服务正在创建整理任务");
     this.creatingServices.add(serviceId);
     try {
@@ -631,7 +661,8 @@ export class ServiceOrganizeManager {
       if (plan.status !== "ready" || plan.credentialRevision !== context.credentialRevision) {
         throw new ApiError(409, "organize_plan_stale", "预览尚未完成或服务凭据已变化，请重新预览");
       }
-      if (plan.items.every((item) => item.status !== "ready")) {
+      const hasReadyItems = plan.items.some((item) => item.status === "ready");
+      if (!hasReadyItems && !recordEmptyExecution) {
         throw new ApiError(422, "organize_plan_empty", "预览中没有可整理的影片");
       }
       const previous = await this.listJobs(serviceId, actorUserId);
@@ -643,7 +674,7 @@ export class ServiceOrganizeManager {
       }
       const now = new Date().toISOString();
       const job: OrganizeJob = { id: randomUUID(), planId, serviceId, userId: context.userId,
-        credentialRevision: context.credentialRevision, status: "queued", workDirectoryId: null,
+        credentialRevision: context.credentialRevision, status: hasReadyItems ? "queued" : "completed", workDirectoryId: null,
         stageDirectoryId: null, backupDirectoryId: null, error: null, autoRetryCount: 0, nextRetryAt: null,
         items: plan.items.map((item, index): OrganizeJobItem => ({ index, stage: "pending", sourceId: item.sourceId, stageRequested: false,
           stagedId: null, replacedId: null, targetParentId: null, stageParentId: null,
@@ -656,7 +687,8 @@ export class ServiceOrganizeManager {
         oldJob.nextRetryAt = null;
         await this.saveJob(oldJob);
       }
-      this.startJob(job.id);
+      // 空结果只留下执行记录；没有网盘文件变化，不进入整理执行器或完成通知流程。
+      if (hasReadyItems) this.startJob(job.id);
       return job;
     } finally { this.creatingServices.delete(serviceId); }
   }
@@ -1399,6 +1431,7 @@ export class ServiceOrganizeManager {
     const completedItems = job.items.filter((item) => item.stage === "completed")
       .map((item) => plan.items[item.index])
       .filter((item): item is OrganizePlanItem => Boolean(item && item.action !== "unrecognized" && item.tmdbId !== null));
+    if (completedItems.length === 0) return;
     // 关键变量：同一剧集的多集视频只算一部影片，文件数仍逐个统计。
     const workCount = new Set(completedItems.map((item) => `${item.category === "电影" ? "movie" : "tv"}:${item.tmdbId}`)).size;
     const service = await this.runtime.repository.getServiceDetail(job.serviceId, job.userId).catch(() => null);

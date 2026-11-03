@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { ApiError, validationError } from "../errors.js";
-import { requireRequestUser, requireSuperAdmin } from "../http.js";
+import { requireConfirmation, requireRequestUser, requireSuperAdmin } from "../http.js";
 import { ServiceOrganizeManager } from "../organize/manager.js";
 import { ServiceOrganizeScheduler } from "../organize/schedule.js";
 import type { OrganizeDirectory, OrganizeMode } from "../organize/types.js";
@@ -74,6 +74,12 @@ export async function registerOrganizeRoutes(server: FastifyInstance, runtime: A
         }
         return { items: page.map((task) => ({ ...task,
           serviceName: serviceNames.get(task.serviceId) ?? "网盘服务" })), total: filtered.length };
+      });
+    server.delete<{ Body: Record<string, unknown> }>(
+      `${admin ? "/api/v1/admin" : "/api/v1"}/organize/tasks/completed`, async (request) => {
+        const ownerId = await actorId(request);
+        requireConfirmation(request.body ?? {}, "completed");
+        return { deletedCount: await manager.clearFinishedJobs(ownerId) };
       });
     server.get<{ Params: { serviceId: string } }>(`${prefix}/:serviceId/organize/schedule`, async (request) =>
       ({ schedule: await scheduler.get(request.params.serviceId, await actorId(request)) }));

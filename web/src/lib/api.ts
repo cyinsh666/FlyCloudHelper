@@ -235,6 +235,13 @@ export interface RecommendationRelatedItem {
   releaseDate: string; rating: number;
 }
 
+/** TMDB 标题搜索返回的电影或剧集候选。 */
+export interface RecommendationTmdbCandidate {
+  id: number; mediaType: "movie" | "tv"; title: string; originalTitle: string; overview: string;
+  year: number | null; releaseDate: string; posterUrl: string | null; backdropUrl: string | null;
+  rating: number; popularity: number;
+}
+
 /** 按当前控制台身份选用影视推荐接口。 */
 function recommendationPath(admin: boolean): string {
   return admin ? "/api/v1/admin/recommendations" : "/api/v1/recommendations";
@@ -264,6 +271,26 @@ export function getRecommendationItemDetail(blockId: string, rank: number, admin
 export async function getRecommendationRelatedItems(blockId: string, rank: number, admin = false): Promise<RecommendationRelatedItem[]> {
   const result = await requestJson<{ items: RecommendationRelatedItem[] }>(
     `${recommendationPath(admin)}/${encodeURIComponent(blockId)}/items/${rank}/related`,
+  );
+  return result.items;
+}
+
+/** 使用已配置的 TMDB Key 同时搜索电影和剧集。 */
+export function searchRecommendationTmdb(query: string, admin = false): Promise<{ items: RecommendationTmdbCandidate[]; errors: string[] }> {
+  return requestJson(`${recommendationPath(admin)}/tmdb/search?query=${encodeURIComponent(query)}`);
+}
+
+/** 按 TMDB 类型和 ID 读取与榜单条目相同的详情字段。 */
+export function getRecommendationTmdbDetail(mediaType: "movie" | "tv", tmdbId: number, admin = false):
+  Promise<Pick<RecommendationItemDetail, "tmdb" | "tmdbError">> {
+  return requestJson(`${recommendationPath(admin)}/tmdb/${mediaType}/${tmdbId}`);
+}
+
+/** 单独读取 TMDB 搜索结果的关联推荐。 */
+export async function getRecommendationTmdbRelatedItems(mediaType: "movie" | "tv", tmdbId: number, admin = false):
+  Promise<RecommendationRelatedItem[]> {
+  const result = await requestJson<{ items: RecommendationRelatedItem[] }>(
+    `${recommendationPath(admin)}/tmdb/${mediaType}/${tmdbId}/related`,
   );
   return result.items;
 }
@@ -1392,6 +1419,15 @@ export function listOrganizeTasks(admin = false, filters: { status?: string; lim
   const query = new URLSearchParams({ status: filters.status ?? "all", limit: String(filters.limit ?? 8),
     offset: String(filters.offset ?? 0) });
   return requestJson(`${admin ? "/api/v1/admin" : "/api/v1"}/organize/tasks?${query.toString()}`);
+}
+
+/** 清除当前账号或管理员范围内已完成、失败或取消的整理任务记录。 */
+export async function clearFinishedOrganizeTasks(admin = false): Promise<number> {
+  const result = await requestJson<{ deletedCount: number }>(
+    `${admin ? "/api/v1/admin" : "/api/v1"}/organize/tasks/completed`,
+    { method: "DELETE", body: JSON.stringify({ confirmation: "completed" }) },
+  );
+  return result.deletedCount;
 }
 
 /** 读取当前网盘服务的整理定时任务。 */
