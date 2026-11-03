@@ -8,6 +8,7 @@ import { AdminTelegramNotificationSettingsPanel } from "@/pages/AdminNotificatio
 import { AdminTelegramSearchSourcesPanel } from "@/pages/AdminTelegramSearchSourcesPanel";
 import { AdminAiModelsPanel } from "@/pages/AiModelPages";
 import { AdminNetworkProxySettingsPanel } from "@/pages/AdminNetworkProxySettingsPanel";
+import { AdminChannelTypeAnalysisPanel } from "@/pages/AdminChannelTypeAnalysisPanel";
 import {
   clearAdminTmdbCache,
   createAdminUser,
@@ -380,8 +381,9 @@ export function AdminConfigurationPage() {
   const resource = useApiResource(() => getAdminConfigStatus(), []);
   const statusResource = useApiResource(() => getAdminStatus(), []);
   // 关键变量：标签由 URL hash 决定，使旧页面地址跳转后能直接打开相应内容。
-  const activeTab = selectedHash === "sources" || selectedHash === "notifications" || selectedHash === "access" || selectedHash === "network"
-    || selectedHash === "status" || selectedHash === "audit" || selectedHash === "ai-models" ? selectedHash : "tmdb";
+  const activeTab = selectedHash === "features" || selectedHash === "tmdb" || selectedHash === "sources"
+    || selectedHash === "notifications" || selectedHash === "access" || selectedHash === "network"
+    || selectedHash === "status" || selectedHash === "audit" || selectedHash === "ai-models" ? selectedHash : "features";
   const [message, setMessage] = useState<string | null>(null);
   const [clearingTmdbCache, setClearingTmdbCache] = useState(false);
 
@@ -475,10 +477,10 @@ export function AdminConfigurationPage() {
 
   return (
     <>
-      <PageHeader title="系统设置" actions={activeTab !== "audit" && activeTab !== "ai-models" ? <SecondaryButton onClick={() => void refreshCurrentTab()}><RefreshCw className="size-4" /> 刷新状态</SecondaryButton> : undefined} />
+      <PageHeader title="系统设置" actions={activeTab !== "features" && activeTab !== "audit" && activeTab !== "ai-models" ? <SecondaryButton onClick={() => void refreshCurrentTab()}><RefreshCw className="size-4" /> 刷新状态</SecondaryButton> : undefined} />
       <div role="tablist" aria-label="系统设置分类" className="mb-4 flex flex-wrap gap-2 border-b border-border pb-3">
         {([
-          { id: "tmdb", label: "TMDB" }, { id: "sources", label: "数据源" },
+          { id: "features", label: "功能" }, { id: "tmdb", label: "TMDB" }, { id: "sources", label: "数据源" },
           { id: "notifications", label: "通知" }, { id: "access", label: "访问" }, { id: "network", label: "代理" },
           { id: "status", label: "状态" },
           { id: "audit", label: "审计日志" }, { id: "ai-models", label: "AI 模型" },
@@ -491,6 +493,9 @@ export function AdminConfigurationPage() {
         </button>)}
       </div>
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
+      <div id="system-panel-features" role="tabpanel" aria-labelledby="system-tab-features" hidden={activeTab !== "features"}>
+        {activeTab === "features" && <AdminChannelTypeAnalysisPanel />}
+      </div>
       <div id="system-panel-notifications" role="tabpanel" aria-labelledby="system-tab-notifications" hidden={activeTab !== "notifications"}>
         <AdminTelegramNotificationSettingsPanel />
       </div>

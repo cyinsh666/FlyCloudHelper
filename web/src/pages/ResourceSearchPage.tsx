@@ -51,7 +51,6 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
   const [sourceErrors, setSourceErrors] = useState<string[]>([]);
   const [selected, setSelected] = useState<ResourceSearchItem | null>(null);
   const [serviceId, setServiceId] = useState("");
-  const [sourceDirectoryId, setSourceDirectoryId] = useState("");
   const [task, setTask] = useState<{ serviceId: string; taskId: string; providerType: string; status: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [searching, setSearching] = useState(false);
@@ -144,26 +143,23 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
       const nextTargets = await getResourceSearchTargets(admin);
       setTargets(nextTargets);
       setSelected(item);
-      const first = nextTargets.find((target) => target.providerType === item.cloudType && target.sources.length > 0);
+      const first = nextTargets.find((target) => target.providerType === item.cloudType && target.directory);
       setServiceId(first?.serviceId ?? "");
-      setSourceDirectoryId(first?.sources[0]?.resourceId ?? "");
     } catch (failure) { setError(failure instanceof Error ? failure.message : "读取转存服务失败"); }
   }
 
-  /** 切换服务时只允许选择该服务已保存的来源目录。 */
+  /** 切换服务时按服务级独立转存目录决定是否允许提交。 */
   function selectService(nextServiceId: string): void {
     setServiceId(nextServiceId);
-    setSourceDirectoryId(targets.find((target) => target.serviceId === nextServiceId)?.sources[0]?.resourceId ?? "");
   }
 
   /** 提交一次网盘远端转存，返回任务编号后关闭选择框。 */
   async function submitTransfer(): Promise<void> {
-    if (!selected || !serviceId || !sourceDirectoryId || transferring) return;
+    if (!selected || !serviceId || !selectedTarget?.directory || transferring) return;
     setTransferring(true);
     setError(null);
     try {
-      const submitted = await transferResource({ shareUrl: selected.shareUrl, password: selected.password,
-        serviceId, sourceDirectoryId }, admin);
+      const submitted = await transferResource({ shareUrl: selected.shareUrl, password: selected.password, serviceId }, admin);
       setTask({ serviceId, taskId: submitted.taskId, providerType: selected.cloudType, status: "pending" });
       setMessage(`已提交 ${submitted.fileCount} 个文件或文件夹，正在等待${transferProviderName(selected.cloudType)}完成转存`);
       setSelected(null);
@@ -276,21 +272,17 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
           <label className="block space-y-1 text-sm">已有{transferProviderName(selected.cloudType)}服务
             <select value={serviceId} onChange={(event) => selectService(event.target.value)} className="w-full rounded-lg border border-border bg-background p-2.5">
               <option value="">请选择服务</option>
-              {targets.filter((target) => target.providerType === selected.cloudType).map((target) => <option key={target.serviceId} value={target.serviceId} disabled={!target.sources.length}>
+              {targets.filter((target) => target.providerType === selected.cloudType).map((target) => <option key={target.serviceId} value={target.serviceId} disabled={!target.directory}>
                 {target.serviceName}{target.reason ? `（${target.reason}）` : ""}
               </option>)}
             </select>
           </label>
-          <label className="block space-y-1 text-sm">影片整理来源目录
-            <select value={sourceDirectoryId} onChange={(event) => setSourceDirectoryId(event.target.value)}
-              className="w-full rounded-lg border border-border bg-background p-2.5" disabled={!selectedTarget?.sources.length}>
-              <option value="">请选择来源目录</option>
-              {selectedTarget?.sources.map((source) => <option key={source.resourceId} value={source.resourceId}>{source.displayPath}</option>)}
-            </select>
-          </label>
-          {!targets.some((target) => target.providerType === selected.cloudType && target.sources.length) && <p className="text-sm text-muted-foreground">没有可用的{transferProviderName(selected.cloudType)}服务；请先在服务的影片整理页面设置来源目录。</p>}
+          {selectedTarget?.directory && <p className="rounded-lg border border-border bg-secondary/30 px-3 py-2 text-xs text-muted-foreground">
+            转存目录：{selectedTarget.directory.displayPath}
+          </p>}
+          {!targets.some((target) => target.providerType === selected.cloudType && target.directory) && <p className="text-sm text-muted-foreground">没有可用的{transferProviderName(selected.cloudType)}服务；请先在网盘服务详情中设置独立转存目录。</p>}
           <div className="flex justify-end gap-2"><SecondaryButton onClick={() => setSelected(null)}>取消</SecondaryButton>
-            <PrimaryButton onClick={() => void submitTransfer()} disabled={!serviceId || !sourceDirectoryId || transferring}>
+            <PrimaryButton onClick={() => void submitTransfer()} disabled={!serviceId || !selectedTarget?.directory || transferring}>
               {transferring ? "转存中…" : "确认转存"}
             </PrimaryButton></div>
         </div>

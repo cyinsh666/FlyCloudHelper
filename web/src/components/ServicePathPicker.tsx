@@ -14,6 +14,7 @@ interface ServicePathPickerProps {
   label: string;
   value: ProviderDirectory[];
   onConfirm: (directories: ProviderDirectory[]) => Promise<void>;
+  maxSelection?: number;
 }
 
 /** 为不同 Provider 生成稳定的目录选择键。 */
@@ -31,7 +32,7 @@ export function toProviderDirectory(directory: Omit<ProviderDirectory, "name"> &
 }
 
 /** 渲染只能通过网盘目录浏览结果进行选择的扫描路径控件。 */
-export function ServicePathPicker({ serviceId, admin, label, value, onConfirm }: ServicePathPickerProps) {
+export function ServicePathPicker({ serviceId, admin, label, value, onConfirm, maxSelection }: ServicePathPickerProps) {
   const [open, setOpen] = useState(false);
   const [draftValue, setDraftValue] = useState<ProviderDirectory[]>([]);
   const [listing, setListing] = useState<ProviderDirectoryListing | null>(null);
@@ -132,7 +133,7 @@ export function ServicePathPicker({ serviceId, admin, label, value, onConfirm }:
       选择前数量: draftValue.length,
       选择后数量: draftValue.length + 1,
     });
-    setDraftValue((current) => [...current, directory]);
+    setDraftValue((current) => maxSelection === 1 ? [directory] : [...current, directory]);
   }
 
   /** 从弹窗的临时选择集中移除一个目录。 */

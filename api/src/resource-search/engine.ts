@@ -148,6 +148,7 @@ const defaultChannels = [
 // 关键变量：正文中的候选 URL 与网页锚点一起处理，只有下方列出的网盘分享域名才会进入结果。
 const shareLinkPattern = /https?:\/\/[^\s<>"'，。；;、）)]+/giu;
 const sourceSettingKey = "resource_search_sources_v2";
+const serviceChannelsSettingPrefix = "resource_search_service_channels:";
 const legacySourceSettingKey = "resource_search_sources";
 
 /** 识别公开网盘分享链接的类型；仅检查域名和分享路径，不请求网盘服务。 */
@@ -326,6 +327,77 @@ class TelegramSearchAdapter implements SearchAdapter {
   }
 }
 
+/** 频道增量巡检需要保留消息 ID，不能使用面向关键词的搜索结果去重。 */
+export interface TelegramChannelMessage {
+  channel: string;
+  channelId: string;
+  messageId: number;
+  postedAt: string | null;
+  shares: Array<{ title: string; shareUrl: string; cloudType: string; password: string }>;
+}
+
+/** 公开页的浏览量令牌含频道数字 ID；缺失时沿用配置中的公开频道名。 */
+function telegramChannelId(viewToken: string | undefined, channel: string): string {
+  if (!viewToken) return channel.toLowerCase();
+  try {
+    const value = JSON.parse(Buffer.from(viewToken, "base64url").toString("utf8")) as Record<string, unknown>;
+    if (typeof value.c === "number" && Number.isSafeInteger(value.c)) return String(value.c);
+  } catch { /* 公开页结构变更时仍可用频道名定位消息。 */ }
+  return channel.toLowerCase();
+}
+
+/** 读取公开频道的一页消息；before 指向上一页最小消息 ID。 */
+export async function readTelegramChannelPage(channel: string, before?: number): Promise<TelegramChannelMessage[]> {
+  if (!/^[A-Za-z0-9_]{5,32}$/u.test(channel) || (before !== undefined && (!Number.isSafeInteger(before) || before < 1))) {
+    throw new ApiError(422, "telegram_channel_invalid", "Telegram 频道参数无效");
+  }
+  const url = new URL(`https://t.me/s/${channel}`);
+  if (before !== undefined) url.searchParams.set("before", String(before));
+  const response = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 FlyCloudHelper/1.0" },
+    signal: AbortSignal.timeout(10_000) });
+  if (!response.ok) throw new Error(`Telegram 频道读取失败（${response.status}）`);
+  const html = await response.text();
+  if (html.length > 3_000_000) throw new Error("Telegram 频道响应过大");
+  const $ = load(html);
+  const messages: TelegramChannelMessage[] = [];
+  $(".tgme_widget_message_wrap").each((_index, wrapper) => {
+    const message = $(wrapper).find(".tgme_widget_message").first();
+    const post = message.attr("data-post") ?? "";
+    const [postChannel, rawId] = post.split("/");
+    const messageId = Number(rawId);
+    if (postChannel?.toLowerCase() !== channel.toLowerCase() || !Number.isSafeInteger(messageId) || messageId < 1) return;
+    const body = message.find(".tgme_widget_message_text").first();
+    const textBody = body.clone();
+    textBody.find("a[href]").each((_linkIndex, anchor) => {
+      const link = $(anchor);
+      const href = link.attr("href") ?? "";
+      if (parseCloudShareUrl(href) && !link.text().includes(href)) link.text(`${link.text()} ${href}`);
+    });
+    textBody.find("br").replaceWith("\n");
+    const messageText = textBody.text().trim();
+    const hrefs = message.find(".tgme_widget_message_text a[href], .tgme_widget_message_inline_keyboard a[href]")
+      .map((_linkIndex, link) => $(link).attr("href") ?? "").get();
+    const lines = messageText.split(/\n/u).map((line) => line.trim()).filter(Boolean);
+    const defaultTitle = messageTitle(lines, "");
+    const messagePassword = /(?:提取码|访问码|密码)\s*[:：]?\s*([A-Za-z0-9]{4,8})/iu.exec(messageText)?.[1] ?? "";
+    const links = extractShareUrls(messageText, hrefs);
+    // 关键变量：同一消息中的每条分享保留自己的标题，之后再和 TMDB 订阅逐条匹配。
+    const shares = links.map((link) => {
+      const work = linkWorkTitle(lines, link.url, defaultTitle);
+      const shareParams = new URL(link.url).searchParams;
+      return { title: work.title, shareUrl: link.url, cloudType: link.cloudType,
+        password: shareParams.get("pwd") ?? shareParams.get("code") ?? shareParams.get("password") ?? messagePassword };
+    });
+    messages.push({ channel, channelId: telegramChannelId(message.attr("data-view"), channel), messageId,
+      postedAt: message.find(".tgme_widget_message_date time").attr("datetime") ?? null,
+      shares });
+  });
+  if (!messages.length && $(".tgme_widget_message_wrap").length > 0) {
+    throw new Error("Telegram 频道消息 ID 无法读取");
+  }
+  return messages.sort((a, b) => a.messageId - b.messageId);
+}
+
 /** 无需登录的公开搜索站适配器；每个站点只负责返回候选，链接类型由云助手统一识别。 */
 class PublicSiteSearchAdapter implements SearchAdapter {
   public readonly kind = "public_site";
@@ -395,6 +467,42 @@ function parseConfiguredSources(value: unknown): SearchSource[] {
 /** 系统级频道配置与搜索执行器；普通用户和管理员共用数据库中的相同来源。 */
 export class ResourceSearchEngine {
   public constructor(private readonly database: FlyCloudHelperDatabase) {}
+
+  /** 读取当前服务关注的频道，仅返回仍在系统频道列表中启用的条目。 */
+  public async serviceChannels(serviceId: string, availableChannels: string[]): Promise<string[]> {
+    const row = await this.database.query("system_settings")
+      .where({ setting_key: `${serviceChannelsSettingPrefix}${serviceId}` }).first();
+    if (!row) return [];
+    let saved: unknown;
+    try { saved = JSON.parse(String(row.setting_value)); }
+    catch { throw new ApiError(500, "service_channels_corrupt", "服务关注频道配置无法读取"); }
+    if (!Array.isArray(saved)) throw new ApiError(500, "service_channels_corrupt", "服务关注频道配置无效");
+    const available = new Set(availableChannels);
+    return saved.filter((key): key is string => typeof key === "string" && available.has(key));
+  }
+
+  /** 保存服务关注频道；系统频道删除或停用后不能再被新配置选中。 */
+  public async saveServiceChannels(serviceId: string, channelKeys: unknown, actorUserId: string): Promise<string[]> {
+    const availableChannels = (await this.listSources())
+      .filter((source) => source.kind === "telegram" && source.enabled).map((source) => source.key);
+    const available = new Set(availableChannels);
+    if (!Array.isArray(channelKeys) || channelKeys.length > availableChannels.length
+      || channelKeys.some((key) => typeof key !== "string" || !available.has(key))
+      || new Set(channelKeys).size !== channelKeys.length) {
+      throw new ApiError(422, "service_channels_invalid", "请从已启用的 Telegram 频道中选择");
+    }
+    // 关键变量：配置键包含服务 ID，同一用户的不同网盘服务互不覆盖。
+    const settingKey = `${serviceChannelsSettingPrefix}${serviceId}`;
+    await this.database.query.transaction(async (transaction) => {
+      const previous = await transaction("system_settings").where({ setting_key: settingKey }).first();
+      const now = new Date().toISOString();
+      const next = { setting_value: JSON.stringify(channelKeys), revision: Number(previous?.revision ?? 0) + 1,
+        updated_by_user_id: actorUserId, updated_at: now };
+      if (previous) await transaction("system_settings").where({ setting_key: settingKey }).update(next);
+      else await transaction("system_settings").insert({ setting_key: settingKey, ...next, created_at: now });
+    });
+    return channelKeys as string[];
+  }
 
   /** 读取全局来源配置；首次启用公开站点时沿用已有频道配置。 */
   public async listSources(): Promise<SearchSource[]> {

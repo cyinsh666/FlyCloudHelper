@@ -24,6 +24,8 @@ import { AdminServiceBasicDetailPage, UserServiceBasicDetailPage } from "@/pages
 import { ServiceOrganizePage } from "@/pages/ServiceOrganizePage";
 import { ResourceSearchPage } from "@/pages/ResourceSearchPage";
 import { RecommendationsPage } from "@/pages/RecommendationsPage";
+import { PersonalSettingsPage } from "@/pages/PersonalSettingsPage";
+import { SubscriptionsPage } from "@/pages/SubscriptionsPage";
 import { LibraryCreatePage } from "@/pages/LibraryCreatePage";
 import { LibraryFileBrowsePage } from "@/pages/LibraryFileBrowsePage";
 import { LibraryAbsSettingsPage } from "@/pages/LibraryAbsSettingsPage";
@@ -400,6 +402,27 @@ const userServicesRoute = createRoute({
   component: UserServicesPage,
 });
 
+/** 个人设置默认进入账号标签。 */
+const userPersonalSettingsRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "settings",
+  component: () => <PersonalSettingsPage tab="account" />,
+});
+
+/** 个人设置中的订阅标签只管理关注频道。 */
+const userSubscriptionSettingsRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "settings/subscriptions",
+  component: () => <PersonalSettingsPage tab="subscription" />,
+});
+
+/** 独立订阅页展示各网盘的影片和查找入口。 */
+const userSubscriptionsRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "subscriptions",
+  component: SubscriptionsPage,
+});
+
 /** 用户资源搜索页面。 */
 const userSearchRoute = createRoute({
   getParentRoute: () => appRoute,
@@ -708,6 +731,9 @@ const adminAuditRoute = createRoute({
 const appRouteTree = appRoute.addChildren([
   appIndexRoute,
   userServicesRoute,
+  userPersonalSettingsRoute,
+  userSubscriptionSettingsRoute,
+  userSubscriptionsRoute,
   userSearchRoute,
   userRecommendationsRoute,
   userServiceCreateRoute,

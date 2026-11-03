@@ -10,6 +10,7 @@ import {
   ListChecks,
   Menu,
   Puzzle,
+  Rss,
   Search,
   Settings2,
   Users,
@@ -67,6 +68,8 @@ const userNavigation: NavigationItem[] = [
   { to: "/app/catalog", label: "媒体库", icon: LibraryBig },
   { to: "/app/recommendations", label: "影视推荐", icon: Clapperboard },
   { to: "/app/search", label: "搜索引擎", icon: Search },
+  { to: "/app/subscriptions", label: "订阅", icon: Rss },
+  { to: "/app/settings", label: "个人设置", icon: Settings2 },
 ];
 
 /** 超级管理员后台导航。 */

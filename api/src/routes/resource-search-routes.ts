@@ -1,17 +1,18 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { ApiError, validationError } from "../errors.js";
 import { requireRequestUser, requireSuperAdmin, requireString } from "../http.js";
-import { ServiceOrganizeManager } from "../organize/manager.js";
-import { ServiceOrganizeScheduler } from "../organize/schedule.js";
-import { ResourceSearchEngine, parseGuangyaShareUrl, parseQuarkShareUrl, type SearchSource } from "../resource-search/engine.js";
-import type { QuarkProvider } from "../providers/quark.js";
+import { ResourceSearchEngine, type SearchSource } from "../resource-search/engine.js";
+import type { ChannelTypeCacheWorker } from "../resource-search/channel-types.js";
+import { getServiceTransferDirectory, saveServiceTransferDirectory, verifyServiceTransferDirectory,
+  type ServiceTransferDirectory } from "../resource-search/transfer-directory.js";
+import { readShareTransferStatus, submitShareTransfer } from "../resource-search/share-transfer.js";
 import type { ApiRuntime } from "../runtime.js";
+import type { MovieSubscriptionWorker } from "../subscriptions/worker.js";
 
 /** 注册资源搜索、Telegram 频道配置及同网盘分享转存。 */
-export async function registerResourceSearchRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
+export async function registerResourceSearchRoutes(server: FastifyInstance, runtime: ApiRuntime,
+  subscriptionWorker: MovieSubscriptionWorker, channelTypeCacheWorker: ChannelTypeCacheWorker): Promise<void> {
   const engine = new ResourceSearchEngine(runtime.database);
-  const organizeManager = new ServiceOrganizeManager(runtime);
-  const scheduler = new ServiceOrganizeScheduler(runtime, organizeManager);
 
   for (const admin of [false, true]) {
     const prefix = admin ? "/api/v1/admin/resource-search" : "/api/v1/resource-search";
@@ -22,32 +23,85 @@ export async function registerResourceSearchRoutes(server: FastifyInstance, runt
       return { userId: user.id, ownerId: admin ? undefined : user.id };
     }
 
-    /** 加载服务凭据及刷新回写回调，转存全程不向浏览器发送 Token。 */
-    async function serviceConnection(serviceId: string, ownerId?: string) {
-      const service = await runtime.repository.getServiceDetail(serviceId, ownerId);
-      if (service.providerType !== "guangya" && service.providerType !== "quark") {
-        throw new ApiError(422, "search_transfer_provider_invalid", "当前只支持光鸭和夸克分享转存");
-      }
-      if (service.status !== "active" || service.connectionStatus !== "valid") {
-        throw new ApiError(409, "search_transfer_service_unavailable", "网盘服务当前不可用");
-      }
-      const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(service.id, service.userId));
-      if (!runtime.providers.get(service.providerType).fileOrganizer?.supports(connection)) {
-        throw new ApiError(422, "search_transfer_auth_unsupported", "当前网盘登录方式不支持转存");
-      }
-      return { service, connection, persistConnection: async (nextConnection: Record<string, unknown>) => {
-        await runtime.repository.refreshActiveEncryptedConnection({
-          serviceId: service.id, userId: service.userId, credentialRevision: service.credentialRevision,
-          encryptedConnection: runtime.vault.encrypt(nextConnection),
-        });
-      } };
-    }
-
     server.get(`${prefix}/sources`, async (request) => {
       await actor(request);
       return { items: await engine.listSources() };
     });
+    const servicePrefix = admin ? "/api/v1/admin/services" : "/api/v1/services";
+
+    /** 读取网盘服务自己的转存目录，不回退到影片整理来源目录。 */
+    server.get<{ Params: { serviceId: string } }>(`${servicePrefix}/:serviceId/transfer-directory`, async (request) => {
+      const { ownerId } = await actor(request);
+      await runtime.repository.getServiceDetail(request.params.serviceId, ownerId);
+      return { directory: await getServiceTransferDirectory(runtime.database, request.params.serviceId) };
+    });
+
+    /** 保存已从当前网盘真实目录树中选择的转存落点。 */
+    server.put<{ Params: { serviceId: string }; Body: { directory?: ServiceTransferDirectory | null } }>(
+      `${servicePrefix}/:serviceId/transfer-directory`, async (request) => {
+        const { ownerId, userId } = await actor(request);
+        const service = await runtime.repository.getServiceDetail(request.params.serviceId, ownerId);
+        const selected = request.body?.directory;
+        if (selected === undefined) throw validationError("directory", "请选择网盘转存目录");
+        let directory: ServiceTransferDirectory | null = null;
+        if (selected !== null) {
+          if (service.status !== "active" || service.connectionStatus !== "valid") {
+            throw new ApiError(409, "transfer_directory_service_unavailable", "网盘服务当前不可用");
+          }
+          const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(service.id, service.userId));
+          /** 网盘刷新凭据后继续保存到原服务，目录配置不依赖整理功能。 */
+          const persistConnection = async (nextConnection: Record<string, unknown>): Promise<void> => {
+            await runtime.repository.refreshActiveEncryptedConnection({
+              serviceId: service.id, userId: service.userId, credentialRevision: service.credentialRevision,
+              encryptedConnection: runtime.vault.encrypt(nextConnection),
+            });
+          };
+          directory = await verifyServiceTransferDirectory(runtime.providers.get(service.providerType),
+            connection, selected, { persistConnection });
+        }
+        return { directory: await saveServiceTransferDirectory(runtime.database, service.id, userId, directory) };
+      });
+    if (!admin) {
+      /** 个人订阅设置只列出当前用户的网盘服务与系统中已启用的 TG 频道。 */
+      server.get(`${prefix}/subscription-channels`, async (request) => {
+        const { userId } = await actor(request);
+        const channels = (await engine.listSources())
+          .filter((source) => source.kind === "telegram" && source.enabled).map((source) => source.key);
+        const channelTypes = await channelTypeCacheWorker.summary(channels);
+        const page = await runtime.repository.listServices({ userId, limit: 10000, offset: 0 });
+        const services = await Promise.all(page.items.map(async (service) => ({
+          serviceId: service.id, serviceName: service.displayName, providerType: service.providerType,
+          channelKeys: await engine.serviceChannels(service.id, channels),
+        })));
+        return { channels, channelTypes: { ...channelTypes, enabled: runtime.config.workerEnabled }, services };
+      });
+
+      /** 每次保存先核实服务归属，防止修改其他用户的关注频道。 */
+      server.put<{ Params: { serviceId: string }; Body: { channelKeys?: unknown } }>(
+        `${prefix}/subscription-channels/:serviceId`, async (request) => {
+          const { userId } = await actor(request);
+          await runtime.repository.getServiceDetail(request.params.serviceId, userId);
+          const channelKeys = await engine.saveServiceChannels(request.params.serviceId, request.body?.channelKeys, userId);
+          await subscriptionWorker.noteChannelsChanged(request.params.serviceId, channelKeys);
+          return { channelKeys };
+        });
+    }
     if (admin) {
+      /** 系统设置读取频道类型缓存和手动分析进度，不执行外部请求。 */
+      server.get(`${prefix}/channel-types`, async (request) => {
+        await actor(request);
+        const channels = (await engine.listSources())
+          .filter((source) => source.kind === "telegram" && source.enabled).map((source) => source.key);
+        return { totalChannels: channels.length, automaticEnabled: runtime.config.workerEnabled,
+          cache: await channelTypeCacheWorker.summary(channels), status: channelTypeCacheWorker.analysisStatus() };
+      });
+
+      /** 管理员立即分析所有已启用频道，HTTP 请求不等待整批扫描完成。 */
+      server.post(`${prefix}/channel-types/analyze`, async (request, reply) => {
+        await actor(request);
+        return reply.code(202).send({ status: channelTypeCacheWorker.analyzeNow() });
+      });
+
       server.put<{ Body: { items: SearchSource[] } }>(`${prefix}/sources`, async (request) => {
         const { userId } = await actor(request);
         return { items: await engine.saveSources(request.body?.items, userId) };
@@ -64,96 +118,29 @@ export async function registerResourceSearchRoutes(server: FastifyInstance, runt
       const servicePages = await Promise.all(["guangya", "quark"].map((providerType) =>
         runtime.repository.listServices({ userId: ownerId, providerType, limit: 1000, offset: 0 })));
       const items = await Promise.all(servicePages.flatMap((page) => page.items).map(async (service) => {
-        const schedule = await scheduler.get(service.id, ownerId);
-        const capability = await organizeManager.capabilities(service.id, ownerId);
+        const directory = await getServiceTransferDirectory(runtime.database, service.id);
         return { serviceId: service.id, serviceName: service.displayName, providerType: service.providerType,
-          sources: capability.supported ? schedule.sources : [],
-          reason: capability.supported ? schedule.sources.length ? null : "尚未设置影片整理来源目录" : capability.reason };
+          directory, reason: directory ? null : "尚未设置独立转存目录" };
       }));
       return { items };
     });
-    server.post<{ Body: { serviceId?: string; sourceDirectoryId?: string; shareUrl?: string; password?: string } }>(
+    server.post<{ Body: { serviceId?: string; shareUrl?: string; password?: string } }>(
       `${prefix}/transfer`, async (request, reply) => {
         const { ownerId, userId } = await actor(request);
         const body = request.body ?? {};
         const serviceId = requireString(body, "serviceId", "网盘服务", 100);
-        const sourceDirectoryId = requireString(body, "sourceDirectoryId", "整理来源目录", 200);
         const shareUrl = requireString(body, "shareUrl", "网盘分享链接", 1000);
-        const guangyaShare = parseGuangyaShareUrl(shareUrl);
-        const quarkShare = parseQuarkShareUrl(shareUrl);
-        if (!guangyaShare && !quarkShare) throw validationError("shareUrl", "请输入有效的光鸭或夸克分享链接");
         const password = typeof body.password === "string" ? body.password.trim() : "";
-        if (password.length > 32) throw validationError("password", "提取码过长");
-        const { service, connection, persistConnection } = await serviceConnection(serviceId, ownerId);
-        if ((service.providerType === "guangya" && !guangyaShare)
-          || (service.providerType === "quark" && !quarkShare)) {
-          throw new ApiError(422, "search_transfer_provider_mismatch", "分享链接与目标网盘服务类型不一致");
-        }
-        const schedule = await scheduler.get(serviceId, ownerId);
-        const source = schedule.sources.find((item) => item.resourceId === sourceDirectoryId);
-        if (!source || !source.resourceId) {
-          throw new ApiError(422, "search_transfer_source_missing", "请先在该网盘服务设置影片整理来源目录");
-        }
-        if (quarkShare) {
-          const provider = runtime.providers.get("quark") as QuarkProvider;
-          const context = { persistConnection };
-          const token = await provider.getShareToken(connection, quarkShare.shareId, password || quarkShare.code, context);
-          const entries = await provider.listShareRoot(connection, quarkShare.shareId, token, context);
-          if (!entries.length) throw new ApiError(422, "search_share_empty", "分享中没有可转存文件");
-          // 关键变量：提交后网络异常不能自动重试，避免夸克已收到请求时重复转存。
-          const taskId = await provider.saveShareRoot(connection, quarkShare.shareId, token, entries, source.resourceId, context);
-          runtime.logBusinessEvent("info", { 日志关键字: "codex-resource-search-transfer", 事件: "提交夸克分享转存",
-            用户ID: userId, 服务ID: service.id, 来源目录ID: source.resourceId, 文件数量: entries.length, 任务ID: taskId });
-          return reply.status(202).send({ taskId, fileCount: entries.length });
-        }
-        if (!guangyaShare) throw validationError("shareUrl", "请输入有效的光鸭分享链接");
-        const parsed = guangyaShare;
-        const client = runtime.providers.guangyaWebClient;
-        const tokenData = await client.mutateFile(connection, "/userres/v1/get_share_access_token",
-          { shareId: parsed.shareId, code: password || parsed.code }, persistConnection);
-        const accessToken = typeof tokenData.accessToken === "string" ? tokenData.accessToken : "";
-        if (!accessToken) throw new ApiError(422, "search_share_unavailable", "分享链接无效或提取码错误");
-        const fileIds: string[] = [];
-        let cursor: number | undefined;
-        for (let page = 0; page < 50; page += 1) {
-          // 关键变量：光鸭分享列表的 cursor 必须保持数字类型，按响应值继续翻页。
-          const payload: Record<string, unknown> = { pageSize: 100, accessToken, orderBy: 0, sortType: 0, parentId: "" };
-          if (cursor !== undefined) payload.cursor = cursor;
-          const data = await client.mutateFile(connection, "/userres/v1/get_share_page_files_list", payload, persistConnection);
-          const list = Array.isArray(data.list) ? data.list as Array<Record<string, unknown>> : [];
-          for (const item of list) {
-            if (typeof item.fileId === "string" && item.fileId) fileIds.push(item.fileId);
-          }
-          const next = Number(data.cursor);
-          if (list.length === 0 || !Number.isFinite(next) || next <= 0 || next === cursor || data.hasMore === false) break;
-          if (page === 49) throw new ApiError(422, "search_share_too_large", "分享目录过大，无法完整读取");
-          cursor = next;
-        }
-        if (!fileIds.length) throw new ApiError(422, "search_share_empty", "分享中没有可转存文件");
-        // 提交可能已到达光鸭，网络错误时不自动重试，以免重复转存。
-        const submitted = await client.mutateFile(connection, "/userres/v1/restore_share",
-          { accessToken, fileIds, parentId: source.resourceId }, persistConnection);
-        const taskId = String(submitted.taskId ?? "");
-        if (!taskId) throw new ApiError(503, "search_transfer_task_missing", "转存已提交，但未收到任务编号；请检查目标目录");
-        runtime.logBusinessEvent("info", { 日志关键字: "codex-resource-search-transfer", 事件: "提交光鸭分享转存",
-          用户ID: userId, 服务ID: service.id, 来源目录ID: source.resourceId, 文件数量: fileIds.length, 任务ID: taskId });
-        return reply.status(202).send({ taskId, fileCount: fileIds.length });
+        const result = await submitShareTransfer(runtime, { serviceId, shareUrl, password,
+          actorUserId: userId, ownerId });
+        return reply.status(202).send({ taskId: result.taskId, fileCount: result.fileCount });
       });
     server.get<{ Params: { taskId: string }; Querystring: { serviceId?: string } }>(
       `${prefix}/transfer-tasks/:taskId`, async (request) => {
         const { ownerId } = await actor(request);
         const serviceId = request.query.serviceId ?? "";
-        if (!serviceId || !/^[0-9A-Za-z_-]{1,128}$/u.test(request.params.taskId)) throw validationError("taskId", "转存任务参数无效");
-        const { service, connection, persistConnection } = await serviceConnection(serviceId, ownerId);
-        if (service.providerType === "quark") {
-          const provider = runtime.providers.get("quark") as QuarkProvider;
-          return { status: await provider.shareTransferTaskStatus(connection, request.params.taskId, { persistConnection }) };
-        }
-        if (!/^\d+$/u.test(request.params.taskId)) throw validationError("taskId", "光鸭转存任务参数无效");
-        const data = await runtime.providers.guangyaWebClient.mutateFile(connection, "/userres/v1/get_task_status",
-          { taskId: request.params.taskId }, persistConnection);
-        const status = Number(data.status ?? -1);
-        return { status: status === 2 ? "completed" : status === 3 ? "failed" : status === 0 ? "pending" : "running" };
+        if (!serviceId) throw validationError("serviceId", "请选择网盘服务");
+        return { status: await readShareTransferStatus(runtime, serviceId, request.params.taskId, ownerId) };
       });
   }
 }

@@ -48,6 +48,9 @@ import { registerScanFailureReportRoutes } from "./routes/scan-failure-report-ro
 import { registerServiceRoutes } from "./routes/service-routes.js";
 import { registerOrganizeRoutes } from "./routes/organize-routes.js";
 import { registerResourceSearchRoutes } from "./routes/resource-search-routes.js";
+import { ChannelTypeCacheWorker } from "./resource-search/channel-types.js";
+import { registerMovieSubscriptionRoutes } from "./subscriptions/routes.js";
+import { MovieSubscriptionWorker } from "./subscriptions/worker.js";
 import { registerVideoRecognitionRoutes } from "./routes/video-recognition-routes.js";
 import { registerLibraryRoutes } from "./routes/library-routes.js";
 import { registerLibraryFileRoutes } from "./routes/library-file-routes.js";
@@ -306,6 +309,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     telegramNotifications,
     logBusinessEvent: logger,
   };
+  const movieSubscriptionWorker = new MovieSubscriptionWorker(runtime);
+  const channelTypeCacheWorker = new ChannelTypeCacheWorker(config, database, logger);
   await server.register(cookie);
   await server.register(multipart, {
     limits: {
@@ -317,6 +322,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   });
   server.addHook("onClose", async () => {
     recommendations.close();
+    await movieSubscriptionWorker.stop();
+    await channelTypeCacheWorker.stop();
     await contentSourceAutoSync.stop();
     await contentSourceDiagnostics.shutdown();
     await liveLibraries.process.close();
@@ -505,7 +512,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerBaiduPanWebLoginRoutes(server, runtime);
   await registerServiceRoutes(server, runtime);
   await registerOrganizeRoutes(server, runtime);
-  await registerResourceSearchRoutes(server, runtime);
+  await registerResourceSearchRoutes(server, runtime, movieSubscriptionWorker, channelTypeCacheWorker);
+  await registerMovieSubscriptionRoutes(server, runtime, movieSubscriptionWorker);
   await registerRecommendationRoutes(server, runtime);
   await registerVideoRecognitionRoutes(server, runtime);
   await registerLibraryRoutes(server, runtime);
@@ -564,6 +572,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   if (config.workerEnabled) {
     scanScheduleWorker.start();
     contentSourceAutoSync.start();
+    movieSubscriptionWorker.start();
+    channelTypeCacheWorker.start();
   }
   return server;
 }

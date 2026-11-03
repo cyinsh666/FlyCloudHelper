@@ -297,15 +297,48 @@ export async function getRecommendationTmdbRelatedItems(mediaType: "movie" | "tv
 
 /** 搜索引擎的公开 Telegram 频道配置。 */
 export interface ResourceSearchSource { kind: string; key: string; enabled: boolean }
+/** 个人订阅设置中的网盘服务与已关注频道。 */
+export interface ServiceSubscriptionChannels {
+  serviceId: string; serviceName: string; providerType: string; channelKeys: string[];
+}
+/** 频道最近三页的分享类型样本，以及历次扫描累计发现的类型。 */
+export interface ChannelCloudTypes {
+  channel: string; recentCounts: Record<string, number>; observedTypes: string[]; sampledMessages: number;
+  oldestMessageId: number | null; newestMessageId: number | null;
+  checkedAt: string | null; lastAttemptAt: string; error: string | null;
+}
+/** 系统设置中手动分析 Telegram 频道资源类型的进度。 */
+export interface ChannelTypeAnalysisStatus {
+  running: boolean; startedAt: string | null; finishedAt: string | null;
+  total: number; completed: number; succeeded: number; failed: number; error: string | null;
+}
+/** 已启用频道的类型缓存及本次分析进度。 */
+export interface AdminChannelTypeAnalysis {
+  totalChannels: number; automaticEnabled: boolean;
+  cache: { pageLimit: number; updatedAt: string | null; items: ChannelCloudTypes[] };
+  status: ChannelTypeAnalysisStatus;
+}
+/** 一个 TMDB 作品与用户网盘服务之间的订阅记录。 */
+export interface MovieSubscription {
+  serviceId: string; mediaType: "movie" | "tv"; tmdbId: number; title: string;
+  originalTitle: string; year: number | null; posterUrl: string | null; createdAt: string;
+}
+/** 一个 TG 消息中单条分享的自动转存处理状态。 */
+export interface MovieSubscriptionActivity {
+  id: string; channel: string; channelId: string; messageId: number; messageUrl: string; title: string;
+  mediaType: "movie" | "tv" | null; tmdbId: number | null;
+  status: "skipped" | "submitting" | "pending" | "running" | "completed" | "failed" | "needs_review";
+  reason: string | null; taskId: string | null; createdAt: string; updatedAt: string;
+}
 /** 各网盘分享的统一搜索结果；目前仅光鸭支持站内转存。 */
 export interface ResourceSearchItem {
   title: string; shareUrl: string; cloudType: string; password: string; source: string; sourceKind: string; sourceName: string;
   postedAt: string | null; messageUrl: string;
 }
-/** 可转存服务及已保存的影片整理来源目录。 */
+/** 可转存服务及服务级独立转存目录。 */
 export interface ResourceSearchTarget {
   serviceId: string; serviceName: string; providerType: "guangya" | "quark";
-  sources: Array<{ resourceId: string; displayPath: string }>; reason: string | null;
+  directory: Pick<ProviderDirectory, "resourceId" | "displayPath" | "driveId"> | null; reason: string | null;
 }
 
 /** 搜索引擎接口前缀按当前控制台身份选择。 */
@@ -316,6 +349,63 @@ function resourceSearchPath(admin: boolean): string {
 /** 读取系统预置及自定义搜索来源。 */
 export async function getResourceSearchSources(admin = false): Promise<ResourceSearchSource[]> {
   return (await requestJson<{ items: ResourceSearchSource[] }>(`${resourceSearchPath(admin)}/sources`)).items;
+}
+
+/** 读取当前账户的网盘服务和系统中可选择的 TG 频道。 */
+export function getSubscriptionChannels(): Promise<{ channels: string[]; services: ServiceSubscriptionChannels[];
+  channelTypes: { pageLimit: number; updatedAt: string | null; enabled: boolean; items: ChannelCloudTypes[] } }> {
+  return requestJson<{ channels: string[]; services: ServiceSubscriptionChannels[];
+    channelTypes: { pageLimit: number; updatedAt: string | null; enabled: boolean; items: ChannelCloudTypes[] } }>(
+    "/api/v1/resource-search/subscription-channels");
+}
+
+/** 读取频道资源类型分析的缓存和进度。 */
+export function getAdminChannelTypeAnalysis(): Promise<AdminChannelTypeAnalysis> {
+  return requestJson("/api/v1/admin/resource-search/channel-types");
+}
+
+/** 立即启动全量频道类型分析，服务器异步执行并分批保存缓存。 */
+export function startAdminChannelTypeAnalysis(): Promise<{ status: ChannelTypeAnalysisStatus }> {
+  return requestJson("/api/v1/admin/resource-search/channel-types/analyze", { method: "POST" });
+}
+
+/** 为当前账户的一个网盘服务保存关注频道。 */
+export async function saveServiceSubscriptionChannels(serviceId: string, channelKeys: string[]): Promise<string[]> {
+  const result = await requestJson<{ channelKeys: string[] }>(
+    `/api/v1/resource-search/subscription-channels/${encodeURIComponent(serviceId)}`,
+    { method: "PUT", body: JSON.stringify({ channelKeys }) });
+  return result.channelKeys;
+}
+
+/** 读取当前账号加入的影片订阅。 */
+export async function listMovieSubscriptions(): Promise<MovieSubscription[]> {
+  const result = await requestJson<{ items: MovieSubscription[] }>("/api/v1/resource-search/subscriptions");
+  return result.items;
+}
+
+/** 查看当前用户一个网盘服务的最近订阅巡检和转存记录。 */
+export function getMovieSubscriptionActivity(serviceId: string): Promise<{
+  lastRunAt: string | null; nextRunAt: string; lastError: string | null; items: MovieSubscriptionActivity[];
+}> {
+  return requestJson(`/api/v1/resource-search/subscriptions/activity?serviceId=${encodeURIComponent(serviceId)}`);
+}
+
+/** 立即检查一个服务关注频道中的新消息。 */
+export function checkMovieSubscriptionNow(serviceId: string): Promise<void> {
+  return requestJson("/api/v1/resource-search/subscriptions/check",
+    { method: "POST", body: JSON.stringify({ serviceId }) });
+}
+
+/** 从 TMDB 详情页把电影或剧集加入一个网盘服务。 */
+export async function addMovieSubscription(input: { serviceId: string; mediaType: "movie" | "tv"; tmdbId: number }):
+  Promise<{ item: MovieSubscription; alreadySubscribed: boolean }> {
+  return requestJson("/api/v1/resource-search/subscriptions", { method: "POST", body: JSON.stringify(input) });
+}
+
+/** 从个人订阅列表中移除指定作品。 */
+export function deleteMovieSubscription(item: Pick<MovieSubscription, "serviceId" | "mediaType" | "tmdbId">): Promise<void> {
+  return requestJson(`/api/v1/resource-search/subscriptions/${encodeURIComponent(item.serviceId)}/${item.mediaType}/${item.tmdbId}`,
+    { method: "DELETE" });
 }
 
 /** 保存频道和公开搜索站的启用状态及频道增删改。 */
@@ -329,13 +419,29 @@ export function searchResources(keyword: string, admin = false): Promise<{ items
   return requestJson(`${resourceSearchPath(admin)}/search?keyword=${encodeURIComponent(keyword)}`);
 }
 
-/** 读取已有光鸭、夸克服务与各自影片整理来源目录。 */
+/** 读取已有光鸭、夸克服务与各自独立转存目录。 */
 export async function getResourceSearchTargets(admin = false): Promise<ResourceSearchTarget[]> {
   return (await requestJson<{ items: ResourceSearchTarget[] }>(`${resourceSearchPath(admin)}/targets`)).items;
 }
 
+/** 读取网盘服务自己保存的转存目录。 */
+export async function getServiceTransferDirectory(serviceId: string, admin = false): Promise<ResourceSearchTarget["directory"]> {
+  const prefix = admin ? "/api/v1/admin/services" : "/api/v1/services";
+  return (await requestJson<{ directory: ResourceSearchTarget["directory"] }>(
+    `${prefix}/${encodeURIComponent(serviceId)}/transfer-directory`)).directory;
+}
+
+/** 保存或清空独立转存目录，不修改影片整理配置。 */
+export async function saveServiceTransferDirectory(serviceId: string, directory: ResourceSearchTarget["directory"],
+  admin = false): Promise<ResourceSearchTarget["directory"]> {
+  const prefix = admin ? "/api/v1/admin/services" : "/api/v1/services";
+  return (await requestJson<{ directory: ResourceSearchTarget["directory"] }>(
+    `${prefix}/${encodeURIComponent(serviceId)}/transfer-directory`,
+    { method: "PUT", body: JSON.stringify({ directory }) })).directory;
+}
+
 /** 提交同网盘分享转存，收到任务编号后由页面继续查询。 */
-export function transferResource(input: { shareUrl: string; password: string; serviceId: string; sourceDirectoryId: string }, admin = false):
+export function transferResource(input: { shareUrl: string; password: string; serviceId: string }, admin = false):
   Promise<{ taskId: string; fileCount: number }> {
   return requestJson(`${resourceSearchPath(admin)}/transfer`, { method: "POST", body: JSON.stringify(input) });
 }

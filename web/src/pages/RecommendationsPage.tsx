@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowLeft, Film, LoaderCircle, RefreshCw, Search } from "lucide-react";
+import { ArrowLeft, Film, LoaderCircle, RefreshCw, Rss, Search } from "lucide-react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
+import { SubscribeMovieDialog } from "@/components/SubscribeMovieDialog";
 import { ResourceSearchPage } from "@/pages/ResourceSearchPage";
 import { getRecommendationDetail, getRecommendationItemDetail, getRecommendationRelatedItems,
   getRecommendationTmdbDetail, getRecommendationTmdbRelatedItems, listRecommendations, searchRecommendationTmdb, syncRecommendations,
@@ -63,6 +64,8 @@ function MovieDetail({ detail, related, relatedLoading, relatedError, searchOpen
   onSearch: () => void; onSearchingChange: (searching: boolean) => void;
 }) {
   const { item, tmdb } = detail;
+  const [subscribeOpen, setSubscribeOpen] = useState(false);
+  const [subscribeMessage, setSubscribeMessage] = useState<string | null>(null);
   const poster = tmdb?.posterUrl ?? item.posterUrl;
   const title = tmdb?.title || item.title;
   const overview = tmdb?.overview || item.overview;
@@ -87,13 +90,17 @@ function MovieDetail({ detail, related, relatedLoading, relatedError, searchOpen
         {cast.length > 0 && <div className="mt-5"><h3 className="text-sm font-medium">主演</h3>
           <p className="mt-2 text-sm leading-6 text-muted-foreground">{cast.map((person) => person.name).join("、")}</p></div>}
         {detail.tmdbError && <p className="mt-5 text-xs text-muted-foreground">TMDB 详情：{detail.tmdbError}，当前展示{detail.block ? "榜单资料" : "搜索结果摘要"}。</p>}
-        <div className="mt-6 border-t border-border pt-4">
+        <div className="mt-6 flex flex-wrap items-center gap-2 border-t border-border pt-4">
           <PrimaryButton type="button" onClick={onSearch}>
             {searchOpen && searchLoading ? <LoaderCircle className="size-4 animate-spin" />
               : searchOpen ? <ArrowLeft className="size-4" /> : <Search className="size-4" />}
             {searchOpen && searchLoading ? "加载中…" : searchOpen ? "查看关联推荐" : "资源搜索"}
           </PrimaryButton>
+          {tmdb && <SecondaryButton type="button" onClick={() => { setSubscribeMessage(null); setSubscribeOpen(true); }}>
+            <Rss className="size-4" /> 订阅
+          </SecondaryButton>}
         </div>
+        {subscribeMessage && <p role="status" className="mt-2 text-xs text-muted-foreground">{subscribeMessage}</p>}
       </div>
     </div>
     {searchOpen ? <ResourceSearchPage admin={admin} embedded initialKeyword={item.title}
@@ -113,6 +120,8 @@ function MovieDetail({ detail, related, relatedLoading, relatedError, searchOpen
         </div>)}
       </div> : <p className="surface p-4 text-sm text-muted-foreground">{relatedError || "暂无关联推荐影片"}</p>}
     </section>}
+    {subscribeOpen && tmdb && <SubscribeMovieDialog item={{ tmdbId: tmdb.id, mediaType: tmdb.mediaType, title: tmdb.title }}
+      onClose={() => setSubscribeOpen(false)} onSubscribed={setSubscribeMessage} />}
   </div>;
 }
 
