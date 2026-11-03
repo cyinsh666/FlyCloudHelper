@@ -776,19 +776,20 @@ function JobsView({ admin }: { admin: boolean }) {
               ))}
             </div>
           </div>
-          <div className="grid gap-2">
-            <p className="text-xs text-muted-foreground">任务类型</p>
-            <div className="flex flex-wrap gap-2">
-              {jobTypeFilterOptions.map((option) => (
-                <FilterChip key={option.value} active={jobTypeFilter === option.value} onClick={() => { setJobPageOffset(0); setJobTypeFilter(option.value); }}>
-                  {option.label}
-                </FilterChip>
-              ))}
-            </div>
-          </div>
         </div>
       </Panel>
-      {!activeRecord ? <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "当前筛选条件下没有任务"}</div></Panel> : (
+      <div role="tablist" aria-label="任务类型" className="mb-4 flex gap-2 overflow-x-auto border-b border-border pb-3">
+        {jobTypeFilterOptions.map((option) => <button key={option.value} type="button" role="tab"
+          aria-selected={jobTypeFilter === option.value}
+          onClick={() => { setJobPageOffset(0); setSelectedJobId(null); setJobTypeFilter(option.value); }}
+          className={`shrink-0 rounded-lg border px-3 py-1.5 text-sm transition-colors ${jobTypeFilter === option.value
+            ? "border-border bg-secondary text-foreground" : "border-transparent text-muted-foreground hover:bg-secondary/50 hover:text-foreground"}`}>
+          {option.label}
+        </button>)}
+      </div>
+      {!activeRecord ? <Panel title="任务列表" description={`当前页 0 条 · 共 ${jobTotal} 条`}>
+        <div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "当前筛选条件下没有任务"}</div>
+      </Panel> : (
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
           {activeOrganizeTask && <OrganizeTaskDetail task={activeOrganizeTask} admin={admin} onRefresh={resource.refresh} />}
           {activeJob && <>

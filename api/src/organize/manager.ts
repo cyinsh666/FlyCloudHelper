@@ -1394,6 +1394,22 @@ export class ServiceOrganizeManager {
     await this.removeIfEmpty(context, work);
   }
 
+  /** 按最终完成的作品和视频文件发送一次整理汇总，不把未识别转移计入已整理影片。 */
+  private async notifyCompletedJob(job: OrganizeJob, plan: OrganizePlan): Promise<void> {
+    const completedItems = job.items.filter((item) => item.stage === "completed")
+      .map((item) => plan.items[item.index])
+      .filter((item): item is OrganizePlanItem => Boolean(item && item.action !== "unrecognized" && item.tmdbId !== null));
+    // 关键变量：同一剧集的多集视频只算一部影片，文件数仍逐个统计。
+    const workCount = new Set(completedItems.map((item) => `${item.category === "电影" ? "movie" : "tv"}:${item.tmdbId}`)).size;
+    const service = await this.runtime.repository.getServiceDetail(job.serviceId, job.userId).catch(() => null);
+    await this.runtime.database.createNotificationSafely({
+      userId: job.userId, notificationEvent: "organize_completed", category: "task", tone: "success",
+      title: "影片整理已完成",
+      message: `服务“${service?.displayName ?? "网盘服务"}”的影片整理已完成：整理 ${workCount} 部影片、${completedItems.length} 个文件。`,
+      actionPath: `/app/services/${job.serviceId}/organize`,
+    });
+  }
+
   /** 执行当前任务，失败时保留现场和阶段，允许之后继续。 */
   private async runJob(jobId: string): Promise<void> {
     let job = await readJson<OrganizeJob>(this.jobPath(jobId));
@@ -1472,6 +1488,7 @@ export class ServiceOrganizeManager {
       }
       job.status = "completed";
       await this.saveJob(job);
+      await this.notifyCompletedJob(job, plan);
     } catch (error) {
       const latest = await readJson<OrganizeJob>(this.jobPath(jobId));
       if (latest && ["queued", "running"].includes(latest.status)) {

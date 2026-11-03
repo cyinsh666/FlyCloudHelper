@@ -87,6 +87,7 @@ export async function notifyFinishedLibraryScanJob(runtime: ApiRuntime, parentJo
   const wasCancelled = parentJob.status === "cancelled" || parentJob.cancelledSourceCount > 0;
   await runtime.database.createNotificationSafely({
     userId,
+    notificationEvent: "scan_completed",
     category: "task",
     tone: hasFailure || hasErrors || wasCancelled ? "warning" : "success",
     title: hasFailure || hasErrors || wasCancelled ? "云聚合扫描异常结束" : "云聚合扫描已完成",

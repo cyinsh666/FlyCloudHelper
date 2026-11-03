@@ -23,6 +23,7 @@ import {
 import { AdminServiceBasicDetailPage, UserServiceBasicDetailPage } from "@/pages/ServiceBasicDetailPage";
 import { ServiceOrganizePage } from "@/pages/ServiceOrganizePage";
 import { ResourceSearchPage } from "@/pages/ResourceSearchPage";
+import { RecommendationsPage } from "@/pages/RecommendationsPage";
 import { LibraryCreatePage } from "@/pages/LibraryCreatePage";
 import { LibraryFileBrowsePage } from "@/pages/LibraryFileBrowsePage";
 import { LibraryAbsSettingsPage } from "@/pages/LibraryAbsSettingsPage";
@@ -238,6 +239,12 @@ function nativeAudiobookSearch(input: Record<string, unknown>): { libraryId?: st
   return typeof input.libraryId === "string" && input.libraryId.length <= 128 ? { libraryId: input.libraryId } : {};
 }
 
+/** 影视推荐跳转搜索时只接收不超过 100 字的片名。 */
+function resourceSearchParams(input: Record<string, unknown>): { keyword?: string } {
+  return typeof input.keyword === "string" && input.keyword.trim() && input.keyword.length <= 100
+    ? { keyword: input.keyword.trim() } : {};
+}
+
 /** 处理普通用户媒体库海报墙路由参数。 */
 function UserLibraryCatalogRouteComponent() {
   const { serviceId } = userLibraryCatalogRoute.useParams();
@@ -397,7 +404,15 @@ const userServicesRoute = createRoute({
 const userSearchRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "search",
+  validateSearch: resourceSearchParams,
   component: ResourceSearchPage,
+});
+
+/** 用户影视推荐榜单页面。 */
+const userRecommendationsRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "recommendations",
+  component: RecommendationsPage,
 });
 
 const userServiceCreateRoute = createRoute({
@@ -535,7 +550,15 @@ const adminServicesRoute = createRoute({
 const adminSearchRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "search",
+  validateSearch: resourceSearchParams,
   component: () => <ResourceSearchPage admin />,
+});
+
+/** 管理员影视推荐榜单页面。 */
+const adminRecommendationsRoute = createRoute({
+  getParentRoute: () => adminRoute,
+  path: "recommendations",
+  component: () => <RecommendationsPage admin />,
 });
 
 /** 旧管理员创建地址切换到个人模式，创建归属当前登录账户。 */
@@ -686,6 +709,7 @@ const appRouteTree = appRoute.addChildren([
   appIndexRoute,
   userServicesRoute,
   userSearchRoute,
+  userRecommendationsRoute,
   userServiceCreateRoute,
   userServiceDetailRoute,
   userServiceOrganizeRoute,
@@ -711,6 +735,7 @@ const adminRouteTree = adminRoute.addChildren([
   adminUsersRoute,
   adminServicesRoute,
   adminSearchRoute,
+  adminRecommendationsRoute,
   adminServiceCreateRoute,
   adminServiceDetailRoute,
   adminServiceOrganizeRoute,

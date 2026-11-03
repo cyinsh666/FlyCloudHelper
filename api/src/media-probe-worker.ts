@@ -472,10 +472,11 @@ export class MediaProbeWorker {
           const notificationEnabled = await this.readServiceNotificationEnabled(job.serviceId);
           await this.database.createNotificationSafely({
             userId: synchronization.job.userId,
+            notificationEvent: "media_probe_completed",
             category: "task",
             tone: synchronization.job.errorCount > 0 ? "warning" : "success",
-            title: "视频规格扫描已完成",
-            message: `服务“${synchronization.job.serviceName}”的视频规格扫描已完成：${synchronization.completedFileCount} 个文件完成了规格扫描。${synchronization.job.errorCount > 0 ? `另有 ${synchronization.job.errorCount} 个文件失败。` : ""}`,
+            title: "视频规格分析已完成",
+            message: `服务“${synchronization.job.serviceName}”的视频规格分析已完成：${synchronization.completedFileCount} 个文件完成了规格分析。${synchronization.job.errorCount > 0 ? `另有 ${synchronization.job.errorCount} 个文件失败。` : ""}`,
             actionPath: "/app/jobs",
             deliverExternally: notificationEnabled,
           });

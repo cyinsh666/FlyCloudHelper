@@ -71,6 +71,7 @@ ENV NODE_ENV=production \
     FLYCLOUDHELPER_IMAGE_CACHE_DIR=/data/image-cache \
     FLYCLOUDHELPER_MIGRATION_DIR=/data/migrations \
     FLYCLOUDHELPER_MUSIC_ARTWORK_DIR=/data/music-artwork \
+    FLYCLOUDHELPER_RECOMMENDATION_CACHE_DIR=/data/recommendations \
     FLYCLOUDHELPER_WEB_DIST_DIR=/app/web/dist \
     FLYCLOUDHELPER_FFPROBE_PATH=/usr/bin/ffprobe \
     FLYCLOUDHELPER_FFMPEG_PATH=/usr/bin/ffmpeg \

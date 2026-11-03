@@ -7,6 +7,7 @@ import { AdminPluginsPanel } from "@/components/AdminPluginsPanel";
 import { AdminTelegramNotificationSettingsPanel } from "@/pages/AdminNotificationSettingsPage";
 import { AdminTelegramSearchSourcesPanel } from "@/pages/AdminTelegramSearchSourcesPanel";
 import { AdminAiModelsPanel } from "@/pages/AiModelPages";
+import { AdminNetworkProxySettingsPanel } from "@/pages/AdminNetworkProxySettingsPanel";
 import {
   clearAdminTmdbCache,
   createAdminUser,
@@ -379,7 +380,7 @@ export function AdminConfigurationPage() {
   const resource = useApiResource(() => getAdminConfigStatus(), []);
   const statusResource = useApiResource(() => getAdminStatus(), []);
   // 关键变量：标签由 URL hash 决定，使旧页面地址跳转后能直接打开相应内容。
-  const activeTab = selectedHash === "sources" || selectedHash === "notifications" || selectedHash === "access"
+  const activeTab = selectedHash === "sources" || selectedHash === "notifications" || selectedHash === "access" || selectedHash === "network"
     || selectedHash === "status" || selectedHash === "audit" || selectedHash === "ai-models" ? selectedHash : "tmdb";
   const [message, setMessage] = useState<string | null>(null);
   const [clearingTmdbCache, setClearingTmdbCache] = useState(false);
@@ -478,7 +479,7 @@ export function AdminConfigurationPage() {
       <div role="tablist" aria-label="系统设置分类" className="mb-4 flex flex-wrap gap-2 border-b border-border pb-3">
         {([
           { id: "tmdb", label: "TMDB" }, { id: "sources", label: "数据源" },
-          { id: "notifications", label: "通知" }, { id: "access", label: "访问" },
+          { id: "notifications", label: "通知" }, { id: "access", label: "访问" }, { id: "network", label: "代理" },
           { id: "status", label: "状态" },
           { id: "audit", label: "审计日志" }, { id: "ai-models", label: "AI 模型" },
         ] as const).map((tab) => <button key={tab.id} id={`system-tab-${tab.id}`} type="button" role="tab"
@@ -514,6 +515,9 @@ export function AdminConfigurationPage() {
         <p className="mt-3 text-xs text-muted-foreground">作用：仅当使用反向代理、HTTPS 域名，或外部端口与云助手 API 实际地址不一致时填写。系统会在该地址后自动追加媒体库设置中的 /j/{`{自定义后缀}`}；清空不会影响 Jellyfin 的启用和访问。</p>
         <p className="mt-2 text-xs text-muted-foreground">配置来源：{resource.data?.publicAccess.source === "environment" ? "环境变量（控制台只读）" : resource.data?.publicAccess.source === "database" ? "数据库" : "未设置（使用云助手 API 地址）"}</p>
       </Panel>
+      </div>
+      <div id="system-panel-network" role="tabpanel" aria-labelledby="system-tab-network" hidden={activeTab !== "network"}>
+        {activeTab === "network" && <AdminNetworkProxySettingsPanel />}
       </div>
       <div id="system-panel-status" role="tabpanel" aria-labelledby="system-tab-status" hidden={activeTab !== "status"}>
         <div className="grid gap-4 xl:grid-cols-2">

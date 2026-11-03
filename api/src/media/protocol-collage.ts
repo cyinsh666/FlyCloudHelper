@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { getOutboundBrowserProxy } from "../network-proxy.js";
 import type { CachedImage, ProtocolImageCache } from "./image-cache.js";
 
 export type CollageProtocol = "jellyfin" | "emby";
@@ -163,7 +164,7 @@ export class ProtocolCollageService {
   private async render(pictures: CachedImage[], title: string, subtitle: string): Promise<Buffer> {
     const { chromium } = await import("playwright-core");
     const browser = await chromium.launch({ executablePath: process.env.FLYCLOUDHELPER_CHROMIUM_PATH || "/usr/bin/chromium",
-      headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
+      headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"], proxy: getOutboundBrowserProxy() });
     try {
       const page = await browser.newPage({ viewport: { width: 1280, height: 720 }, deviceScaleFactor: 1 });
       const cards = Array.from({ length: 9 }, (_, index) => {

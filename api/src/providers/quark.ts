@@ -13,6 +13,7 @@ import {
 import { type ProviderConnectionContext, type ProviderDescriptor, type ProviderEntry, type ProviderFileAccess, type ProviderFileOrganizer, type ProviderMutationResult, createProviderRecommendedScanSettings, requireConnectionString } from "./types.js";
 
 const QUARK_API = "https://drive.quark.cn/1/clouddrive";
+const QUARK_SHARE_API = "https://drive-pc.quark.cn/1/clouddrive";
 const QUARK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4";
 
 /** 夸克网盘 Cookie Provider，目录浏览与文件整理共用凭据轮换。 */
@@ -45,6 +46,72 @@ export class QuarkProvider extends CloudDriveProviderBase {
   };
 
   public constructor(private readonly networkOptions: ProviderNetworkOptions) { super(); }
+
+  /** 用已登录账号取得分享访问令牌，提取码为空时也可访问公开分享。 */
+  public async getShareToken(connection: Record<string, unknown>, shareId: string, passcode: string,
+    context?: ProviderConnectionContext): Promise<string> {
+    const query = new URLSearchParams({ pr: "ucpro", fr: "pc", uc_param_str: "" });
+    let payload: Record<string, unknown>;
+    try {
+      payload = await this.request(connection, `${QUARK_SHARE_API}/share/sharepage/token?${query}`,
+        { method: "POST", body: JSON.stringify({ pwd_id: shareId, passcode }) }, undefined, context);
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "quark_business_failed") {
+        throw new ApiError(422, "search_share_unavailable", "夸克分享链接无效、已过期或提取码错误");
+      }
+      throw error;
+    }
+    const token = readCloudText(readCloudRecord(payload.data), ["stoken"]);
+    if (!token) throw new ApiError(422, "search_share_unavailable", "夸克分享访问令牌缺失，请检查分享链接和提取码");
+    return token;
+  }
+
+  /** 逐页读取分享根目录，保留文件与文件夹对应的 fid 和分享文件令牌。 */
+  public async listShareRoot(connection: Record<string, unknown>, shareId: string, token: string,
+    context?: ProviderConnectionContext): Promise<Array<{ fid: string; token: string }>> {
+    const entries: Array<{ fid: string; token: string }> = [];
+    const pageSize = 50;
+    for (let page = 1; page <= 100; page += 1) {
+      const query = new URLSearchParams({ pr: "ucpro", fr: "pc", uc_param_str: "", pwd_id: shareId,
+        stoken: token, pdir_fid: "0", force: "0", _page: String(page), _size: String(pageSize),
+        _sort: "file_type:asc,updated_at:desc" });
+      const payload = await this.request(connection, `${QUARK_SHARE_API}/share/sharepage/detail?${query}`,
+        { method: "GET" }, undefined, context);
+      const items = readCloudRecord(payload.data).list;
+      if (!Array.isArray(items)) throw new ApiError(502, "quark_share_list_invalid", "夸克分享目录响应无效");
+      for (const value of items) {
+        const item = readCloudRecord(value);
+        const fid = readCloudText(item, ["fid"]);
+        const fileToken = readCloudText(item, ["share_fid_token"]);
+        if (!fid || !fileToken) throw new ApiError(502, "quark_share_file_invalid", "夸克分享文件缺少转存凭据");
+        entries.push({ fid, token: fileToken });
+      }
+      const total = readCloudNumber(readCloudRecord(payload.metadata)._total);
+      if (items.length < pageSize || (total > 0 && entries.length >= total)) return entries;
+    }
+    throw new ApiError(422, "search_share_too_large", "分享目录过大，无法完整读取");
+  }
+
+  /** 提交一次夸克分享转存，返回异步任务编号；调用方不能自动重试提交。 */
+  public async saveShareRoot(connection: Record<string, unknown>, shareId: string, token: string,
+    entries: Array<{ fid: string; token: string }>, targetDirectoryId: string,
+    context?: ProviderConnectionContext): Promise<string> {
+    const query = new URLSearchParams({ pr: "ucpro", fr: "pc", uc_param_str: "" });
+    const payload = await this.request(connection, `${QUARK_API}/share/sharepage/save?${query}`,
+      { method: "POST", body: JSON.stringify({ fid_list: entries.map((item) => item.fid),
+        fid_token_list: entries.map((item) => item.token), to_pdir_fid: targetDirectoryId,
+        pwd_id: shareId, stoken: token, pdir_fid: "0", pdir_save_all: false, exclude_fids: [], scene: "link" }) },
+      undefined, context);
+    const taskId = readCloudText(readCloudRecord(payload.data), ["task_id"]);
+    if (!taskId) throw new ApiError(503, "search_transfer_task_missing", "转存已提交，但未收到任务编号；请检查目标目录");
+    return taskId;
+  }
+
+  /** 分享转存沿用夸克文件复制使用的异步任务状态接口。 */
+  public async shareTransferTaskStatus(connection: Record<string, unknown>, taskId: string,
+    context?: ProviderConnectionContext): Promise<"pending" | "running" | "completed" | "failed"> {
+    return this.organizeTaskStatus(connection, taskId, context);
+  }
 
   /** 夸克文件 ID 为稳定字符串，整理写入不能针对根目录。 */
   private organizeIds(resourceIds: string[]): string[] {
@@ -204,7 +271,7 @@ export class QuarkProvider extends CloudDriveProviderBase {
       this.applyLatestCookie(connection, cookieIdentityKey);
       const result = await requestCloudApiText(url, { ...init, headers: { ...this.createHeaders(connection), ...init.headers } }, this.networkOptions, signal);
       await this.mergeRotatingCookies(connection, result.response, context, cookieIdentityKey);
-      const payload = parseCloudApiObject(result.text, ["uid"]);
+      const payload = parseCloudApiObject(result.text, ["uid", "fid", "task_id"]);
       const status = Number(payload.status);
       const businessCode = Number(payload.code);
       if (status === 429 || businessCode === 429) {

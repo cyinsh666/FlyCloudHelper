@@ -2,6 +2,7 @@ import { Link, Outlet, useRouterState } from "@tanstack/react-router";
 import {
   Activity,
   Bell,
+  Clapperboard,
   ChevronRight,
   HardDrive,
   LayoutDashboard,
@@ -61,21 +62,23 @@ function formatNotificationTime(createdAt: string): string {
 /** 普通用户控制台导航。 */
 const userNavigation: NavigationItem[] = [
   { to: "/app", label: "概览", icon: LayoutDashboard },
-  { to: "/app/services", label: "我的服务", icon: HardDrive },
-  { to: "/app/search", label: "搜索引擎", icon: Search },
   { to: "/app/jobs", label: "后台任务", icon: ListChecks },
+  { to: "/app/services", label: "我的服务", icon: HardDrive },
   { to: "/app/catalog", label: "媒体库", icon: LibraryBig },
+  { to: "/app/recommendations", label: "影视推荐", icon: Clapperboard },
+  { to: "/app/search", label: "搜索引擎", icon: Search },
 ];
 
 /** 超级管理员后台导航。 */
 const adminNavigation: NavigationItem[] = [
   { to: "/admin", label: "管理概览", icon: Activity },
-  { to: "/admin/users", label: "用户管理", icon: Users },
-  { to: "/admin/services", label: "全部服务", icon: HardDrive },
-  { to: "/admin/search", label: "搜索引擎", icon: Search },
   { to: "/admin/jobs", label: "后台任务", icon: ListChecks },
+  { to: "/admin/services", label: "全部服务", icon: HardDrive },
   { to: "/admin/catalog", label: "媒体库", icon: LibraryBig },
+  { to: "/admin/recommendations", label: "影视推荐", icon: Clapperboard },
+  { to: "/admin/search", label: "搜索引擎", icon: Search },
   { to: "/admin/plugins", label: "插件管理", icon: Puzzle },
+  { to: "/admin/users", label: "用户管理", icon: Users },
   { to: "/admin/config", label: "系统设置", icon: Settings2 },
 ];
 

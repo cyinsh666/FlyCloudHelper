@@ -3407,6 +3407,8 @@ export class ServiceRepository {
     const current = await this.getJob(jobId);
     const now = new Date().toISOString();
     const finishedAt = input.status === "paused" ? null : now;
+    // 关键变量：只在当前凭据首次转为需重新授权时提醒，避免同一异常反复推送。
+    let credentialBecameInvalid = false;
     await this.database.query.transaction(async (transaction) => {
       const timingRow = await transaction("scan_jobs")
         .select("status", "active_duration_ms", "active_started_at")
@@ -3487,6 +3489,8 @@ export class ServiceRepository {
         }
       }
       const previousConnectionStatus = source?.source_mode === "owned_copy" ? source?.connection_status : service?.connection_status;
+      credentialBecameInvalid = usesCurrentCredential && isAuthenticationFailure
+        && previousConnectionStatus !== "reauthorization_required";
       if (connectionStatus !== previousConnectionStatus || (!usesCurrentCredential && input.errorCode)) {
         this.logger?.("info", {
           日志关键字: "codex-library-source-state",
@@ -3510,6 +3514,14 @@ export class ServiceRepository {
         errorMessage: input.errorMessage ?? null,
       });
     });
+    if (credentialBecameInvalid) {
+      await this.database.createNotificationSafely({
+        userId: current.userId, notificationEvent: "credential_abnormal", category: "system", tone: "warning",
+        title: "网盘凭据异常",
+        message: `服务“${current.serviceName}”的网盘登录已失效，请重新授权后继续使用。`,
+        actionPath: "/app/services",
+      });
+    }
     const finishedJob = await this.getJob(jobId);
     if (finishedJob.parentJobId) await this.refreshLibraryScanJob(finishedJob.parentJobId);
     return finishedJob;
@@ -4979,7 +4991,8 @@ export class ServiceRepository {
     expectedCredentialRevision?: number,
   ): Promise<MediaProbeAuthenticationFailureResult> {
     const now = new Date().toISOString();
-    return this.database.query.transaction(async (transaction) => {
+    let invalidatedServiceName = "";
+    const result = await this.database.query.transaction(async (transaction) => {
       const service = await transaction("cloud_services")
         .where({ id: serviceId, user_id: userId })
         .whereNull("deleted_at")
@@ -4990,6 +5003,9 @@ export class ServiceRepository {
       if (expectedCredentialRevision !== undefined
         && Number(service.credential_revision) !== expectedCredentialRevision) {
         return { stoppedJobIds: [], ignoredStaleCredential: true };
+      }
+      if (String(service.connection_status) !== "reauthorization_required") {
+        invalidatedServiceName = String(service.display_name);
       }
       const jobRows = await transaction("media_probe_jobs")
         .where({ service_id: serviceId, user_id: userId })
@@ -5030,6 +5046,14 @@ export class ServiceRepository {
       });
       return { stoppedJobIds: jobIds, ignoredStaleCredential: false };
     });
+    if (invalidatedServiceName) {
+      await this.database.createNotificationSafely({
+        userId, notificationEvent: "credential_abnormal", category: "system", tone: "warning",
+        title: "网盘凭据异常", message: `服务“${invalidatedServiceName}”的网盘登录已失效，请重新授权后继续使用。`,
+        actionPath: "/app/services",
+      });
+    }
+    return result;
   }
 
   /** 来源鉴权失效只影响当前媒体库来源；linked_service 继续沿用旧服务级处理。 */
@@ -5043,7 +5067,8 @@ export class ServiceRepository {
       return this.failMediaProbeJobsForAuthentication(source.serviceId, userId, expectedCredentialRevision);
     }
     const now = new Date().toISOString();
-    return this.database.query.transaction(async (transaction) => {
+    let credentialBecameInvalid = false;
+    const result = await this.database.query.transaction(async (transaction) => {
       const lockedSource = await transaction("library_sources")
         .where({ id: librarySourceId, user_id: userId, source_mode: "owned_copy" })
         .forUpdate()
@@ -5053,6 +5078,7 @@ export class ServiceRepository {
         && Number(lockedSource.credential_revision) !== expectedCredentialRevision) {
         return { stoppedJobIds: [], ignoredStaleCredential: true };
       }
+      credentialBecameInvalid = String(lockedSource.connection_status) !== "reauthorization_required";
       const jobRows = await transaction("media_probe_jobs")
         .where({ library_source_id: librarySourceId, user_id: userId })
         .whereIn("status", ["queued", "running", "retry_waiting"])
@@ -5083,6 +5109,14 @@ export class ServiceRepository {
       });
       return { stoppedJobIds: jobIds, ignoredStaleCredential: false };
     });
+    if (credentialBecameInvalid) {
+      await this.database.createNotificationSafely({
+        userId, notificationEvent: "credential_abnormal", category: "system", tone: "warning",
+        title: "网盘凭据异常", message: `媒体库来源“${source.displayName}”的网盘登录已失效，请重新授权后继续使用。`,
+        actionPath: "/app/services",
+      });
+    }
+    return result;
   }
 
   /** 启动恢复时识别上次已经确认的鉴权失败，立即阻止服务继续逐文件重试失效凭据。 */

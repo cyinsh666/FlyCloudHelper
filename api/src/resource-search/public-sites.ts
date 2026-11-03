@@ -1,5 +1,6 @@
 import { parseExpressionAt } from "acorn";
 import { load } from "cheerio";
+import { getOutboundBrowserProxy } from "../network-proxy.js";
 
 /** 公开搜索站返回的统一网盘分享结果。 */
 export interface PublicSiteResult {
@@ -265,6 +266,7 @@ async function loadKdocsDocument(sourceKey: string): Promise<KdocsEntry[]> {
     executablePath: process.env.FLYCLOUDHELPER_CHROMIUM_PATH
       || (process.platform === "darwin" ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" : "/usr/bin/chromium"),
     headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"],
+    proxy: getOutboundBrowserProxy(),
   });
   try {
     const page = await browser.newPage();

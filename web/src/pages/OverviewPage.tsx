@@ -9,10 +9,13 @@ import {
   runServiceOrganizeNow,
   createScanJob,
   listJobs,
+  listOrganizeTasks,
   listLibraryItems,
   listLibraries,
   listServices,
   type JobStatus,
+  type ScanJob,
+  type OrganizeTaskSummary,
   type CloudService,
   type MediaLibrary,
   type ServiceStatus,
@@ -36,6 +39,29 @@ const jobStatusLabels: Record<JobStatus, string> = {
   failed: "失败",
   cancelled: "已取消",
 };
+
+type RecentTaskType = "all" | "scan" | "media_probe" | "organize";
+type RecentTask = { kind: "scan" | "media_probe"; job: ScanJob; createdAt: string }
+  | { kind: "organize"; task: OrganizeTaskSummary; createdAt: string };
+
+// 关键变量：概览与后台任务列表使用相同的四类任务标签。
+const recentTaskTypeOptions: Array<{ value: RecentTaskType; label: string }> = [
+  { value: "all", label: "全部" },
+  { value: "scan", label: "扫描刮削" },
+  { value: "media_probe", label: "视频规格分析" },
+  { value: "organize", label: "影片整理" },
+];
+
+/** 为最近任务中的影片整理记录显示实际执行状态。 */
+function getOrganizeTaskStatus(task: OrganizeTaskSummary): { label: string; tone: "primary" | "warning" | "success" | "danger" | "neutral" } {
+  if (task.status === "preparing") return { label: "识别中", tone: "primary" };
+  if (task.status === "running") return { label: "整理中", tone: "primary" };
+  if (task.status === "queued") return { label: "排队中", tone: "warning" };
+  if (task.status === "paused") return { label: "已暂停", tone: "warning" };
+  if (task.status === "completed") return { label: "已完成", tone: "success" };
+  if (task.status === "failed") return { label: "失败", tone: "danger" };
+  return { label: "已取消", tone: "neutral" };
+}
 
 /** 概览服务卡片仅在网盘当前具备整理写能力时展示快捷入口。 */
 function OverviewServiceCard({ service }: { service: CloudService }) {
@@ -136,24 +162,36 @@ function OverviewLibraryCard({ library }: { library: MediaLibrary }) {
 
 /** 普通用户个人概览页面。 */
 export function OverviewPage() {
+  const [recentTaskType, setRecentTaskType] = useState<RecentTaskType>("all");
   const resource = useApiResource(async () => {
-    const [overview, services, libraries, jobs] = await Promise.all([
+    const [overview, services, libraries, scanJobs, mediaProbeJobs, organizeTasks] = await Promise.all([
       getOverview(),
       listServices(),
       listLibraries(),
-      listJobs(),
+      listJobs(false, { jobType: "scan", limit: 3 }),
+      listJobs(false, { jobType: "media_probe", limit: 3 }),
+      listOrganizeTasks(false, { limit: 3 }),
     ]);
     const recentCatalogs = await Promise.all(libraries.items.slice(0, 4).map((library) => (
       listLibraryItems(library.id, { limit: 6 }).catch(() => ({ items: [], total: 0, catalogVersion: 0 }))
     )));
-    return { overview, services: services.items, libraries: libraries.items, jobs: jobs.items, recentItems: recentCatalogs.flatMap((item) => item.items).slice(0, 6) };
+    // 关键变量：每种类型各读取最近 3 条，切换标签后都能展示该类型的真实最新任务。
+    const recentTasks: RecentTask[] = [
+      ...scanJobs.items.map((job) => ({ kind: job.jobType, job, createdAt: job.createdAt })),
+      ...mediaProbeJobs.items.map((job) => ({ kind: job.jobType, job, createdAt: job.createdAt })),
+      ...organizeTasks.items.map((task) => ({ kind: "organize" as const, task, createdAt: task.createdAt })),
+    ];
+    recentTasks.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    return { overview, services: services.items, libraries: libraries.items, recentTasks, recentItems: recentCatalogs.flatMap((item) => item.items).slice(0, 6) };
   }, []);
 
   if (!resource.data) {
     return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取个人概览…"}</div></Panel>;
   }
 
-  const { overview, services, libraries, jobs, recentItems } = resource.data;
+  const { overview, services, libraries, recentTasks, recentItems } = resource.data;
+  // 关键变量：仅截取当前类型最近 3 条，不让其他类型占用该标签的展示名额。
+  const visibleRecentTasks = recentTasks.filter((task) => recentTaskType === "all" || task.kind === recentTaskType).slice(0, 3);
   const abnormalServices = services.filter((service) => service.status !== "active" || service.connectionStatus !== "valid");
   // 关键变量：顶部异常卡片汇总需要处理的服务与失败任务。
   const alertCount = abnormalServices.length + overview.failedJobCount;
@@ -179,13 +217,38 @@ export function OverviewPage() {
 
       <Panel
         title="最近任务"
-        description="任务状态来自服务端，刷新页面可获取最新进度"
+        description="按类型查看最近 3 条任务，刷新页面可获取最新进度"
         className="mt-4"
         action={<Link to="/app/jobs" className="inline-flex items-center gap-1 text-xs text-primary-soft">全部任务 <ArrowUpRight className="size-3.5" /></Link>}
       >
+          <div role="tablist" aria-label="最近任务类型" className="mb-3 flex gap-2 overflow-x-auto border-b border-border pb-3">
+            {recentTaskTypeOptions.map((option) => <button key={option.value} type="button" role="tab"
+              aria-selected={recentTaskType === option.value} onClick={() => setRecentTaskType(option.value)}
+              className={`shrink-0 rounded-lg border px-3 py-1.5 text-sm transition-colors ${recentTaskType === option.value
+                ? "border-border bg-secondary text-foreground" : "border-transparent text-muted-foreground hover:bg-secondary/50 hover:text-foreground"}`}>
+              {option.label}
+            </button>)}
+          </div>
           <ul className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 19rem), 1fr))" }}>
-            {jobs.slice(0, 3).map((job) => (
-              <li key={job.id} className="min-w-0 rounded-xl border border-border bg-secondary/40 p-3">
+            {visibleRecentTasks.map((record) => {
+              if (record.kind === "organize") {
+                const task = record.task;
+                const status = getOrganizeTaskStatus(task);
+                return <li key={`organize:${task.id}`} className="min-w-0 rounded-xl border border-border bg-secondary/40 p-3">
+                  <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
+                    <div className="min-w-0"><p className="truncate text-sm font-medium">{task.serviceName}</p>
+                      <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" title={task.id}>{task.id} · 影片整理</p></div>
+                    <StatusPill tone={status.tone}>{status.label}</StatusPill>
+                  </div>
+                  <div className="mt-1.5 grid gap-1 text-[11px] text-muted-foreground">
+                    <span>创建时间：{formatJobDateTime(task.createdAt)}</span>
+                    <span>已处理：{(task.completedCount + task.failedCount).toLocaleString()} 项{task.totalCount !== null ? ` / ${task.totalCount.toLocaleString()} 项` : " · 正在识别"}</span>
+                  </div>
+                  <div className="mt-2.5"><ProgressMeter value={task.completedCount + task.failedCount} total={task.totalCount} /></div>
+                </li>;
+              }
+              const job = record.job;
+              return <li key={`${record.kind}:${job.id}`} className="min-w-0 rounded-xl border border-border bg-secondary/40 p-3">
                 <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
                   <div className="min-w-0">
                     <p className="truncate text-sm font-medium">{job.serviceName}</p>
@@ -201,9 +264,9 @@ export function OverviewPage() {
                   <div className="min-w-0 flex-1"><ProgressMeter value={job.processedCount} total={job.totalCount} /></div>
                   <span className="shrink-0 font-mono text-[11px] text-muted-foreground">已处理 {job.processedCount.toLocaleString()} 项</span>
                 </div>
-              </li>
-            ))}
-            {jobs.length === 0 && <li className="col-span-full py-6 text-center text-sm text-muted-foreground">还没有后台任务</li>}
+              </li>;
+            })}
+            {visibleRecentTasks.length === 0 && <li className="col-span-full py-6 text-center text-sm text-muted-foreground">{recentTaskType === "all" ? "还没有后台任务" : "该类型暂无最近任务"}</li>}
           </ul>
       </Panel>
 

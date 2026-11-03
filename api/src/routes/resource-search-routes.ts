@@ -3,10 +3,11 @@ import { ApiError, validationError } from "../errors.js";
 import { requireRequestUser, requireSuperAdmin, requireString } from "../http.js";
 import { ServiceOrganizeManager } from "../organize/manager.js";
 import { ServiceOrganizeScheduler } from "../organize/schedule.js";
-import { ResourceSearchEngine, parseGuangyaShareUrl, type SearchSource } from "../resource-search/engine.js";
+import { ResourceSearchEngine, parseGuangyaShareUrl, parseQuarkShareUrl, type SearchSource } from "../resource-search/engine.js";
+import type { QuarkProvider } from "../providers/quark.js";
 import type { ApiRuntime } from "../runtime.js";
 
-/** 注册资源搜索、Telegram 频道配置和光鸭分享转存。 */
+/** 注册资源搜索、Telegram 频道配置及同网盘分享转存。 */
 export async function registerResourceSearchRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
   const engine = new ResourceSearchEngine(runtime.database);
   const organizeManager = new ServiceOrganizeManager(runtime);
@@ -24,13 +25,15 @@ export async function registerResourceSearchRoutes(server: FastifyInstance, runt
     /** 加载服务凭据及刷新回写回调，转存全程不向浏览器发送 Token。 */
     async function serviceConnection(serviceId: string, ownerId?: string) {
       const service = await runtime.repository.getServiceDetail(serviceId, ownerId);
-      if (service.providerType !== "guangya") throw new ApiError(422, "search_transfer_provider_invalid", "当前只支持光鸭分享转存");
+      if (service.providerType !== "guangya" && service.providerType !== "quark") {
+        throw new ApiError(422, "search_transfer_provider_invalid", "当前只支持光鸭和夸克分享转存");
+      }
       if (service.status !== "active" || service.connectionStatus !== "valid") {
-        throw new ApiError(409, "search_transfer_service_unavailable", "光鸭服务当前不可用");
+        throw new ApiError(409, "search_transfer_service_unavailable", "网盘服务当前不可用");
       }
       const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(service.id, service.userId));
-      if (!runtime.providers.get("guangya").fileOrganizer?.supports(connection)) {
-        throw new ApiError(422, "search_transfer_auth_unsupported", "当前光鸭登录方式不支持转存");
+      if (!runtime.providers.get(service.providerType).fileOrganizer?.supports(connection)) {
+        throw new ApiError(422, "search_transfer_auth_unsupported", "当前网盘登录方式不支持转存");
       }
       return { service, connection, persistConnection: async (nextConnection: Record<string, unknown>) => {
         await runtime.repository.refreshActiveEncryptedConnection({
@@ -58,11 +61,12 @@ export async function registerResourceSearchRoutes(server: FastifyInstance, runt
     });
     server.get(`${prefix}/targets`, async (request) => {
       const { ownerId } = await actor(request);
-      const services = await runtime.repository.listServices({ userId: ownerId, providerType: "guangya", limit: 1000, offset: 0 });
-      const items = await Promise.all(services.items.map(async (service) => {
+      const servicePages = await Promise.all(["guangya", "quark"].map((providerType) =>
+        runtime.repository.listServices({ userId: ownerId, providerType, limit: 1000, offset: 0 })));
+      const items = await Promise.all(servicePages.flatMap((page) => page.items).map(async (service) => {
         const schedule = await scheduler.get(service.id, ownerId);
         const capability = await organizeManager.capabilities(service.id, ownerId);
-        return { serviceId: service.id, serviceName: service.displayName,
+        return { serviceId: service.id, serviceName: service.displayName, providerType: service.providerType,
           sources: capability.supported ? schedule.sources : [],
           reason: capability.supported ? schedule.sources.length ? null : "尚未设置影片整理来源目录" : capability.reason };
       }));
@@ -72,19 +76,38 @@ export async function registerResourceSearchRoutes(server: FastifyInstance, runt
       `${prefix}/transfer`, async (request, reply) => {
         const { ownerId, userId } = await actor(request);
         const body = request.body ?? {};
-        const serviceId = requireString(body, "serviceId", "光鸭服务", 100);
+        const serviceId = requireString(body, "serviceId", "网盘服务", 100);
         const sourceDirectoryId = requireString(body, "sourceDirectoryId", "整理来源目录", 200);
-        const shareUrl = requireString(body, "shareUrl", "光鸭分享链接", 1000);
-        const parsed = parseGuangyaShareUrl(shareUrl);
-        if (!parsed) throw validationError("shareUrl", "请输入有效的光鸭分享链接");
+        const shareUrl = requireString(body, "shareUrl", "网盘分享链接", 1000);
+        const guangyaShare = parseGuangyaShareUrl(shareUrl);
+        const quarkShare = parseQuarkShareUrl(shareUrl);
+        if (!guangyaShare && !quarkShare) throw validationError("shareUrl", "请输入有效的光鸭或夸克分享链接");
         const password = typeof body.password === "string" ? body.password.trim() : "";
         if (password.length > 32) throw validationError("password", "提取码过长");
+        const { service, connection, persistConnection } = await serviceConnection(serviceId, ownerId);
+        if ((service.providerType === "guangya" && !guangyaShare)
+          || (service.providerType === "quark" && !quarkShare)) {
+          throw new ApiError(422, "search_transfer_provider_mismatch", "分享链接与目标网盘服务类型不一致");
+        }
         const schedule = await scheduler.get(serviceId, ownerId);
         const source = schedule.sources.find((item) => item.resourceId === sourceDirectoryId);
         if (!source || !source.resourceId) {
-          throw new ApiError(422, "search_transfer_source_missing", "请先在该光鸭服务设置影片整理来源目录");
+          throw new ApiError(422, "search_transfer_source_missing", "请先在该网盘服务设置影片整理来源目录");
         }
-        const { service, connection, persistConnection } = await serviceConnection(serviceId, ownerId);
+        if (quarkShare) {
+          const provider = runtime.providers.get("quark") as QuarkProvider;
+          const context = { persistConnection };
+          const token = await provider.getShareToken(connection, quarkShare.shareId, password || quarkShare.code, context);
+          const entries = await provider.listShareRoot(connection, quarkShare.shareId, token, context);
+          if (!entries.length) throw new ApiError(422, "search_share_empty", "分享中没有可转存文件");
+          // 关键变量：提交后网络异常不能自动重试，避免夸克已收到请求时重复转存。
+          const taskId = await provider.saveShareRoot(connection, quarkShare.shareId, token, entries, source.resourceId, context);
+          runtime.logBusinessEvent("info", { 日志关键字: "codex-resource-search-transfer", 事件: "提交夸克分享转存",
+            用户ID: userId, 服务ID: service.id, 来源目录ID: source.resourceId, 文件数量: entries.length, 任务ID: taskId });
+          return reply.status(202).send({ taskId, fileCount: entries.length });
+        }
+        if (!guangyaShare) throw validationError("shareUrl", "请输入有效的光鸭分享链接");
+        const parsed = guangyaShare;
         const client = runtime.providers.guangyaWebClient;
         const tokenData = await client.mutateFile(connection, "/userres/v1/get_share_access_token",
           { shareId: parsed.shareId, code: password || parsed.code }, persistConnection);
@@ -120,8 +143,13 @@ export async function registerResourceSearchRoutes(server: FastifyInstance, runt
       `${prefix}/transfer-tasks/:taskId`, async (request) => {
         const { ownerId } = await actor(request);
         const serviceId = request.query.serviceId ?? "";
-        if (!serviceId || !/^\d+$/u.test(request.params.taskId)) throw validationError("taskId", "转存任务参数无效");
-        const { connection, persistConnection } = await serviceConnection(serviceId, ownerId);
+        if (!serviceId || !/^[0-9A-Za-z_-]{1,128}$/u.test(request.params.taskId)) throw validationError("taskId", "转存任务参数无效");
+        const { service, connection, persistConnection } = await serviceConnection(serviceId, ownerId);
+        if (service.providerType === "quark") {
+          const provider = runtime.providers.get("quark") as QuarkProvider;
+          return { status: await provider.shareTransferTaskStatus(connection, request.params.taskId, { persistConnection }) };
+        }
+        if (!/^\d+$/u.test(request.params.taskId)) throw validationError("taskId", "光鸭转存任务参数无效");
         const data = await runtime.providers.guangyaWebClient.mutateFile(connection, "/userres/v1/get_task_status",
           { taskId: request.params.taskId }, persistConnection);
         const status = Number(data.status ?? -1);

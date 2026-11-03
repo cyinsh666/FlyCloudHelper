@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Browser, BrowserContext, Page } from "playwright-core";
+import { getOutboundBrowserProxy } from "../network-proxy.js";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { ApiError } from "../errors.js";
 import { requireRequestUser, requireSuperAdmin } from "../http.js";
@@ -161,6 +162,7 @@ async function startSession(runtime: ApiRuntime, serviceId: string, ownerUserId:
     session.browser = await chromium.launch({
       executablePath: process.env.FLYCLOUDHELPER_CHROMIUM_PATH || "/usr/bin/chromium",
       headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"],
+      proxy: getOutboundBrowserProxy(),
     });
     session.context = await session.browser.newContext({ viewport: { width: 900, height: 700 },
       userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" });

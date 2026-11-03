@@ -41,8 +41,58 @@ export interface TelegramNotificationSettings {
   configurationRevision: number;
 }
 
+/** 系统通知设置中的四类业务事件开关。 */
+export interface NotificationEventSettings {
+  credentialAbnormal: boolean;
+  organizeCompleted: boolean;
+  scanCompleted: boolean;
+  mediaProbeCompleted: boolean;
+  configurationRevision: number;
+}
+
 export interface AdminNotificationSettings {
   telegram: TelegramNotificationSettings;
+  events: NotificationEventSettings;
+}
+
+/** 全局出站代理的脱敏配置，密码只返回是否已配置。 */
+export interface AdminNetworkProxySettings {
+  enabled: boolean;
+  protocol: "http" | "socks5";
+  host: string;
+  port: number;
+  username: string;
+  passwordConfigured: boolean;
+  configurationRevision: number;
+}
+
+/** 读取全局出站代理设置。 */
+export async function getAdminNetworkProxy(): Promise<AdminNetworkProxySettings> {
+  const result = await requestJson<{ proxy: AdminNetworkProxySettings }>("/api/v1/admin/config/network-proxy");
+  return result.proxy;
+}
+
+/** 保存出站代理；不传 password 时保留同一用户名已有的密码。 */
+export async function updateAdminNetworkProxy(input: {
+  enabled: boolean;
+  protocol: "http" | "socks5";
+  host: string;
+  port: number;
+  username: string;
+  password?: string;
+}): Promise<AdminNetworkProxySettings> {
+  const result = await requestJson<{ proxy: AdminNetworkProxySettings }>("/api/v1/admin/config/network-proxy", {
+    method: "PUT", body: JSON.stringify(input),
+  });
+  return result.proxy;
+}
+
+/** 通过当前代理检查公开站点的连通性。 */
+export async function testAdminNetworkProxy(): Promise<{ reachable: boolean; statusCode: number }> {
+  const result = await requestJson<{ result: { reachable: boolean; statusCode: number } }>("/api/v1/admin/config/network-proxy/test", {
+    method: "POST", body: "{}",
+  });
+  return result.result;
 }
 
 export interface CredentialKeyBackup {
@@ -149,6 +199,75 @@ export type MatchState = "matched" | "needs_review" | "unmatched" | "processing"
 export type ServiceStatus = "active" | "scanning" | "disabled" | "reauthorization_required";
 export type JobStatus = "queued" | "running" | "retry_waiting" | "paused" | "completed" | "failed" | "cancelled";
 
+/** 云助手本地缓存的影视推荐榜单入口。 */
+export interface RecommendationBlock {
+  id: string; title: string; description: string | null; group: string; category: string | null;
+  mediaType: string | null; itemCount: number; posterUrl: string | null; lastUpdated: string | null;
+}
+
+/** 榜单内的竖版海报条目。 */
+export interface RecommendationItem {
+  rank: number; title: string; overview: string | null; posterUrl: string | null;
+  tmdbId: number | null; mediaType: string | null; rating: number | null; releaseDate: string | null;
+}
+
+export interface RecommendationDetail extends RecommendationBlock {
+  pagination: { page: number; pageSize: number; totalItems: number; totalPages: number };
+  items: RecommendationItem[];
+}
+
+/** 榜单条目读取到的 TMDB 作品详情；缺失时页面仍展示榜单原始资料。 */
+export interface RecommendationItemDetail {
+  block: RecommendationBlock;
+  item: RecommendationItem;
+  tmdb: {
+    id: number; mediaType: "movie" | "tv"; title: string; originalTitle: string; overview: string;
+    year: number | null; releaseDate: string; rating: number; genres: string[]; originCountries: string[];
+    posterUrl: string | null; backdropUrl: string | null; episodeCount: number;
+    people: Array<{ name: string; role: string; type: "cast" | "crew"; profileUrl: string | null }>;
+  } | null;
+  tmdbError: string | null;
+}
+
+/** 当前作品的 TMDB 关联推荐摘要。 */
+export interface RecommendationRelatedItem {
+  id: number; mediaType: "movie" | "tv"; title: string; posterUrl: string | null;
+  releaseDate: string; rating: number;
+}
+
+/** 按当前控制台身份选用影视推荐接口。 */
+function recommendationPath(admin: boolean): string {
+  return admin ? "/api/v1/admin/recommendations" : "/api/v1/recommendations";
+}
+
+/** 读取云助手已同步的全部榜单入口。 */
+export function listRecommendations(admin = false): Promise<{ total: number; updatedAt: string; items: RecommendationBlock[] }> {
+  return requestJson(recommendationPath(admin));
+}
+
+/** 立即从榜单上游同步完整快照，失败时服务端保留旧缓存。 */
+export function syncRecommendations(admin = false): Promise<{ total: number; updatedAt: string; items: RecommendationBlock[] }> {
+  return requestJson(`${recommendationPath(admin)}/sync`, { method: "POST" });
+}
+
+/** 从本地快照分页读取一个榜单，不请求 FlymbyServer。 */
+export function getRecommendationDetail(blockId: string, page = 1, admin = false): Promise<RecommendationDetail> {
+  return requestJson(`${recommendationPath(admin)}/${encodeURIComponent(blockId)}?page=${page}&pageSize=24`);
+}
+
+/** 按榜单内的原始名次读取条目及其 TMDB 详情。 */
+export function getRecommendationItemDetail(blockId: string, rank: number, admin = false): Promise<RecommendationItemDetail> {
+  return requestJson(`${recommendationPath(admin)}/${encodeURIComponent(blockId)}/items/${rank}`);
+}
+
+/** 单独读取关联推荐，避免 TMDB 推荐请求阻塞作品详情。 */
+export async function getRecommendationRelatedItems(blockId: string, rank: number, admin = false): Promise<RecommendationRelatedItem[]> {
+  const result = await requestJson<{ items: RecommendationRelatedItem[] }>(
+    `${recommendationPath(admin)}/${encodeURIComponent(blockId)}/items/${rank}/related`,
+  );
+  return result.items;
+}
+
 /** 搜索引擎的公开 Telegram 频道配置。 */
 export interface ResourceSearchSource { kind: string; key: string; enabled: boolean }
 /** 各网盘分享的统一搜索结果；目前仅光鸭支持站内转存。 */
@@ -158,7 +277,8 @@ export interface ResourceSearchItem {
 }
 /** 可转存服务及已保存的影片整理来源目录。 */
 export interface ResourceSearchTarget {
-  serviceId: string; serviceName: string; sources: Array<{ resourceId: string; displayPath: string }>; reason: string | null;
+  serviceId: string; serviceName: string; providerType: "guangya" | "quark";
+  sources: Array<{ resourceId: string; displayPath: string }>; reason: string | null;
 }
 
 /** 搜索引擎接口前缀按当前控制台身份选择。 */
@@ -182,18 +302,18 @@ export function searchResources(keyword: string, admin = false): Promise<{ items
   return requestJson(`${resourceSearchPath(admin)}/search?keyword=${encodeURIComponent(keyword)}`);
 }
 
-/** 读取已有光鸭服务与其影片整理来源目录。 */
+/** 读取已有光鸭、夸克服务与各自影片整理来源目录。 */
 export async function getResourceSearchTargets(admin = false): Promise<ResourceSearchTarget[]> {
   return (await requestJson<{ items: ResourceSearchTarget[] }>(`${resourceSearchPath(admin)}/targets`)).items;
 }
 
-/** 提交光鸭分享转存，收到任务编号后由页面继续查询。 */
+/** 提交同网盘分享转存，收到任务编号后由页面继续查询。 */
 export function transferResource(input: { shareUrl: string; password: string; serviceId: string; sourceDirectoryId: string }, admin = false):
   Promise<{ taskId: string; fileCount: number }> {
   return requestJson(`${resourceSearchPath(admin)}/transfer`, { method: "POST", body: JSON.stringify(input) });
 }
 
-/** 查询已提交光鸭转存任务的执行状态。 */
+/** 查询已提交分享转存任务的执行状态。 */
 export function getResourceTransferStatus(serviceId: string, taskId: string, admin = false):
   Promise<{ status: "pending" | "running" | "completed" | "failed" }> {
   return requestJson(`${resourceSearchPath(admin)}/transfer-tasks/${encodeURIComponent(taskId)}?serviceId=${encodeURIComponent(serviceId)}`);
@@ -2253,6 +2373,14 @@ export function getAdminConfigStatus(): Promise<AdminConfigStatus> {
 /** 读取系统级外部通知渠道的脱敏设置。 */
 export function getAdminNotificationSettings(): Promise<AdminNotificationSettings> {
   return requestJson("/api/v1/admin/notification-settings");
+}
+
+/** 保存通知项目开关，不修改 Telegram Bot 和发送目标。 */
+export async function updateAdminNotificationEvents(input: Omit<NotificationEventSettings, "configurationRevision">): Promise<NotificationEventSettings> {
+  const result = await requestJson<{ events: NotificationEventSettings }>("/api/v1/admin/notification-settings/events", {
+    method: "PUT", body: JSON.stringify(input),
+  });
+  return result.events;
 }
 
 /** 保存 Telegram 通知渠道；Bot Token 留空时保留服务端已有值。 */

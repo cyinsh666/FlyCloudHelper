@@ -209,7 +209,7 @@ export function AdminPluginsPanel() {
     {sources.error && <p role="alert" className="mb-3 text-sm text-destructive">插件加载失败：{sources.error}</p>}
     {metadata.error && <p role="alert" className="mb-3 text-sm text-destructive">插件加载失败：{metadata.error}</p>}
     {message && <p role="status" className="mb-4 text-sm text-muted-foreground">{message}</p>}
-    <div className="grid gap-3 lg:grid-cols-2">
+    <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,20rem),1fr))] gap-3">
       {initialLoading && [0, 1].map((index) => <div key={`loading-${index}`} aria-label="插件加载中" className="surface animate-pulse p-4"><div className="h-5 w-36 rounded bg-muted" /><div className="mt-4 h-8 w-40 rounded bg-muted" /></div>)}
       {entries.map((entry) => <article key={getPluginKey(entry)} className="surface p-4">
         <header className="flex items-center justify-between gap-3"><h2 className="min-w-0 truncate text-sm font-medium" title={entry.plugin.displayName}>{entry.plugin.displayName}</h2><StatusPill tone={entry.plugin.status === "enabled" ? "success" : "neutral"}>{pluginStatusLabels[entry.plugin.status]}</StatusPill></header>

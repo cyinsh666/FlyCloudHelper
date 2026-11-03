@@ -114,6 +114,35 @@ async function getTmdbConfigurationStatus(runtime: ApiRuntime) {
 
 /** 注册超级管理员的用户、服务、任务、目录与系统状态接口。 */
 export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
+  /** 超级管理员读取脱敏的全局出站代理配置。 */
+  server.get("/api/v1/admin/config/network-proxy", async (request) => {
+    await requireSuperAdmin(request, runtime.database);
+    return { proxy: runtime.networkProxy.getStatus() };
+  });
+
+  /** 保存加密代理凭据并即时切换后续出站请求。 */
+  server.put<{ Body: Record<string, unknown> }>("/api/v1/admin/config/network-proxy", async (request) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    const proxy = await runtime.networkProxy.save(request.body, operator.id);
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-network-proxy",
+      事件: proxy.enabled ? "启用或修改全局出站代理" : "停用全局出站代理",
+      用户ID: operator.id,
+      代理类型: proxy.protocol,
+      配置修订: proxy.configurationRevision,
+    });
+    await audit(runtime, operator, "update_network_proxy", "system_configuration", "network_outbound_proxy", {
+      是否启用: proxy.enabled, 代理类型: proxy.protocol, 配置修订: proxy.configurationRevision,
+    });
+    return { proxy };
+  });
+
+  /** 使用当前代理执行有时限的公开站点连通性检查。 */
+  server.post("/api/v1/admin/config/network-proxy/test", async (request) => {
+    await requireSuperAdmin(request, runtime.database);
+    return { result: await runtime.networkProxy.test() };
+  });
+
   server.get("/api/v1/admin/status", async (request) => {
     await requireSuperAdmin(request, runtime.database);
     const [overview, userCount, state] = await Promise.all([

@@ -63,6 +63,9 @@ import { loadTmdbBaseUrls, loadTmdbKeys } from "./system-settings.js";
 import { ScanWorker } from "./worker.js";
 import { MediaProbeWorker } from "./media-probe-worker.js";
 import { TelegramNotificationService } from "./telegram-notification-service.js";
+import { NetworkProxyManager, setActiveNetworkProxy } from "./network-proxy.js";
+import { RecommendationService } from "./recommendations/service.js";
+import { registerRecommendationRoutes } from "./recommendations/routes.js";
 
 /** 判断当前 API 是否允许在首次初始化未完成时访问。 */
 function isSetupPublicPath(url: string): boolean {
@@ -173,9 +176,15 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     source: config.credentialKeySource,
     generatedNow: config.credentialKeyGeneratedNow,
   });
-  const logger = createBusinessLogger(server);
-  const providers = new ProviderRegistry(config, (fields) => logger("warn", fields));
   const vault = new CredentialVault(config.credentialMasterKey);
+  const networkProxy = new NetworkProxyManager(database, vault);
+  await networkProxy.initialize();
+  setActiveNetworkProxy(networkProxy);
+  const logger = createBusinessLogger(server);
+  const recommendations = new RecommendationService(config.recommendationCacheDirectory,
+    config.recommendationUpstreamUrl, logger);
+  await recommendations.start();
+  const providers = new ProviderRegistry(config, (fields) => logger("warn", fields));
   const telegramNotifications = new TelegramNotificationService(database, vault, logger);
   database.setNotificationDeliveryHandler((notification) => telegramNotifications.enqueue(notification));
   const serviceAccess = new ServiceAccessService(database, vault);
@@ -267,6 +276,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   const runtime: ApiRuntime = {
     config,
     database,
+    networkProxy,
+    recommendations,
     repository,
     providers,
     vault,
@@ -305,6 +316,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     },
   });
   server.addHook("onClose", async () => {
+    recommendations.close();
     await contentSourceAutoSync.stop();
     await contentSourceDiagnostics.shutdown();
     await liveLibraries.process.close();
@@ -316,6 +328,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     await worker.stop();
     await mediaProbeWorker.stop();
     await tmdbCache.close();
+    setActiveNetworkProxy(null);
+    await networkProxy.close();
     await database.close();
   });
 
@@ -492,6 +506,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerServiceRoutes(server, runtime);
   await registerOrganizeRoutes(server, runtime);
   await registerResourceSearchRoutes(server, runtime);
+  await registerRecommendationRoutes(server, runtime);
   await registerVideoRecognitionRoutes(server, runtime);
   await registerLibraryRoutes(server, runtime);
   await registerLibraryFileRoutes(server, runtime);

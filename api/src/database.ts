@@ -16,6 +16,7 @@ import {
   parseJsonObject,
 } from "./domain.js";
 import { ApiError } from "./errors.js";
+import { notificationEventEnabled, type NotificationEvent } from "./notification-events.js";
 import { currentSchemaVersion, migrateDatabase } from "./schema.js";
 
 interface UserRow {
@@ -328,8 +329,11 @@ export class FlyCloudHelperDatabase {
     actionPath?: string | null;
     /** 是否把该站内通知同步到 Telegram 等外部渠道，默认同步。 */
     deliverExternally?: boolean;
+    /** 指定业务事件时由系统通知开关决定是否生成本条通知。 */
+    notificationEvent?: NotificationEvent;
   }): Promise<void> {
     try {
+      if (input.notificationEvent && !await notificationEventEnabled(this, input.notificationEvent)) return;
       await this.createNotification(input);
     } catch (error) {
       this.bootstrapLogger("warn", {

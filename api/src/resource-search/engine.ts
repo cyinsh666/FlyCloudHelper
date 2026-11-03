@@ -154,14 +154,15 @@ const legacySourceSettingKey = "resource_search_sources";
 function parseCloudShareUrl(input: string): { cloudType: string; url: string } | null {
   const guangya = parseGuangyaShareUrl(input);
   if (guangya) return { cloudType: "guangya", url: guangya.url };
+  const quark = parseQuarkShareUrl(input);
+  if (quark) return { cloudType: "quark", url: quark.url };
   try {
     const parsed = new URL(input.trim().replace(/[.!?。！？，,]+$/u, ""));
     if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
     const host = parsed.hostname.toLowerCase();
     const pathname = parsed.pathname.toLowerCase();
     let cloudType = "";
-    if (host === "pan.quark.cn" && pathname.startsWith("/s/")) cloudType = "quark";
-    else if (host === "drive.uc.cn" && pathname.startsWith("/s/")) cloudType = "uc";
+    if (host === "drive.uc.cn" && pathname.startsWith("/s/")) cloudType = "uc";
     else if (host === "pan.baidu.com" && (pathname.startsWith("/s/") || pathname.startsWith("/share/"))) cloudType = "baidu";
     else if (["www.aliyundrive.com", "aliyundrive.com", "www.alipan.com", "alipan.com"].includes(host) && pathname.startsWith("/s/")) cloudType = "aliyun";
     else if (host === "pan.xunlei.com" && pathname.startsWith("/s/")) cloudType = "xunlei";
@@ -185,6 +186,19 @@ export function parseGuangyaShareUrl(input: string): { shareId: string; code: st
     if (!matched?.[1]) return null;
     const code = parsed.searchParams.get("pwd") ?? parsed.searchParams.get("code") ?? parsed.searchParams.get("password") ?? "";
     return { shareId: matched[1], code, url: `https://www.guangyapan.com/s/${matched[1]}${code ? `?pwd=${encodeURIComponent(code)}` : ""}` };
+  } catch { return null; }
+}
+
+/** 仅接受夸克官方分享地址，并提取 URL 中可能携带的提取码。 */
+export function parseQuarkShareUrl(input: string): { shareId: string; code: string; url: string } | null {
+  try {
+    const parsed = new URL(input.trim().replace(/[.!?。！？，,]+$/u, ""));
+    if (parsed.protocol !== "https:" || parsed.hostname !== "pan.quark.cn") return null;
+    const matched = /^\/s\/([0-9A-Za-z_-]+)\/?$/u.exec(parsed.pathname);
+    if (!matched?.[1]) return null;
+    const code = parsed.searchParams.get("pwd") ?? parsed.searchParams.get("passcode")
+      ?? parsed.searchParams.get("code") ?? parsed.searchParams.get("password") ?? "";
+    return { shareId: matched[1], code, url: `https://pan.quark.cn/s/${matched[1]}${code ? `?pwd=${encodeURIComponent(code)}` : ""}` };
   } catch { return null; }
 }
 
@@ -293,11 +307,11 @@ class TelegramSearchAdapter implements SearchAdapter {
       const lines = messageText.split(/\n/u).map((line) => line.trim()).filter(Boolean);
       const defaultTitle = messageTitle(lines, keyword);
       const shares = extractShareUrls(messageText, hrefs);
-      // 关键变量：一条消息可能包含多个不同网盘的分享链接。
+      // 关键变量：一条消息可能包含多个作品或网盘链接，逐条核对链接对应的作品名。
       for (const share of shares) {
-        const work = shares.length > 4 ? linkWorkTitle(lines, share.url, defaultTitle) : { title: defaultTitle, matched: false };
-        // 明确识别到链接所属作品时按作品标题过滤；其余沿用 Telegram 正文匹配结果。
-        if (work.matched && !messageMatchesKeyword(work.title, keyword)) continue;
+        const work = shares.length > 1 ? linkWorkTitle(lines, share.url, defaultTitle) : { title: defaultTitle, matched: false };
+        // 正文命中关键词不足以证明分享链接属于该作品，最终标题也必须匹配。
+        if (!messageMatchesKeyword(work.title, keyword)) continue;
         // 关键变量：链接自带的提取码优先于消息中的公共提取码。
         const shareParams = new URL(share.url).searchParams;
         const linkPassword = shareParams.get("pwd") ?? shareParams.get("code") ?? shareParams.get("password") ?? "";

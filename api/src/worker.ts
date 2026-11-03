@@ -584,6 +584,7 @@ export class ScanWorker {
       const wasCancelled = parentJob.status === "cancelled" || parentJob.cancelledSourceCount > 0;
       await this.database.createNotificationSafely({
         userId: job.userId,
+        notificationEvent: "scan_completed",
         category: "task",
         tone: hasFailure || hasErrors || wasCancelled ? "warning" : "success",
         title: hasFailure || hasErrors || wasCancelled ? "云聚合扫描异常结束" : "云聚合扫描已完成",
@@ -1513,9 +1514,10 @@ export class ScanWorker {
       this.readServiceNotificationEnabled(job.serviceId, job.libraryId), this.readScanCreatedMediaCounts(job), this.repository.getJob(job.id, job.userId),
     ]);
     await this.database.createNotificationSafely({ userId: job.userId, category: "task",
+      notificationEvent: "scan_completed",
       tone: completedJob.errorCount > 0 || completedJob.status !== "completed" ? "warning" : "success", title: completedJob.status === "completed" ? "音乐扫描任务已完成" : "音乐阶段已结束，其他阶段待继续",
       message: buildScanCompletionMessage(job, createdMediaCounts), actionPath: "/app/jobs",
-      deliverExternally: notificationEnabled && createdMediaCounts.songCount > 0 });
+      deliverExternally: notificationEnabled });
   }
 
   /** 完成 Provider 枚举、分类、刮削、持久化和 generation 对账。 */
@@ -2989,15 +2991,16 @@ export class ScanWorker {
       this.readServiceNotificationEnabled(job.serviceId, job.libraryId),
       this.readScanCreatedMediaCounts(job),
     ]);
-    // 关键变量：影视与音乐使用不同业务单位，只有本次任务确实有新内容入库时才投递 Telegram。
+    // 关键变量：新增内容数量继续用于通知正文；完成事件由通知开关决定是否投递。
     const createdContentCount = job.dataType === "audiobook"
       ? (createdMediaCounts.bookCount ?? 0) + (createdMediaCounts.chapterCount ?? 0)
       : createdMediaCounts.videoContentCount;
-    const deliverScanNotificationExternally = notificationEnabled && createdContentCount > 0;
+    const deliverScanNotificationExternally = notificationEnabled;
     const completionMessage = buildScanCompletionMessage(job, createdMediaCounts);
     if (!belongsToAggregateParent) {
       await this.database.createNotificationSafely({
         userId: job.userId,
+        notificationEvent: "scan_completed",
         category: "task",
         tone: businessProgress.failedKeys.size > 0 ? "warning" : "success",
         title: "扫描任务已完成",

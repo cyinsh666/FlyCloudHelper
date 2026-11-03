@@ -206,7 +206,8 @@ export class JavaScriptSpiderRuntime {
       // 独立进程组用于取消时同时释放源脚本创建的子进程，不调用 shell。
       detached: process.platform !== "win32",
       shell: false,
-      env: { PATH: process.env.PATH, LANG: process.env.LANG, TZ: process.env.TZ },
+      env: { PATH: process.env.PATH, LANG: process.env.LANG, TZ: process.env.TZ,
+        http_proxy: process.env.http_proxy, https_proxy: process.env.https_proxy, no_proxy: process.env.no_proxy },
     });
     let finishClosed: () => void = () => {};
     const closed = new Promise<void>((resolve) => { finishClosed = resolve; });

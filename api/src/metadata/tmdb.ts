@@ -98,6 +98,16 @@ export interface TmdbVideoSearchCandidate {
   popularity: number;
 }
 
+/** TMDB 为当前电影或剧集返回的关联推荐摘要。 */
+export interface TmdbVideoRecommendation {
+  id: number;
+  mediaType: "movie" | "tv";
+  title: string;
+  posterUrl: string | null;
+  releaseDate: string;
+  rating: number;
+}
+
 export interface TmdbPersonMetadata {
   id: number;
   name: string;
@@ -638,6 +648,34 @@ export class TmdbKeyPool {
     const metadata = await this.readDetails(mediaType, tmdbId, "手动匹配", 1, language, region, signal);
     if (metadata) await this.writeCachedVideo(cacheKey, language, region, metadata);
     return metadata;
+  }
+
+  /** 读取同类型作品的 TMDB 关联推荐，详情页只展示第一页。 */
+  public async readVideoRecommendations(
+    mediaType: "movie" | "tv",
+    tmdbId: number,
+    language: string,
+    signal?: AbortSignal,
+  ): Promise<TmdbVideoRecommendation[]> {
+    if (tmdbId <= 0 || signal?.aborted || this.states.length === 0) return [];
+    const payload = await this.requestJson<Record<string, unknown>>(
+      `/${mediaType}/${tmdbId}/recommendations`,
+      { language: language || "zh-CN", page: "1" },
+      signal,
+    );
+    const results = Array.isArray(payload?.results) ? payload.results : [];
+    return results.flatMap((raw): TmdbVideoRecommendation[] => {
+      const item = asRecord(raw);
+      const id = toPositiveNumber(item.id);
+      const title = toText(mediaType === "movie" ? item.title : item.name).trim();
+      if (!id || !title || id === tmdbId) return [];
+      return [{
+        id, mediaType, title,
+        posterUrl: buildImageUrl(toText(item.poster_path), "w500", this.imageBaseUrl),
+        releaseDate: toText(mediaType === "movie" ? item.release_date : item.first_air_date),
+        rating: toNumber(item.vote_average),
+      }];
+    });
   }
 
   /** 读取节目季信息，并只返回本地文件实际需要的单集元数据。 */

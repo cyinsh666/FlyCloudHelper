@@ -49,6 +49,10 @@ export interface ApiConfig {
   imageCacheDirectory: string;
   /** 音频内嵌封面的内容寻址缓存目录。 */
   musicArtworkDirectory: string;
+  /** 影视推荐榜单的本地快照目录。 */
+  recommendationCacheDirectory: string;
+  /** 影视推荐榜单上游，仅由服务端定时访问。 */
+  recommendationUpstreamUrl: string;
   webDistDirectory: string;
   allowInsecureProviderHttp: boolean;
   pluginMaxBytes: number;
@@ -365,6 +369,11 @@ export function loadApiConfig(): ApiConfig {
       readEnvironmentValue("FLYCLOUDHELPER_MUSIC_ARTWORK_DIR"),
       "data/music-artwork",
     ),
+    recommendationCacheDirectory: resolveProjectPath(
+      readEnvironmentValue("FLYCLOUDHELPER_RECOMMENDATION_CACHE_DIR"), "data/recommendations",
+    ),
+    recommendationUpstreamUrl: readEnvironmentValue("FLYCLOUDHELPER_RECOMMENDATION_UPSTREAM_URL")
+      || "https://bangdan.190147.xyz",
     webDistDirectory: resolveProjectPath(readEnvironmentValue("FLYCLOUDHELPER_WEB_DIST_DIR"), "web/dist"),
     allowInsecureProviderHttp: readBoolean("FLYCLOUDHELPER_ALLOW_INSECURE_HTTP", true),
     pluginMaxBytes: readPositiveInteger("FLYCLOUDHELPER_PLUGIN_MAX_BYTES", 10 * 1024 * 1024),

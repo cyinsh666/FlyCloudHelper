@@ -5,6 +5,7 @@ import https from "node:https";
 import { pipeline } from "node:stream/promises";
 import type { LookupFunction } from "node:net";
 import { ApiError } from "../errors.js";
+import { getOutboundNodeAgent } from "../network-proxy.js";
 
 export interface ProviderNetworkOptions {
   allowInsecureHttp: boolean;
@@ -242,7 +243,7 @@ export async function providerUploadStream(
   let request: ClientRequest;
   const response = new Promise<number>((resolve, reject) => {
     request = transport.request(target.url, {
-      method: "PUT", headers, lookup: createPinnedProviderLookup(target),
+      method: "PUT", headers, lookup: createPinnedProviderLookup(target), agent: getOutboundNodeAgent(),
     }, (incoming) => {
       const status = incoming.statusCode ?? 500;
       incoming.resume();
@@ -301,6 +302,7 @@ async function requestResolvedProviderWithoutBudget(
       method: init.method ?? "GET",
       headers,
       lookup: createPinnedProviderLookup(target),
+      agent: getOutboundNodeAgent(),
     }, (incoming) => {
       const chunks: Buffer[] = [];
       incoming.on("data", (chunk: Buffer | string) => {
@@ -350,6 +352,7 @@ async function requestResolvedProviderStreamWithoutBudget(
       method: init.method ?? "GET",
       headers,
       lookup: createPinnedProviderLookup(target),
+      agent: getOutboundNodeAgent(),
     }, resolve);
     request.once("error", reject);
     const abortRequest = () => request.destroy(new Error("provider_stream_aborted"));

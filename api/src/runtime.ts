@@ -25,11 +25,17 @@ import type { ContentSourceAutoSyncWorker } from "./content-sources/auto-sync.js
 import type { ContentSourceDiagnostics } from "./content-sources/diagnostics.js";
 import type { ProtocolImageCache } from "./media/image-cache.js";
 import type { ProtocolCollageService } from "./media/protocol-collage.js";
+import type { NetworkProxyManager } from "./network-proxy.js";
+import type { RecommendationService } from "./recommendations/service.js";
 
 /** 后台路由共享的已初始化运行时依赖。 */
 export interface ApiRuntime {
   config: ApiConfig;
   database: FlyCloudHelperDatabase;
+  /** 全局出站代理和加密配置。 */
+  networkProxy: NetworkProxyManager;
+  /** 影视推荐榜单的定时拉取和本地快照。 */
+  recommendations: RecommendationService;
   repository: ServiceRepository;
   providers: ProviderRegistry;
   vault: CredentialVault;

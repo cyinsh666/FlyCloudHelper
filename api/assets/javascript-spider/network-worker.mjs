@@ -4,9 +4,12 @@ import http from "node:http";
 import https from "node:https";
 import { isIP } from "node:net";
 import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
+import { ProxyAgent } from "proxy-agent";
 
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_REDIRECTS = 5;
+// 关键变量：受控脚本只读取宿主提供的本机出口，源代码不能直接拿到上游代理凭据。
+const networkProxyAgent = new ProxyAgent();
 
 /** 拒绝本地和保留地址，网络请求不会把插件变成访问宿主内网的入口。 */
 function publicAddress(address) {
@@ -61,6 +64,7 @@ async function sendRequest(value, options, allowInsecureHttp) {
       const transport = url.protocol === "https:" ? https : http;
       const request = transport.request(url, {
         method, headers, rejectUnauthorized: true,
+        agent: networkProxyAgent,
         lookup: (_hostname, lookupOptions, callback) => lookupOptions.all ? callback(null, [record]) : callback(null, record.address, record.family),
       });
       const timer = setTimeout(() => request.destroy(new Error("javascript_source_network_timeout")), remaining);

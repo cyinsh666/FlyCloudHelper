@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { requireSuperAdmin } from "../http.js";
 import type { ApiRuntime } from "../runtime.js";
+import { loadNotificationEventSettings, saveNotificationEventSettings } from "../notification-events.js";
 import { telegramNotificationSettingName } from "../telegram-notification-service.js";
 
 /** 写入 Telegram 通知设置相关的管理员审计记录。 */
@@ -27,7 +28,23 @@ async function auditTelegramSetting(
 export async function registerAdminNotificationSettingsRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
   server.get("/api/v1/admin/notification-settings", async (request) => {
     await requireSuperAdmin(request, runtime.database);
-    return { telegram: await runtime.telegramNotifications.getSettings() };
+    const [telegram, events] = await Promise.all([
+      runtime.telegramNotifications.getSettings(), loadNotificationEventSettings(runtime.database),
+    ]);
+    return { telegram, events };
+  });
+
+  server.put<{ Body: Record<string, unknown> }>("/api/v1/admin/notification-settings/events", async (request) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    const events = await saveNotificationEventSettings(runtime.database, request.body, operator.id);
+    await runtime.database.addAudit({
+      id: randomUUID(), operatorUserId: operator.id, operatorUsername: operator.username,
+      operationType: "update_notification_events", targetType: "system_configuration",
+      targetId: "notification_events", result: "success",
+      detail: { 凭据异常: events.credentialAbnormal, 整理执行完成: events.organizeCompleted,
+        扫描识别完成: events.scanCompleted, 视频规格分析完成: events.mediaProbeCompleted },
+    });
+    return { events };
   });
 
   server.put<{ Body: Record<string, unknown> }>("/api/v1/admin/notification-settings/telegram", async (request) => {
