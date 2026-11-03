@@ -68,16 +68,22 @@ function ServiceSubscriptions({ service, items, onRemoved }: {
     {activity.error && <p role="alert" className="mb-3 text-sm text-destructive">{activity.error}</p>}
     {service.channelKeys.length === 0 && <p className="mb-3 text-sm text-muted-foreground">请先为这个网盘设置关注频道。</p>}
     {items.length === 0 && <p className="text-sm text-muted-foreground">这个网盘还没有订阅影片，可从 TMDB 作品详情页添加。</p>}
-    <div className="space-y-2">{items.map((item) => {
+    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">{items.map((item) => {
       const key = `${item.mediaType}:${item.tmdbId}`;
-      return <div key={key} className="flex items-center gap-3 rounded-lg border border-border bg-secondary/20 p-2.5">
-        {item.posterUrl && <img src={item.posterUrl} alt="" loading="lazy" className="h-14 w-10 shrink-0 rounded object-cover" />}
-        <div className="min-w-0 flex-1"><p className="truncate text-sm font-medium">{item.title}{item.year ? ` (${item.year})` : ""}</p>
-          <p className="mt-1 truncate text-xs text-muted-foreground">{item.mediaType === "tv" ? "剧集" : "电影"} · TMDB {item.tmdbId}</p></div>
-        <button type="button" onClick={() => void remove(item)} disabled={removing === key}
-          className="shrink-0 rounded-lg border border-border px-3 py-1.5 text-xs text-muted-foreground hover:bg-secondary disabled:opacity-50">
-          {removing === key ? "移除中…" : "取消订阅"}
-        </button>
+      return <div key={key} className="flex min-w-0 gap-3 rounded-lg border border-border bg-secondary/20 p-3">
+        {item.posterUrl
+          ? <img src={item.posterUrl} alt="" loading="lazy" className="h-20 w-14 shrink-0 rounded object-cover" />
+          : <div className="grid h-20 w-14 shrink-0 place-items-center rounded bg-secondary text-[10px] text-muted-foreground">暂无海报</div>}
+        <div className="flex min-w-0 flex-1 flex-col">
+          <p className="line-clamp-2 break-words text-sm font-medium leading-5" title={item.title}>
+            {item.title}{item.year ? ` (${item.year})` : ""}
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground">{item.mediaType === "tv" ? "剧集" : "电影"} · TMDB {item.tmdbId}</p>
+          <button type="button" onClick={() => void remove(item)} disabled={removing === key}
+            className="mt-auto self-start rounded-lg border border-border px-2.5 py-1 text-xs text-muted-foreground hover:bg-secondary disabled:opacity-50">
+            {removing === key ? "移除中…" : "取消订阅"}
+          </button>
+        </div>
       </div>;
     })}</div>
     {activity.loading && !activity.data && <div className="mt-4 h-12 animate-pulse rounded-lg bg-secondary" aria-label="查找记录加载中" />}

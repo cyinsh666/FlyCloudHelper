@@ -27,6 +27,8 @@ function ServiceChannelsEditor({ service, channels, channelTypes, scanEnabled, o
 }) {
   const [selected, setSelected] = useState<string[]>(service.channelKeys);
   const [filter, setFilter] = useState("");
+  // 关键变量：切换到一个网盘时频道列表默认收起，避免长列表占满设置页。
+  const [channelsExpanded, setChannelsExpanded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -42,6 +44,21 @@ function ServiceChannelsEditor({ service, channels, channelTypes, scanEnabled, o
     setSelected((current) => [...new Set([...current, ...relatedChannels])]);
     setMessage(`已选中 ${relatedChannels.length} 个相关频道，请点击保存关注频道`);
   }
+
+  /** 清空当前网盘的频道选择，保存前不修改服务端配置。 */
+  function clearChannels(): void {
+    setSelected([]);
+    setMessage("已清空频道选择，请点击保存关注频道");
+  }
+
+  /** 选中当前网盘可选的全部已启用频道，保存前不修改服务端配置。 */
+  function selectAllChannels(): void {
+    setSelected([...channels]);
+    setMessage(`已选中全部 ${channels.length} 个频道，请点击保存关注频道`);
+  }
+
+  /** 展开或收起当前网盘的频道列表，不改变已经勾选的频道。 */
+  function toggleChannelList(): void { setChannelsExpanded((current) => !current); }
 
   /** 服务端再次校验频道是否仍在系统频道列表中且已启用。 */
   async function save(): Promise<void> {
@@ -94,15 +111,29 @@ function ServiceChannelsEditor({ service, channels, channelTypes, scanEnabled, o
     {message && <p role="status" className="mb-3 text-sm text-muted-foreground">{message}</p>}
     {channels.length === 0 ? <p className="text-sm text-muted-foreground">暂无已启用的 TG 频道，请联系管理员在系统设置中配置。</p> : <>
       <div className="mb-3 flex flex-wrap items-center gap-2">
-        <input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="筛选已有频道"
-          aria-label="筛选已有频道" className="min-w-0 flex-1 rounded-lg border border-border bg-background px-3 py-2 text-sm" />
+        <button type="button" onClick={toggleChannelList} aria-expanded={channelsExpanded}
+          aria-controls={`channel-list-${service.serviceId}`}
+          className="rounded-lg border border-border bg-secondary/50 px-3 py-2 text-xs text-foreground hover:bg-secondary">
+          {channelsExpanded ? "收起频道列表" : "展开频道列表"}
+        </button>
+        <button type="button" onClick={clearChannels} disabled={saving || selected.length === 0}
+          className="rounded-lg border border-border bg-secondary/50 px-3 py-2 text-xs text-foreground hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40">
+          清空
+        </button>
+        <button type="button" onClick={selectAllChannels} disabled={saving || selected.length === channels.length}
+          className="rounded-lg border border-border bg-secondary/50 px-3 py-2 text-xs text-foreground hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40">
+          全选
+        </button>
         <button type="button" onClick={selectRelatedChannels} disabled={saving || relatedChannels.length === 0}
           className="rounded-lg border border-border bg-secondary/50 px-3 py-2 text-xs text-foreground hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40">
           一键选中相关频道（{relatedChannels.length}）
         </button>
         <span className="text-xs text-muted-foreground">已选 {selected.length} / {channels.length}</span>
       </div>
-      <div className="grid max-h-96 gap-2 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
+      <div id={`channel-list-${service.serviceId}`} hidden={!channelsExpanded}>
+        <input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="筛选已有频道"
+          aria-label="筛选已有频道" className="mb-3 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm" />
+        <div className="grid max-h-96 gap-2 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
         {visibleChannels.map((key) => {
           const typeInfo = typesByChannel.get(key);
           const typeText = channelTypeText(key);
@@ -114,8 +145,9 @@ function ServiceChannelsEditor({ service, channels, channelTypes, scanEnabled, o
               <span className="block truncate text-[11px] text-muted-foreground" title={typeTooltip}>{typeText}</span></span>
           </label>;
         })}
+        </div>
+        {visibleChannels.length === 0 && <p className="py-4 text-sm text-muted-foreground">没有匹配的频道</p>}
       </div>
-      {visibleChannels.length === 0 && <p className="py-4 text-sm text-muted-foreground">没有匹配的频道</p>}
       {relatedChannels.length === 0 && <p className="mt-2 text-xs text-muted-foreground">{!serviceCloudType
         ? "当前网盘类型没有可匹配的分享链接类型，可以手动选择频道。"
         : scanEnabled

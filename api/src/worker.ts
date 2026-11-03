@@ -75,6 +75,7 @@ import {
   buildAggregateScanCompletionMessage,
   buildScanCompletionMessage,
   createEmptyScanCreatedMediaCounts,
+  shouldNotifyScanCompletion,
 } from "./scan-notification.js";
 import {
   ServiceRepository,
@@ -575,26 +576,31 @@ export class ScanWorker {
     try {
       const parentJob = await this.repository.claimLibraryScanJobCompletionNotification(job.parentJobId, job.userId);
       if (!parentJob) return true;
-      const [notificationEnabled, createdMediaCounts] = await Promise.all([
+      const [notificationEnabled, countedMedia] = await Promise.all([
         this.readServiceNotificationEnabled(job.serviceId, job.libraryId),
         this.readLibraryScanCreatedMediaCounts(parentJob),
       ]);
+      const createdMediaCounts = countedMedia ?? createEmptyScanCreatedMediaCounts();
       const hasFailure = parentJob.failedSourceCount > 0;
       const hasErrors = parentJob.errorCount > 0;
       const wasCancelled = parentJob.status === "cancelled" || parentJob.cancelledSourceCount > 0;
-      await this.database.createNotificationSafely({
-        userId: job.userId,
-        notificationEvent: "scan_completed",
-        category: "task",
-        tone: hasFailure || hasErrors || wasCancelled ? "warning" : "success",
-        title: hasFailure || hasErrors || wasCancelled ? "云聚合扫描异常结束" : "云聚合扫描已完成",
-        message: buildAggregateScanCompletionMessage(parentJob, createdMediaCounts),
-        actionPath: "/app/jobs",
-        deliverExternally: notificationEnabled,
-      });
+      const shouldNotify = shouldNotifyScanCompletion(
+        { dataType: "video", scanMode: parentJob.scanMode }, countedMedia, hasFailure || hasErrors || wasCancelled);
+      if (shouldNotify) {
+        await this.database.createNotificationSafely({
+          userId: job.userId,
+          notificationEvent: "scan_completed",
+          category: "task",
+          tone: hasFailure || hasErrors || wasCancelled ? "warning" : "success",
+          title: hasFailure || hasErrors || wasCancelled ? "云聚合扫描异常结束" : "云聚合扫描已完成",
+          message: buildAggregateScanCompletionMessage(parentJob, createdMediaCounts),
+          actionPath: "/app/jobs",
+          deliverExternally: notificationEnabled,
+        });
+      }
       this.logger.info({
         日志关键字: "codex-library-scan-parent",
-        事件: "发送云聚合父任务汇总通知",
+        事件: shouldNotify ? "发送云聚合父任务汇总通知" : "空增量云聚合扫描不发送完成通知",
         父任务ID: parentJob.id,
         媒体库ID: parentJob.libraryId,
         最终状态: parentJob.status,
@@ -616,8 +622,8 @@ export class ScanWorker {
     return true;
   }
 
-  /** 尽力统计云聚合父任务新增内容；统计失败时仍发送不含明细的完成通知。 */
-  private async readLibraryScanCreatedMediaCounts(parentJob: LibraryScanJobRecord): Promise<ScanCreatedMediaCounts> {
+  /** 尽力统计云聚合父任务新增内容；统计失败时返回空标记以保留完成通知。 */
+  private async readLibraryScanCreatedMediaCounts(parentJob: LibraryScanJobRecord): Promise<ScanCreatedMediaCounts | null> {
     try {
       return await this.repository.getLibraryScanCreatedMediaCounts(parentJob);
     } catch (error) {
@@ -628,14 +634,14 @@ export class ScanWorker {
         媒体库ID: parentJob.libraryId,
         错误信息: error instanceof Error ? error.message : "未知数据库错误",
       });
-      return createEmptyScanCreatedMediaCounts();
+      return null;
     }
   }
 
-  /** 尽力统计本次扫描新增入库内容；统计失败时使用零值完成原任务。 */
+  /** 尽力统计本次扫描新增入库内容；统计失败时返回空标记以保留完成通知。 */
   private async readScanCreatedMediaCounts(
     job: Pick<ScanJobRecord, "serviceId" | "libraryId" | "startedAt">,
-  ): Promise<ScanCreatedMediaCounts> {
+  ): Promise<ScanCreatedMediaCounts | null> {
     try {
       return await this.repository.getScanCreatedMediaCounts(job);
     } catch (error) {
@@ -645,7 +651,7 @@ export class ScanWorker {
         服务ID: job.serviceId,
         错误信息: error instanceof Error ? error.message : "未知数据库错误",
       });
-      return createEmptyScanCreatedMediaCounts();
+      return null;
     }
   }
 
@@ -1510,14 +1516,16 @@ export class ScanWorker {
         this.logger.warn({ 日志关键字: "codex-flycloud-music", 事件: "音乐阶段失败", 任务ID: job.id, 阶段: stage, 资源ID: entry?.resourceId, 错误信息: message });
       },
     });
-    const [notificationEnabled, createdMediaCounts, completedJob] = await Promise.all([
+    const [notificationEnabled, countedMedia, completedJob] = await Promise.all([
       this.readServiceNotificationEnabled(job.serviceId, job.libraryId), this.readScanCreatedMediaCounts(job), this.repository.getJob(job.id, job.userId),
     ]);
-    await this.database.createNotificationSafely({ userId: job.userId, category: "task",
-      notificationEvent: "scan_completed",
-      tone: completedJob.errorCount > 0 || completedJob.status !== "completed" ? "warning" : "success", title: completedJob.status === "completed" ? "音乐扫描任务已完成" : "音乐阶段已结束，其他阶段待继续",
-      message: buildScanCompletionMessage(job, createdMediaCounts), actionPath: "/app/jobs",
-      deliverExternally: notificationEnabled });
+    if (shouldNotifyScanCompletion(job, countedMedia, completedJob.errorCount > 0 || completedJob.status !== "completed")) {
+      await this.database.createNotificationSafely({ userId: job.userId, category: "task",
+        notificationEvent: "scan_completed",
+        tone: completedJob.errorCount > 0 || completedJob.status !== "completed" ? "warning" : "success", title: completedJob.status === "completed" ? "音乐扫描任务已完成" : "音乐阶段已结束，其他阶段待继续",
+        message: buildScanCompletionMessage(job, countedMedia ?? createEmptyScanCreatedMediaCounts()), actionPath: "/app/jobs",
+        deliverExternally: notificationEnabled });
+    }
   }
 
   /** 完成 Provider 枚举、分类、刮削、持久化和 generation 对账。 */
@@ -2987,24 +2995,26 @@ export class ScanWorker {
     }
     await this.repository.finishJob(job.id, { status: "completed" });
     const belongsToAggregateParent = await this.notifyAggregateParentIfFinished(job);
-    const [notificationEnabled, createdMediaCounts] = await Promise.all([
+    const [notificationEnabled, countedMedia] = await Promise.all([
       this.readServiceNotificationEnabled(job.serviceId, job.libraryId),
       this.readScanCreatedMediaCounts(job),
     ]);
-    // 关键变量：新增内容数量继续用于通知正文；完成事件由通知开关决定是否投递。
+    const createdMediaCounts = countedMedia ?? createEmptyScanCreatedMediaCounts();
+    // 关键变量：统计可靠且没有异常的空增量扫描跳过完成通知，任务结果仍照常保存。
     const createdContentCount = job.dataType === "audiobook"
       ? (createdMediaCounts.bookCount ?? 0) + (createdMediaCounts.chapterCount ?? 0)
       : createdMediaCounts.videoContentCount;
-    const deliverScanNotificationExternally = notificationEnabled;
-    const completionMessage = buildScanCompletionMessage(job, createdMediaCounts);
-    if (!belongsToAggregateParent) {
+    const shouldNotify = !belongsToAggregateParent && shouldNotifyScanCompletion(
+      job, countedMedia, businessProgress.failedKeys.size > 0 || providerWarningCount > 0);
+    const deliverScanNotificationExternally = notificationEnabled && shouldNotify;
+    if (shouldNotify) {
       await this.database.createNotificationSafely({
         userId: job.userId,
         notificationEvent: "scan_completed",
         category: "task",
         tone: businessProgress.failedKeys.size > 0 ? "warning" : "success",
         title: "扫描任务已完成",
-        message: completionMessage,
+        message: buildScanCompletionMessage(job, createdMediaCounts),
         actionPath: "/app/jobs",
         deliverExternally: deliverScanNotificationExternally,
       });

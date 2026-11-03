@@ -6,6 +6,22 @@ export function createEmptyScanCreatedMediaCounts(): ScanCreatedMediaCounts {
   return { videoContentCount: 0, videoContents: [], songCount: 0, albumCount: 0, artistCount: 0, bookCount: 0, chapterCount: 0 };
 }
 
+/** 成功的增量扫描没有新增内容时不发完成通知；统计失败时保留原有通知。 */
+export function shouldNotifyScanCompletion(
+  job: Pick<ScanJobRecord, "dataType" | "scanMode">,
+  createdMediaCounts: ScanCreatedMediaCounts | null,
+  hasErrors: boolean,
+): boolean {
+  if (job.scanMode !== "incremental" || hasErrors || !createdMediaCounts) return true;
+  if (job.dataType === "audiobook") {
+    return (createdMediaCounts.bookCount ?? 0) + (createdMediaCounts.chapterCount ?? 0) > 0;
+  }
+  if (job.dataType === "music") {
+    return createdMediaCounts.songCount + createdMediaCounts.albumCount + createdMediaCounts.artistCount > 0;
+  }
+  return createdMediaCounts.videoContentCount > 0;
+}
+
 /** 把本次新增的影视内容转换为通知明细，最多展示仓储层返回的五条内容。 */
 function buildCreatedVideoLines(createdMediaCounts: ScanCreatedMediaCounts): string[] {
   return createdMediaCounts.videoContents.map((content, index) => (
