@@ -1,6 +1,7 @@
 import type { FlyCloudHelperDatabase } from "./database.js";
 import type { NotificationRecord } from "./domain.js";
 import { ApiError, validationError } from "./errors.js";
+import type { ProtocolImageCache } from "./media/image-cache.js";
 import type { CredentialVault } from "./secrets.js";
 
 /** Telegram 通知配置在系统级加密配置表中的稳定标识。 */
@@ -129,6 +130,7 @@ export class TelegramNotificationService {
     private readonly database: FlyCloudHelperDatabase,
     private readonly vault: CredentialVault,
     private readonly logger: TelegramNotificationLogger,
+    private readonly imageCache: ProtocolImageCache,
   ) {}
 
   /** 读取脱敏后的 Telegram 通知设置。 */
@@ -211,17 +213,38 @@ export class TelegramNotificationService {
   }
 
   /** 将已写入的站内通知加入串行队列，投递异常只记录日志。 */
-  public enqueue(notification: NotificationRecord): void {
+  public enqueue(notification: NotificationRecord & { imageUrl?: string | null }): void {
     this.deliveryQueue = this.deliveryQueue
       .then(async () => {
         const configuration = await this.loadConfiguration();
         if (!configuration.enabled || !configuration.botToken || !configuration.destinationId) return;
-        await this.sendMessage(configuration, buildTelegramMessage(notification));
+        const text = buildTelegramMessage(notification);
+        let sentAsPhoto = false;
+        if (notification.imageUrl) {
+          // 关键变量：Telegram 图片说明上限为 1024 字符，剩余通知内容另发文字消息。
+          const characters = [...text];
+          try {
+            await this.sendPhoto(configuration, characters.slice(0, 1_000).join(""), notification.imageUrl);
+            sentAsPhoto = true;
+          } catch (error) {
+            this.logger("warn", {
+              日志关键字: "codex-flycloud-telegram-notification",
+              事件: "Telegram通知图片发送失败，改发文字",
+              通知标题: notification.title,
+              错误信息: error instanceof Error ? error.message : "未知错误",
+            });
+          }
+          if (sentAsPhoto && characters.length > 1_000) {
+            await this.sendMessage(configuration, characters.slice(1_000).join(""));
+          }
+        }
+        if (!sentAsPhoto) await this.sendMessage(configuration, text);
         this.logger("info", {
           日志关键字: "codex-flycloud-telegram-notification",
           事件: "Telegram通知发送成功",
           通知分类: notification.category,
           通知标题: notification.title,
+          通知形式: sentAsPhoto ? "图片" : "文字",
           目标类型: configuration.destinationType === "chat" ? "聊天" : "个人",
           配置修订: configuration.configurationRevision,
         });
@@ -285,6 +308,25 @@ export class TelegramNotificationService {
         link_preview_options: { is_disabled: true },
       }),
       signal: AbortSignal.timeout(12_000),
+    });
+    const result = await response.json().catch(() => null) as { ok?: boolean; description?: string } | null;
+    if (!response.ok || result?.ok !== true) {
+      throw new Error(result?.description || `Telegram Bot API 返回 HTTP ${response.status}`);
+    }
+  }
+
+  /** 从服务器图片缓存读取背景图，再以文件方式发送，避免 Telegram 无法访问源站图片地址。 */
+  private async sendPhoto(configuration: TelegramNotificationConfiguration, caption: string, imageUrl: string): Promise<void> {
+    const image = await this.imageCache.getOrFetch(imageUrl);
+    const form = new FormData();
+    form.append("chat_id", configuration.destinationId);
+    form.append("caption", caption);
+    form.append("photo", new Blob([new Uint8Array(image.body)], { type: image.contentType }),
+      image.contentType.includes("png") ? "backdrop.png" : "backdrop.jpg");
+    const response = await fetch(`https://api.telegram.org/bot${configuration.botToken}/sendPhoto`, {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.timeout(20_000),
     });
     const result = await response.json().catch(() => null) as { ok?: boolean; description?: string } | null;
     if (!response.ok || result?.ok !== true) {

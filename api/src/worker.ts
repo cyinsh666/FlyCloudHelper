@@ -596,6 +596,10 @@ export class ScanWorker {
           message: buildAggregateScanCompletionMessage(parentJob, createdMediaCounts),
           actionPath: "/app/jobs",
           deliverExternally: notificationEnabled,
+          imageUrl: notificationEnabled
+            ? await this.readScanNotificationBackdropUrl(parentJob.libraryId,
+              parentJob.sourceJobs.map((sourceJob) => sourceJob.startedAt).filter((value): value is string => Boolean(value))
+                .sort()[0] ?? parentJob.startedAt, createdMediaCounts.videoContents) : null,
         });
       }
       this.logger.info({
@@ -649,6 +653,23 @@ export class ScanWorker {
         日志关键字: "codex-flycloud-helper-service-notification",
         事件: "统计扫描新增入库数量失败",
         服务ID: job.serviceId,
+        错误信息: error instanceof Error ? error.message : "未知数据库错误",
+      });
+      return null;
+    }
+  }
+
+  /** 背景图查询失败时继续发送原有文字通知，不影响扫描任务的完成状态。 */
+  private async readScanNotificationBackdropUrl(
+    libraryId: string, startedAt: string | null, videoContents: ScanCreatedMediaCounts["videoContents"],
+  ): Promise<string | null> {
+    try {
+      return await this.repository.getScanNotificationBackdropUrl(libraryId, startedAt, videoContents);
+    } catch (error) {
+      this.logger.warn({
+        日志关键字: "codex-flycloud-helper-service-notification",
+        事件: "读取扫描通知背景图失败",
+        媒体库ID: libraryId,
         错误信息: error instanceof Error ? error.message : "未知数据库错误",
       });
       return null;
@@ -3017,6 +3038,8 @@ export class ScanWorker {
         message: buildScanCompletionMessage(job, createdMediaCounts),
         actionPath: "/app/jobs",
         deliverExternally: deliverScanNotificationExternally,
+        imageUrl: job.dataType === "video" && deliverScanNotificationExternally
+          ? await this.readScanNotificationBackdropUrl(job.libraryId, job.startedAt, createdMediaCounts.videoContents) : null,
       });
     }
     this.logger.info({
@@ -3645,8 +3668,8 @@ export class ScanWorker {
     const mediaType = descriptor.itemType === "video.episode" ? "tv" : "movie";
     const query = String(descriptor.metadata.query ?? descriptor.parent?.title ?? descriptor.title).trim();
     if (!query) return null;
-    // 关键变量：仅在目录查询无候选时交给 TMDB 客户端执行一次的文件名回退查询。
-    const rawFallbackQuery = String(descriptor.metadata.fallbackQuery ?? "").trim();
+    // 关键变量：只有电影可用文件名作第二查询词；旧剧集元数据中的备用词也不再用于补查。
+    const rawFallbackQuery = mediaType === "movie" ? String(descriptor.metadata.fallbackQuery ?? "").trim() : "";
     const fallbackQuery = FlymbyVideoTitleCleaner.normalizeSearchText(rawFallbackQuery)
       === FlymbyVideoTitleCleaner.normalizeSearchText(query) ? "" : rawFallbackQuery;
     const language = String(profile.language ?? "zh-CN");

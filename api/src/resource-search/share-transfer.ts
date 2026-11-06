@@ -9,7 +9,7 @@ export interface ShareTransferSubmission { taskId: string; fileCount: number; pr
 export type ShareTransferStatus = "pending" | "running" | "completed" | "failed";
 
 /** 加载目标服务的有效凭据；自动任务也只允许光鸭和夸克网页登录。 */
-async function transferConnection(runtime: ApiRuntime, serviceId: string, ownerId?: string) {
+export async function transferConnection(runtime: ApiRuntime, serviceId: string, ownerId?: string) {
   const service = await runtime.repository.getServiceDetail(serviceId, ownerId);
   if (service.providerType !== "guangya" && service.providerType !== "quark") {
     throw new ApiError(422, "search_transfer_provider_invalid", "当前只支持光鸭和夸克分享转存");

@@ -302,6 +302,8 @@ export interface ScanCreatedVideoContent {
   itemType: "video.movie" | "video.series";
   /** 电影为空；节目表示本次扫描新入库的集数。 */
   episodeCount: number | null;
+  /** 本条通知明细对应影片的背景图，仅供本次通知选图。 */
+  backdropUrl?: string | null;
 }
 
 /** 扫描任务启动后新建的媒体数量和最多五条影视明细。 */
@@ -3889,20 +3891,20 @@ export class ServiceRepository {
       .countDistinct<{ count: string | number }[]>({ count: "series.id" })
       .first();
     const existingSeriesRows = await existingSeriesBaseQuery.clone()
-      .select("series.id", "series.title")
-      .count<{ id: string; title: string; episode_count: string | number }[]>({ episode_count: "episode.id" })
-      .groupBy("series.id", "series.title")
+      .select("series.id", "series.title", "series.backdrop_url", "series.match_state")
+      .count<{ id: string; title: string; backdrop_url: string | null; match_state: string; episode_count: string | number }[]>({ episode_count: "episode.id" })
+      .groupBy("series.id", "series.title", "series.backdrop_url", "series.match_state")
       .orderBy("series.title", "asc")
       .limit(5);
 
     const newTopLevelRows = await this.database.query("media_items")
-      .select("id", "title", "item_type")
+      .select("id", "title", "item_type", "backdrop_url", "match_state")
       .where({ library_id: job.libraryId })
       .whereNull("deleted_at")
       .where("created_at", ">=", job.startedAt)
       .whereIn("item_type", ["video.movie", "video.series"])
       .orderBy("title", "asc")
-      .limit(5) as Array<{ id: string; title: string; item_type: "video.movie" | "video.series" }>;
+      .limit(5) as Array<{ id: string; title: string; item_type: "video.movie" | "video.series"; backdrop_url: string | null; match_state: string }>;
     const displayedNewSeriesIds = newTopLevelRows
       .filter((row) => row.item_type === "video.series")
       .map((row) => String(row.id));
@@ -3926,11 +3928,13 @@ export class ServiceRepository {
         title: readNotificationVideoTitle(row.title),
         itemType: row.item_type,
         episodeCount: row.item_type === "video.series" ? displayedNewSeriesEpisodeCounts.get(String(row.id)) ?? 0 : null,
+        backdropUrl: row.match_state === "matched" ? row.backdrop_url : null,
       })),
       ...existingSeriesRows.map((row): ScanCreatedVideoContent => ({
         title: readNotificationVideoTitle(row.title),
         itemType: "video.series",
         episodeCount: Number(row.episode_count ?? 0),
+        backdropUrl: row.match_state === "matched" ? row.backdrop_url : null,
       })),
     ].sort((left, right) => left.title.localeCompare(right.title, "zh-CN")).slice(0, 5);
 
@@ -3956,6 +3960,13 @@ export class ServiceRepository {
       .flatMap((sourceJob) => sourceJob.startedAt ? [sourceJob.startedAt] : [])
       .sort((left, right) => left.localeCompare(right))[0] ?? job.startedAt;
     return this.getScanCreatedMediaCounts({ libraryId: job.libraryId, startedAt: sourceStartedAt });
+  }
+
+  /** 扫描通知只使用正文列出的已识别影片背景图；没有合适图片时发送纯文字。 */
+  public async getScanNotificationBackdropUrl(
+    _libraryId: string, _startedAt: string | null, videoContents: ScanCreatedVideoContent[],
+  ): Promise<string | null> {
+    return videoContents.find((content) => Boolean(content.backdropUrl?.trim()))?.backdropUrl ?? null;
   }
 
   /** 删除媒体库协议账号和观看状态，来源网盘服务不参与协议数据归属。 */

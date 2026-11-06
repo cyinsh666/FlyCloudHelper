@@ -38,7 +38,7 @@ type DatabaseBootstrapLogger = (
 ) => void;
 
 /** 接收已经写入站内通知的数据，并交给外部通知渠道异步投递。 */
-type NotificationDeliveryHandler = (notification: NotificationRecord) => void;
+type NotificationDeliveryHandler = (notification: NotificationRecord & { imageUrl?: string | null }) => void;
 
 interface RemoteDatabaseTarget {
   databaseName: string;
@@ -269,6 +269,8 @@ export class FlyCloudHelperDatabase {
     actionPath?: string | null;
     /** 是否把该站内通知同步到 Telegram 等外部渠道，默认同步。 */
     deliverExternally?: boolean;
+    /** 仅用于本次外部投递的图片，不写入站内通知数据库。 */
+    imageUrl?: string | null;
   }): Promise<NotificationRecord> {
     const row = {
       id: randomUUID(),
@@ -282,7 +284,7 @@ export class FlyCloudHelperDatabase {
     };
     await this.query("user_notifications").insert(row);
     const notification = mapNotification(row);
-    if (input.deliverExternally !== false) this.notificationDeliveryHandler?.(notification);
+    if (input.deliverExternally !== false) this.notificationDeliveryHandler?.({ ...notification, imageUrl: input.imageUrl });
     return notification;
   }
 
@@ -329,6 +331,8 @@ export class FlyCloudHelperDatabase {
     actionPath?: string | null;
     /** 是否把该站内通知同步到 Telegram 等外部渠道，默认同步。 */
     deliverExternally?: boolean;
+    /** 仅用于本次外部投递的图片，不写入站内通知数据库。 */
+    imageUrl?: string | null;
     /** 指定业务事件时由系统通知开关决定是否生成本条通知。 */
     notificationEvent?: NotificationEvent;
   }): Promise<void> {

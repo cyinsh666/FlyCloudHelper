@@ -4,7 +4,8 @@ import { ExternalLink, LoaderCircle, Search } from "lucide-react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, StatusPill } from "@/components/ui-kit";
 import {
-  getResourceSearchTargets, getResourceTransferStatus, searchResources, transferResource,
+  getOfflineTransferStatus, getResourceSearchTargets, getResourceTransferStatus, offlineTransferResource,
+  searchResources, transferResource,
   type ResourceSearchItem, type ResourceSearchTarget,
 } from "@/lib/api";
 
@@ -14,6 +15,7 @@ const cloudTabs = [
   { id: "baidu", label: "百度" }, { id: "aliyun", label: "阿里云盘" }, { id: "guangya", label: "光鸭" },
   { id: "xunlei", label: "迅雷" }, { id: "tianyi", label: "天翼" }, { id: "115", label: "115" },
   { id: "123", label: "123" }, { id: "mobile", label: "移动云盘" }, { id: "pikpak", label: "PikPak" },
+  { id: "magnet", label: "磁力" },
 ] as const;
 
 /** 来源筛选将所有 Telegram 频道合并，公开站点仍按站点名称分别展示。 */
@@ -51,7 +53,8 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
   const [sourceErrors, setSourceErrors] = useState<string[]>([]);
   const [selected, setSelected] = useState<ResourceSearchItem | null>(null);
   const [serviceId, setServiceId] = useState("");
-  const [task, setTask] = useState<{ serviceId: string; taskId: string; providerType: string; status: string } | null>(null);
+  const [task, setTask] = useState<{ serviceId: string; taskId: string; providerType: string;
+    mode: "share" | "offline"; status: string; progress: number } | null>(null);
   const [loading, setLoading] = useState(true);
   const [searching, setSearching] = useState(false);
   const [transferring, setTransferring] = useState(false);
@@ -76,20 +79,24 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
 
   /** 转存提交成功后轮询同一任务，避免重复提交分享。 */
   useEffect(() => {
-    if (!task || task.status === "completed" || task.status === "failed") return undefined;
+    if (!task || task.status === "completed" || task.status === "partial" || task.status === "failed") return undefined;
     let alive = true;
     const timer = window.setInterval(() => {
-      void getResourceTransferStatus(task.serviceId, task.taskId, admin)
+      void (task.mode === "offline" ? getOfflineTransferStatus(task.serviceId, task.taskId, admin)
+        : getResourceTransferStatus(task.serviceId, task.taskId, admin))
         .then((result) => {
           if (!alive) return;
-          setTask((current) => current?.taskId === task.taskId ? { ...current, status: result.status } : current);
-          if (result.status === "completed") setMessage(`${transferProviderName(task.providerType)}转存已完成`);
-          if (result.status === "failed") setError(`${transferProviderName(task.providerType)}转存任务失败，请检查分享链接和目标目录`);
+          setTask((current) => current?.taskId === task.taskId ? { ...current, status: result.status,
+            progress: "progress" in result ? result.progress : current.progress } : current);
+          if (result.status === "completed") setMessage(task.mode === "offline" ? "光鸭离线任务已完成" : `${transferProviderName(task.providerType)}转存已完成`);
+          if (result.status === "partial") setMessage("光鸭离线任务部分完成，请检查目标目录和光鸭任务列表");
+          if (result.status === "failed") setError(task.mode === "offline" ? "光鸭离线任务失败，请检查磁力资源和光鸭任务列表"
+            : `${transferProviderName(task.providerType)}转存任务失败，请检查分享链接和目标目录`);
         })
         .catch((failure) => { if (alive) setError(failure instanceof Error ? failure.message : "查询转存状态失败"); });
-    }, 2500);
+    }, task.mode === "offline" ? 30_000 : 2500);
     return () => { alive = false; window.clearInterval(timer); };
-  }, [task?.serviceId, task?.taskId, task?.status, admin]);
+  }, [task?.serviceId, task?.taskId, task?.status, task?.mode, admin]);
 
   /** 从已启用来源搜索关键词，自动跳转与手动提交共用同一段状态更新。 */
   async function searchKeyword(keyword: string): Promise<void> {
@@ -143,7 +150,8 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
       const nextTargets = await getResourceSearchTargets(admin);
       setTargets(nextTargets);
       setSelected(item);
-      const first = nextTargets.find((target) => target.providerType === item.cloudType && target.directory);
+      const providerType = item.cloudType === "magnet" ? "guangya" : item.cloudType;
+      const first = nextTargets.find((target) => target.providerType === providerType && target.directory);
       setServiceId(first?.serviceId ?? "");
     } catch (failure) { setError(failure instanceof Error ? failure.message : "读取转存服务失败"); }
   }
@@ -159,9 +167,14 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
     setTransferring(true);
     setError(null);
     try {
-      const submitted = await transferResource({ shareUrl: selected.shareUrl, password: selected.password, serviceId }, admin);
-      setTask({ serviceId, taskId: submitted.taskId, providerType: selected.cloudType, status: "pending" });
-      setMessage(`已提交 ${submitted.fileCount} 个文件或文件夹，正在等待${transferProviderName(selected.cloudType)}完成转存`);
+      const offline = selected.cloudType === "magnet";
+      const submitted = offline
+        ? await offlineTransferResource({ magnetUrl: selected.shareUrl, serviceId }, admin)
+        : await transferResource({ shareUrl: selected.shareUrl, password: selected.password, serviceId }, admin);
+      setTask({ serviceId, taskId: submitted.taskId, providerType: offline ? "guangya" : selected.cloudType,
+        mode: offline ? "offline" : "share", status: "pending", progress: 0 });
+      setMessage(offline ? "磁力已提交到光鸭，正在等待云添加完成"
+        : `已提交 ${submitted.fileCount} 个文件或文件夹，正在等待${transferProviderName(selected.cloudType)}完成转存`);
       setSelected(null);
     } catch (failure) { setError(failure instanceof Error ? failure.message : "提交转存失败，请检查目标目录再决定是否重试"); }
     finally { setTransferring(false); }
@@ -194,11 +207,13 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
       {error && <div role="alert" className="mb-4 rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">{error}</div>}
       {message && <div role="status" className="mb-4 rounded-lg border border-border bg-secondary/50 p-3 text-sm">{message}</div>}
       {task && <div className="mb-4 rounded-lg border border-border bg-secondary/50 p-3 text-sm">
-        {transferProviderName(task.providerType)}转存任务：{task.status === "completed" ? "已完成" : task.status === "failed" ? "失败" : "处理中"}（{task.taskId}）
+        {task.mode === "offline" ? "光鸭离线任务" : `${transferProviderName(task.providerType)}转存任务`}：
+        {task.status === "completed" ? "已完成" : task.status === "partial" ? "部分完成" : task.status === "failed" ? "失败" : "处理中"}
+        {task.mode === "offline" && task.status === "running" ? ` ${task.progress}%` : ""}（{task.taskId}）
       </div>}
 
       {(!embedded || results.length > 0) && <Panel title={embedded ? undefined : "搜索网盘资源"}
-        description={embedded ? undefined : "从已启用的 Telegram 频道和公开搜索站查找网盘分享；光鸭与夸克支持站内转存。"}>
+        description={embedded ? undefined : "从已启用的 Telegram 频道和公开站点查找分享与磁力；磁力可离线到光鸭。"}>
         {!embedded && <form onSubmit={(event) => void runSearch(event)} className="flex flex-col gap-3 sm:flex-row">
           <input ref={keywordInputRef} name="keyword" maxLength={100} required
             onCompositionStart={() => { composingRef.current = true; }}
@@ -248,12 +263,17 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
                   : item.sourceKind === "public_site" ? `站点:${item.sourceName}` : item.source}</StatusPill>
                 {item.postedAt && <span>· {new Date(item.postedAt).toLocaleString("zh-CN")}</span>}
               </div>
-              <a href={item.shareUrl} target="_blank" rel="noopener noreferrer" className="mt-2 inline-flex max-w-full items-center gap-1 break-all text-sm text-primary-soft">
-                {item.shareUrl}<ExternalLink className="size-3 shrink-0" />
-              </a>
+              {item.cloudType === "magnet"
+                ? <p className="mt-2 break-all text-xs text-muted-foreground" title={item.shareUrl}>
+                  {item.shareUrl.length > 180 ? `${item.shareUrl.slice(0, 180)}…` : item.shareUrl}</p>
+                : <a href={item.shareUrl} target="_blank" rel="noopener noreferrer" className="mt-2 inline-flex max-w-full items-center gap-1 break-all text-sm text-primary-soft">
+                  {item.shareUrl}<ExternalLink className="size-3 shrink-0" />
+                </a>}
               {item.password && <p className="mt-1 text-xs text-muted-foreground">提取码：{item.password}</p>}
             </div>
-            {(item.cloudType === "guangya" || item.cloudType === "quark") && <SecondaryButton onClick={() => void openTransfer(item)} disabled={loading}>转存</SecondaryButton>}
+            {(item.cloudType === "guangya" || item.cloudType === "quark" || item.cloudType === "magnet")
+              && <SecondaryButton onClick={() => void openTransfer(item)} disabled={loading}>
+                {item.cloudType === "magnet" ? "离线到光鸭" : "转存"}</SecondaryButton>}
           </div>
         </Panel>)}
         {!searching && visibleResults.length === 0 && !loading && <p className="col-span-full py-5 text-center text-sm text-muted-foreground">{results.length > 0 ? "当前筛选暂无搜索结果" : "暂无搜索结果"}</p>}
@@ -266,13 +286,13 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
       {selected && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="presentation" onClick={() => setSelected(null)}>
         <div role="dialog" aria-modal="true" aria-label={`选择${transferProviderName(selected.cloudType)}转存位置`} onClick={(event) => event.stopPropagation()}
           className="surface w-full max-w-lg space-y-4 p-5">
-          <h2 className="text-lg font-semibold">转存到{transferProviderName(selected.cloudType)}服务</h2>
+          <h2 className="text-lg font-semibold">{selected.cloudType === "magnet" ? "离线到光鸭服务" : `转存到${transferProviderName(selected.cloudType)}服务`}</h2>
           {error && <p role="alert" className="rounded-lg bg-destructive/10 p-2 text-sm text-destructive">{error}</p>}
           <p className="truncate text-sm text-muted-foreground">{selected.title}</p>
           <label className="block space-y-1 text-sm">已有{transferProviderName(selected.cloudType)}服务
             <select value={serviceId} onChange={(event) => selectService(event.target.value)} className="w-full rounded-lg border border-border bg-background p-2.5">
               <option value="">请选择服务</option>
-              {targets.filter((target) => target.providerType === selected.cloudType).map((target) => <option key={target.serviceId} value={target.serviceId} disabled={!target.directory}>
+              {targets.filter((target) => target.providerType === (selected.cloudType === "magnet" ? "guangya" : selected.cloudType)).map((target) => <option key={target.serviceId} value={target.serviceId} disabled={!target.directory}>
                 {target.serviceName}{target.reason ? `（${target.reason}）` : ""}
               </option>)}
             </select>
@@ -280,10 +300,11 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
           {selectedTarget?.directory && <p className="rounded-lg border border-border bg-secondary/30 px-3 py-2 text-xs text-muted-foreground">
             转存目录：{selectedTarget.directory.displayPath}
           </p>}
-          {!targets.some((target) => target.providerType === selected.cloudType && target.directory) && <p className="text-sm text-muted-foreground">没有可用的{transferProviderName(selected.cloudType)}服务；请先在网盘服务详情中设置独立转存目录。</p>}
+          {!targets.some((target) => target.providerType === (selected.cloudType === "magnet" ? "guangya" : selected.cloudType) && target.directory)
+            && <p className="text-sm text-muted-foreground">没有可用的{transferProviderName(selected.cloudType)}服务；请先在网盘服务详情中设置独立转存目录。</p>}
           <div className="flex justify-end gap-2"><SecondaryButton onClick={() => setSelected(null)}>取消</SecondaryButton>
             <PrimaryButton onClick={() => void submitTransfer()} disabled={!serviceId || !selectedTarget?.directory || transferring}>
-              {transferring ? "转存中…" : "确认转存"}
+              {transferring ? "提交中…" : selected.cloudType === "magnet" ? "确认离线" : "确认转存"}
             </PrimaryButton></div>
         </div>
       </div>}

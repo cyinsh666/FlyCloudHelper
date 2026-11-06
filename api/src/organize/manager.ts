@@ -278,7 +278,13 @@ export class ServiceOrganizeManager {
       const directoryRecognitionCache = new Map<string, ReturnType<typeof parseFlymbyVideoDirectory>>();
       let aiSnapshot: Awaited<ReturnType<typeof prepareOrganizeAi>> = null;
       if (plan.aiAssistEnabled) {
-        try { aiSnapshot = await prepareOrganizeAi(this.runtime, plan.aiModelId ?? ""); }
+        try {
+          aiSnapshot = await prepareOrganizeAi(this.runtime, plan.aiModelId ?? "");
+          if (aiSnapshot) this.runtime.logBusinessEvent("info", {
+            日志关键字: "codex-flycloud-organize-ai", 事件: "AI辅助整理已准备",
+            服务ID: plan.serviceId, 预览ID: plan.id,
+          });
+        }
         catch (error) {
           this.runtime.logBusinessEvent("warn", {
             日志关键字: "codex-flycloud-organize-ai", 事件: "AI模型不可用，继续规则识别",
@@ -314,7 +320,7 @@ export class ServiceOrganizeManager {
         let key = JSON.stringify([parsed.mediaType, parsed.query, parsed.year, parsed.tmdbId]);
         if (!matchCache.has(key)) matchCache.set(key, await this.matchEntry(parsed));
         let matched = matchCache.get(key)!;
-        if (!matched && parsed !== fileParsed && fileParsed.mediaType === parsed.mediaType
+        if (!matched && parsed.mediaType === "movie" && parsed !== fileParsed && fileParsed.mediaType === parsed.mediaType
           && fileParsed.seasonNumber === parsed.seasonNumber
           && fileParsed.episodeNumber === parsed.episodeNumber) {
           const fileKey = JSON.stringify([fileParsed.mediaType, fileParsed.query, fileParsed.year, fileParsed.tmdbId]);
@@ -322,8 +328,8 @@ export class ServiceOrganizeManager {
           const fileMatch = matchCache.get(fileKey)!;
           if (fileMatch) { parsed = fileParsed; matched = fileMatch; key = fileKey; }
         }
-        // 英文发行名可以作为 TMDB 的搜索别名；命中后仍读取正式作品详情。
-        if (!matched && parsed.tmdbId <= 0 && parsed.fallbackQuery) {
+        // 电影的英文发行名可以作为 TMDB 搜索别名；剧集不从单集文件名补查作品。
+        if (!matched && parsed.mediaType === "movie" && parsed.tmdbId <= 0 && parsed.fallbackQuery) {
           const alternate = { ...parsed, title: parsed.fallbackQuery, query: parsed.fallbackQuery };
           const alternateKey = JSON.stringify([alternate.mediaType, alternate.query, alternate.year, alternate.tmdbId]);
           if (!matchCache.has(alternateKey)) matchCache.set(alternateKey, await this.matchEntry(alternate));
@@ -331,7 +337,8 @@ export class ServiceOrganizeManager {
         }
         // 同一电影目录中的数字版本缺少片名时，可借用另一版本文件名中的英文发行名。
         const siblingVideos = videosByDirectory.get(directoryPath) ?? [];
-        if (!matched && parsed.tmdbId <= 0 && siblingVideos.length > 1 && siblingVideos.length <= 5) {
+        if (!matched && parsed.mediaType === "movie" && parsed.tmdbId <= 0
+          && siblingVideos.length > 1 && siblingVideos.length <= 5) {
           for (const sibling of siblingVideos) {
             if (sibling.resourceId === entry.resourceId) continue;
             const siblingParsed = parseFlymbyVideoName({ ...sibling, path: sibling.displayPath, name: sibling.name,
@@ -359,6 +366,9 @@ export class ServiceOrganizeManager {
           }
         }
         const ruleItem = this.makeItem(entry, parsed, matched);
+        // 关键变量：只有本次实际向模型发起查询，才记录一次 AI 结果和 TMDB 判定。
+        let requestedAi = false;
+        const ruleTitle = parsed.title;
         if (ruleItem.status === "skipped" && plan.aiAssistEnabled && !aiSnapshot) {
           plan.aiFailureCount = (plan.aiFailureCount ?? 0) + 1;
           aiFailedSourceIds.add(entry.resourceId);
@@ -368,7 +378,8 @@ export class ServiceOrganizeManager {
           const aiKey = JSON.stringify([parsed.mediaType, parsed.query || entry.name, parsed.year,
             path.posix.dirname(entry.displayPath), parsed.seasonNumber,
             parsed.episodeNumber > 0 && parsed.seasonNumber >= 0 ? "" : entry.name]);
-          if (!aiCache.has(aiKey)) {
+          requestedAi = !aiCache.has(aiKey);
+          if (requestedAi) {
             try {
               const assisted = await recognizeUnmatchedByAi(this.runtime, aiSnapshot, entry, parsed,
                 siblingNamesByDirectory.get(directoryPath) ?? []);
@@ -405,6 +416,13 @@ export class ServiceOrganizeManager {
           }
         }
         const assistedItem = this.makeItem(entry, parsed, matched);
+        if (requestedAi) this.runtime.logBusinessEvent("info", {
+          日志关键字: "codex-flycloud-organize-ai", 事件: "AI辅助整理判定",
+          服务ID: plan.serviceId, 预览ID: plan.id, 来源资源ID: entry.resourceId,
+          来源目录名: path.posix.basename(directoryPath), 规则片名: ruleTitle, AI采用片名: parsed.title,
+          TMDB匹配: matched ? "成功" : "未匹配", TMDB编号: matched?.id ?? null,
+          整理状态: assistedItem.status, 未整理原因: assistedItem.reason,
+        });
         plan.items.push(assistedItem.status === "ready" ? assistedItem : ruleItem);
       }
       if (plan.unrecognizedTransferEnabled && plan.unrecognizedDirectory) {

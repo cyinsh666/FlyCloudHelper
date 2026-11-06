@@ -192,11 +192,14 @@ export class VideoIdentityResolver {
       if (!first) { decisions.push({ workKey: item.workKey, status: "pending", reason: "no_usable_title", candidate: null, candidates: [] }); continue; }
       const candidates = new Map<number, TmdbVideoSearchCandidate>();
       const steps = [{ title: first.title, year: item.year }];
-      // 首轮无可靠结论时，优先用独立年份前的原文件标题补查，避免继续带上发行组残留。
-      const second = item.titles.find((evidence) => evidence.source === "file_structure"
-        && compareVideoTitle(evidence.title) !== compareVideoTitle(first.title))
-        ?? item.titles.find((evidence) => evidence.source === "directory_structure"
-          && compareVideoTitle(evidence.title) !== compareVideoTitle(first.title)) ?? item.titles[1];
+      // 剧集补查只使用目录或 NFO 证据；电影仍可使用原文件中的独立标题。
+      const second = item.mediaType === "tv"
+        ? item.titles.find((evidence) => ["directory_structure", "path_structure", "nfo"].includes(evidence.source)
+          && compareVideoTitle(evidence.title) !== compareVideoTitle(first.title))
+        : item.titles.find((evidence) => evidence.source === "file_structure"
+          && compareVideoTitle(evidence.title) !== compareVideoTitle(first.title))
+          ?? item.titles.find((evidence) => evidence.source === "directory_structure"
+            && compareVideoTitle(evidence.title) !== compareVideoTitle(first.title)) ?? item.titles[1];
       if (second) steps.push({ title: second.title, year: second.source === "directory_structure" ? second.year ?? null : null });
       else if (item.year) steps.push({ title: first.title, year: null });
       let decision = decide(item, []);

@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { PageHeader, PrimaryButton } from "@/components/ConsoleShell";
 import { ProviderSelectionIcon } from "@/components/ServiceCreateSelection";
 import { Panel } from "@/components/ui-kit";
@@ -29,6 +29,22 @@ function ServiceSubscriptions({ service, items, onRemoved }: {
   const [checking, setChecking] = useState(false);
   const [removing, setRemoving] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // 关键变量：仅当前服务有未完成转存时轮询页面记录，隐藏标签页不发请求。
+  const hasPendingTransfer = activity.data?.items.some((item) => item.status === "pending" || item.status === "running") ?? false;
+  useEffect(() => {
+    if (!hasPendingTransfer) return;
+    /** 页面可见时更新待处理任务，不重新执行频道查找。 */
+    function refreshVisible(): void {
+      if (document.visibilityState === "visible") void activity.refresh();
+    }
+    const timer = window.setInterval(refreshVisible, 30_000);
+    document.addEventListener("visibilitychange", refreshVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshVisible);
+    };
+  }, [activity.refresh, hasPendingTransfer]);
 
   /** 只对当前服务执行一次订阅查找，完成后刷新当前服务的执行记录。 */
   async function checkNow(): Promise<void> {

@@ -2,6 +2,7 @@ import { load } from "cheerio";
 import type { FlyCloudHelperDatabase } from "../database.js";
 import { ApiError } from "../errors.js";
 import { publicSiteNames, searchPublicSite } from "./public-sites.js";
+import { parseMagnetUrl, resourceResultKey } from "./magnet.js";
 
 /** 可由页面维护的公开频道或代码内置搜索站。 */
 export interface SearchSource {
@@ -10,7 +11,7 @@ export interface SearchSource {
   enabled: boolean;
 }
 
-/** 网盘分享搜索的统一候选结果；后续网站适配器也返回此结构。 */
+/** 网盘分享与磁力搜索的统一候选结果。 */
 export interface ShareSearchResult {
   title: string;
   shareUrl: string;
@@ -145,8 +146,10 @@ const defaultChannels = [
   "rbzhwpzy",
   "Panzi88com",
 ];
-// 关键变量：正文中的候选 URL 与网页锚点一起处理，只有下方列出的网盘分享域名才会进入结果。
+// 关键变量：网页链接只收录已支持的网盘域名，磁力则单独校验 BTIH。
 const shareLinkPattern = /https?:\/\/[^\s<>"'，。；;、）)]+/giu;
+// 关键变量：Telegram 正文中的磁力可能不在锚点里，按文本提取后再交给统一解析器校验。
+const magnetLinkPattern = /magnet:\?[^\s<>"'，。；;、）)]+/giu;
 const sourceSettingKey = "resource_search_sources_v2";
 const serviceChannelsSettingPrefix = "resource_search_service_channels:";
 const legacySourceSettingKey = "resource_search_sources";
@@ -203,11 +206,14 @@ export function parseQuarkShareUrl(input: string): { shareId: string; code: stri
   } catch { return null; }
 }
 
-/** 从消息链接和正文收集各网盘分享，同一消息中的相同链接只保留一次。 */
+/** 从消息链接和正文收集网盘分享与磁力，同一消息中的相同资源只保留一次。 */
 function extractShareUrls(text: string, hrefs: string[]): Array<{ cloudType: string; url: string }> {
-  const values = [...hrefs, ...(text.match(shareLinkPattern) ?? [])];
-  const links = values.map(parseCloudShareUrl).filter((value): value is { cloudType: string; url: string } => Boolean(value));
-  return [...new Map(links.map((link) => [link.url, link])).values()];
+  const values = [...hrefs, ...(text.match(shareLinkPattern) ?? []), ...(text.match(magnetLinkPattern) ?? [])];
+  const links = values.map((value) => {
+    const magnet = parseMagnetUrl(value);
+    return magnet ? { cloudType: "magnet", url: magnet.url } : parseCloudShareUrl(value);
+  }).filter((value): value is { cloudType: string; url: string } => Boolean(value));
+  return [...new Map(links.map((link) => [resourceResultKey(link.cloudType, link.url), link])).values()];
 }
 
 /** Telegram 搜索页可能混入无关消息；按消息正文再次核对用户输入的关键词。 */
@@ -220,7 +226,7 @@ function messageMatchesKeyword(messageText: string, keyword: string): boolean {
 
 /** 跳过频道分类、日期和资源说明，只从正文中选择作品标题。 */
 function isTitleLine(line: string): boolean {
-  if (!line || line === "." || line.startsWith("http") || /^#[^\s]+$/u.test(line)) return false;
+  if (!line || line === "." || line.startsWith("http") || line.startsWith("magnet:") || /^#[^\s]+$/u.test(line)) return false;
   const text = line.replace(/^[^\p{L}\p{N}]+/gu, "");
   if (/^\d{1,4}(?:年|[-/.])\d{1,2}/u.test(text)) return false;
   if (/^(?:夸克|百度|阿里|光鸭|迅雷|天翼|UC|115|123|PikPak|移动)(?:网盘|云盘)?\s*[:：]?$/iu.test(text)) return false;
@@ -240,7 +246,7 @@ function linkWorkTitle(lines: string[], shareUrl: string, fallbackTitle: string)
   const lineIndex = lines.findIndex((line) => extractShareUrls(line, []).some((link) => link.url === shareUrl));
   if (lineIndex < 0) return { title: fallbackTitle, matched: false };
   const line = lines[lineIndex]!;
-  const urlIndex = line.search(/https?:\/\//iu);
+  const urlIndex = line.search(/https?:\/\/|magnet:\?/iu);
   const beforeUrl = urlIndex < 0 ? "" : line.slice(0, urlIndex).trim();
   const sameLineTitle = beforeUrl.includes("丨") ? beforeUrl.split("丨")[0]?.trim() ?? "" : beforeUrl;
   if (sameLineTitle && isTitleLine(sameLineTitle)) {
@@ -297,7 +303,7 @@ class TelegramSearchAdapter implements SearchAdapter {
       textBody.find("a[href]").each((_linkIndex, anchor) => {
         const link = $(anchor);
         const href = link.attr("href") ?? "";
-        if (parseCloudShareUrl(href) && !link.text().includes(href)) link.text(`${link.text()} ${href}`);
+        if ((parseCloudShareUrl(href) || parseMagnetUrl(href)) && !link.text().includes(href)) link.text(`${link.text()} ${href}`);
       });
       textBody.find("br").replaceWith("\n");
       const messageText = textBody.text().trim();
@@ -371,7 +377,7 @@ export async function readTelegramChannelPage(channel: string, before?: number):
     textBody.find("a[href]").each((_linkIndex, anchor) => {
       const link = $(anchor);
       const href = link.attr("href") ?? "";
-      if (parseCloudShareUrl(href) && !link.text().includes(href)) link.text(`${link.text()} ${href}`);
+      if ((parseCloudShareUrl(href) || parseMagnetUrl(href)) && !link.text().includes(href)) link.text(`${link.text()} ${href}`);
     });
     textBody.find("br").replaceWith("\n");
     const messageText = textBody.text().trim();
@@ -414,7 +420,8 @@ class PublicSiteSearchAdapter implements SearchAdapter {
     const candidates = await searchPublicSite(source.key, keyword);
     const results: ShareSearchResult[] = [];
     for (const candidate of candidates) {
-      const share = parseCloudShareUrl(candidate.shareUrl);
+      const magnet = parseMagnetUrl(candidate.shareUrl);
+      const share = magnet ? { cloudType: "magnet", url: magnet.url } : parseCloudShareUrl(candidate.shareUrl);
       if (!share || !messageMatchesKeyword(candidate.title, keyword)) continue;
       results.push({ title: candidate.title.slice(0, 180), shareUrl: share.url, cloudType: share.cloudType,
         password: candidate.password, source: `站点 / ${publicSiteNames[source.key]}`,
@@ -521,7 +528,7 @@ export class ResourceSearchEngine {
 
   /** 原子保存全局频道配置并增加修订号。 */
   public async saveSources(sources: SearchSource[], actorUserId: string): Promise<SearchSource[]> {
-    if (!Array.isArray(sources) || sources.length > 150 || sources.some((source) => !source
+    if (!Array.isArray(sources) || sources.length > 160 || sources.some((source) => !source
       || typeof source.kind !== "string" || typeof source.key !== "string" || typeof source.enabled !== "boolean"
       || !adapters.get(source.kind)?.validateSource(source))
       || new Set(sources.map((source) => `${source.kind}:${source.key.toLowerCase()}`)).size !== sources.length) {
@@ -566,7 +573,7 @@ export class ResourceSearchEngine {
         return;
       }
       for (const item of outcome.value) {
-        const key = `${item.cloudType}:${item.shareUrl}`;
+        const key = resourceResultKey(item.cloudType, item.shareUrl);
         const existing = items.get(key);
         if (!existing || (item.postedAt ?? "") > (existing.postedAt ?? "")) items.set(key, item);
       }

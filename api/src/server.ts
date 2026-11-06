@@ -97,6 +97,15 @@ function isCredentialBackupAllowedPath(url: string): boolean {
   ]).has(pathname);
 }
 
+/** 识别 Jellyfin 和 Emby 的取消收藏接口，兼容客户端发送的空 JSON DELETE 请求。 */
+function isProtocolFavoriteDelete(method: string, url: string): boolean {
+  if (method !== "DELETE") {
+    return false;
+  }
+  const pathname = url.split("?", 1)[0] ?? url;
+  return /^\/(?:j|e)\/[^/]+\/(?:emby\/)?(?:Users\/[^/]+\/FavoriteItems|UserFavoriteItems)\/[^/]+\/?$/i.test(pathname);
+}
+
 /** 记录不包含凭据、Key、数据库地址和完整媒体路径的中文业务日志。 */
 function createBusinessLogger(server: FastifyInstance) {
   return (
@@ -170,6 +179,21 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
       config.pluginMaxBytes + 1024 * 1024,
     ),
   });
+  server.addHook("onRequest", (request, _reply, done) => {
+    if (isProtocolFavoriteDelete(request.method, request.url)) {
+      // 关键变量：无请求体但带 JSON 类型的 DELETE 会在 Fastify 5 中被提前拒绝。
+      const headers = request.raw.headers;
+      const contentType = headers["content-type"];
+      const contentLength = headers["content-length"];
+      if (typeof contentType === "string"
+        && contentType.split(";", 1)[0]?.trim().toLowerCase() === "application/json"
+        && (contentLength === undefined || contentLength === "0")
+        && headers["transfer-encoding"] === undefined) {
+        delete headers["content-type"];
+      }
+    }
+    done();
+  });
   const database = new FlyCloudHelperDatabase(config, (level, fields) => {
     server.log[level](fields);
   });
@@ -188,7 +212,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     config.recommendationUpstreamUrl, logger);
   await recommendations.start();
   const providers = new ProviderRegistry(config, (fields) => logger("warn", fields));
-  const telegramNotifications = new TelegramNotificationService(database, vault, logger);
+  const imageCache = new ProtocolImageCache(config.imageCacheDirectory);
+  const telegramNotifications = new TelegramNotificationService(database, vault, logger, imageCache);
   database.setNotificationDeliveryHandler((notification) => telegramNotifications.enqueue(notification));
   const serviceAccess = new ServiceAccessService(database, vault);
   const embyAccess = new EmbyAccessService(database);
@@ -214,7 +239,6 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     });
   }
   const tmdbCache = new TmdbMetadataCache(database, logger);
-  const imageCache = new ProtocolImageCache(config.imageCacheDirectory);
   const protocolCollage = new ProtocolCollageService(path.join(path.dirname(config.imageCacheDirectory), "protocol-collage"), imageCache);
   const tmdbBaseUrls = await loadTmdbBaseUrls(database); // 关键变量：启动时一次读取当前 TMDB API 与图片地址。
   const tmdb = new TmdbKeyPool(

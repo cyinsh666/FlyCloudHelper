@@ -1,9 +1,8 @@
-import { Link } from "@tanstack/react-router";
 import { FolderOutput, Pause, Play, Square } from "lucide-react";
 import { useEffect, useState } from "react";
 import { SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, ProgressMeter, StatusPill, type StatusTone } from "@/components/ui-kit";
-import { controlServiceOrganizeJob, listOrganizeTasks, type OrganizeTaskSummary } from "@/lib/api";
+import { controlServiceOrganizeJob, getServiceOrganizeTaskStats, listOrganizeTasks, type OrganizeTaskSummary } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
 
 const PAGE_SIZE = 8;
@@ -26,13 +25,47 @@ function taskPercent(task: OrganizeTaskSummary): string {
   return `${Math.min(100, Math.round((task.completedCount + task.failedCount) / task.totalCount * 100))}%`;
 }
 
+/** 本次任务只展示数量汇总，执行进度由任务列表的实时摘要提供。 */
+function OrganizeTaskStatsPanel({ task, admin }: { task: OrganizeTaskSummary; admin: boolean }) {
+  const resource = useApiResource(() => getServiceOrganizeTaskStats(task.serviceId, task.id,
+    task.status === "preparing", admin), [task.serviceId, task.id, task.status === "preparing", admin]);
+  // 关键变量：预览跳过项不进入执行任务，剩余数只按可整理条目计算。
+  const remainingCount = task.totalCount === null ? null
+    : Math.max(0, task.totalCount - task.completedCount - task.failedCount);
+  const counts = resource.data ? [
+    { label: "扫描目录", value: resource.data.directoryCount },
+    { label: "识别条目", value: resource.data.itemCount },
+    { label: "可整理", value: resource.data.readyCount },
+    { label: "预览跳过", value: resource.data.skippedCount },
+    { label: "预计覆盖", value: resource.data.overwriteCount },
+    { label: "已完成", value: task.completedCount },
+    { label: "失败", value: task.failedCount },
+    { label: "剩余", value: remainingCount },
+  ] : [];
+  return <div className="rounded-xl border border-border bg-secondary/20 p-3">
+    <div className="flex items-center justify-between gap-2">
+      <p className="text-sm font-medium">本次整理统计</p>
+      <button type="button" onClick={() => void resource.refresh()} disabled={resource.loading}
+        className="text-xs text-muted-foreground underline disabled:opacity-50">刷新统计</button>
+    </div>
+    {resource.error && <p role="alert" className="mt-2 text-xs text-destructive">{resource.error}</p>}
+    {resource.loading && !resource.data && <div aria-label="整理统计加载中" className="mt-3 h-20 animate-pulse rounded bg-muted" />}
+    {resource.data && <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+      {counts.map((count) => <div key={count.label} className="rounded-lg border border-border bg-background/40 p-2.5">
+        <p className="text-xs text-muted-foreground">{count.label}</p>
+        <p className="mt-1 text-lg font-semibold">{count.value === null ? "识别中" : count.value.toLocaleString()}</p>
+      </div>)}
+    </div>}
+  </div>;
+}
+
 /** 与扫描记录共用任务列表时展示整理任务的操作和进度。 */
 export function OrganizeTaskDetail({ task, admin, onRefresh }: {
   task: OrganizeTaskSummary; admin: boolean; onRefresh: () => Promise<unknown>;
 }) {
   const [operation, setOperation] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
-  const detailPath = admin ? "/admin/services/$serviceId/organize" : "/app/services/$serviceId/organize";
+  const [detailsOpen, setDetailsOpen] = useState(false);
 
   /** 整理任务控制完成后刷新同一个任务列表。 */
   async function control(action: "pause" | "resume" | "cancel"): Promise<void> {
@@ -63,12 +96,15 @@ export function OrganizeTaskDetail({ task, admin, onRefresh }: {
         <p className="mt-2 text-xs text-muted-foreground">已自动继续 3 次，请检查失败原因后手动继续或取消。</p>}
       <p className="mt-3 text-xs text-muted-foreground">创建时间：{new Date(task.createdAt).toLocaleString("zh-CN")}</p>
       <div className="mt-4 flex flex-wrap gap-2">
-        <Link to={detailPath} params={{ serviceId: task.serviceId }}><SecondaryButton>查看整理详情</SecondaryButton></Link>
+        <SecondaryButton aria-expanded={detailsOpen} onClick={() => setDetailsOpen((open) => !open)}>
+          {detailsOpen ? "收起整理详情" : "查看整理详情"}
+        </SecondaryButton>
         {["queued", "running"].includes(task.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control("pause")}><Pause className="size-4" />暂停</SecondaryButton>}
         {["paused", "failed"].includes(task.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control("resume")}><Play className="size-4" />继续</SecondaryButton>}
         {["queued", "running", "paused", "failed"].includes(task.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control("cancel")}><Square className="size-4" />取消</SecondaryButton>}
       </div>
     </div>
+    {detailsOpen && <div className="mt-4"><OrganizeTaskStatsPanel key={task.id} task={task} admin={admin} /></div>}
   </Panel>;
 }
 
@@ -94,6 +130,7 @@ export function OrganizeTasksPanel({ admin, statusFilter }: { admin: boolean; st
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [operation, setOperation] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [detailsTaskId, setDetailsTaskId] = useState<string | null>(null);
   const resource = useApiResource(() => listOrganizeTasks(admin, {
     status: statusFilter, limit: PAGE_SIZE, offset,
   }), [admin, statusFilter, offset]);
@@ -132,7 +169,6 @@ export function OrganizeTasksPanel({ admin, statusFilter }: { admin: boolean; st
 
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const currentPage = Math.floor(offset / PAGE_SIZE) + 1;
-  const detailPath = admin ? "/admin/services/$serviceId/organize" : "/app/services/$serviceId/organize";
   return <Panel title="影片整理任务" description="识别阶段显示进行中状态；执行阶段按已处理条目和总条目计算进度。">
     {message && <p role="alert" className="mb-3 text-sm text-destructive">{message}</p>}
     {resource.error && <p role="alert" className="mb-3 text-sm text-destructive">{resource.error}</p>}
@@ -170,11 +206,16 @@ export function OrganizeTasksPanel({ admin, statusFilter }: { admin: boolean; st
             <p className="mt-2 text-xs text-muted-foreground">已自动继续 3 次，请检查失败原因后手动继续或取消。</p>}
           <p className="mt-3 text-xs text-muted-foreground">创建时间：{new Date(selected.createdAt).toLocaleString("zh-CN")}</p>
           <div className="mt-4 flex flex-wrap gap-2">
-            <Link to={detailPath} params={{ serviceId: selected.serviceId }}><SecondaryButton>查看整理详情</SecondaryButton></Link>
+            <SecondaryButton aria-expanded={detailsTaskId === selected.id}
+              onClick={() => setDetailsTaskId((id) => id === selected.id ? null : selected.id)}>
+              {detailsTaskId === selected.id ? "收起整理详情" : "查看整理详情"}
+            </SecondaryButton>
             {["queued", "running"].includes(selected.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control(selected, "pause")}><Pause className="size-4" />暂停</SecondaryButton>}
             {["paused", "failed"].includes(selected.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control(selected, "resume")}><Play className="size-4" />继续</SecondaryButton>}
             {["queued", "running", "paused", "failed"].includes(selected.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control(selected, "cancel")}><Square className="size-4" />取消</SecondaryButton>}
           </div>
+          {detailsTaskId === selected.id && <div className="mt-4"><OrganizeTaskStatsPanel key={selected.id}
+            task={selected} admin={admin} /></div>}
         </div>}
       </div>}
     {total > PAGE_SIZE && <div className="mt-4 flex items-center justify-center gap-3 border-t border-border/70 pt-3">

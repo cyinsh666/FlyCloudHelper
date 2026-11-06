@@ -20,7 +20,7 @@ export interface FlymbyParsedVideoName {
   baseName: string;
   title: string;
   query: string;
-  /** 目录查询无候选时，从原始文件名提取的第二查询词。 */
+  /** 电影目录查询无候选时，从原始文件名提取的第二查询词。 */
   fallbackQuery: string;
   /** 本次媒体类型和标题的主要识别依据，仅供诊断日志使用。 */
   recognitionReason: string;
@@ -107,7 +107,7 @@ function recognizeEntry(entry: ProviderEntry, rootPath: string, directoryContext
   const sourceParsed = WebdavVideoNameParser.parse(entry.name, entry.path);
   let fallbackQuery = mediaType === "movie"
     ? WebdavMediaMovieEvidence.buildFirstMoviePartFallback(rootPath, file.parentPath, query) : "";
-  if (!fallbackQuery) {
+  if (!fallbackQuery && mediaType === "movie") {
     const candidate = WebdavVideoTitleCleaner.cleanTitle(stripTmdbId(sourceParsed.query || sourceParsed.title));
     if (candidate && !WebdavVideoTitleCleaner.isGenericBucketTitle(candidate)
       && (!WebdavVideoNameParser.isWeakScrapeTitle(candidate) || hasNumericMovieTitleEvidence(entry.name, candidate))) fallbackQuery = candidate;

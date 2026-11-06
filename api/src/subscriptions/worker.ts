@@ -3,13 +3,15 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { ApiError } from "../errors.js";
 import { ResourceSearchEngine, readTelegramChannelPage, type TelegramChannelMessage } from "../resource-search/engine.js";
-import { readShareTransferStatus, submitShareTransfer } from "../resource-search/share-transfer.js";
+import { readShareTransferStatus, submitShareTransfer, type ShareTransferStatus } from "../resource-search/share-transfer.js";
 import { getServiceTransferDirectory } from "../resource-search/transfer-directory.js";
 import type { ApiRuntime } from "../runtime.js";
 import { matchSubscription } from "./matching.js";
 import { listStoredSubscriptions, type MovieSubscription } from "./store.js";
 
 const subscriptionPollMs = 10 * 60_000;
+// 关键变量：已提交的网盘转存任务每 30 秒查询一次，频道查找仍按独立周期执行。
+const transferStatusPollMs = 30_000;
 const feedPageLimit = 40;
 
 interface ChannelCursor { activatedAt: string; lastMessageId: number }
@@ -46,6 +48,12 @@ function postedAfter(postedAt: string | null, sinceAt: string): boolean {
   return Number.isFinite(posted) && Number.isFinite(since) && posted > since;
 }
 
+/** 按北京时间确定转存当天，避免服务器时区不同导致同一链接跨频道重复提交。 */
+function transferDay(createdAt: string): string {
+  const timestamp = Date.parse(createdAt);
+  return Number.isFinite(timestamp) ? new Date(timestamp + 8 * 60 * 60_000).toISOString().slice(0, 10) : "";
+}
+
 /** 订阅状态按服务单独保存在已有 data/exports 下，不修改数据库结构。 */
 export class MovieSubscriptionWorker {
   private readonly directory: string;
@@ -60,7 +68,7 @@ export class MovieSubscriptionWorker {
     this.engine = new ResourceSearchEngine(runtime.database);
   }
 
-  /** 启动后先检查一次，随后每分钟检查哪些服务到了十分钟巡检时间。 */
+  /** 启动后先检查一次，随后每 30 秒检查网盘任务状态和频道查找时间。 */
   public start(): void { this.stopping = false; this.schedule(1000); }
 
   /** 停止接收新巡检并等当前持久写入结束。 */
@@ -168,7 +176,7 @@ export class MovieSubscriptionWorker {
     if (this.stopping) return;
     this.timer = setTimeout(() => {
       this.activeTick = this.tick().catch((error) => this.logFailure("订阅巡检入口失败", "", error))
-        .finally(() => { this.activeTick = null; this.schedule(60_000); });
+        .finally(() => { this.activeTick = null; this.schedule(transferStatusPollMs); });
     }, delayMs);
   }
 
@@ -186,7 +194,14 @@ export class MovieSubscriptionWorker {
       try {
         await this.serial(serviceId, async () => {
           const state = await this.readState(serviceId);
-          if (state.nextRunAt > new Date().toISOString()) return;
+          // 频道仍每十分钟查找一次；等待中的网盘任务在每 30 秒巡检时单独更新状态。
+          if (state.nextRunAt > new Date().toISOString()) {
+            if (state.activities.some((activity) => activity.taskId
+              && (activity.status === "pending" || activity.status === "running"))) {
+              await this.refreshTasks(state);
+            }
+            return;
+          }
           await this.runService(state, items);
         });
       } catch (error) { this.logFailure("服务订阅巡检失败", serviceId, error); }
@@ -281,6 +296,9 @@ export class MovieSubscriptionWorker {
     const messages = await this.newerMessages(channel, cursor);
     // 关键变量：本频道的一次巡检使用内存集合查重，避免随着历史记录增长反复扫描整个数组。
     const seenActivities = new Set(state.activities.map((item) => item.id));
+    // 关键变量：已有提交记录的日期与链接指纹，同服务跨频道、跨消息当天只提交一次。
+    const submittedLinksByDay = new Set(state.activities.filter((item) => item.status !== "skipped")
+      .map((item) => `${transferDay(item.createdAt)}:${item.id.slice(item.id.lastIndexOf(":") + 1)}`));
     for (const message of messages) {
       if (this.stopping) break;
       if (!message.postedAt || !Number.isFinite(Date.parse(message.postedAt))) {
@@ -308,16 +326,20 @@ export class MovieSubscriptionWorker {
           const activityId = `${message.channelId}:${message.messageId}:${digest}`;
           if (seenActivities.has(activityId)) continue;
           const now = new Date().toISOString();
+          const linkDayKey = `${transferDay(now)}:${digest}`;
+          const alreadySubmittedToday = Boolean(matched.subscription && submittedLinksByDay.has(linkDayKey));
           const activity: SubscriptionActivity = { id: activityId, channel, channelId: message.channelId, messageId: message.messageId,
             messageUrl: `https://t.me/${channel}/${message.messageId}`, title: share.title,
             mediaType: matched.subscription?.mediaType ?? null, tmdbId: matched.subscription?.tmdbId ?? null,
-            status: matched.subscription ? "submitting" : "skipped", reason: matched.reason,
+            status: matched.subscription && !alreadySubmittedToday ? "submitting" : "skipped",
+            reason: alreadySubmittedToday ? "今天已提交相同分享链接，跳过重复转存" : matched.reason,
             taskId: null, createdAt: now, updatedAt: now };
           state.activities.push(activity);
           seenActivities.add(activityId);
           // 提交前先落盘；中途退出时保留待核实状态，不自动重发远端写请求。
           await this.saveState(state);
-          if (!matched.subscription) continue;
+          if (!matched.subscription || alreadySubmittedToday) continue;
+          submittedLinksByDay.add(linkDayKey);
           try {
             const submitted = await submitShareTransfer(this.runtime, { serviceId: state.serviceId,
               shareUrl: share.shareUrl, password: share.password, actorUserId: ownerId, ownerId });
@@ -341,13 +363,27 @@ export class MovieSubscriptionWorker {
 
   /** 已取得任务 ID 的分享只查询状态，失败也不直接重新提交。 */
   private async refreshTasks(state: ServiceSubscriptionState): Promise<void> {
+    // 关键变量：多个频道消息可能返回同一个网盘任务编号，本轮只向网盘查询一次。
+    const checkedTasks = new Map<string, ShareTransferStatus | null>();
     for (const activity of state.activities) {
       if (!activity.taskId || (activity.status !== "pending" && activity.status !== "running")) continue;
       try {
-        activity.status = await readShareTransferStatus(this.runtime, state.serviceId, activity.taskId);
+        let status = checkedTasks.get(activity.taskId);
+        if (status === undefined) {
+          status = await readShareTransferStatus(this.runtime, state.serviceId, activity.taskId);
+          checkedTasks.set(activity.taskId, status);
+        }
+        if (status === null) continue;
+        if (status === activity.status) continue;
+        activity.status = status;
         activity.updatedAt = new Date().toISOString();
         await this.saveState(state);
-      } catch (error) { this.logFailure("订阅转存状态查询失败", state.serviceId, error, activity.channel); }
+      } catch (error) {
+        if (!checkedTasks.has(activity.taskId)) {
+          checkedTasks.set(activity.taskId, null);
+          this.logFailure("订阅转存状态查询失败", state.serviceId, error, activity.channel);
+        }
+      }
     }
   }
 

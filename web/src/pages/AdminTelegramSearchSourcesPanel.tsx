@@ -8,6 +8,7 @@ import { getResourceSearchSources, saveResourceSearchSources, type ResourceSearc
 const publicSiteLabels: Record<string, string> = {
   pansearch: "PanSearch", quarkres: "热门夸克资源", quark4k: "Quark4K", haitunsou: "海豚搜",
   kdocs_guangya_didida: "光鸭滴滴嗒", kdocs_mobile_didida: "移动滴滴嗒",
+  clmao: "磁力猫",
 };
 
 /** 系统设置中的公开 Telegram 搜索频道管理。 */
@@ -53,6 +54,7 @@ export function AdminTelegramSearchSourcesPanel() {
     setMessage(null);
     setError(null);
   }
+
 
   /** 保存完整全局配置，搜索请求从下一次开始读取新频道列表。 */
   async function saveSources(): Promise<void> {

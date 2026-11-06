@@ -85,6 +85,23 @@ export async function notifyFinishedLibraryScanJob(runtime: ApiRuntime, parentJo
   const hasFailure = parentJob.failedSourceCount > 0;
   const hasErrors = parentJob.errorCount > 0;
   const wasCancelled = parentJob.status === "cancelled" || parentJob.cancelledSourceCount > 0;
+  let imageUrl: string | null = null;
+  if (notificationEnabled) {
+    try {
+      // 关键变量：父任务开始时间可能晚于首个来源，使用最早的来源时间选本次扫描背景图。
+      const startedAt = parentJob.sourceJobs.map((sourceJob) => sourceJob.startedAt)
+        .filter((value): value is string => Boolean(value)).sort()[0] ?? parentJob.startedAt;
+      imageUrl = await runtime.repository.getScanNotificationBackdropUrl(
+        parentJob.libraryId, startedAt, createdMediaCounts.videoContents);
+    } catch (error) {
+      runtime.logBusinessEvent("warn", {
+        日志关键字: "codex-flycloud-helper-service-notification",
+        事件: "请求线程读取扫描通知背景图失败",
+        媒体库ID: parentJob.libraryId,
+        错误信息: error instanceof Error ? error.message : "未知数据库错误",
+      });
+    }
+  }
   await runtime.database.createNotificationSafely({
     userId,
     notificationEvent: "scan_completed",
@@ -94,6 +111,7 @@ export async function notifyFinishedLibraryScanJob(runtime: ApiRuntime, parentJo
     message: buildAggregateScanCompletionMessage(parentJob, createdMediaCounts),
     actionPath: "/app/jobs",
     deliverExternally: notificationEnabled,
+    imageUrl,
   });
   runtime.logBusinessEvent("info", {
     日志关键字: "codex-library-scan-parent",

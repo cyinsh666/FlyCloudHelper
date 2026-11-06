@@ -330,7 +330,7 @@ export interface MovieSubscriptionActivity {
   status: "skipped" | "submitting" | "pending" | "running" | "completed" | "failed" | "needs_review";
   reason: string | null; taskId: string | null; createdAt: string; updatedAt: string;
 }
-/** 各网盘分享的统一搜索结果；目前仅光鸭支持站内转存。 */
+/** 网盘分享与磁力统一搜索结果；磁力可提交到光鸭云添加。 */
 export interface ResourceSearchItem {
   title: string; shareUrl: string; cloudType: string; password: string; source: string; sourceKind: string; sourceName: string;
   postedAt: string | null; messageUrl: string;
@@ -450,6 +450,18 @@ export function transferResource(input: { shareUrl: string; password: string; se
 export function getResourceTransferStatus(serviceId: string, taskId: string, admin = false):
   Promise<{ status: "pending" | "running" | "completed" | "failed" }> {
   return requestJson(`${resourceSearchPath(admin)}/transfer-tasks/${encodeURIComponent(taskId)}?serviceId=${encodeURIComponent(serviceId)}`);
+}
+
+/** 将磁力提交到已有光鸭服务的独立转存目录。 */
+export function offlineTransferResource(input: { magnetUrl: string; serviceId: string }, admin = false):
+  Promise<{ taskId: string; fileCount: number }> {
+  return requestJson(`${resourceSearchPath(admin)}/offline-transfer`, { method: "POST", body: JSON.stringify(input) });
+}
+
+/** 查询光鸭磁力云添加任务的进度。 */
+export function getOfflineTransferStatus(serviceId: string, taskId: string, admin = false):
+  Promise<{ status: "pending" | "running" | "completed" | "partial" | "failed"; progress: number }> {
+  return requestJson(`${resourceSearchPath(admin)}/offline-tasks/${encodeURIComponent(taskId)}?serviceId=${encodeURIComponent(serviceId)}`);
 }
 export type ScanScheduleType = "interval" | "daily" | "weekly" | "monthly";
 
@@ -1138,6 +1150,15 @@ export interface OrganizeJob {
   createdAt: string;
 }
 
+/** 本次整理预览与执行的数量汇总。 */
+export interface OrganizeTaskStats {
+  directoryCount: number;
+  itemCount: number;
+  readyCount: number;
+  skippedCount: number;
+  overwriteCount: number;
+}
+
 /** 后台任务页中的整理任务摘要；识别阶段尚无可计算的文件总数。 */
 export interface OrganizeTaskSummary {
   id: string;
@@ -1564,6 +1585,13 @@ export async function runServiceOrganizeNow(serviceId: string, admin = false): P
 export async function getServiceOrganizeJob(serviceId: string, jobId: string, admin = false): Promise<OrganizeJob> {
   const result = await requestJson<{ job: OrganizeJob }>(`${admin ? "/api/v1/admin" : "/api/v1"}/services/${serviceId}/organize/jobs/${jobId}`);
   return result.job;
+}
+
+/** 只读取指定整理任务的数量汇总，不传文件级列表。 */
+export function getServiceOrganizeTaskStats(serviceId: string, taskId: string, preparing = false,
+  admin = false): Promise<OrganizeTaskStats> {
+  return requestJson<OrganizeTaskStats>(
+    `${admin ? "/api/v1/admin" : "/api/v1"}/services/${serviceId}/organize/tasks/${taskId}/summary?preparing=${preparing}`);
 }
 
 /** 在文件边界暂停、继续或取消整理任务。 */

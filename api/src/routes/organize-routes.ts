@@ -113,6 +113,19 @@ export async function registerOrganizeRoutes(server: FastifyInstance, runtime: A
     });
     server.get<{ Params: { serviceId: string; jobId: string } }>(`${prefix}/:serviceId/organize/jobs/:jobId`, async (request) =>
       ({ job: jobSummary(await manager.getJob(request.params.serviceId, request.params.jobId, await actorId(request))) }));
+    /** 只汇总本次整理的数量，不向任务页传送文件路径和文件级流水。 */
+    server.get<{ Params: { serviceId: string; taskId: string }; Querystring: { preparing?: string } }>(
+      `${prefix}/:serviceId/organize/tasks/:taskId/summary`, async (request) => {
+        const ownerId = await actorId(request);
+        const planId = request.query.preparing === "true" ? request.params.taskId
+          : (await manager.getJob(request.params.serviceId, request.params.taskId, ownerId)).planId;
+        const plan = await manager.getPlan(request.params.serviceId, planId, ownerId);
+        // 关键变量：预览中被跳过的条目不进入执行任务，总项数与可整理数分别统计。
+        const readyCount = plan.items.filter((item) => item.status === "ready").length;
+        return { directoryCount: plan.scannedDirectories.length, itemCount: plan.items.length,
+          readyCount, skippedCount: plan.items.length - readyCount,
+          overwriteCount: plan.items.filter((item) => item.status === "ready" && item.willOverwrite).length };
+      });
     server.post<{ Params: { serviceId: string; jobId: string }; Body: { action: "pause" | "resume" | "cancel" } }>(
       `${prefix}/:serviceId/organize/jobs/:jobId/control`, async (request) => {
         const action = request.body?.action;

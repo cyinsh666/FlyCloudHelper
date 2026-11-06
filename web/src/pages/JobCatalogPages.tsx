@@ -797,7 +797,8 @@ function JobsView({ admin }: { admin: boolean }) {
         <div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "当前筛选条件下没有任务"}</div>
       </Panel> : (
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
-          {activeOrganizeTask && <OrganizeTaskDetail task={activeOrganizeTask} admin={admin} onRefresh={resource.refresh} />}
+          {activeOrganizeTask && <OrganizeTaskDetail key={activeOrganizeTask.id} task={activeOrganizeTask}
+            admin={admin} onRefresh={resource.refresh} />}
           {activeJob && <>
           <Panel className="p-4 sm:p-4 xl:h-[calc(100vh-14rem)] xl:min-h-[560px] xl:max-h-[720px] xl:overflow-y-auto" title="任务详情" description={`${activeJob.serviceName} · ${getBackgroundJobLabel(activeJob)}${admin ? ` · ${activeJob.ownerUsername}` : ""} · 任务 ${activeJob.id.slice(0, 8)}`}>
             <div className="rounded-xl border border-primary/25 bg-primary/8 p-4">

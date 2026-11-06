@@ -1,8 +1,9 @@
 import { parseExpressionAt } from "acorn";
 import { load } from "cheerio";
 import { getOutboundBrowserProxy } from "../network-proxy.js";
+import { searchClmao } from "./clmao-search.js";
 
-/** 公开搜索站返回的统一网盘分享结果。 */
+/** 公开搜索站返回的网盘分享或磁力结果。 */
 export interface PublicSiteResult {
   title: string;
   shareUrl: string;
@@ -19,6 +20,7 @@ export const publicSiteNames: Record<string, string> = {
   haitunsou: "海豚搜",
   kdocs_guangya_didida: "光鸭滴滴嗒",
   kdocs_mobile_didida: "移动滴滴嗒",
+  clmao: "磁力猫",
 };
 
 // 关键变量：每个上游请求限制 12 秒和 3 MiB，避免慢站点或异常页面占住搜索请求。
@@ -342,6 +344,7 @@ export async function searchPublicSite(key: string, keyword: string): Promise<Pu
     case "haitunsou": return searchHaitunsou(keyword);
     case "kdocs_guangya_didida": return searchKdocsDocument(key, keyword);
     case "kdocs_mobile_didida": return searchKdocsDocument(key, keyword);
+    case "clmao": return searchClmao(keyword);
     default: throw new Error("不支持的公开搜索站");
   }
 }

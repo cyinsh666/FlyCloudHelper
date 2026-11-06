@@ -6,6 +6,7 @@ import type { ChannelTypeCacheWorker } from "../resource-search/channel-types.js
 import { getServiceTransferDirectory, saveServiceTransferDirectory, verifyServiceTransferDirectory,
   type ServiceTransferDirectory } from "../resource-search/transfer-directory.js";
 import { readShareTransferStatus, submitShareTransfer } from "../resource-search/share-transfer.js";
+import { readGuangyaOfflineTransfer, submitGuangyaOfflineTransfer } from "../resource-search/offline-transfer.js";
 import type { ApiRuntime } from "../runtime.js";
 import type { MovieSubscriptionWorker } from "../subscriptions/worker.js";
 
@@ -134,6 +135,25 @@ export async function registerResourceSearchRoutes(server: FastifyInstance, runt
         const result = await submitShareTransfer(runtime, { serviceId, shareUrl, password,
           actorUserId: userId, ownerId });
         return reply.status(202).send({ taskId: result.taskId, fileCount: result.fileCount });
+      });
+    /** 搜索结果中的磁力由用户确认后提交到光鸭云添加，不经过本机下载。 */
+    server.post<{ Body: { serviceId?: string; magnetUrl?: string } }>(
+      `${prefix}/offline-transfer`, async (request, reply) => {
+        const { ownerId, userId } = await actor(request);
+        const body = request.body ?? {};
+        const serviceId = requireString(body, "serviceId", "光鸭服务", 100);
+        const magnetUrl = requireString(body, "magnetUrl", "磁力链接", 4000);
+        const result = await submitGuangyaOfflineTransfer(runtime, { serviceId, magnetUrl,
+          actorUserId: userId, ownerId });
+        return reply.status(202).send(result);
+      });
+    /** 页面继续查询远端云添加进度，避免用户重复提交同一磁力。 */
+    server.get<{ Params: { taskId: string }; Querystring: { serviceId?: string } }>(
+      `${prefix}/offline-tasks/:taskId`, async (request) => {
+        const { ownerId } = await actor(request);
+        const serviceId = request.query.serviceId ?? "";
+        if (!serviceId) throw validationError("serviceId", "请选择光鸭服务");
+        return readGuangyaOfflineTransfer(runtime, serviceId, request.params.taskId, ownerId);
       });
     server.get<{ Params: { taskId: string }; Querystring: { serviceId?: string } }>(
       `${prefix}/transfer-tasks/:taskId`, async (request) => {
