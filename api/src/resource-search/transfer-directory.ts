@@ -7,6 +7,21 @@ export type ServiceTransferDirectory = Pick<ProviderDirectory, "resourceId" | "d
 
 const transferDirectorySettingPrefix = "resource_transfer_directory:";
 
+/** 服务级订阅命名设置独立保存，清空转存目录不会丢失开关。 */
+export async function getSubscriptionTransferRename(database: FlyCloudHelperDatabase, serviceId: string): Promise<boolean> {
+  const row = await database.query("system_settings").where({ setting_key: `subscription_transfer_rename:${serviceId}` }).first();
+  return row?.setting_value === "true";
+}
+
+/** 只影响后续订阅自动转存，已提交任务使用自己的设置快照。 */
+export async function saveSubscriptionTransferRename(database: FlyCloudHelperDatabase, serviceId: string,
+  userId: string, enabled: boolean): Promise<void> {
+  const now = new Date().toISOString();
+  await database.query("system_settings").insert({ setting_key: `subscription_transfer_rename:${serviceId}`,
+    setting_value: String(enabled), revision: 1, updated_by_user_id: userId, created_at: now, updated_at: now })
+    .onConflict("setting_key").merge({ setting_value: String(enabled), updated_by_user_id: userId, updated_at: now });
+}
+
 /** 读取服务已保存的转存目录；旧服务没有配置时返回空。 */
 export async function getServiceTransferDirectory(database: FlyCloudHelperDatabase, serviceId: string):
   Promise<ServiceTransferDirectory | null> {

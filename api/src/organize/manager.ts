@@ -5,6 +5,8 @@ import { ApiError } from "../errors.js";
 import { parseFlymbyVideoDirectory, parseFlymbyVideoName } from "../media/flymby-video-parser.js";
 import { WebdavVideoNameParser } from "../media/app-recognition/WebdavVideoNameParser.js";
 import { prepareOrganizeAi, recognizeUnmatchedByAi } from "./recognition-ai.js";
+import { readSubscriptionTransferRoots, insideSubscriptionRoot, subscriptionReceivingPrefix,
+  type SubscriptionTransferRoot } from "../subscriptions/transfer-root.js";
 import type { ProviderAdapter, ProviderBrowseEntry, ProviderConnectionContext, ProviderFileOrganizer, ProviderMutationResult } from "../providers/types.js";
 import type { ApiRuntime } from "../runtime.js";
 import type { OrganizeDirectory, OrganizeJob, OrganizeJobItem, OrganizeMode, OrganizePlan, OrganizePlanItem, OrganizeTaskSummary } from "./types.js";
@@ -91,6 +93,8 @@ interface OrganizeContext {
   directTargetListings?: Map<string, ProviderBrowseEntry[]>;
   /** 已进入旧暂存流程的历史任务继续按原阶段恢复。 */
   directEnabled?: boolean;
+  /** 清理时重新读取未完成订阅批次，避免空接收目录被当作空来源删除。 */
+  subscriptionPendingRoots?: SubscriptionTransferRoot[];
 }
 
 /** 已读取详情并通过唯一标题核验的 TMDB 作品。 */
@@ -244,10 +248,32 @@ export class ServiceOrganizeManager {
       // 关键变量：AI 仅参考同目录视频和 NFO 名称，不额外下载文件或读取视频内容。
       const siblingNamesByDirectory = new Map<string, string[]>();
       const seenDirectories = new Set<string>();
+      const subscriptionRoots = await readSubscriptionTransferRoots(this.runtime, plan.serviceId);
+      const subscriptionRootsById = new Map(subscriptionRoots.flatMap((root) => root.directory ? [[root.directory.resourceId, root] as const] : []));
+      const subscriptionScopes = new Map<string, SubscriptionTransferRoot>();
+      const protectedSubscriptionPaths = new Set<string>();
+      // 关键变量：直接选择批次内子目录时，先验证批次根的真实 ID，再继承订阅身份。
+      for (const source of plan.sourceDirectories) {
+        const root = subscriptionRoots.find((item) => item.directory && insideSubscriptionRoot(source.displayPath, item.directory.displayPath));
+        if (root?.directory) {
+          const actual = await this.findDirectory(context, root.directory.displayPath);
+          if (actual?.resourceId === root.directory.resourceId) subscriptionScopes.set(source.resourceId, root);
+        }
+      }
       const queue = [...plan.sourceDirectories];
       while (queue.length > 0) {
         if (seenDirectories.size >= MAX_DIRECTORIES) throw new ApiError(422, "organize_directory_limit", "来源目录超过 2000 个，请缩小范围");
         const directory = queue.shift()!;
+        const subscriptionRoot = subscriptionRootsById.get(directory.resourceId)
+          ?? subscriptionScopes.get(directory.resourceId);
+        if (directory.displayPath.split("/").some((part) => part.startsWith(subscriptionReceivingPrefix))
+          || subscriptionRoot && !subscriptionRoot.ready
+          || subscriptionRoots.some((root) => !root.ready && root.finalName
+            && insideSubscriptionRoot(directory.displayPath, path.posix.join(root.parent.displayPath, root.finalName)))) {
+          protectedSubscriptionPaths.add(directory.displayPath);
+          continue;
+        }
+        if (subscriptionRoot) subscriptionScopes.set(directory.resourceId, subscriptionRoot);
         if (seenDirectories.has(directory.resourceId)) continue;
         seenDirectories.add(directory.resourceId);
         plan.scannedDirectories.push(directory);
@@ -256,6 +282,12 @@ export class ServiceOrganizeManager {
           && (VIDEO_EXTENSION.test(entry.name) || /\.nfo$/iu.test(entry.name)))
           .map((entry) => entry.name).slice(0, 24));
         for (const entry of listing.items) {
+          const childRoot = subscriptionRootsById.get(entry.resourceId);
+          if (entry.isDirectory && (entry.name.startsWith(subscriptionReceivingPrefix) || childRoot && !childRoot.ready)) {
+            protectedSubscriptionPaths.add(entry.displayPath);
+            continue;
+          }
+          if (entry.isDirectory && subscriptionRoot) subscriptionScopes.set(entry.resourceId, subscriptionRoot);
           if (plan.unrecognizedTransferEnabled) allEntries.push(entry);
           if (entry.isDirectory) queue.push({ resourceId: entry.resourceId, displayPath: entry.displayPath });
           else if (VIDEO_EXTENSION.test(entry.name)) entries.push(entry);
@@ -317,6 +349,36 @@ export class ServiceOrganizeManager {
         }
         const directoryParsed = directoryRecognition.get(entry.resourceId);
         let parsed = directoryParsed?.mediaType === "tv" ? directoryParsed : fileParsed;
+        const subscriptionRoot = subscriptionScopes.get(entry.parentResourceId);
+        if (subscriptionRoot?.ready && subscriptionRoot.replaceName) {
+          // 订阅身份只在已核实的接收根内生效；其他明确 TMDB 编号仍作为冲突保留。
+          const identity = subscriptionRoot.identity;
+          const explicitIds = [...entry.displayPath.matchAll(/(?:tmdbid|tmdb)\s*[-_:：=]?\s*(\d{2,10})/giu)]
+            .map((match) => Number(match[1]));
+          const conflict = explicitIds.some((id) => id !== identity.tmdbId);
+          parsed = { ...parsed, title: identity.title, query: identity.title, year: identity.year,
+            mediaType: identity.mediaType, tmdbId: identity.tmdbId,
+            ...(identity.mediaType === "movie" ? { seasonNumber: 0, episodeNumber: 0, episodeNumbers: [] } : {}) };
+          const identityKey = `subscription:${identity.mediaType}:${identity.tmdbId}`;
+          if (!conflict && !matchCache.has(identityKey)) {
+            try {
+              const metadata = await this.runtime.tmdb.readVideoMetadata(identity.mediaType, identity.tmdbId, "zh-CN", "CN");
+              matchCache.set(identityKey, metadata ? { id: metadata.id, title: metadata.title, year: metadata.year, genres: metadata.genres } : null);
+            } catch (error) {
+              matchCache.set(identityKey, null);
+              this.runtime.logBusinessEvent("warn", { 日志关键字: "codex-movie-subscription", 事件: "整理订阅批次详情暂不可用",
+                服务ID: plan.serviceId, TMDB编号: identity.tmdbId, 错误信息: error instanceof Error ? error.message : String(error) });
+            }
+          }
+          const item = this.makeItem(entry, parsed, conflict ? null : matchCache.get(identityKey) ?? null);
+          if (conflict || !matchCache.get(identityKey)) {
+            item.reason = conflict ? "文件或子目录的 TMDB 编号与订阅不一致，已保留来源"
+              : "订阅 TMDB 详情暂不可用，已保留来源等待重试";
+            aiFailedSourceIds.add(entry.resourceId);
+          }
+          plan.items.push(item);
+          continue;
+        }
         let key = JSON.stringify([parsed.mediaType, parsed.query, parsed.year, parsed.tmdbId]);
         if (!matchCache.has(key)) matchCache.set(key, await this.matchEntry(parsed));
         let matched = matchCache.get(key)!;
@@ -426,7 +488,7 @@ export class ServiceOrganizeManager {
         plan.items.push(assistedItem.status === "ready" ? assistedItem : ruleItem);
       }
       if (plan.unrecognizedTransferEnabled && plan.unrecognizedDirectory) {
-        this.addUnrecognizedItems(plan, allEntries, aiFailedSourceIds);
+        this.addUnrecognizedItems(plan, allEntries, aiFailedSourceIds, protectedSubscriptionPaths);
       }
       const targets = new Set<string>();
       for (const item of plan.items) {
@@ -469,7 +531,8 @@ export class ServiceOrganizeManager {
   }
 
   /** 将规则及 AI 最终无法识别的内容放进独立目录；纯未识别子树整夹搬迁，混合目录仅保留原层级搬迁未识别文件。 */
-  private addUnrecognizedItems(plan: OrganizePlan, allEntries: ProviderBrowseEntry[], aiFailedSourceIds: Set<string>): void {
+  private addUnrecognizedItems(plan: OrganizePlan, allEntries: ProviderBrowseEntry[], aiFailedSourceIds: Set<string>,
+    protectedPaths = new Set<string>()): void {
     const unknown = plan.items.filter((item) => item.status === "skipped"
       && item.tmdbId === null && !aiFailedSourceIds.has(item.sourceId));
     // AI 未完成或已确认作品但无法按季集规则整理的文件留在来源目录，不能整夹搬走。
@@ -484,6 +547,7 @@ export class ServiceOrganizeManager {
     /** 判断文件或子目录位于指定目录树内。 */
     const inside = (filePath: string, folderPath: string): boolean => filePath.startsWith(`${folderPath.replace(/\/$/u, "")}/`);
     for (const folder of [...plan.scannedDirectories].sort((left, right) => left.displayPath.length - right.displayPath.length)) {
+      if ([...protectedPaths].some((blocked) => insideSubscriptionRoot(blocked, folder.displayPath))) continue;
       const root = rootOf(folder.displayPath);
       if (!root || folder.resourceId === root.resourceId || selectedFolders.some((selected) => inside(folder.displayPath, selected))) continue;
       const descendants = unknown.filter((item) => inside(item.sourcePath, folder.displayPath));
@@ -1359,16 +1423,26 @@ export class ServiceOrganizeManager {
     await this.waitMutation(context, await context.organizer.remove(context.connection, directory.resourceId, context.providerContext));
   }
 
+  /** 未完成订阅根及其子目录在整理和清理阶段均须保留。 */
+  private isSubscriptionReceivingDirectory(context: OrganizeContext, directory: OrganizeDirectory): boolean {
+    if (directory.displayPath.split("/").some((part) => part.startsWith(subscriptionReceivingPrefix))) return true;
+    return Boolean(context.subscriptionPendingRoots?.some((root) => root.directory?.resourceId === directory.resourceId
+      || root.directory && insideSubscriptionRoot(directory.displayPath, root.directory.displayPath)
+      || root.finalName && insideSubscriptionRoot(directory.displayPath, path.posix.join(root.parent.displayPath, root.finalName))));
+  }
+
   /** 实时检查目录树，任何视频或新增的子目录读取错误都会阻止整棵目录清理。 */
   private async containsSourceVideo(context: OrganizeContext, directory: OrganizeDirectory): Promise<boolean> {
     const queue = [directory];
     const seen = new Set<string>();
     while (queue.length > 0) {
       const current = queue.shift()!;
+      if (this.isSubscriptionReceivingDirectory(context, current)) return true;
       if (seen.has(current.resourceId)) continue;
       seen.add(current.resourceId);
       if (seen.size > MAX_DIRECTORIES) throw new Error("来源目录层级超过清理上限，已保留原目录");
       for (const entry of await this.children(context, current)) {
+        if (entry.isDirectory && this.isSubscriptionReceivingDirectory(context, entry)) return true;
         if (entry.isDirectory) queue.push({ resourceId: entry.resourceId, displayPath: entry.displayPath });
         else if (VIDEO_EXTENSION.test(entry.name) || /\.strm$/iu.test(entry.name)) return true;
       }
@@ -1378,6 +1452,7 @@ export class ServiceOrganizeManager {
 
   /** 仅在整棵目录已确认没有视频后，逐项删除附属文件和子目录，最后删除空目录。 */
   private async removeVideoFreeSourceTree(context: OrganizeContext, directory: OrganizeDirectory): Promise<void> {
+    if (this.isSubscriptionReceivingDirectory(context, directory)) throw new Error("订阅接收目录尚未完成，已停止清理");
     const entries = await this.children(context, directory);
     if (entries.some((entry) => !entry.isDirectory && (VIDEO_EXTENSION.test(entry.name) || /\.strm$/iu.test(entry.name)))) {
       throw new Error("来源目录出现新视频，已停止清理并保留原目录");
@@ -1406,12 +1481,14 @@ export class ServiceOrganizeManager {
 
   /** 按层级逆序清理来源子目录；只清理本次涉及视频且整棵树已无视频的目录。 */
   private async cleanupSources(context: OrganizeContext, plan: OrganizePlan): Promise<void> {
+    context.subscriptionPendingRoots = (await readSubscriptionTransferRoots(this.runtime, plan.serviceId)).filter((root) => !root.ready);
     const scannedByPath = new Map(plan.scannedDirectories.map((directory) => [directory.displayPath, directory]));
     // 关键变量：已整夹转移的目录及子目录属于新目标，不能再按旧来源路径清理。
     const movedFolders = plan.items.filter((item) => item.status === "ready" && item.action === "unrecognized" && item.isDirectory)
       .map((item) => item.sourcePath);
     const sourceRoots = new Set(plan.sourceDirectories.map((directory) => directory.resourceId));
     for (const directory of [...plan.scannedDirectories].sort((left, right) => right.displayPath.length - left.displayPath.length)) {
+      if (this.isSubscriptionReceivingDirectory(context, directory)) continue;
       if (directory.displayPath === "/") continue;
       // 关键变量：定时任务下一轮还要读取来源根目录，只清理根目录之下的空目录。
       if (sourceRoots.has(directory.resourceId)) continue;

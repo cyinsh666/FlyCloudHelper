@@ -8,6 +8,7 @@ import { getServiceTransferDirectory } from "../resource-search/transfer-directo
 import type { ApiRuntime } from "../runtime.js";
 import { matchSubscription } from "./matching.js";
 import { listStoredSubscriptions, type MovieSubscription } from "./store.js";
+import { prepareSubscriptionTransferRoot, finishSubscriptionTransferRoot, type SubscriptionTransferRoot } from "./transfer-root.js";
 
 const subscriptionPollMs = 10 * 60_000;
 // 关键变量：已提交的网盘转存任务每 30 秒查询一次，频道查找仍按独立周期执行。
@@ -29,6 +30,10 @@ export interface SubscriptionActivity {
   taskId: string | null;
   createdAt: string;
   updatedAt: string;
+  /** 新批次的接收目录和提交时身份快照；历史活动没有此字段。 */
+  transferRoot?: SubscriptionTransferRoot;
+  /** 网盘已完成时只重试命名，不再反复查询或提交分享。 */
+  transferCompleted?: boolean;
 }
 
 interface ServiceSubscriptionState {
@@ -189,11 +194,20 @@ export class MovieSubscriptionWorker {
       group.push(item);
       byService.set(item.serviceId, group);
     }
+    // 取消最后一条订阅后，已提交的批次仍须继续确认转存和完成命名。
+    const stateFiles = await fs.readdir(this.directory).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+    for (const file of stateFiles) {
+      if (/^[0-9a-f-]{36}\.json$/iu.test(file) && !byService.has(file.slice(0, -5))) byService.set(file.slice(0, -5), []);
+    }
     for (const [serviceId, items] of byService) {
       if (this.stopping) break;
       try {
         await this.serial(serviceId, async () => {
           const state = await this.readState(serviceId);
+          if (!items.length) { await this.refreshTasks(state); return; }
           // 频道仍每十分钟查找一次；等待中的网盘任务在每 30 秒巡检时单独更新状态。
           if (state.nextRunAt > new Date().toISOString()) {
             if (state.activities.some((activity) => activity.taskId
@@ -341,8 +355,11 @@ export class MovieSubscriptionWorker {
           if (!matched.subscription || alreadySubmittedToday) continue;
           submittedLinksByDay.add(linkDayKey);
           try {
+            const root = await prepareSubscriptionTransferRoot(this.runtime, state.serviceId, matched.subscription, share.title,
+              async (prepared) => { activity.transferRoot = prepared; await this.saveState(state); });
             const submitted = await submitShareTransfer(this.runtime, { serviceId: state.serviceId,
-              shareUrl: share.shareUrl, password: share.password, actorUserId: ownerId, ownerId });
+              shareUrl: share.shareUrl, password: share.password, actorUserId: ownerId, ownerId,
+              subscriptionDirectory: root.directory! });
             activity.status = "pending";
             activity.taskId = submitted.taskId;
             activity.updatedAt = new Date().toISOString();
@@ -368,17 +385,33 @@ export class MovieSubscriptionWorker {
     for (const activity of state.activities) {
       if (!activity.taskId || (activity.status !== "pending" && activity.status !== "running")) continue;
       try {
-        let status = checkedTasks.get(activity.taskId);
+        let status: ShareTransferStatus | null | undefined = activity.transferCompleted ? "completed" : checkedTasks.get(activity.taskId);
         if (status === undefined) {
           status = await readShareTransferStatus(this.runtime, state.serviceId, activity.taskId);
           checkedTasks.set(activity.taskId, status);
         }
         if (status === null) continue;
+        if (status === "completed" && activity.transferRoot) {
+          activity.transferCompleted = true;
+          activity.status = "running";
+          activity.reason = "网盘转存已完成，正在确认根目录命名";
+          await this.saveState(state);
+          const ready = await finishSubscriptionTransferRoot(this.runtime, state.serviceId, activity.transferRoot,
+            async () => { activity.updatedAt = new Date().toISOString(); await this.saveState(state); });
+          if (!ready) continue;
+          activity.reason = null;
+        }
         if (status === activity.status) continue;
         activity.status = status;
         activity.updatedAt = new Date().toISOString();
         await this.saveState(state);
       } catch (error) {
+        if (activity.transferCompleted) {
+          activity.reason = `网盘转存已完成，根目录命名待重试：${error instanceof Error ? error.message : "未知错误"}`;
+          activity.updatedAt = new Date().toISOString();
+          await this.saveState(state);
+          this.logFailure("订阅根目录命名待重试", state.serviceId, error, activity.channel);
+        }
         if (!checkedTasks.has(activity.taskId)) {
           checkedTasks.set(activity.taskId, null);
           this.logFailure("订阅转存状态查询失败", state.serviceId, error, activity.channel);

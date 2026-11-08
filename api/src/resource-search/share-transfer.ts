@@ -34,6 +34,8 @@ export async function transferConnection(runtime: ApiRuntime, serviceId: string,
 /** 提交一条分享链接，目标始终是服务独立配置的转存目录。 */
 export async function submitShareTransfer(runtime: ApiRuntime, input: {
   serviceId: string; shareUrl: string; password: string; actorUserId: string; ownerId?: string;
+  /** 仅订阅 Worker 传入本次接收根目录，HTTP 请求不能指定此字段。 */
+  subscriptionDirectory?: import("./transfer-directory.js").ServiceTransferDirectory;
 }): Promise<ShareTransferSubmission> {
   const guangyaShare = parseGuangyaShareUrl(input.shareUrl);
   const quarkShare = parseQuarkShareUrl(input.shareUrl);
@@ -43,7 +45,7 @@ export async function submitShareTransfer(runtime: ApiRuntime, input: {
   if ((service.providerType === "guangya" && !guangyaShare) || (service.providerType === "quark" && !quarkShare)) {
     throw new ApiError(422, "search_transfer_provider_mismatch", "分享链接与目标网盘服务类型不一致");
   }
-  const configuredDirectory = await getServiceTransferDirectory(runtime.database, service.id);
+  const configuredDirectory = input.subscriptionDirectory ?? await getServiceTransferDirectory(runtime.database, service.id);
   if (!configuredDirectory) throw new ApiError(422, "transfer_directory_missing", "请先在网盘服务中设置转存目录");
   const directory = await verifyServiceTransferDirectory(runtime.providers.get(service.providerType),
     connection, configuredDirectory, { persistConnection });

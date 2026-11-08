@@ -4,6 +4,7 @@ import { requireRequestUser, requireSuperAdmin, requireString } from "../http.js
 import { ResourceSearchEngine, type SearchSource } from "../resource-search/engine.js";
 import type { ChannelTypeCacheWorker } from "../resource-search/channel-types.js";
 import { getServiceTransferDirectory, saveServiceTransferDirectory, verifyServiceTransferDirectory,
+  getSubscriptionTransferRename, saveSubscriptionTransferRename,
   type ServiceTransferDirectory } from "../resource-search/transfer-directory.js";
 import { readShareTransferStatus, submitShareTransfer } from "../resource-search/share-transfer.js";
 import { readGuangyaOfflineTransfer, submitGuangyaOfflineTransfer } from "../resource-search/offline-transfer.js";
@@ -29,6 +30,28 @@ export async function registerResourceSearchRoutes(server: FastifyInstance, runt
       return { items: await engine.listSources() };
     });
     const servicePrefix = admin ? "/api/v1/admin/services" : "/api/v1/services";
+
+    /** 订阅命名开关按服务归属读取，默认关闭。 */
+    server.get<{ Params: { serviceId: string } }>(`${servicePrefix}/:serviceId/subscription-transfer-settings`, async (request) => {
+      const { ownerId } = await actor(request);
+      const service = await runtime.repository.getServiceDetail(request.params.serviceId, ownerId);
+      return { supported: service.providerType === "guangya" || service.providerType === "quark",
+        replaceName: await getSubscriptionTransferRename(runtime.database, service.id) };
+    });
+
+    /** 保存服务级开关，不修改转存目录或已经提交的批次快照。 */
+    server.put<{ Params: { serviceId: string }; Body: { replaceName?: boolean } }>(
+      `${servicePrefix}/:serviceId/subscription-transfer-settings`, async (request) => {
+        const { ownerId, userId } = await actor(request);
+        const service = await runtime.repository.getServiceDetail(request.params.serviceId, ownerId);
+        if (service.providerType !== "guangya" && service.providerType !== "quark") {
+          throw new ApiError(422, "subscription_transfer_unsupported", "当前服务不支持订阅自动转存");
+        }
+        const replaceName = request.body?.replaceName;
+        if (typeof replaceName !== "boolean") throw validationError("replaceName", "请选择是否替换订阅转存片名");
+        await saveSubscriptionTransferRename(runtime.database, service.id, userId, replaceName);
+        return { replaceName };
+      });
 
     /** 读取网盘服务自己的转存目录，不回退到影片整理来源目录。 */
     server.get<{ Params: { serviceId: string } }>(`${servicePrefix}/:serviceId/transfer-directory`, async (request) => {

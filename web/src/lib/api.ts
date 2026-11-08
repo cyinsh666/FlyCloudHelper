@@ -424,6 +424,19 @@ export async function getResourceSearchTargets(admin = false): Promise<ResourceS
   return (await requestJson<{ items: ResourceSearchTarget[] }>(`${resourceSearchPath(admin)}/targets`)).items;
 }
 
+/** 读取服务级订阅转存命名开关。 */
+export function getSubscriptionTransferSettings(serviceId: string, admin = false): Promise<{ supported: boolean; replaceName: boolean }> {
+  const prefix = admin ? "/api/v1/admin/services" : "/api/v1/services";
+  return requestJson(`${prefix}/${encodeURIComponent(serviceId)}/subscription-transfer-settings`);
+}
+
+/** 保存开关只作用于后续提交的订阅转存。 */
+export function saveSubscriptionTransferSettings(serviceId: string, replaceName: boolean, admin = false): Promise<{ replaceName: boolean }> {
+  const prefix = admin ? "/api/v1/admin/services" : "/api/v1/services";
+  return requestJson(`${prefix}/${encodeURIComponent(serviceId)}/subscription-transfer-settings`,
+    { method: "PUT", body: JSON.stringify({ replaceName }) });
+}
+
 /** 读取网盘服务自己保存的转存目录。 */
 export async function getServiceTransferDirectory(serviceId: string, admin = false): Promise<ResourceSearchTarget["directory"]> {
   const prefix = admin ? "/api/v1/admin/services" : "/api/v1/services";
