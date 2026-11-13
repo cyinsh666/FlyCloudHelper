@@ -241,8 +241,6 @@ export class ServiceOrganizeScheduler {
   /** 逐服务处理到期计划；单个源失败不阻塞其他服务。 */
   private async poll(): Promise<void> {
     try {
-      // 失败任务优先沿原文件阶段继续，避免定时计划再次生成预览并重复搬运。
-      await this.manager.resumeDueFailedJobs();
       const names = await fs.readdir(this.directory).catch((error: NodeJS.ErrnoException) => {
         if (error.code === "ENOENT") return [] as string[];
         throw error;
@@ -288,11 +286,6 @@ export class ServiceOrganizeScheduler {
       const jobs = await this.manager.listJobs(serviceId);
       const active = jobs.find((job) => ["queued", "running", "paused"].includes(job.status));
       if (active) { await this.retry(schedule, "当前服务已有排队、运行或暂停的整理任务", active.id); return; }
-      // 最新任务失败时先恢复原任务；更早的历史失败不阻断已经成功运行的计划。
-      if (jobs[0]?.status === "failed") {
-        await this.retry(schedule, `上次整理任务待自动重试或人工处理：${jobs[0].error ?? "未知错误"}`, jobs[0].id);
-        return;
-      }
       try {
         const plan = await this.manager.createPlan(serviceId, schedule.userId, {
           sources: schedule.sources, target: schedule.target!, mode: schedule.mode,
@@ -333,7 +326,7 @@ export class ServiceOrganizeScheduler {
     }
   }
 
-  /** 保留失败原因，并在五分钟后尝试下一次；失败预览需要重新生成。 */
+  /** 占用时稍后检查；预览或创建失败则放弃本轮，按原配置等待下一轮。 */
   private async retry(schedule: OrganizeSchedule, message: string, blockingJobId?: string): Promise<void> {
     // 关键变量：手动任务失败不应改变原有定时任务的下次执行时间。
     const manualRun = schedule.pendingRunKind === "manual";
@@ -343,16 +336,20 @@ export class ServiceOrganizeScheduler {
     schedule.lastRunMessage = null;
     schedule.pendingPlanId = null;
     schedule.pendingRunKind = undefined;
-    if (!manualRun) schedule.nextRunAt = schedule.enabled ? new Date(Date.now() + 5 * 60_000).toISOString() : null;
+    if (!manualRun) schedule.nextRunAt = blockingJobId
+      ? schedule.enabled ? new Date(Date.now() + 5 * 60_000).toISOString() : null
+      : calculateNextScanRunAt(schedule, new Date());
     schedule.updatedAt = new Date().toISOString();
     schedule.lastBlockedNotificationKey = notificationKey;
     await saveSchedule(this.fileName(schedule.serviceId), schedule);
     if (!shouldNotify) return;
     const service = await this.runtime.repository.getServiceDetail(schedule.serviceId, schedule.userId).catch(() => null);
     await this.runtime.database.createNotificationSafely({
-      userId: schedule.userId, category: "task", tone: "warning", title: "影片整理受阻",
+      userId: schedule.userId, category: "task", tone: blockingJobId ? "warning" : "danger",
+      title: blockingJobId ? "影片整理受阻" : "影片整理失败",
       message: `服务“${service?.displayName ?? "网盘服务"}”的${manualRun ? "本次整理" : "定时整理"}未能继续：${message}。`
-        + (schedule.enabled && !manualRun ? "五分钟后再次检查，同一阻塞原因不重复提醒。" : "请检查整理设置和任务状态后重试。"),
+        + (blockingJobId && schedule.enabled && !manualRun ? "五分钟后再次检查，同一阻塞原因不重复提醒。"
+          : "本轮已放弃，不自动重试，后续定时计划按原配置执行。"),
       actionPath: `/app/services/${schedule.serviceId}/organize`,
     });
   }

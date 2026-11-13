@@ -16,28 +16,6 @@ const VIDEO_EXTENSION = /\.(?:mp4|mkv|avi|mov|wmv|flv|m4v|ts|m2ts|mpg|mpeg|rmvb|
 const MAX_FILES = 5000;
 const MAX_DIRECTORIES = 2000;
 const MAX_ENTRIES = 20_000;
-/** 临时网盘故障最多自动继续三次，间隔逐步增加，避免故障期间反复写网盘。 */
-const AUTO_RETRY_DELAYS_MS = [5, 15, 30].map((minutes) => minutes * 60_000);
-/** 只接受明确表示连接中断或限流的稳定错误码，不把凭据、冲突和文件变化列入自动重试。 */
-const RETRYABLE_PROVIDER_CODES = new Set([
-  "provider_connection_timeout", "provider_connection_refused", "provider_network_unreachable",
-  "provider_dns_resolution_failed", "provider_unavailable", "provider_rate_limited",
-  "cloud139_rate_limited", "quark_organize_move_pending",
-  "organize_wash_delete_pending",
-]);
-
-/** 仅临时网络、限流及已持久化的远端任务等待超时可自动继续。 */
-function isRetryableOrganizeFailure(error: unknown): boolean {
-  if (error instanceof ApiError) {
-    if (RETRYABLE_PROVIDER_CODES.has(error.code)) return true;
-    return error.code === "provider_request_failed" && /状态码 (?:429|502|503|504)$/u.test(error.message);
-  }
-  if (!(error instanceof Error)) return false;
-  return error.message === "网盘文件任务等待超时，可稍后继续任务"
-    || error.message === "传输结果尚未确认，请稍后继续任务"
-    || error.message === "批量覆盖删除尚未完成，请稍后继续任务";
-}
-
 /** 从文件名提取可重复验证的命名标签，不读取媒体字节。 */
 function readNameTags(name: string, resolution: string, source: string): string[] {
   const tags: string[] = [];
@@ -724,7 +702,7 @@ export class ServiceOrganizeManager {
       const fileName = path.join(this.directory, name);
       const stored = await readJson<OrganizeJob>(fileName);
       if (!stored || actorUserId && stored.userId !== actorUserId) continue;
-      // 关键变量：任务可能在等待文件写入或自动继续；删除前读取最终状态。
+      // 关键变量：任务可能仍在等待文件写入；删除前读取最终状态。
       await this.jobWrites.get(stored.id);
       const job = await readJson<OrganizeJob>(fileName);
       if (!job || actorUserId && job.userId !== actorUserId
@@ -775,7 +753,7 @@ export class ServiceOrganizeManager {
           backupParentId: null, pendingTaskId: null, error: null })).filter((item) => plan.items[item.index]?.status === "ready"),
         createdAt: now, updatedAt: now };
       await this.withExclusiveScanSlot(serviceId, () => this.saveJob(job));
-      // 新计划由用户主动创建时，旧失败任务不再自动继续，避免两份计划先后写同一目标。
+      // 新计划创建时一并清空旧版本遗留的自动继续时间。
       for (const oldJob of previous) {
         if (oldJob.status !== "failed" || !oldJob.nextRetryAt) continue;
         oldJob.nextRetryAt = null;
@@ -805,9 +783,9 @@ export class ServiceOrganizeManager {
     if (scan) throw new ApiError(409, "organize_scan_active", "当前网盘服务有未结束的扫描任务，请稍后整理");
   }
 
-  /** 暂停和取消只在当前文件完成后生效；automatic 只供到期轮询继续失败任务。 */
+  /** 暂停和取消只在当前文件完成后生效；失败任务仅允许用户主动继续。 */
   public async controlJob(serviceId: string, jobId: string, action: "pause" | "resume" | "cancel",
-    actorUserId?: string, automatic = false): Promise<OrganizeJob> {
+    actorUserId?: string): Promise<OrganizeJob> {
     await this.getJob(serviceId, jobId, actorUserId);
     // 关键变量：控制操作与执行阶段共用串行写队列，避免暂停覆盖刚保存的文件进度。
     const previousWrite = this.jobWrites.get(jobId) ?? Promise.resolve();
@@ -821,13 +799,9 @@ export class ServiceOrganizeManager {
           || (await this.listJobs(serviceId, actorUserId)).some((other) => other.id !== jobId
             && ["queued", "running", "paused"].includes(other.status));
         if (occupied) throw new ApiError(409, "organize_job_exists", "当前服务已有排队、运行或暂停的整理任务");
-        if (automatic && (!job.nextRetryAt || job.nextRetryAt > new Date().toISOString()
-          || (job.autoRetryCount ?? 0) >= AUTO_RETRY_DELAYS_MS.length)) {
-          throw new ApiError(409, "organize_retry_not_due", "整理任务尚未到自动重试时间");
-        }
         job.status = "queued";
         job.error = null;
-        job.autoRetryCount = automatic ? (job.autoRetryCount ?? 0) + 1 : 0;
+        job.autoRetryCount = 0;
         job.nextRetryAt = null;
         for (const item of job.items) if (item.stage === "failed") { item.stage = "pending"; item.error = null; }
       } else if (action === "cancel" && ["queued", "running", "paused", "failed"].includes(job.status)) {
@@ -847,47 +821,6 @@ export class ServiceOrganizeManager {
     finally { if (this.jobWrites.get(jobId) === write) this.jobWrites.delete(jobId); }
     if (action === "resume") this.startJob(job.id);
     return job;
-  }
-
-  /** 定时轮询只继续当前任务，不重建预览；进程重启后仍读取持久化的重试时间。 */
-  public async resumeDueFailedJobs(): Promise<void> {
-    const names = await fs.readdir(this.directory).catch((error: NodeJS.ErrnoException) => {
-      if (error.code === "ENOENT") return [] as string[];
-      throw error;
-    });
-    // 关键变量：每个服务只看最新任务，旧失败任务不会在新计划完成后重新启动。
-    const latestByService = new Map<string, OrganizeJob>();
-    for (const name of names) {
-      if (!/^job-[0-9a-f-]{36}\.json$/iu.test(name)) continue;
-      const job = await readJson<OrganizeJob>(path.join(this.directory, name));
-      if (!job) continue;
-      const previous = latestByService.get(job.serviceId);
-      if (!previous || job.createdAt > previous.createdAt) latestByService.set(job.serviceId, job);
-    }
-    for (const job of latestByService.values()) {
-      // 旧版原名冲突发生在远端写入前；修复后只恢复一次，继续原文件进度。
-      if (job.status === "failed" && !job.sourceNameConflictRecoveryAt && !job.nextRetryAt
-        && job.error?.endsWith("：目标目录已有与来源同名的其他内容，无法直接移动")
-        && job.items.some((item) => item.stage === "failed" && !item.directOperation
-          && !item.stageRequested && !item.pendingTaskId && !item.stagedId)) {
-        job.sourceNameConflictRecoveryAt = new Date().toISOString();
-        job.nextRetryAt = job.sourceNameConflictRecoveryAt;
-        job.autoRetryCount = 0;
-        await this.saveJob(job);
-      }
-      if (!job || job.status !== "failed" || !job.nextRetryAt || job.nextRetryAt > new Date().toISOString()
-        || this.activeServices.has(job.serviceId) || this.creatingServices.has(job.serviceId)) continue;
-      try {
-        await this.requireNoActiveScan(job.serviceId);
-        await this.controlJob(job.serviceId, job.id, "resume", job.userId, true);
-      } catch (error) {
-        // 其它任务和扫描暂时占用服务时保留原重试时间，下次轮询再尝试。
-        if (error instanceof ApiError && ["organize_job_exists", "organize_scan_active", "organize_retry_not_due"].includes(error.code)) continue;
-        this.runtime.logBusinessEvent("warn", { 日志关键字: "codex-flycloud-organize-retry",
-          事件: "整理任务自动继续失败", 任务ID: job.id,
-          错误信息: error instanceof Error ? error.message : "未知错误" });
-      }
-    }
   }
 
   /** 服务启动后恢复之前正在运行的任务，暂停和失败任务由用户明确继续。 */
@@ -911,6 +844,12 @@ export class ServiceOrganizeManager {
       }
       if (!/^job-[0-9a-f-]{36}\.json$/iu.test(name)) continue;
       const job = await readJson<OrganizeJob>(path.join(this.directory, name));
+      // 旧版失败记录不再等待自动继续，保留失败信息供用户查看。
+      if (job?.status === "failed" && (job.nextRetryAt || job.autoRetryCount)) {
+        job.nextRetryAt = null;
+        job.autoRetryCount = 0;
+        await this.saveJob(job);
+      }
       if (job && ["queued", "running"].includes(job.status)) this.startJob(job.id);
     }
   }
@@ -947,20 +886,39 @@ export class ServiceOrganizeManager {
     finally { if (this.jobWrites.get(job.id) === write) this.jobWrites.delete(job.id); }
   }
 
-  /** 保留失败文件阶段，仅为可恢复故障记录下一次自动继续时间。 */
-  private async failJob(job: OrganizeJob, error: unknown): Promise<void> {
+  /** 失败条目直接放弃；共用同一次远端写入的成员一并结束，不重复等待或提交。 */
+  private async abandonItem(job: OrganizeJob, plan: OrganizePlan, state: OrganizeJobItem,
+    error: unknown, abandonBatch = false): Promise<void> {
+    const message = `${plan.items[state.index]?.sourceName ?? "文件"}：${error instanceof Error ? error.message : "文件整理失败"}`;
+    const sharedTaskId = state.pendingTaskId;
+    for (const member of job.items) {
+      if (member.stage === "completed" || member.stage === "failed") continue;
+      if (member !== state && !(sharedTaskId && member.pendingTaskId === sharedTaskId)
+        && !(abandonBatch && state.directBatchId && member.directBatchId === state.directBatchId)) continue;
+      member.stage = "failed";
+      member.error = message;
+    }
+    job.error = message;
+    await this.saveJob(job);
+  }
+
+  /** 结束本轮失败任务并保留现场，后续定时计划不受该失败状态影响。 */
+  private async failJob(job: OrganizeJob): Promise<void> {
     job.status = "failed";
-    const attempts = job.autoRetryCount ?? 0;
-    job.nextRetryAt = isRetryableOrganizeFailure(error) && attempts < AUTO_RETRY_DELAYS_MS.length
-      ? new Date(Date.now() + AUTO_RETRY_DELAYS_MS[attempts]!).toISOString() : null;
+    job.nextRetryAt = null;
+    job.autoRetryCount = 0;
+    for (const item of job.items) if (item.stage !== "completed" && item.stage !== "failed") {
+      item.stage = "failed";
+      item.error = job.error ?? "本轮整理已放弃";
+    }
     await this.saveJob(job);
     if (job.status !== "failed") return;
     const service = await this.runtime.repository.getServiceDetail(job.serviceId, job.userId).catch(() => null);
     await this.runtime.database.createNotificationSafely({
       userId: job.userId, category: "task", tone: "danger", title: "影片整理失败",
-      message: `服务“${service?.displayName ?? "网盘服务"}”的影片整理失败：${job.error ?? "未知错误"}。`
-        + (job.nextRetryAt ? `将在 ${new Date(job.nextRetryAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })} 自动继续。`
-          : "任务进度已保留，请在整理任务中继续或取消；定时整理暂时受阻。"),
+      message: `服务“${service?.displayName ?? "网盘服务"}”的本轮整理已结束：完成 ${job.items.filter((item) => item.stage === "completed").length} 项，`
+        + `失败 ${job.items.filter((item) => item.stage === "failed").length} 项。${job.error ?? "未知错误"}。`
+        + "失败项已放弃，不自动重试，后续定时计划照常执行；已产生的暂存和备份内容保留。",
       actionPath: `/app/services/${job.serviceId}/organize`,
     });
   }
@@ -1095,16 +1053,7 @@ export class ServiceOrganizeManager {
       if (deletion.taskId) {
         for (const state of selected) state.pendingTaskId = deletion.taskId;
         await this.saveJob(job);
-        try { await this.waitMutation(context, { taskId: deletion.taskId }); }
-        catch (error) {
-          if (!(error instanceof Error) || error.message !== "网盘文件任务执行失败") throw error;
-          for (const state of selected) {
-            state.pendingTaskId = null;
-            state.directDeleteFailed = true;
-          }
-          await this.saveJob(job);
-          return true;
-        }
+        await this.waitMutation(context, { taskId: deletion.taskId });
         for (const state of selected) state.pendingTaskId = null;
         await this.saveJob(job);
       }
@@ -1175,7 +1124,7 @@ export class ServiceOrganizeManager {
     return true;
   }
 
-  /** 逐项重试和覆盖后的传输共用提交路径，先记提交意图再调用网盘接口。 */
+  /** 单项直达和覆盖后的传输共用提交路径，先记提交意图再调用网盘接口。 */
   private async submitDirectTransfer(context: OrganizeContext, job: OrganizeJob,
     state: OrganizeJobItem, targetParentId: string): Promise<void> {
     state.directPhase = "transfer";
@@ -1200,45 +1149,16 @@ export class ServiceOrganizeManager {
           ? plan.unrecognizedDirectory.displayPath : plan.targetDirectory.displayPath, ...item.targetParts)) };
     if (state.pendingTaskId) {
       const taskId = state.pendingTaskId;
-      let failedPhase = false;
-      try {
-        await this.waitMutation(context, { taskId });
-        for (const member of job.items) if (member.pendingTaskId === taskId) member.pendingTaskId = null;
-      } catch (error) {
-        if (!(error instanceof Error) || error.message !== "网盘文件任务执行失败") throw error;
-        for (const member of job.items) if (member.pendingTaskId === taskId) {
-          member.pendingTaskId = null;
-          if (member.directPhase === "transfer") member.stageRequested = false;
-          if (member.directPhase === "delete") member.directDeleteFailed = true;
-        }
-        failedPhase = state.directPhase !== "transfer";
-      }
+      await this.waitMutation(context, { taskId });
+      for (const member of job.items) if (member.pendingTaskId === taskId) member.pendingTaskId = null;
       context.directTargetListings?.delete(target.resourceId);
       await this.saveJob(job);
-      if (failedPhase) throw new Error("网盘文件操作失败，请检查目标目录后继续任务");
     }
     if (state.directPhase === "delete") {
       const batchMembers = job.items.filter((member) => member.directBatchId === state.directBatchId
         && member.directPhase === "delete");
       const oldIds = new Set(batchMembers.map((member) => member.replacedId).filter((id): id is string => Boolean(id)));
       const remaining = (await this.children(context, target)).filter((entry) => oldIds.has(entry.resourceId));
-      if (remaining.length && state.directDeleteFailed && (state.directRetryCount ?? 0) < 1) {
-        for (const member of batchMembers) {
-          member.directRetryCount = (member.directRetryCount ?? 0) + 1;
-          member.directDeleteFailed = false;
-        }
-        await this.saveJob(job);
-        const ids = remaining.map((entry) => entry.resourceId);
-        const result = ids.length > 1
-          ? await context.organizer.removeMany!(context.connection, ids, context.providerContext)
-          : await context.organizer.remove(context.connection, ids[0]!, context.providerContext);
-        if (result.taskId) {
-          for (const member of batchMembers) member.pendingTaskId = result.taskId;
-          await this.saveJob(job);
-        }
-        context.directTargetListings?.delete(target.resourceId);
-        return this.finishDirectTransfer(context, plan, job, state);
-      }
       if (remaining.length) throw new Error("旧目标删除尚未确认，请稍后继续任务");
       if (item.parentId === target.resourceId && state.directOperation === "move") {
         state.directPhase = "rename";
@@ -1283,11 +1203,6 @@ export class ServiceOrganizeManager {
         const sourceParent: OrganizeDirectory = { resourceId: item.parentId,
           displayPath: normalizedPath(path.posix.dirname(item.sourcePath)) };
         const source = (await this.children(context, sourceParent)).find((entry) => entry.resourceId === item.sourceId);
-        if (source && !state.stageRequested && (state.directRetryCount ?? 0) < 1) {
-          state.directRetryCount = (state.directRetryCount ?? 0) + 1;
-          await this.submitDirectTransfer(context, job, state, target.resourceId);
-          return this.finishDirectTransfer(context, plan, job, state);
-        }
         throw new Error(source ? "传输结果尚未确认，请稍后继续任务" : "传输后来源和目标均未找到文件");
       }
       state.stagedId = placed.resourceId;
@@ -1322,20 +1237,17 @@ export class ServiceOrganizeManager {
     await this.saveJob(job);
   }
 
-  /** 已提交的整批文件完成改名后才响应暂停或取消，避免留下未命名的半批文件。 */
+  /** 批次内失败项记录后跳过，其他未失败成员继续完成改名。 */
   private async finishDirectBatch(context: OrganizeContext, plan: OrganizePlan, job: OrganizeJob,
-    batchId: string): Promise<boolean> {
+    batchId: string): Promise<void> {
     for (const state of job.items.filter((item) => item.directBatchId === batchId && item.stage !== "completed")) {
+      if (state.stage === "failed") continue;
       try { await this.finishDirectTransfer(context, plan, job, state); }
       catch (error) {
-        state.stage = "failed";
-        state.error = error instanceof Error ? error.message : "批量移动失败";
-        job.error = `${plan.items[state.index]?.sourceName ?? "文件"}：${state.error}`;
-        await this.failJob(job, error);
-        return false;
+        context.directTargetListings?.clear();
+        await this.abandonItem(job, plan, state, error);
       }
     }
-    return true;
   }
 
   /** 整夹转移前再次枚举子树；预览后任何子项增减都会阻止搬迁。 */
@@ -1647,7 +1559,7 @@ export class ServiceOrganizeManager {
     });
   }
 
-  /** 执行当前任务，失败时保留现场和阶段，允许之后继续。 */
+  /** 执行当前任务，失败项保留现场并放弃，继续处理其他文件。 */
   private async runJob(jobId: string): Promise<void> {
     let job = await readJson<OrganizeJob>(this.jobPath(jobId));
     if (!job || !["queued", "running"].includes(job.status)) return;
@@ -1690,7 +1602,7 @@ export class ServiceOrganizeManager {
         if (!latest || latest.status !== "running") return;
         job = latest;
         const current = job.items.find((item) => item.index === state.index)!;
-        if (current.stage === "completed") continue;
+        if (current.stage === "completed" || current.stage === "failed") continue;
         await this.requireNoActiveScan(job.serviceId);
         try {
           if (plan.items[current.index]?.action === "wash_cleanup") {
@@ -1710,7 +1622,7 @@ export class ServiceOrganizeManager {
               }
             }
             if (!current.directBatchId) throw new Error("批量移动状态缺少批次标识，请重新检查任务");
-            if (!await this.finishDirectBatch(context, plan, job, current.directBatchId)) return;
+            await this.finishDirectBatch(context, plan, job, current.directBatchId);
             continue;
           }
           context.directTargetListings.clear();
@@ -1718,16 +1630,18 @@ export class ServiceOrganizeManager {
           await this.processItem(context, plan, job, current, working.stageRoot, working.backupRoot);
         }
         catch (error) {
-          current.stage = "failed";
-          current.error = error instanceof Error ? error.message : "文件整理失败";
-          job.error = `${plan.items[current.index]?.sourceName ?? "文件"}：${current.error}`;
-          await this.failJob(job, error);
-          return;
+          context.directTargetListings.clear();
+          await this.abandonItem(job, plan, current, error, true);
         }
       }
       const beforeCleanup = await readJson<OrganizeJob>(this.jobPath(jobId));
       if (!beforeCleanup || beforeCleanup.status !== "running") return;
       job = beforeCleanup;
+      // 失败现场可能留有暂存或旧文件备份，本轮直接结束，不进入整体清理。
+      if (job.items.some((item) => item.stage === "failed")) {
+        await this.failJob(job);
+        return;
+      }
       if (plan.washEnabled) {
         context.subscriptionPendingRoots = (await readSubscriptionTransferRoots(this.runtime, plan.serviceId)).filter((root) => !root.ready);
         const actualTargets = await readWashTargets(plan, async (directory) => (await this.children(context, directory))
@@ -1759,7 +1673,7 @@ export class ServiceOrganizeManager {
       const latest = await readJson<OrganizeJob>(this.jobPath(jobId));
       if (latest && ["queued", "running"].includes(latest.status)) {
         latest.error = error instanceof Error ? error.message : "影片整理失败";
-        await this.failJob(latest, error);
+        await this.failJob(latest);
       }
     }
   }
