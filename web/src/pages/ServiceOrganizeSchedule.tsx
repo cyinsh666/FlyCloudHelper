@@ -3,7 +3,7 @@ import { useState } from "react";
 import { PrimaryButton } from "@/components/ConsoleShell";
 import { Panel } from "@/components/ui-kit";
 import { runServiceOrganizeNow, updateServiceOrganizeSchedule, type OrganizeSchedule, type ProviderDirectory,
-  type ScanScheduleType } from "@/lib/api";
+  type ScanScheduleType, type WashPriority } from "@/lib/api";
 
 type IntervalUnit = "minute" | "hour" | "day";
 
@@ -45,7 +45,7 @@ function showTime(value: string | null): string { return value ? new Date(value)
 
 /** 与媒体库扫描一致的整理定时任务编辑卡片。 */
 export function ServiceOrganizeSchedule({ serviceId, admin, schedule, sources, target, mode,
-  unrecognizedTransferEnabled, unrecognizedDirectory, aiAssistEnabled, aiModelId, activeJob, onSaved }: {
+  unrecognizedTransferEnabled, unrecognizedDirectory, aiAssistEnabled, aiModelId, washEnabled, washPriorities, activeJob, onSaved }: {
   serviceId: string;
   admin: boolean;
   schedule: OrganizeSchedule;
@@ -56,6 +56,8 @@ export function ServiceOrganizeSchedule({ serviceId, admin, schedule, sources, t
   unrecognizedDirectory: ProviderDirectory | null;
   aiAssistEnabled: boolean;
   aiModelId: string;
+  washEnabled: boolean;
+  washPriorities: WashPriority[];
   activeJob: boolean;
   onSaved: (next: OrganizeSchedule) => void;
 }) {
@@ -86,6 +88,7 @@ export function ServiceOrganizeSchedule({ serviceId, admin, schedule, sources, t
         quietStartTime: form.quietStartTime, quietEndTime: form.quietEndTime,
         sources, target, mode, unrecognizedTransferEnabled, unrecognizedDirectory,
         aiAssistEnabled, aiModelId: aiAssistEnabled ? aiModelId : null,
+        washEnabled, washPriorities,
       }, admin);
       onSaved(next);
       setMessage("整理计划已保存");

@@ -4,14 +4,14 @@ import { randomUUID } from "node:crypto";
 import { ApiError } from "../errors.js";
 import type { ApiRuntime } from "../runtime.js";
 import { transferConnection } from "../resource-search/share-transfer.js";
-import { getServiceTransferDirectory, getSubscriptionTransferRename, verifyServiceTransferDirectory,
+import { getServiceTransferDirectory, verifyServiceTransferDirectory,
   type ServiceTransferDirectory } from "../resource-search/transfer-directory.js";
 import type { MovieSubscription } from "./store.js";
 
 /** 未完成的接收目录使用固定前缀，进程中断且记录未落盘时仍能阻止整理。 */
 export const subscriptionReceivingPrefix = "订阅转存中-";
 
-/** 每次提交保存独立目录及身份快照，后续设置变化和取消订阅不改变该批次。 */
+/** 独立接收目录及身份快照，后续设置变化和取消订阅不改变该批次。 */
 export interface SubscriptionTransferRoot {
   parent: ServiceTransferDirectory;
   directory: ServiceTransferDirectory | null;
@@ -49,9 +49,9 @@ export async function readSubscriptionTransferRoots(runtime: ApiRuntime, service
   }
 }
 
-/** 先保存目录意图再创建；提交前保存真实资源 ID，崩溃恢复不凭同名猜目录。 */
+/** 片名替换开启时创建接收根，先保存目录意图，提交前保存真实资源 ID。 */
 export async function prepareSubscriptionTransferRoot(runtime: ApiRuntime, serviceId: string,
-  subscription: MovieSubscription, publishedTitle: string,
+  subscription: MovieSubscription,
   save: (root: SubscriptionTransferRoot) => Promise<void>): Promise<SubscriptionTransferRoot> {
   const { service, connection, persistConnection } = await transferConnection(runtime, serviceId);
   const adapter = runtime.providers.get(service.providerType);
@@ -59,10 +59,9 @@ export async function prepareSubscriptionTransferRoot(runtime: ApiRuntime, servi
   const selected = await getServiceTransferDirectory(runtime.database, serviceId);
   if (!selected) throw new ApiError(422, "transfer_directory_missing", "请先在网盘服务中设置转存目录");
   const parent = await verifyServiceTransferDirectory(adapter, connection, selected, { persistConnection });
-  const replaceName = await getSubscriptionTransferRename(runtime.database, serviceId);
   // 关键变量：缺少年份时补取一次详情；仍不可用则省略年份，不编造年份或丢弃已知身份。
   let year = subscription.year;
-  if (replaceName && !year) {
+  if (!year) {
     try {
       year = (await runtime.tmdb.readVideoMetadata(subscription.mediaType, subscription.tmdbId, "zh-CN", "CN"))?.year ?? null;
     } catch (error) {
@@ -71,12 +70,11 @@ export async function prepareSubscriptionTransferRoot(runtime: ApiRuntime, servi
     }
   }
   const title = legalName(subscription.title);
-  if (replaceName && !title) throw new Error("订阅片名无法生成合法目录名称");
+  if (!title) throw new Error("订阅片名无法生成合法目录名称");
   const root: SubscriptionTransferRoot = {
     parent, directory: null, temporaryName: `${subscriptionReceivingPrefix}${randomUUID()}`,
-    baseName: replaceName ? `${title}${year ? `(${year})` : ""}{tmdbid-${subscription.tmdbId}}`
-      : legalName(publishedTitle) || "订阅转存",
-    finalName: null, renameTaskId: null, replaceName, ready: false,
+    baseName: `${title}${year ? `(${year})` : ""}{tmdbid-${subscription.tmdbId}}`,
+    finalName: null, renameTaskId: null, replaceName: true, ready: false,
     identity: { title: subscription.title, year, mediaType: subscription.mediaType, tmdbId: subscription.tmdbId },
   };
   await save(root);

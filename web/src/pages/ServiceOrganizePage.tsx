@@ -8,9 +8,10 @@ import {
   controlServiceOrganizeJob, createServiceOrganizeJob, createServiceOrganizePlan,
   getServiceOrganizeAiModels, getServiceOrganizeCapabilities, getServiceOrganizeJob, getServiceOrganizePlan,
   getServiceOrganizeSchedule, listServiceOrganizeJobs, type OrganizeJob, type OrganizePlan,
-  type OrganizeSchedule, type ProviderDirectory, type AvailableAiModel,
+  type OrganizeSchedule, type ProviderDirectory, type AvailableAiModel, type WashPriority,
 } from "@/lib/api";
 import { ServiceOrganizeSchedule } from "./ServiceOrganizeSchedule";
+import { ServiceOrganizeWash } from "./ServiceOrganizeWash";
 
 /** 网盘服务下的独立影片整理页面；只读预览完成后才允许发起远端写操作。 */
 export function ServiceOrganizePage({ serviceId, admin = false }: { serviceId: string; admin?: boolean }) {
@@ -22,6 +23,8 @@ export function ServiceOrganizePage({ serviceId, admin = false }: { serviceId: s
   const [unrecognizedDirectories, setUnrecognizedDirectories] = useState<ProviderDirectory[]>([]);
   const [aiAssistEnabled, setAiAssistEnabled] = useState(false);
   const [aiModelId, setAiModelId] = useState("");
+  const [washEnabled, setWashEnabled] = useState(false);
+  const [washPriorities, setWashPriorities] = useState<WashPriority[]>(["resolution"]);
   const [aiModels, setAiModels] = useState<AvailableAiModel[]>([]);
   const [plan, setPlan] = useState<OrganizePlan | null>(null);
   const [job, setJob] = useState<OrganizeJob | null>(null);
@@ -49,6 +52,8 @@ export function ServiceOrganizePage({ serviceId, admin = false }: { serviceId: s
         setUnrecognizedDirectories(savedSchedule.unrecognizedDirectory ? [savedSchedule.unrecognizedDirectory] : []);
         setAiAssistEnabled(savedSchedule.aiAssistEnabled === true);
         setAiModelId(savedSchedule.aiModelId ?? "");
+        setWashEnabled(savedSchedule.washEnabled === true);
+        setWashPriorities(savedSchedule.washPriorities ?? ["resolution"]);
         setAiModels(models.items);
       }).catch((failure) => { if (alive) setError(failure instanceof Error ? failure.message : "读取整理服务失败"); })
       .finally(() => { if (alive) setLoading(false); });
@@ -107,7 +112,7 @@ export function ServiceOrganizePage({ serviceId, admin = false }: { serviceId: s
     setError(null);
     try { setPlan(await createServiceOrganizePlan(serviceId, { sources, target: targets[0]!, mode,
       unrecognizedTransferEnabled, unrecognizedDirectory: unrecognizedDirectories[0] ?? null,
-      aiAssistEnabled, aiModelId: aiAssistEnabled ? aiModelId : null }, admin)); }
+      aiAssistEnabled, aiModelId: aiAssistEnabled ? aiModelId : null, washEnabled, washPriorities }, admin)); }
     catch (failure) { setError(failure instanceof Error ? failure.message : "创建预览失败"); }
     finally { setBusy(false); }
   }
@@ -174,6 +179,8 @@ export function ServiceOrganizePage({ serviceId, admin = false }: { serviceId: s
           <PrimaryButton onClick={() => void preview()} disabled={busy || plan?.status === "preparing"}>生成识别预览</PrimaryButton>
         </div>
       </Panel>
+      <ServiceOrganizeWash state={{ enabled: washEnabled, priorities: washPriorities,
+        onChange: (enabled, priorities) => { setWashEnabled(enabled); setWashPriorities(priorities); invalidatePlan(); } }} />
       <Panel title="未识别内容" description="识别完成后可将仍未识别的内容移动到独立目录。纯未识别文件夹会整夹移动；混合文件夹只移动未识别视频并保留原目录层级。目标同名时跳过。">
         <label className="flex cursor-pointer items-center gap-2 text-sm"><input type="checkbox" checked={unrecognizedTransferEnabled}
           onChange={(event) => { setUnrecognizedTransferEnabled(event.target.checked); invalidatePlan(); }} />未识别自动转移</label>
@@ -199,20 +206,25 @@ export function ServiceOrganizePage({ serviceId, admin = false }: { serviceId: s
         sources={sources} target={targets[0] ?? null} mode={mode}
         unrecognizedTransferEnabled={unrecognizedTransferEnabled} unrecognizedDirectory={unrecognizedDirectories[0] ?? null}
         aiAssistEnabled={aiAssistEnabled} aiModelId={aiModelId}
+        washEnabled={washEnabled} washPriorities={washPriorities}
         activeJob={Boolean(job && ["queued", "running", "paused"].includes(job.status))} onSaved={setSchedule} />}
       {plan && <Panel title="识别预览">
         {plan.status === "preparing" && <p className="flex items-center gap-2 text-sm text-muted-foreground"><LoaderCircle className="size-4 animate-spin" />正在扫描目录并匹配影片…</p>}
         {plan.status === "failed" && <p role="alert" className="text-sm text-destructive">{plan.error}</p>}
         {plan.status === "ready" && <>
           <p className="text-sm">已扫描 {plan.directoryCount} 个目录，{readyCount} 项可处理，{plan.itemCount - readyCount} 项跳过，{overwriteCount} 个整理目标将被覆盖。</p>
+          {plan.washSummary && <p className="mt-1 text-sm">洗版：保留已有 {plan.washSummary.keepExisting} 份，选用新版本 {plan.washSummary.selectNew} 份，
+            预计清理目标旧版本 {plan.washSummary.cleanup} 份，保留并跳过来源重复版本 {plan.washSummary.skippedSources} 份。</p>}
           {Boolean(plan.aiFailureCount) && <p className="mt-1 text-xs text-amber-600">{plan.aiFailureCount} 个条目的 AI 请求失败，已按未识别内容处理。</p>}
           <p className="mt-1 text-xs text-muted-foreground">普通整理遵循所选移动或复制模式；未识别项始终移动，目标同名时跳过。移动后仅删除已空的来源目录。</p>
           <div className="mt-3 max-h-80 overflow-y-auto rounded-lg border border-border">
             {plan.items.map((item, index) => <div key={`${item.sourceId}-${index}`} className="border-b border-border px-3 py-2 text-xs last:border-b-0">
               <p className="break-all font-medium">{item.sourcePath}</p>
               <p className={item.status === "ready" ? "mt-1 break-all text-muted-foreground" : "mt-1 text-destructive"}>
-                {item.status === "ready" ? `${item.action === "unrecognized" ? "未识别转移" : "整理"} → ${[...item.targetParts, item.targetName].join("/")}` : `跳过：${item.reason}`}
+                {item.status === "ready" ? item.action === "wash_cleanup" ? `洗版清理此旧版本；保留 → ${item.targetName}`
+                  : `${item.action === "unrecognized" ? "未识别转移" : "整理"} → ${[...item.targetParts, item.targetName].join("/")}` : `跳过：${item.reason}`}
               </p>
+              {item.status === "ready" && item.washReason && <p className="mt-1 text-muted-foreground">洗版：{item.washReason}</p>}
             </div>)}
           </div>
           {plan.nextOffset !== null && <div className="mt-3"><SecondaryButton disabled={loadingMore} onClick={() => void loadMore()}>{loadingMore ? "读取中…" : "加载更多预览"}</SecondaryButton></div>}

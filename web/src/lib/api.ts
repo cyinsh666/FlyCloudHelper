@@ -1115,12 +1115,15 @@ export interface ProviderDirectoryListing {
 }
 
 /** 服务级整理预览与执行任务只使用网盘资源编号，不依赖媒体库。 */
+export type WashPriority = "dv" | "hdr" | "bitrate" | "frame_rate" | "resolution" | "data_saving";
+
 export interface OrganizePlanItem {
   sourceId: string;
   sourcePath: string;
   sourceName: string;
   isDirectory?: boolean;
-  action?: "organize" | "unrecognized";
+  action?: "organize" | "unrecognized" | "wash_cleanup";
+  washReason?: string;
   targetParts: string[];
   targetName: string;
   willOverwrite: boolean;
@@ -1136,6 +1139,9 @@ export interface OrganizePlan {
   unrecognizedDirectory?: ProviderDirectory | null;
   aiAssistEnabled?: boolean;
   aiModelId?: string | null;
+  washEnabled?: boolean;
+  washPriorities?: WashPriority[];
+  washSummary?: { keepExisting: number; selectNew: number; cleanup: number; skippedSources: number };
   aiFailureCount?: number;
   status: "preparing" | "ready" | "failed";
   error: string | null;
@@ -1198,6 +1204,8 @@ export interface OrganizeSchedule extends Omit<ScanSchedule, "id" | "libraryId" 
   unrecognizedDirectory?: ProviderDirectory | null;
   aiAssistEnabled?: boolean;
   aiModelId?: string | null;
+  washEnabled?: boolean;
+  washPriorities?: WashPriority[];
   pendingPlanId: string | null;
   pendingRunKind?: "scheduled" | "manual";
   lastRunMessage?: string | null;
@@ -1207,7 +1215,7 @@ export type UpdateOrganizeScheduleInput = Pick<OrganizeSchedule,
   "enabled" | "scheduleType" | "intervalMinutes" | "timeOfDay" | "dayOfWeek" | "dayOfMonth" |
   "timezoneOffsetMinutes" | "quietPeriodEnabled" | "quietStartTime" | "quietEndTime" |
   "sources" | "target" | "mode" | "unrecognizedTransferEnabled" | "unrecognizedDirectory" |
-  "aiAssistEnabled" | "aiModelId">;
+  "aiAssistEnabled" | "aiModelId" | "washEnabled" | "washPriorities">;
 
 /** 视频媒体库文件浏览的当前目录条目。 */
 export interface LibraryBrowseEntry extends ProviderDirectory {
@@ -1529,6 +1537,7 @@ export async function createServiceOrganizePlan(serviceId: string, input: {
   sources: ProviderDirectory[]; target: ProviderDirectory; mode: "move" | "copy";
   unrecognizedTransferEnabled?: boolean; unrecognizedDirectory?: ProviderDirectory | null;
   aiAssistEnabled?: boolean; aiModelId?: string | null;
+  washEnabled?: boolean; washPriorities?: WashPriority[];
 }, admin = false): Promise<OrganizePlan> {
   const result = await requestJson<{ plan: OrganizePlan }>(`${admin ? "/api/v1/admin" : "/api/v1"}/services/${serviceId}/organize/plans`,
     { method: "POST", body: JSON.stringify(input) });

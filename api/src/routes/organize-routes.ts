@@ -3,14 +3,14 @@ import { ApiError, validationError } from "../errors.js";
 import { requireConfirmation, requireRequestUser, requireSuperAdmin } from "../http.js";
 import { ServiceOrganizeManager } from "../organize/manager.js";
 import { ServiceOrganizeScheduler } from "../organize/schedule.js";
-import type { OrganizeDirectory, OrganizeMode } from "../organize/types.js";
+import type { OrganizeDirectory, OrganizeMode, WashPriority } from "../organize/types.js";
 import type { OrganizeJob, OrganizePlan } from "../organize/types.js";
 import type { ApiRuntime } from "../runtime.js";
 
 /** 预览逐页返回，避免几千个源文件一次塞进浏览器响应。 */
 function planPage(plan: OrganizePlan, offset: number) {
   const limit = 100;
-  return { ...plan, scannedDirectories: [], directoryCount: plan.scannedDirectories.length,
+  return { ...plan, washGroups: undefined, scannedDirectories: [], directoryCount: plan.scannedDirectories.length,
     items: plan.items.slice(offset, offset + limit), itemCount: plan.items.length,
     readyCount: plan.items.filter((item) => item.status === "ready").length,
     overwriteCount: plan.items.filter((item) => item.status === "ready" && item.willOverwrite).length,
@@ -92,7 +92,7 @@ export async function registerOrganizeRoutes(server: FastifyInstance, runtime: A
       reply.status(202).send({ schedule: await scheduler.runNow(request.params.serviceId, await actorId(request)) }));
     server.post<{ Params: { serviceId: string }; Body: { sources: OrganizeDirectory[]; target: OrganizeDirectory; mode: OrganizeMode;
       unrecognizedTransferEnabled?: boolean; unrecognizedDirectory?: OrganizeDirectory | null;
-      aiAssistEnabled?: boolean; aiModelId?: string | null } }>(
+      aiAssistEnabled?: boolean; aiModelId?: string | null; washEnabled?: boolean; washPriorities?: WashPriority[] } }>(
       `${prefix}/:serviceId/organize/plans`, async (request, reply) => {
         if (!request.body || typeof request.body !== "object") throw validationError("sources", "请选择有效的整理目录");
         const plan = await manager.createPlan(request.params.serviceId, await actorId(request), request.body);

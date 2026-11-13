@@ -16,6 +16,9 @@ const QUARK_API = "https://drive.quark.cn/1/clouddrive";
 const QUARK_SHARE_API = "https://drive-pc.quark.cn/1/clouddrive";
 const QUARK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4";
 
+/** 分享条目保留目录属性，订阅转存可展开最外层作品目录。 */
+export interface QuarkShareEntry { fid: string; token: string; name: string; isDirectory: boolean }
+
 /** 夸克网盘 Cookie Provider，目录浏览与文件整理共用凭据轮换。 */
 export class QuarkProvider extends CloudDriveProviderBase {
   protected readonly rootResourceId = "0";
@@ -66,14 +69,14 @@ export class QuarkProvider extends CloudDriveProviderBase {
     return token;
   }
 
-  /** 逐页读取分享根目录，保留文件与文件夹对应的 fid 和分享文件令牌。 */
+  /** 逐页读取分享目录，默认根目录；展开作品目录时继续使用该目录自己的文件令牌。 */
   public async listShareRoot(connection: Record<string, unknown>, shareId: string, token: string,
-    context?: ProviderConnectionContext): Promise<Array<{ fid: string; token: string }>> {
-    const entries: Array<{ fid: string; token: string }> = [];
+    context?: ProviderConnectionContext, parentId = "0"): Promise<QuarkShareEntry[]> {
+    const entries: QuarkShareEntry[] = [];
     const pageSize = 50;
     for (let page = 1; page <= 100; page += 1) {
       const query = new URLSearchParams({ pr: "ucpro", fr: "pc", uc_param_str: "", pwd_id: shareId,
-        stoken: token, pdir_fid: "0", force: "0", _page: String(page), _size: String(pageSize),
+        stoken: token, pdir_fid: parentId, force: "0", _page: String(page), _size: String(pageSize),
         _sort: "file_type:asc,updated_at:desc" });
       const payload = await this.request(connection, `${QUARK_SHARE_API}/share/sharepage/detail?${query}`,
         { method: "GET" }, undefined, context);
@@ -84,7 +87,8 @@ export class QuarkProvider extends CloudDriveProviderBase {
         const fid = readCloudText(item, ["fid"]);
         const fileToken = readCloudText(item, ["share_fid_token"]);
         if (!fid || !fileToken) throw new ApiError(502, "quark_share_file_invalid", "夸克分享文件缺少转存凭据");
-        entries.push({ fid, token: fileToken });
+        entries.push({ fid, token: fileToken, name: readCloudText(item, ["file_name", "name"]),
+          isDirectory: item.dir === true || Number(item.file_type) === 0 });
       }
       const total = readCloudNumber(readCloudRecord(payload.metadata)._total);
       if (items.length < pageSize || (total > 0 && entries.length >= total)) return entries;
@@ -95,12 +99,12 @@ export class QuarkProvider extends CloudDriveProviderBase {
   /** 提交一次夸克分享转存，返回异步任务编号；调用方不能自动重试提交。 */
   public async saveShareRoot(connection: Record<string, unknown>, shareId: string, token: string,
     entries: Array<{ fid: string; token: string }>, targetDirectoryId: string,
-    context?: ProviderConnectionContext): Promise<string> {
+    context?: ProviderConnectionContext, sourceParentId = "0"): Promise<string> {
     const query = new URLSearchParams({ pr: "ucpro", fr: "pc", uc_param_str: "" });
     const payload = await this.request(connection, `${QUARK_API}/share/sharepage/save?${query}`,
       { method: "POST", body: JSON.stringify({ fid_list: entries.map((item) => item.fid),
         fid_token_list: entries.map((item) => item.token), to_pdir_fid: targetDirectoryId,
-        pwd_id: shareId, stoken: token, pdir_fid: "0", pdir_save_all: false, exclude_fids: [], scene: "link" }) },
+        pwd_id: shareId, stoken: token, pdir_fid: sourceParentId, pdir_save_all: false, exclude_fids: [], scene: "link" }) },
       undefined, context);
     const taskId = readCloudText(readCloudRecord(payload.data), ["task_id"]);
     if (!taskId) throw new ApiError(503, "search_transfer_task_missing", "转存已提交，但未收到任务编号；请检查目标目录");

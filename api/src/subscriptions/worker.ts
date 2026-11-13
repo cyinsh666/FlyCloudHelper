@@ -4,7 +4,7 @@ import path from "node:path";
 import { ApiError } from "../errors.js";
 import { ResourceSearchEngine, readTelegramChannelPage, type TelegramChannelMessage } from "../resource-search/engine.js";
 import { readShareTransferStatus, submitShareTransfer, type ShareTransferStatus } from "../resource-search/share-transfer.js";
-import { getServiceTransferDirectory } from "../resource-search/transfer-directory.js";
+import { getServiceTransferDirectory, getSubscriptionTransferRename } from "../resource-search/transfer-directory.js";
 import type { ApiRuntime } from "../runtime.js";
 import { matchSubscription } from "./matching.js";
 import { listStoredSubscriptions, type MovieSubscription } from "./store.js";
@@ -30,10 +30,14 @@ export interface SubscriptionActivity {
   taskId: string | null;
   createdAt: string;
   updatedAt: string;
-  /** 新批次的接收目录和提交时身份快照；历史活动没有此字段。 */
+  /** 使用独立接收目录的批次保存目录和提交时的身份快照。 */
   transferRoot?: SubscriptionTransferRoot;
   /** 网盘已完成时只重试命名，不再反复查询或提交分享。 */
   transferCompleted?: boolean;
+  /** 只给本版本新确认完成的转存补发通知，不追发历史已完成记录。 */
+  completionNotificationPending?: boolean;
+  /** 同一远端转存任务跨频道出现时，沿用已记录的通知时间去重。 */
+  completionNotificationAt?: string;
 }
 
 interface ServiceSubscriptionState {
@@ -210,7 +214,7 @@ export class MovieSubscriptionWorker {
           if (!items.length) { await this.refreshTasks(state); return; }
           // 频道仍每十分钟查找一次；等待中的网盘任务在每 30 秒巡检时单独更新状态。
           if (state.nextRunAt > new Date().toISOString()) {
-            if (state.activities.some((activity) => activity.taskId
+            if (state.activities.some((activity) => activity.completionNotificationPending || activity.taskId
               && (activity.status === "pending" || activity.status === "running"))) {
               await this.refreshTasks(state);
             }
@@ -355,11 +359,17 @@ export class MovieSubscriptionWorker {
           if (!matched.subscription || alreadySubmittedToday) continue;
           submittedLinksByDay.add(linkDayKey);
           try {
-            const root = await prepareSubscriptionTransferRoot(this.runtime, state.serviceId, matched.subscription, share.title,
-              async (prepared) => { activity.transferRoot = prepared; await this.saveState(state); });
+            const subscription = matched.subscription;
+            // 本次提交只读取一次开关，关闭时沿用直接转存，保留分享顶层结构。
+            const replaceName = await getSubscriptionTransferRename(this.runtime.database, state.serviceId);
             const submitted = await submitShareTransfer(this.runtime, { serviceId: state.serviceId,
               shareUrl: share.shareUrl, password: share.password, actorUserId: ownerId, ownerId,
-              subscriptionDirectory: root.directory! });
+              // 分享失效、为空或目录分页失败时不会调用此函数，也就不会留下空接收目录。
+              prepareSubscriptionDirectory: replaceName ? async () => {
+                const root = await prepareSubscriptionTransferRoot(this.runtime, state.serviceId, subscription,
+                  async (prepared) => { activity.transferRoot = prepared; await this.saveState(state); });
+                return root.directory!;
+              } : undefined });
             activity.status = "pending";
             activity.taskId = submitted.taskId;
             activity.updatedAt = new Date().toISOString();
@@ -383,6 +393,10 @@ export class MovieSubscriptionWorker {
     // 关键变量：多个频道消息可能返回同一个网盘任务编号，本轮只向网盘查询一次。
     const checkedTasks = new Map<string, ShareTransferStatus | null>();
     for (const activity of state.activities) {
+      if (activity.status === "completed" && activity.completionNotificationPending) {
+        await this.notifyTransferCompleted(state, activity);
+        continue;
+      }
       if (!activity.taskId || (activity.status !== "pending" && activity.status !== "running")) continue;
       try {
         let status: ShareTransferStatus | null | undefined = activity.transferCompleted ? "completed" : checkedTasks.get(activity.taskId);
@@ -404,7 +418,9 @@ export class MovieSubscriptionWorker {
         if (status === activity.status) continue;
         activity.status = status;
         activity.updatedAt = new Date().toISOString();
+        if (status === "completed") activity.completionNotificationPending = true;
         await this.saveState(state);
+        if (status === "completed") await this.notifyTransferCompleted(state, activity);
       } catch (error) {
         if (activity.transferCompleted) {
           activity.reason = `网盘转存已完成，根目录命名待重试：${error instanceof Error ? error.message : "未知错误"}`;
@@ -417,6 +433,28 @@ export class MovieSubscriptionWorker {
           this.logFailure("订阅转存状态查询失败", state.serviceId, error, activity.channel);
         }
       }
+    }
+  }
+
+  /** 确认转存及接收根命名都完成后提醒一次，通知异常不改变转存结果。 */
+  private async notifyTransferCompleted(state: ServiceSubscriptionState, activity: SubscriptionActivity): Promise<void> {
+    try {
+      const notified = state.activities.find((other) => other.taskId === activity.taskId && other.completionNotificationAt);
+      if (!notified) {
+        const service = await this.runtime.repository.getServiceDetail(state.serviceId);
+        const target = activity.transferRoot?.directory ?? await getServiceTransferDirectory(this.runtime.database, state.serviceId);
+        await this.runtime.database.createNotification({
+          userId: service.userId, category: "task", tone: "success", title: "订阅转存已完成",
+          message: `服务“${service.displayName}”的订阅转存已完成：${activity.transferRoot?.identity.title ?? activity.title}。`
+            + (target ? `\n保存目录：${target.displayPath}` : "") + `\n来源：${activity.messageUrl}`,
+          actionPath: `/app/services/${state.serviceId}`,
+        });
+      }
+      activity.completionNotificationAt = notified?.completionNotificationAt ?? new Date().toISOString();
+      activity.completionNotificationPending = false;
+      await this.saveState(state);
+    } catch (error) {
+      this.logFailure("订阅转存完成通知失败", state.serviceId, error, activity.channel);
     }
   }
 

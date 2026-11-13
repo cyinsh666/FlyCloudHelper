@@ -1,5 +1,25 @@
 /** 服务级影片整理的公共任务模型，不依赖媒体库或具体网盘接口。 */
 export type OrganizeMode = "move" | "copy";
+export type WashPriority = "dv" | "hdr" | "bitrate" | "frame_rate" | "resolution" | "data_saving";
+
+/** 洗版身份与展示名称、规格无关，只对已确认的作品和明确单集生效。 */
+export interface WashIdentity {
+  key: string;
+  mediaType: "movie" | "tv";
+  tmdbId: number;
+  season: number;
+  episode: number;
+}
+
+/** 保留目标已有版本时，执行前按资源 ID 和列表快照重新核验。 */
+export interface WashExistingFile {
+  resourceId: string;
+  parent: OrganizeDirectory;
+  displayPath: string;
+  name: string;
+  size: number;
+  modifiedAt: string | null;
+}
 
 export interface OrganizeDirectory {
   resourceId: string;
@@ -12,7 +32,12 @@ export interface OrganizePlanItem {
   /** 整夹预览时的完整子项签名，执行前复查目录内容没有变化。 */
   containedEntries?: string[];
   /** 未识别项始终移动，普通整理仍遵循计划的复制或移动模式。 */
-  action?: "organize" | "unrecognized";
+  action?: "organize" | "unrecognized" | "wash_cleanup";
+  washIdentity?: WashIdentity;
+  /** 清理项引用本次新保留文件的来源 ID，或已存在的保留文件快照。 */
+  washWinnerSourceId?: string;
+  washExistingWinner?: WashExistingFile;
+  washReason?: string;
   sourceId: string;
   parentId: string;
   sourcePath: string;
@@ -42,6 +67,11 @@ export interface OrganizePlan {
   unrecognizedDirectory?: OrganizeDirectory | null;
   aiAssistEnabled?: boolean;
   aiModelId?: string | null;
+  washEnabled?: boolean;
+  washPriorities?: WashPriority[];
+  /** 仅本次来源涉及的作品身份，用于清理结束后的目标唯一性核验。 */
+  washGroups?: WashIdentity[];
+  washSummary?: { keepExisting: number; selectNew: number; cleanup: number; skippedSources: number };
   /** 模型请求失败时仍继续规则结果和未识别转移，供页面提示。 */
   aiFailureCount?: number;
   scannedDirectories: OrganizeDirectory[];
@@ -95,6 +125,8 @@ export interface OrganizeJob {
   autoRetryCount?: number;
   /** 下次自动继续时间；为空时失败任务只允许人工继续。 */
   nextRetryAt?: string | null;
+  /** 旧版原名冲突仅自动恢复一次；其他人工处理类失败不因此重试。 */
+  sourceNameConflictRecoveryAt?: string;
   createdAt: string;
   updatedAt: string;
 }

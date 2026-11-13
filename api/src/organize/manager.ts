@@ -5,11 +5,12 @@ import { ApiError } from "../errors.js";
 import { parseFlymbyVideoDirectory, parseFlymbyVideoName } from "../media/flymby-video-parser.js";
 import { WebdavVideoNameParser } from "../media/app-recognition/WebdavVideoNameParser.js";
 import { prepareOrganizeAi, recognizeUnmatchedByAi } from "./recognition-ai.js";
+import { prepareWashPlan, readWashOptions, readWashTargets, washIdentity, washNameTags } from "./wash.js";
 import { readSubscriptionTransferRoots, insideSubscriptionRoot, subscriptionReceivingPrefix,
   type SubscriptionTransferRoot } from "../subscriptions/transfer-root.js";
 import type { ProviderAdapter, ProviderBrowseEntry, ProviderConnectionContext, ProviderFileOrganizer, ProviderMutationResult } from "../providers/types.js";
 import type { ApiRuntime } from "../runtime.js";
-import type { OrganizeDirectory, OrganizeJob, OrganizeJobItem, OrganizeMode, OrganizePlan, OrganizePlanItem, OrganizeTaskSummary } from "./types.js";
+import type { OrganizeDirectory, OrganizeJob, OrganizeJobItem, OrganizeMode, OrganizePlan, OrganizePlanItem, OrganizeTaskSummary, WashPriority } from "./types.js";
 
 const VIDEO_EXTENSION = /\.(?:mp4|mkv|avi|mov|wmv|flv|m4v|ts|m2ts|mpg|mpeg|rmvb|webm|3gp|iso)$/iu;
 const MAX_FILES = 5000;
@@ -22,6 +23,7 @@ const RETRYABLE_PROVIDER_CODES = new Set([
   "provider_connection_timeout", "provider_connection_refused", "provider_network_unreachable",
   "provider_dns_resolution_failed", "provider_unavailable", "provider_rate_limited",
   "cloud139_rate_limited", "quark_organize_move_pending",
+  "organize_wash_delete_pending",
 ]);
 
 /** 仅临时网络、限流及已持久化的远端任务等待超时可自动继续。 */
@@ -178,6 +180,7 @@ export class ServiceOrganizeManager {
     sources: OrganizeDirectory[]; target: OrganizeDirectory; mode: OrganizeMode;
     unrecognizedTransferEnabled?: boolean; unrecognizedDirectory?: OrganizeDirectory | null;
     aiAssistEnabled?: boolean; aiModelId?: string | null;
+    washEnabled?: boolean; washPriorities?: WashPriority[];
   }): Promise<OrganizePlan> {
     const context = await this.context(serviceId, actorUserId);
     if (!Array.isArray(input.sources) || input.sources.length < 1 || input.sources.length > 20
@@ -219,6 +222,7 @@ export class ServiceOrganizeManager {
       mode: input.mode, sourceDirectories: uniqueSources, targetDirectory: target, scannedDirectories: [],
       unrecognizedTransferEnabled: Boolean(input.unrecognizedTransferEnabled), unrecognizedDirectory,
       aiAssistEnabled: Boolean(input.aiAssistEnabled), aiModelId,
+      ...readWashOptions(input),
       aiFailureCount: 0, status: "preparing", error: null, items: [], createdAt: now, updatedAt: now };
     await this.withExclusiveScanSlot(serviceId, () => saveJson(this.planPath(plan.id), plan));
     this.activePlans.add(plan.id);
@@ -249,6 +253,7 @@ export class ServiceOrganizeManager {
       const siblingNamesByDirectory = new Map<string, string[]>();
       const seenDirectories = new Set<string>();
       const subscriptionRoots = await readSubscriptionTransferRoots(this.runtime, plan.serviceId);
+      context.subscriptionPendingRoots = subscriptionRoots.filter((root) => !root.ready);
       const subscriptionRootsById = new Map(subscriptionRoots.flatMap((root) => root.directory ? [[root.directory.resourceId, root] as const] : []));
       const subscriptionScopes = new Map<string, SubscriptionTransferRoot>();
       const protectedSubscriptionPaths = new Set<string>();
@@ -370,7 +375,7 @@ export class ServiceOrganizeManager {
                 服务ID: plan.serviceId, TMDB编号: identity.tmdbId, 错误信息: error instanceof Error ? error.message : String(error) });
             }
           }
-          const item = this.makeItem(entry, parsed, conflict ? null : matchCache.get(identityKey) ?? null);
+          const item = this.makeItem(entry, parsed, conflict ? null : matchCache.get(identityKey) ?? null, plan.washEnabled);
           if (conflict || !matchCache.get(identityKey)) {
             item.reason = conflict ? "文件或子目录的 TMDB 编号与订阅不一致，已保留来源"
               : "订阅 TMDB 详情暂不可用，已保留来源等待重试";
@@ -427,7 +432,7 @@ export class ServiceOrganizeManager {
             if (seriesMatch) { parsed = series; matched = seriesMatch; key = seriesKey; }
           }
         }
-        const ruleItem = this.makeItem(entry, parsed, matched);
+        const ruleItem = this.makeItem(entry, parsed, matched, plan.washEnabled);
         // 关键变量：只有本次实际向模型发起查询，才记录一次 AI 结果和 TMDB 判定。
         let requestedAi = false;
         const ruleTitle = parsed.title;
@@ -477,7 +482,7 @@ export class ServiceOrganizeManager {
             matched = matchCache.get(key)!;
           }
         }
-        const assistedItem = this.makeItem(entry, parsed, matched);
+        const assistedItem = this.makeItem(entry, parsed, matched, plan.washEnabled);
         if (requestedAi) this.runtime.logBusinessEvent("info", {
           日志关键字: "codex-flycloud-organize-ai", 事件: "AI辅助整理判定",
           服务ID: plan.serviceId, 预览ID: plan.id, 来源资源ID: entry.resourceId,
@@ -490,9 +495,11 @@ export class ServiceOrganizeManager {
       if (plan.unrecognizedTransferEnabled && plan.unrecognizedDirectory) {
         this.addUnrecognizedItems(plan, allEntries, aiFailedSourceIds, protectedSubscriptionPaths);
       }
+      await prepareWashPlan(plan, async (directory) => (await this.children(context, directory))
+        .filter((entry) => !entry.isDirectory || !this.isSubscriptionReceivingDirectory(context, entry)));
       const targets = new Set<string>();
       for (const item of plan.items) {
-        if (item.status !== "ready") continue;
+        if (item.status !== "ready" || item.action === "wash_cleanup") continue;
         const key = [item.action === "unrecognized" ? "unrecognized" : "organize", ...item.targetParts, item.targetName].join("/");
         if (targets.has(key)) { item.status = "skipped"; item.reason = "多个来源文件生成相同目标路径"; }
         else targets.add(key);
@@ -500,7 +507,7 @@ export class ServiceOrganizeManager {
       // 关键变量：目标目录列表在本次预览中按资源 ID 缓存，避免同作品几千集重复请求网盘。
       const targetListings = new Map<string, ProviderBrowseEntry[]>();
       for (const item of plan.items) {
-        if (item.status !== "ready") continue;
+        if (item.status !== "ready" || item.action === "wash_cleanup") continue;
         let parent: OrganizeDirectory | null = item.action === "unrecognized" && plan.unrecognizedDirectory
           ? plan.unrecognizedDirectory : plan.targetDirectory;
         for (const name of item.targetParts) {
@@ -605,7 +612,7 @@ export class ServiceOrganizeManager {
 
   /** 使用同一作品名生成目录及文件名，缺少身份或季集号时只留跳过记录。 */
   private makeItem(entry: ProviderBrowseEntry, parsed: ReturnType<typeof parseFlymbyVideoName>,
-    match: MatchedTitle | null): OrganizePlanItem {
+    match: MatchedTitle | null, washEnabled = false): OrganizePlanItem {
     const base: OrganizePlanItem = { sourceId: entry.resourceId, parentId: entry.parentResourceId,
       sourcePath: entry.displayPath, sourceName: entry.name, size: entry.size, modifiedAt: entry.modifiedAt,
       targetParts: [], targetName: "", category: "", tmdbId: match?.id ?? null, willOverwrite: false,
@@ -623,10 +630,14 @@ export class ServiceOrganizeManager {
     const category = parsed.mediaType === "movie" ? "电影" : anime ? "动漫" : variety ? "综艺" : "剧集";
     const year = match.year ?? parsed.year;
     const extension = path.extname(entry.name);
-    const tags = readNameTags(entry.displayPath, parsed.resolution, parsed.source);
+    const tags = washEnabled
+      ? washNameTags(entry.name, entry.displayPath, readNameTags(entry.name, "", ""))
+      : readNameTags(entry.displayPath, parsed.resolution, parsed.source);
     const nameParts = [title, year ? String(year) : ""];
     if (parsed.mediaType === "tv") nameParts.push(`S${String(parsed.seasonNumber).padStart(2, "0")}E${String(parsed.episodeNumber).padStart(2, "0")}`, `第${parsed.episodeNumber}集`);
-    const targetName = safeName([...nameParts, ...tags].filter(Boolean).join(".")) + extension;
+    const joinedName = [...nameParts, ...tags].filter(Boolean).join(".");
+    // 洗版文件的季集和比较标签不能被截断，超过网盘限制时整项跳过。
+    const targetName = (washEnabled ? joinedName : safeName(joinedName)) + extension;
     if ([...targetName].length > 255) { base.reason = "目标文件名超过网盘限制"; return base; }
     // 电影作品目录使用“片名 (年份) {tmdb-ID}”，剧集目录保持原有命名规则。
     const workDirectoryName = parsed.mediaType === "movie"
@@ -635,6 +646,7 @@ export class ServiceOrganizeManager {
     base.targetParts = [category, workDirectoryName, ...(parsed.mediaType === "tv" ? [`Season ${String(parsed.seasonNumber).padStart(2, "0")}`] : [])];
     base.targetName = targetName;
     base.category = category;
+    base.washIdentity = washIdentity(parsed.mediaType, match.id, parsed.seasonNumber, parsed.episodeNumber);
     base.status = "ready";
     return base;
   }
@@ -853,6 +865,16 @@ export class ServiceOrganizeManager {
       if (!previous || job.createdAt > previous.createdAt) latestByService.set(job.serviceId, job);
     }
     for (const job of latestByService.values()) {
+      // 旧版原名冲突发生在远端写入前；修复后只恢复一次，继续原文件进度。
+      if (job.status === "failed" && !job.sourceNameConflictRecoveryAt && !job.nextRetryAt
+        && job.error?.endsWith("：目标目录已有与来源同名的其他内容，无法直接移动")
+        && job.items.some((item) => item.stage === "failed" && !item.directOperation
+          && !item.stageRequested && !item.pendingTaskId && !item.stagedId)) {
+        job.sourceNameConflictRecoveryAt = new Date().toISOString();
+        job.nextRetryAt = job.sourceNameConflictRecoveryAt;
+        job.autoRetryCount = 0;
+        await this.saveJob(job);
+      }
       if (!job || job.status !== "failed" || !job.nextRetryAt || job.nextRetryAt > new Date().toISOString()
         || this.activeServices.has(job.serviceId) || this.creatingServices.has(job.serviceId)) continue;
       try {
@@ -932,6 +954,15 @@ export class ServiceOrganizeManager {
     job.nextRetryAt = isRetryableOrganizeFailure(error) && attempts < AUTO_RETRY_DELAYS_MS.length
       ? new Date(Date.now() + AUTO_RETRY_DELAYS_MS[attempts]!).toISOString() : null;
     await this.saveJob(job);
+    if (job.status !== "failed") return;
+    const service = await this.runtime.repository.getServiceDetail(job.serviceId, job.userId).catch(() => null);
+    await this.runtime.database.createNotificationSafely({
+      userId: job.userId, category: "task", tone: "danger", title: "影片整理失败",
+      message: `服务“${service?.displayName ?? "网盘服务"}”的影片整理失败：${job.error ?? "未知错误"}。`
+        + (job.nextRetryAt ? `将在 ${new Date(job.nextRetryAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })} 自动继续。`
+          : "任务进度已保留，请在整理任务中继续或取消；定时整理暂时受阻。"),
+      actionPath: `/app/services/${job.serviceId}/organize`,
+    });
   }
 
   /** 远端任务必须完成才允许进入下一阶段。 */
@@ -989,7 +1020,8 @@ export class ServiceOrganizeManager {
   /** 支持批量写入的新任务直接到达目标；历史暂存任务继续从原阶段恢复。 */
   private canDirectTransfer(context: OrganizeContext, plan: OrganizePlan, state: OrganizeJobItem): boolean {
     const item = plan.items[state.index];
-    if (!item || item.status !== "ready") return false;
+    if (!item || item.status !== "ready" || item.action === "wash_cleanup"
+      || plan.washEnabled && item.willOverwrite) return false;
     return Boolean(context.directEnabled && context.organizer.moveMany && context.organizer.copyMany
       && state.stage === "pending" && !state.stageRequested && !state.directOperation && !state.pendingTaskId);
   }
@@ -1036,7 +1068,7 @@ export class ServiceOrganizeManager {
         && entry.resourceId !== item.sourceId && entry.resourceId !== existing?.resourceId);
       if (!source || source.name !== item.sourceName || source.isDirectory !== Boolean(item.isDirectory)
         || (!item.isDirectory && (source.size !== item.size || source.modifiedAt !== item.modifiedAt))
-        || (existing && (item.action === "unrecognized" || existing.isDirectory)) || sourceNameCollision
+        || (existing && (plan.washEnabled || item.action === "unrecognized" || existing.isDirectory)) || sourceNameCollision
         || reservedNames.has(item.sourceName) || reservedNames.has(item.targetName)) continue;
       await this.requireUnchangedFolder(context, item);
       selected.push(state);
@@ -1101,9 +1133,9 @@ export class ServiceOrganizeManager {
     return true;
   }
 
-  /** 目标有同名内容时先按覆盖规则删除，再单项直达目标，不创建暂存目录。 */
+  /** 按原规则单项直达；原名被其他内容占用时返回 false，交给暂存改名流程。 */
   private async startDirectSingle(context: OrganizeContext, plan: OrganizePlan, job: OrganizeJob,
-    state: OrganizeJobItem): Promise<void> {
+    state: OrganizeJobItem): Promise<boolean> {
     if (this.hasEarlierDirectTarget(plan, job, state)) throw new Error("计划中有多个条目生成同名目标，请重新预览");
     const item = plan.items[state.index]!;
     const operation = item.action === "unrecognized" ? "move" : plan.mode;
@@ -1119,11 +1151,12 @@ export class ServiceOrganizeManager {
     const targetEntries = await this.children(context, target);
     context.directTargetListings?.delete(target.resourceId);
     const existing = targetEntries.find((entry) => entry.name === item.targetName && entry.resourceId !== item.sourceId);
+    if (existing && plan.washEnabled) throw new Error("洗版直达目标出现同名文件，请重新预览，已保留双方文件");
     if (existing && item.action === "unrecognized") throw new Error("未识别目标已有同名内容，来源保持原位");
     if (existing?.isDirectory) throw new Error("目标名称被目录占用，不能覆盖");
     const sourceNameCollision = targetEntries.find((entry) => entry.name === item.sourceName
       && entry.resourceId !== item.sourceId && entry.resourceId !== existing?.resourceId);
-    if (sourceNameCollision) throw new Error("目标目录已有与来源同名的其他内容，无法直接移动");
+    if (sourceNameCollision) return false;
     state.directOperation = operation;
     state.directBatchId = randomUUID();
     state.targetParentId = target.resourceId;
@@ -1139,6 +1172,7 @@ export class ServiceOrganizeManager {
     } else if (state.directPhase === "transfer") {
       await this.submitDirectTransfer(context, job, state, target.resourceId);
     }
+    return true;
   }
 
   /** 逐项重试和覆盖后的传输共用提交路径，先记提交意图再调用网盘接口。 */
@@ -1268,6 +1302,7 @@ export class ServiceOrganizeManager {
       const collision = targetEntries.find((entry) => entry.name === item.targetName
         && entry.resourceId !== placedId);
       if (collision) {
+        if (plan.washEnabled) throw new Error("洗版命名时目标出现新同名文件，已保留双方文件，请重新预览");
         if (item.action === "unrecognized" || collision.isDirectory) throw new Error("改名前目标出现同名内容，已保留来源文件");
         await this.waitMutation(context, await context.organizer.remove(context.connection,
           collision.resourceId, context.providerContext), job, state);
@@ -1322,6 +1357,57 @@ export class ServiceOrganizeManager {
     }
   }
 
+  /** 洗版只删除预览中明确列出的目标旧版本，保留版本每次都必须先按真实 ID 核验。 */
+  private async processWashCleanup(context: OrganizeContext, plan: OrganizePlan, job: OrganizeJob,
+    state: OrganizeJobItem): Promise<void> {
+    const item = plan.items[state.index]!;
+    let winnerId: string;
+    let winnerParent: OrganizeDirectory;
+    let winnerName: string;
+    let winnerSize: number;
+    if (item.washExistingWinner) {
+      const winner = item.washExistingWinner;
+      winnerId = winner.resourceId; winnerParent = winner.parent; winnerName = winner.name; winnerSize = winner.size;
+    } else {
+      const winnerIndex = plan.items.findIndex((candidate) => candidate.action !== "wash_cleanup"
+        && candidate.sourceId === item.washWinnerSourceId && candidate.washIdentity?.key === item.washIdentity?.key);
+      const winnerState = job.items.find((candidate) => candidate.index === winnerIndex);
+      if (!winnerState || winnerState.stage !== "completed" || !winnerState.stagedId || !winnerState.targetParentId) {
+        throw new Error("洗版保留版本尚未完成入位核验，旧版本已保留");
+      }
+      const winner = plan.items[winnerIndex]!;
+      winnerId = winnerState.stagedId;
+      winnerParent = { resourceId: winnerState.targetParentId,
+        displayPath: normalizedPath(path.posix.join(plan.targetDirectory.displayPath, ...winner.targetParts)) };
+      winnerName = winner.targetName; winnerSize = winner.size;
+    }
+    const kept = (await this.children(context, winnerParent)).find((entry) => entry.resourceId === winnerId && !entry.isDirectory);
+    if (!kept || kept.name !== winnerName || kept.size !== winnerSize
+      || item.washExistingWinner && kept.modifiedAt !== item.washExistingWinner.modifiedAt) {
+      throw new Error("洗版保留版本已变化，停止清理其他版本，请重新预览");
+    }
+    if (winnerId === item.sourceId) throw new Error("洗版清理与保留文件身份相同，已停止处理");
+    const parent = { resourceId: item.parentId, displayPath: path.posix.dirname(item.sourcePath) };
+    if (state.pendingTaskId) await this.waitMutation(context, { taskId: state.pendingTaskId }, job, state);
+    const old = (await this.children(context, parent)).find((entry) => entry.resourceId === item.sourceId);
+    if (old) {
+      if (old.isDirectory || old.name !== item.sourceName || old.size !== item.size || old.modifiedAt !== item.modifiedAt) {
+        throw new Error("洗版旧版本与预览不一致，已保留文件，请重新预览");
+      }
+      if (state.stageRequested) throw new ApiError(503, "organize_wash_delete_pending", "洗版删除请求结果尚未确认，等待目录同步，不重复提交");
+      state.stageRequested = true;
+      await this.saveJob(job);
+      await this.waitMutation(context, await context.organizer.remove(context.connection, old.resourceId,
+        context.providerContext), job, state);
+      if ((await this.children(context, parent)).some((entry) => entry.resourceId === old.resourceId)) {
+        throw new ApiError(503, "organize_wash_delete_pending", "洗版旧版本删除尚未在目录列表确认，请稍后继续任务");
+      }
+    }
+    state.stage = "completed";
+    state.error = null;
+    await this.saveJob(job);
+  }
+
   /** 处理文件或未识别文件夹：先暂存来源，再按计划放置和验证；普通文件继续支持旧目标备份。 */
   private async processItem(context: OrganizeContext, plan: OrganizePlan, job: OrganizeJob, state: OrganizeJobItem,
     stageRoot: OrganizeDirectory, backupRoot: OrganizeDirectory): Promise<void> {
@@ -1367,6 +1453,18 @@ export class ServiceOrganizeManager {
     if (staged) { state.stagedId = staged.resourceId; state.stage = "staged"; await this.saveJob(job); }
     if (!state.stagedId) throw new Error("暂存文件定位失败");
 
+    // 仅解决中转原名冲突：在独立暂存目录先改为最终名，不删除占用原名的其他文件。
+    if (staged && staged.name !== item.targetName && (await this.children(context, target))
+      .some((entry) => entry.name === staged!.name && entry.resourceId !== state.stagedId)) {
+      const renamed = await context.organizer.rename(context.connection, staged.resourceId, item.targetName, context.providerContext);
+      await this.waitMutation(context, renamed, job, state);
+      staged = (await this.children(context, stageDir)).find((entry) => entry.name === item.targetName
+        && entry.isDirectory === Boolean(item.isDirectory) && (item.isDirectory || entry.size === item.size));
+      if (!staged) throw new Error("暂存文件改名尚未确认，请稍后继续任务");
+      state.stagedId = staged.resourceId;
+      await this.saveJob(job);
+    }
+
     const backupEntries = await this.children(context, backupDir);
     const backedUpFiles = backupEntries.filter((entry) => !entry.isDirectory);
     if (backedUpFiles.length > 1) throw new Error("备份目录出现多个文件，已停止覆盖");
@@ -1374,6 +1472,13 @@ export class ServiceOrganizeManager {
     if (backedUp) state.replacedId = backedUp.resourceId;
     const currentTarget = await this.children(context, target);
     const old = currentTarget.find((entry) => entry.name === item.targetName && entry.resourceId !== state.stagedId);
+    if (old && plan.washEnabled && item.washIdentity) {
+      const expected = plan.items.find((candidate) => candidate.action === "wash_cleanup" && candidate.sourceId === old.resourceId
+        && candidate.washIdentity?.key === item.washIdentity?.key);
+      if (!expected || expected.sourceName !== old.name || expected.size !== old.size || expected.modifiedAt !== old.modifiedAt) {
+        throw new Error("洗版同名目标与预览不一致，已保留新旧文件，请重新预览");
+      }
+    }
     if (old && item.action === "unrecognized") throw new Error("未识别目标已有同名内容，已保留暂存内容，避免覆盖");
     if (old?.isDirectory) throw new Error("目标名称被目录占用，不能覆盖");
     if (old && !backedUp) {
@@ -1525,15 +1630,19 @@ export class ServiceOrganizeManager {
   private async notifyCompletedJob(job: OrganizeJob, plan: OrganizePlan): Promise<void> {
     const completedItems = job.items.filter((item) => item.stage === "completed")
       .map((item) => plan.items[item.index])
-      .filter((item): item is OrganizePlanItem => Boolean(item && item.action !== "unrecognized" && item.tmdbId !== null));
-    if (completedItems.length === 0) return;
+      .filter((item): item is OrganizePlanItem => Boolean(item && item.action !== "unrecognized"
+        && item.action !== "wash_cleanup" && item.tmdbId !== null));
+    const washedCount = job.items.filter((item) => item.stage === "completed"
+      && plan.items[item.index]?.action === "wash_cleanup").length;
+    if (completedItems.length === 0 && washedCount === 0) return;
     // 关键变量：同一剧集的多集视频只算一部影片，文件数仍逐个统计。
     const workCount = new Set(completedItems.map((item) => `${item.category === "电影" ? "movie" : "tv"}:${item.tmdbId}`)).size;
     const service = await this.runtime.repository.getServiceDetail(job.serviceId, job.userId).catch(() => null);
     await this.runtime.database.createNotificationSafely({
       userId: job.userId, notificationEvent: "organize_completed", category: "task", tone: "success",
       title: "影片整理已完成",
-      message: `服务“${service?.displayName ?? "网盘服务"}”的影片整理已完成：整理 ${workCount} 部影片、${completedItems.length} 个文件。`,
+      message: `服务“${service?.displayName ?? "网盘服务"}”的影片整理已完成：整理 ${workCount} 部影片、${completedItems.length} 个文件。`
+        + (washedCount ? `洗版清理 ${washedCount} 个目标旧版本。` : ""),
       actionPath: `/app/services/${job.serviceId}/organize`,
     });
   }
@@ -1584,9 +1693,21 @@ export class ServiceOrganizeManager {
         if (current.stage === "completed") continue;
         await this.requireNoActiveScan(job.serviceId);
         try {
-          if (context.directEnabled) {
+          if (plan.items[current.index]?.action === "wash_cleanup") {
+            await this.processWashCleanup(context, plan, job, current);
+            continue;
+          }
+          // 洗版只在确有同名替换时使用旧目标备份；不同名的新版本继续走原有批量直达。
+          const washNeedsBackup = plan.washEnabled && plan.items[current.index]?.willOverwrite;
+          if (current.directOperation || context.directEnabled && !washNeedsBackup) {
             if (!current.directOperation && !(await this.startDirectBatch(context, plan, job, current))) {
-              await this.startDirectSingle(context, plan, job, current);
+              const started = await this.startDirectSingle(context, plan, job, current);
+              if (!started) {
+                context.directTargetListings.clear();
+                const working = await ensureWork();
+                await this.processItem(context, plan, job, current, working.stageRoot, working.backupRoot);
+                continue;
+              }
             }
             if (!current.directBatchId) throw new Error("批量移动状态缺少批次标识，请重新检查任务");
             if (!await this.finishDirectBatch(context, plan, job, current.directBatchId)) return;
@@ -1607,6 +1728,23 @@ export class ServiceOrganizeManager {
       const beforeCleanup = await readJson<OrganizeJob>(this.jobPath(jobId));
       if (!beforeCleanup || beforeCleanup.status !== "running") return;
       job = beforeCleanup;
+      if (plan.washEnabled) {
+        context.subscriptionPendingRoots = (await readSubscriptionTransferRoots(this.runtime, plan.serviceId)).filter((root) => !root.ready);
+        const actualTargets = await readWashTargets(plan, async (directory) => (await this.children(context, directory))
+          .filter((entry) => !entry.isDirectory || !this.isSubscriptionReceivingDirectory(context, entry)));
+        for (const identity of plan.washGroups ?? []) {
+          const actual = actualTargets.get(identity.key) ?? [];
+          const decision = plan.items.find((item) => item.action !== "wash_cleanup" && item.washIdentity?.key === identity.key);
+          const selectedIndex = plan.items.findIndex((item) => item.action !== "wash_cleanup"
+            && item.sourceId === decision?.washWinnerSourceId && item.washIdentity?.key === identity.key);
+          const expectedId = decision?.washExistingWinner?.resourceId
+            ?? job.items.find((state) => state.index === selectedIndex && state.stage === "completed")?.stagedId;
+          const expectedSize = decision?.washExistingWinner?.size ?? plan.items[selectedIndex]?.size;
+          if (actual.length !== 1 || !expectedId || actual[0]?.resourceId !== expectedId || actual[0]?.size !== expectedSize) {
+            throw new Error("洗版目标版本已变化或数量不为一，请重新预览核实");
+          }
+        }
+      }
       if (plan.mode === "move" || plan.items.some((item) => item.status === "ready" && item.action === "unrecognized")) {
         await this.cleanupSources(context, plan);
       }

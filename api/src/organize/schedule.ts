@@ -6,7 +6,8 @@ import { calculateNextScanRunAt, postponeQuietCandidate, type ScanScheduleConfig
 import type { ApiRuntime } from "../runtime.js";
 import { ServiceOrganizeManager } from "./manager.js";
 import { prepareOrganizeAi } from "./recognition-ai.js";
-import type { OrganizeDirectory, OrganizeMode } from "./types.js";
+import type { OrganizeDirectory, OrganizeMode, WashPriority } from "./types.js";
+import { readWashOptions } from "./wash.js";
 
 /** 整理计划按服务保存到已有 /data 目录，不占用媒体库定时扫描表。 */
 export interface OrganizeSchedule extends ScanScheduleConfiguration {
@@ -19,11 +20,15 @@ export interface OrganizeSchedule extends ScanScheduleConfiguration {
   unrecognizedDirectory?: OrganizeDirectory | null;
   aiAssistEnabled?: boolean;
   aiModelId?: string | null;
+  washEnabled?: boolean;
+  washPriorities?: WashPriority[];
   nextRunAt: string | null;
   lastTriggeredAt: string | null;
   lastJobId: string | null;
   lastError: string | null;
   lastRunMessage?: string | null;
+  /** 同一任务、同一阻塞原因只提醒一次，服务重启后继续去重。 */
+  lastBlockedNotificationKey?: string | null;
   pendingPlanId: string | null;
   pendingRunKind?: "scheduled" | "manual";
   updatedAt: string;
@@ -42,6 +47,7 @@ function defaultSchedule(serviceId: string, userId: string): OrganizeSchedule {
   return {
     serviceId, userId, sources: [], target: null, mode: "move", enabled: false,
     unrecognizedTransferEnabled: false, unrecognizedDirectory: null, aiAssistEnabled: false, aiModelId: null,
+    washEnabled: false, washPriorities: ["resolution"],
     scheduleType: "interval", intervalMinutes: 24 * 60, timeOfDay: "03:00", dayOfWeek: 1,
     dayOfMonth: 1, timezoneOffsetMinutes: -new Date().getTimezoneOffset(), quietPeriodEnabled: false,
     quietStartTime: "00:00", quietEndTime: "07:00", nextRunAt: null, lastTriggeredAt: null,
@@ -53,7 +59,7 @@ function defaultSchedule(serviceId: string, userId: string): OrganizeSchedule {
 export function readOrganizeScheduleInput(body: Record<string, unknown>): Pick<OrganizeSchedule,
   "enabled" | "scheduleType" | "intervalMinutes" | "timeOfDay" | "dayOfWeek" | "dayOfMonth" |
   "timezoneOffsetMinutes" | "quietPeriodEnabled" | "quietStartTime" | "quietEndTime" | "sources" | "target" | "mode" |
-  "unrecognizedTransferEnabled" | "unrecognizedDirectory" | "aiAssistEnabled" | "aiModelId"> {
+  "unrecognizedTransferEnabled" | "unrecognizedDirectory" | "aiAssistEnabled" | "aiModelId" | "washEnabled" | "washPriorities"> {
   const integer = (name: string, min: number, max: number): number => {
     const value = body[name];
     if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
@@ -114,6 +120,7 @@ export function readOrganizeScheduleInput(body: Record<string, unknown>): Pick<O
     sources: sources as OrganizeDirectory[], target: target as OrganizeDirectory | null, mode: body.mode,
     unrecognizedTransferEnabled, unrecognizedDirectory: unrecognizedTransferEnabled ? unrecognizedDirectory as OrganizeDirectory : null,
     aiAssistEnabled, aiModelId,
+    ...readWashOptions(body),
   };
 }
 
@@ -184,6 +191,7 @@ export class ServiceOrganizeScheduler {
         unrecognizedTransferEnabled: schedule.unrecognizedTransferEnabled,
         unrecognizedDirectory: schedule.unrecognizedDirectory,
         aiAssistEnabled: schedule.aiAssistEnabled, aiModelId: schedule.aiModelId,
+        washEnabled: schedule.washEnabled, washPriorities: schedule.washPriorities,
       });
       const now = new Date().toISOString();
       schedule.pendingPlanId = plan.id;
@@ -279,15 +287,19 @@ export class ServiceOrganizeScheduler {
       }
       const jobs = await this.manager.listJobs(serviceId);
       const active = jobs.find((job) => ["queued", "running", "paused"].includes(job.status));
-      if (active) { await this.retry(schedule, "当前服务已有排队、运行或暂停的整理任务"); return; }
+      if (active) { await this.retry(schedule, "当前服务已有排队、运行或暂停的整理任务", active.id); return; }
       // 最新任务失败时先恢复原任务；更早的历史失败不阻断已经成功运行的计划。
-      if (jobs[0]?.status === "failed") { await this.retry(schedule, "上次整理任务待自动重试或人工处理"); return; }
+      if (jobs[0]?.status === "failed") {
+        await this.retry(schedule, `上次整理任务待自动重试或人工处理：${jobs[0].error ?? "未知错误"}`, jobs[0].id);
+        return;
+      }
       try {
         const plan = await this.manager.createPlan(serviceId, schedule.userId, {
           sources: schedule.sources, target: schedule.target!, mode: schedule.mode,
           unrecognizedTransferEnabled: schedule.unrecognizedTransferEnabled,
           unrecognizedDirectory: schedule.unrecognizedDirectory,
-          aiAssistEnabled: schedule.aiAssistEnabled, aiModelId: schedule.aiModelId });
+          aiAssistEnabled: schedule.aiAssistEnabled, aiModelId: schedule.aiModelId,
+          washEnabled: schedule.washEnabled, washPriorities: schedule.washPriorities });
         schedule.lastTriggeredAt = now.toISOString();
         schedule.nextRunAt = calculateNextScanRunAt(schedule, now);
         schedule.pendingPlanId = plan.id;
@@ -310,6 +322,7 @@ export class ServiceOrganizeScheduler {
       const job = existing ?? await this.manager.createJob(serviceId, plan.id, schedule.userId, !hasReadyItems);
       schedule.lastJobId = job.id;
       schedule.lastError = null;
+      schedule.lastBlockedNotificationKey = null;
       schedule.lastRunMessage = hasReadyItems ? "已启动整理任务" : "本次没有可整理的内容";
       schedule.pendingPlanId = null;
       schedule.pendingRunKind = undefined;
@@ -321,16 +334,27 @@ export class ServiceOrganizeScheduler {
   }
 
   /** 保留失败原因，并在五分钟后尝试下一次；失败预览需要重新生成。 */
-  private async retry(schedule: OrganizeSchedule, message: string): Promise<void> {
+  private async retry(schedule: OrganizeSchedule, message: string, blockingJobId?: string): Promise<void> {
     // 关键变量：手动任务失败不应改变原有定时任务的下次执行时间。
     const manualRun = schedule.pendingRunKind === "manual";
+    const notificationKey = `${blockingJobId ?? ""}:${message}`;
+    const shouldNotify = schedule.lastBlockedNotificationKey !== notificationKey;
     schedule.lastError = message;
     schedule.lastRunMessage = null;
     schedule.pendingPlanId = null;
     schedule.pendingRunKind = undefined;
     if (!manualRun) schedule.nextRunAt = schedule.enabled ? new Date(Date.now() + 5 * 60_000).toISOString() : null;
     schedule.updatedAt = new Date().toISOString();
+    schedule.lastBlockedNotificationKey = notificationKey;
     await saveSchedule(this.fileName(schedule.serviceId), schedule);
+    if (!shouldNotify) return;
+    const service = await this.runtime.repository.getServiceDetail(schedule.serviceId, schedule.userId).catch(() => null);
+    await this.runtime.database.createNotificationSafely({
+      userId: schedule.userId, category: "task", tone: "warning", title: "影片整理受阻",
+      message: `服务“${service?.displayName ?? "网盘服务"}”的${manualRun ? "本次整理" : "定时整理"}未能继续：${message}。`
+        + (schedule.enabled && !manualRun ? "五分钟后再次检查，同一阻塞原因不重复提醒。" : "请检查整理设置和任务状态后重试。"),
+      actionPath: `/app/services/${schedule.serviceId}/organize`,
+    });
   }
 
   /** 仅允许服务 UUID 构成配置文件名。 */
