@@ -308,9 +308,9 @@ async function sendResource(
       isManifest = detectContentContainer(prefix, rawContentType, upstream.finalUrl) === "hls";
     }
     if (!isManifest) {
-      // 普通媒体可能持续数小时；只限制空闲等待，不能按总播放时间截断整条字节流。
+      // 只给仍在读取的媒体设置空闲超时，已读完的短响应可能已释放连接。
       clearTimeout(timeout);
-      body.setTimeout?.(120_000, abort);
+      if (!body.readableEnded && !body.destroyed) body.setTimeout?.(120_000, abort);
     }
     reply.header("Cache-Control", "private, no-store").header("X-Accel-Buffering", "no");
     if (isManifest && upstream.statusCode !== 416) {
