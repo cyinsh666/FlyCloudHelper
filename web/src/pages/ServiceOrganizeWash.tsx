@@ -12,8 +12,9 @@ const options: Array<{ value: WashPriority; label: string; description: string }
 
 /** 洗版设置只修改当前整理表单，修改后由父页面使旧预览失效。 */
 export function ServiceOrganizeWash({ state }: { state: {
-  enabled: boolean; priorities: WashPriority[];
+  enabled: boolean; priorities: WashPriority[]; cleanupSources: boolean; busy: boolean;
   onChange: (enabled: boolean, priorities: WashPriority[]) => void;
+  onCleanupSourcesChange: (enabled: boolean) => void;
 } }) {
   /** 勾选后排到末尾，至少保留一个优先项。 */
   function toggle(priority: WashPriority): void {
@@ -37,6 +38,7 @@ export function ServiceOrganizeWash({ state }: { state: {
     <div className="flex items-center justify-between gap-4">
       <span className="text-sm">启用洗版</span>
       <button type="button" role="switch" aria-label="启用洗版" aria-checked={state.enabled}
+        disabled={state.busy}
         onClick={() => state.onChange(!state.enabled, state.priorities.length ? state.priorities : ["resolution"])}
         className={`relative h-7 w-12 shrink-0 rounded-full border border-border transition-colors ${state.enabled ? "bg-foreground" : "bg-secondary"}`}>
         <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-background transition-transform ${state.enabled ? "translate-x-5" : "translate-x-0"}`} />
@@ -61,7 +63,19 @@ export function ServiceOrganizeWash({ state }: { state: {
           </div>}
         </div>;
       })}
-      <p className="text-xs text-muted-foreground">保留版本核验成功后才清理目标旧版本；未选中的来源文件保留，不转入未识别目录。</p>
+      <p className="text-xs text-muted-foreground">确认保留版本已在目标目录后，才清理目标旧版本。</p>
+      <div className="flex items-center justify-between gap-4 border-t border-border pt-3">
+        <div>
+          <p className="text-sm">清理剩余内容</p>
+          <p className="mt-0.5 text-xs text-muted-foreground">整理后删除来源中同一部电影或同一集的落选版本，移动和复制模式均生效。</p>
+        </div>
+        <button type="button" role="switch" aria-label="清理剩余内容" aria-checked={state.cleanupSources}
+          disabled={state.busy}
+          onClick={() => state.onCleanupSourcesChange(!state.cleanupSources)}
+          className={`relative h-7 w-12 shrink-0 rounded-full border border-border transition-colors ${state.cleanupSources ? "bg-foreground" : "bg-secondary"}`}>
+          <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-background transition-transform ${state.cleanupSources ? "translate-x-5" : "translate-x-0"}`} />
+        </button>
+      </div>
     </div>}
   </Panel>;
 }

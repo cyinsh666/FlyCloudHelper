@@ -1,9 +1,10 @@
 import type { FastifyInstance } from "fastify";
-import { ApiError, validationError } from "../errors.js";
+import { validationError } from "../errors.js";
 import { requireRequestUser } from "../http.js";
 import type { ApiRuntime } from "../runtime.js";
-import { listStoredSubscriptions, readSubscription, subscriptionSettingKey, type MovieSubscription } from "./store.js";
+import { listStoredSubscriptions, subscriptionSettingKey } from "./store.js";
 import type { MovieSubscriptionWorker } from "./worker.js";
+import { createMovieSubscription } from "./actions.js";
 
 /** 只接受 TMDB 电影或剧集及其正整数 ID。 */
 function subscriptionIdentity(mediaType: unknown, tmdbId: unknown): { mediaType: "movie" | "tv"; tmdbId: number } {
@@ -36,50 +37,32 @@ export async function registerMovieSubscriptionRoutes(server: FastifyInstance, r
     if (typeof serviceId !== "string" || !serviceId || serviceId.length > 64) {
       throw validationError("serviceId", "请选择已有网盘服务");
     }
-    const service = await runtime.repository.getServiceDetail(serviceId, user.id);
-    if (service.providerType !== "guangya" && service.providerType !== "quark") {
-      throw new ApiError(422, "subscription_provider_unsupported", "当前只支持订阅到光鸭和夸克网盘服务");
-    }
     const identity = subscriptionIdentity(request.body?.mediaType, request.body?.tmdbId);
-    const settingKey = subscriptionSettingKey(serviceId, identity.mediaType, identity.tmdbId);
-    const existing = await runtime.database.query("system_settings").where({ setting_key: settingKey }).first();
-    if (existing) {
-      const item = readSubscription(existing.setting_value);
-      return { item, alreadySubscribed: true };
-    }
-
-    const metadata = await runtime.tmdb.readVideoMetadata(identity.mediaType, identity.tmdbId, "zh-CN", "CN");
-    if (!metadata) throw new ApiError(404, "subscription_tmdb_missing", "TMDB 中找不到这部影片");
-    const now = new Date().toISOString();
-    const item: MovieSubscription = { serviceId, mediaType: identity.mediaType, tmdbId: identity.tmdbId,
-      title: metadata.title, originalTitle: metadata.originalTitle, year: metadata.year,
-      posterUrl: metadata.posterUrl, createdAt: now };
-    await worker.noteSubscriptionCreated(serviceId, now);
-    // 关键变量：两个页面同时添加同一作品时，数据库唯一键阻止重复订阅记录。
-    await runtime.database.query("system_settings").insert({ setting_key: settingKey,
-      setting_value: JSON.stringify(item), revision: 1, updated_by_user_id: user.id, created_at: now, updated_at: now,
-    }).onConflict("setting_key").ignore();
-    const saved = await runtime.database.query("system_settings").where({ setting_key: settingKey }).first();
-    return reply.code(201).send({ item: readSubscription(saved?.setting_value), alreadySubscribed: false });
+    const result = await createMovieSubscription(runtime, worker, user.id, serviceId, identity.mediaType, identity.tmdbId);
+    return reply.code(result.alreadySubscribed ? 200 : 201).send(result);
   });
 
   /** 订阅页展示最近的消息处理和远端转存状态，先确认服务属于当前用户。 */
-  server.get<{ Querystring: { serviceId?: string } }>(`${prefix}/activity`, async (request) => {
+  server.get<{ Querystring: { serviceId?: string; mediaType?: string; tmdbId?: string } }>(`${prefix}/activity`, async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     const serviceId = request.query.serviceId;
     if (!serviceId) throw validationError("serviceId", "请选择网盘服务");
     await runtime.repository.getServiceDetail(serviceId, user.id);
-    return worker.recent(serviceId);
+    const identity = request.query.mediaType !== undefined || request.query.tmdbId !== undefined
+      ? subscriptionIdentity(request.query.mediaType, request.query.tmdbId) : undefined;
+    return worker.recent(serviceId, identity);
   });
 
-  /** 立即检查当前用户的一个服务，供新增订阅后直接验证。 */
-  server.post<{ Body: { serviceId?: string } }>(`${prefix}/check`, async (request) => {
+  /** 可选作品身份限定本次查找；不传时保持整网盘查找。 */
+  server.post<{ Body: { serviceId?: string; mediaType?: unknown; tmdbId?: unknown } }>(`${prefix}/check`, async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     const serviceId = request.body?.serviceId;
     if (!serviceId) throw validationError("serviceId", "请选择网盘服务");
     await runtime.repository.getServiceDetail(serviceId, user.id);
-    await worker.runNow(serviceId);
-    return worker.recent(serviceId);
+    const identity = request.body?.mediaType !== undefined || request.body?.tmdbId !== undefined
+      ? subscriptionIdentity(request.body?.mediaType, request.body?.tmdbId) : undefined;
+    const result = await worker.runNow(serviceId, identity);
+    return { ...await worker.recent(serviceId, identity), lastError: result.lastError };
   });
 
   /** 删除当前账号指定服务上的一条影片订阅。 */

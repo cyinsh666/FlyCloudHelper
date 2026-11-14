@@ -27,6 +27,7 @@ import type { ProtocolImageCache } from "./media/image-cache.js";
 import type { ProtocolCollageService } from "./media/protocol-collage.js";
 import type { NetworkProxyManager } from "./network-proxy.js";
 import type { RecommendationService } from "./recommendations/service.js";
+import type { TelegramBotService } from "./telegram-bot/service.js";
 
 /** 后台路由共享的已初始化运行时依赖。 */
 export interface ApiRuntime {
@@ -72,6 +73,8 @@ export interface ApiRuntime {
   /** 按有声书媒体库隔离的 ABS 账号、JWT 和刷新会话。 */
   absAccess: AbsAccessService;
   telegramNotifications: TelegramNotificationService;
+  /** 机器人初始化后接收个人任务通知，并跟踪转存后可选入库。 */
+  telegramBot?: TelegramBotService;
   logBusinessEvent: (
     level: "info" | "warn",
     fields: Record<string, string | number | boolean | null>,

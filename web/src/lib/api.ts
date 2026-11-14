@@ -209,6 +209,8 @@ export interface RecommendationBlock {
 export interface RecommendationItem {
   rank: number; title: string; overview: string | null; posterUrl: string | null;
   tmdbId: number | null; mediaType: string | null; rating: number | null; releaseDate: string | null;
+  /** 地区上映或下一集播出的实际排期。 */
+  scheduleDate?: string;
 }
 
 export interface RecommendationDetail extends RecommendationBlock {
@@ -383,17 +385,22 @@ export async function listMovieSubscriptions(): Promise<MovieSubscription[]> {
   return result.items;
 }
 
-/** 查看当前用户一个网盘服务的最近订阅巡检和转存记录。 */
-export function getMovieSubscriptionActivity(serviceId: string): Promise<{
+/** 查看服务或指定作品的最近订阅巡检和转存记录。 */
+export function getMovieSubscriptionActivity(serviceId: string, identity?: Pick<MovieSubscription, "mediaType" | "tmdbId">): Promise<{
   lastRunAt: string | null; nextRunAt: string; lastError: string | null; items: MovieSubscriptionActivity[];
 }> {
-  return requestJson(`/api/v1/resource-search/subscriptions/activity?serviceId=${encodeURIComponent(serviceId)}`);
+  const query = new URLSearchParams({ serviceId });
+  if (identity) {
+    query.set("mediaType", identity.mediaType);
+    query.set("tmdbId", String(identity.tmdbId));
+  }
+  return requestJson(`/api/v1/resource-search/subscriptions/activity?${query.toString()}`);
 }
 
-/** 立即检查一个服务关注频道中的新消息。 */
-export function checkMovieSubscriptionNow(serviceId: string): Promise<void> {
+/** 指定作品时只检查该作品，不传作品时沿用整服务查找。 */
+export function checkMovieSubscriptionNow(serviceId: string, identity?: Pick<MovieSubscription, "mediaType" | "tmdbId">): Promise<{ lastError: string | null }> {
   return requestJson("/api/v1/resource-search/subscriptions/check",
-    { method: "POST", body: JSON.stringify({ serviceId }) });
+    { method: "POST", body: JSON.stringify({ serviceId, ...(identity ? { mediaType: identity.mediaType, tmdbId: identity.tmdbId } : {}) }) });
 }
 
 /** 从 TMDB 详情页把电影或剧集加入一个网盘服务。 */
@@ -414,9 +421,63 @@ export async function saveResourceSearchSources(items: ResourceSearchSource[], a
     { method: "PUT", body: JSON.stringify({ items }) })).items;
 }
 
-/** 从云助手内部来源适配器搜索各网盘分享。 */
-export function searchResources(keyword: string, admin = false): Promise<{ items: ResourceSearchItem[]; errors: string[] }> {
-  return requestJson(`${resourceSearchPath(admin)}/search?keyword=${encodeURIComponent(keyword)}`);
+interface ResourceSearchResponse { items: ResourceSearchItem[]; errors: string[] }
+
+/** 分批读取已返回结果；连接到旧版服务时仍可读取普通 JSON。 */
+export async function searchResources(keyword: string, admin = false,
+  onProgress?: (progress: ResourceSearchResponse & { completed: number; total: number }) => void,
+  signal?: AbortSignal): Promise<ResourceSearchResponse> {
+  const url = `${resourceSearchPath(admin)}/search?keyword=${encodeURIComponent(keyword)}`;
+  if (!onProgress) return requestJson(url, { signal });
+  // 关键变量：给后端收尾留十秒，代理或连接异常时前端也能结束等待。
+  const deadline = AbortSignal.timeout(70_000);
+  const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: { Accept: "application/x-ndjson" },
+      credentials: "include", cache: "no-store", signal: requestSignal });
+  } catch (error) {
+    if (deadline.aborted) throw new Error("搜索连接超时，已保留收到的结果");
+    throw error;
+  }
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => ({}))) as ApiErrorResponse;
+    throw new ApiClientError(response.status, payload.error?.code ?? "request_failed", payload.error?.message ?? "搜索失败");
+  }
+  if (!response.headers.get("content-type")?.includes("application/x-ndjson")) {
+    try { return await response.json() as ResourceSearchResponse; }
+    catch (error) {
+      if (deadline.aborted) throw new Error("搜索连接超时，已保留收到的结果");
+      throw error;
+    }
+  }
+  if (!response.body) throw new Error("搜索未返回数据，请重试");
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) throw new Error("搜索连接提前结束，请重试");
+      const lines = (buffer + chunk.value).split("\n");
+      // 关键变量：一个数据帧可能跨越多个网络分块。
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const event = JSON.parse(line) as
+          | ({ type: "progress"; completed: number; total: number } & ResourceSearchResponse)
+          | ({ type: "done" } & ResourceSearchResponse)
+          | { type: "error"; message: string };
+        if (event.type === "done") return event;
+        if (event.type === "error") throw new Error(event.message);
+        if (event.type === "progress") onProgress(event);
+      }
+    }
+  } catch (error) {
+    if (deadline.aborted) throw new Error("搜索连接超时，已保留收到的结果");
+    throw error;
+  } finally {
+    void reader.cancel().catch(() => undefined);
+  }
 }
 
 /** 读取已有光鸭、夸克服务与各自独立转存目录。 */
@@ -1122,7 +1183,7 @@ export interface OrganizePlanItem {
   sourcePath: string;
   sourceName: string;
   isDirectory?: boolean;
-  action?: "organize" | "unrecognized" | "wash_cleanup";
+  action?: "organize" | "unrecognized" | "wash_cleanup" | "wash_source_cleanup";
   washReason?: string;
   targetParts: string[];
   targetName: string;
@@ -1140,8 +1201,9 @@ export interface OrganizePlan {
   aiAssistEnabled?: boolean;
   aiModelId?: string | null;
   washEnabled?: boolean;
+  washCleanupSources?: boolean;
   washPriorities?: WashPriority[];
-  washSummary?: { keepExisting: number; selectNew: number; cleanup: number; skippedSources: number };
+  washSummary?: { keepExisting: number; selectNew: number; cleanup: number; skippedSources: number; sourceCleanup?: number };
   aiFailureCount?: number;
   status: "preparing" | "ready" | "failed";
   error: string | null;
@@ -1205,6 +1267,7 @@ export interface OrganizeSchedule extends Omit<ScanSchedule, "id" | "libraryId" 
   aiAssistEnabled?: boolean;
   aiModelId?: string | null;
   washEnabled?: boolean;
+  washCleanupSources?: boolean;
   washPriorities?: WashPriority[];
   pendingPlanId: string | null;
   pendingRunKind?: "scheduled" | "manual";
@@ -1215,7 +1278,7 @@ export type UpdateOrganizeScheduleInput = Pick<OrganizeSchedule,
   "enabled" | "scheduleType" | "intervalMinutes" | "timeOfDay" | "dayOfWeek" | "dayOfMonth" |
   "timezoneOffsetMinutes" | "quietPeriodEnabled" | "quietStartTime" | "quietEndTime" |
   "sources" | "target" | "mode" | "unrecognizedTransferEnabled" | "unrecognizedDirectory" |
-  "aiAssistEnabled" | "aiModelId" | "washEnabled" | "washPriorities">;
+  "aiAssistEnabled" | "aiModelId" | "washEnabled" | "washPriorities" | "washCleanupSources">;
 
 /** 视频媒体库文件浏览的当前目录条目。 */
 export interface LibraryBrowseEntry extends ProviderDirectory {
@@ -1537,7 +1600,7 @@ export async function createServiceOrganizePlan(serviceId: string, input: {
   sources: ProviderDirectory[]; target: ProviderDirectory; mode: "move" | "copy";
   unrecognizedTransferEnabled?: boolean; unrecognizedDirectory?: ProviderDirectory | null;
   aiAssistEnabled?: boolean; aiModelId?: string | null;
-  washEnabled?: boolean; washPriorities?: WashPriority[];
+  washEnabled?: boolean; washPriorities?: WashPriority[]; washCleanupSources?: boolean;
 }, admin = false): Promise<OrganizePlan> {
   const result = await requestJson<{ plan: OrganizePlan }>(`${admin ? "/api/v1/admin" : "/api/v1"}/services/${serviceId}/organize/plans`,
     { method: "POST", body: JSON.stringify(input) });

@@ -4,6 +4,26 @@ import { ApiError } from "../errors.js";
 import { publicSiteNames, searchPublicSite } from "./public-sites.js";
 import { parseMagnetUrl, resourceResultKey } from "./magnet.js";
 
+// 关键变量：首批即时展示，后续有变化的结果最多每十秒发送一次。
+const searchUpdateIntervalMs = 10_000;
+const sourceSearchTimeoutMs = 25_000;
+const totalSearchTimeoutMs = 60_000;
+
+/** 部分适配器不支持取消，仍须在超时时结束对其结果的等待。 */
+async function waitForSearch<T>(work: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  let cancel: () => void = () => {};
+  const aborted = new Promise<never>((_resolve, reject) => {
+    cancel = () => reject(signal.reason);
+    signal.addEventListener("abort", cancel, { once: true });
+  });
+  try {
+    return await Promise.race([work(), aborted]);
+  } finally {
+    signal.removeEventListener("abort", cancel);
+  }
+}
+
 /** 可由页面维护的公开频道或代码内置搜索站。 */
 export interface SearchSource {
   kind: string;
@@ -24,12 +44,20 @@ export interface ShareSearchResult {
   messageUrl: string;
 }
 
+/** 网页搜索可随来源完成接收当前去重结果。 */
+export interface ResourceSearchProgress {
+  items: ShareSearchResult[];
+  errors: string[];
+  completed: number;
+  total: number;
+}
+
 /** 新增网站搜索时实现此接口，并在下面的适配器列表注册。 */
 export interface SearchAdapter {
   kind: string;
   defaultSources: SearchSource[];
   validateSource(source: SearchSource): boolean;
-  search(keyword: string, source: SearchSource): Promise<ShareSearchResult[]>;
+  search(keyword: string, source: SearchSource, signal?: AbortSignal): Promise<ShareSearchResult[]>;
 }
 
 /** 预置频道名单取自 PanSou 发布配置的快照；运行时不读取或调用 PanSou。 */
@@ -281,13 +309,13 @@ class TelegramSearchAdapter implements SearchAdapter {
   }
 
   /** 按频道查询并从每条消息中提取标题、时间、链接和提取码。 */
-  public async search(keyword: string, source: SearchSource): Promise<ShareSearchResult[]> {
+  public async search(keyword: string, source: SearchSource, signal?: AbortSignal): Promise<ShareSearchResult[]> {
     // 关键变量：书名号是用户输入的展示符号，不作为 Telegram 频道检索词。
     const queryKeyword = keyword.replace(/[《》〈〉「」『』]/gu, "").trim();
     if (!queryKeyword) return [];
     const response = await fetch(`https://t.me/s/${source.key}?q=${encodeURIComponent(queryKeyword)}`, {
       headers: { "User-Agent": "Mozilla/5.0 FlyCloudHelper/1.0" },
-      signal: AbortSignal.timeout(10_000),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000),
     });
     if (!response.ok) throw new Error(`Telegram 搜索请求失败（${response.status}）`);
     const html = await response.text();
@@ -444,13 +472,13 @@ function isTransientSiteFailure(reason: unknown): boolean {
 }
 
 /** 搜索单个来源；公开站点出现临时网络错误时补发一次请求。 */
-async function searchSource(keyword: string, source: SearchSource): Promise<ShareSearchResult[]> {
+async function searchSource(keyword: string, source: SearchSource, signal?: AbortSignal): Promise<ShareSearchResult[]> {
   const adapter = adapters.get(source.kind)!;
   try {
-    return await adapter.search(keyword, source);
+    return await adapter.search(keyword, source, signal);
   } catch (reason) {
-    if (source.kind !== "public_site" || !isTransientSiteFailure(reason)) throw reason;
-    return adapter.search(keyword, source);
+    if (signal?.aborted || source.kind !== "public_site" || !isTransientSiteFailure(reason)) throw reason;
+    return adapter.search(keyword, source, signal);
   }
 }
 
@@ -546,22 +574,89 @@ export class ResourceSearchEngine {
   }
 
   /** 同时查询已启用来源，按网盘分享链接去重，并返回来源错误供页面提示。 */
-  public async search(keyword: string): Promise<{ items: ShareSearchResult[]; errors: string[] }> {
-    const sources = (await this.listSources()).filter((source) => source.enabled);
+  public async search(keyword: string, onProgress?: (progress: ResourceSearchProgress) => void,
+    signal?: AbortSignal): Promise<{ items: ShareSearchResult[]; errors: string[] }> {
+    const deadline = AbortSignal.timeout(totalSearchTimeoutMs);
+    const searchSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    const startedAt = Date.now();
+    const sources = (await waitForSearch(() => this.listSources(), searchSignal)).filter((source) => source.enabled);
     // 关键变量：频道超过百个，限制并发请求数。
     const settled: PromiseSettledResult<ShareSearchResult[]>[] = new Array(sources.length);
     let nextIndex = 0;
-    await Promise.all(Array.from({ length: Math.min(24, sources.length) }, async () => {
-      while (nextIndex < sources.length) {
-        const index = nextIndex++;
-        const source = sources[index]!;
-        try {
-          settled[index] = { status: "fulfilled", value: await searchSource(keyword, source) };
-        } catch (reason) {
-          settled[index] = { status: "rejected", reason };
-        }
+    let completed = 0;
+    let sentResults = false;
+    let lastSentAt = Date.now();
+    let lastPayload = JSON.stringify({ items: [], errors: [] });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    onProgress?.({ items: [], errors: [], completed, total: sources.length });
+
+    /** 对实际去重后的列表和错误做比较，来源计数变化不触发列表刷新。 */
+    const sendChangedProgress = (): void => {
+      if (!onProgress || searchSignal.aborted || completed === sources.length) return;
+      const result = this.collectResults(sources, settled);
+      const payload = JSON.stringify(result);
+      if (payload === lastPayload) return;
+      lastPayload = payload;
+      lastSentAt = Date.now();
+      sentResults ||= result.items.length > 0;
+      onProgress({ ...result, completed, total: sources.length });
+    };
+
+    /** 首批结果直接发出，其余来源合并到下一次可发送的时间。 */
+    const reportProgress = (hasResults: boolean): void => {
+      if (!onProgress || searchSignal.aborted || completed === sources.length) return;
+      if (hasResults && !sentResults) {
+        clearTimeout(timer);
+        timer = undefined;
+        sendChangedProgress();
+      } else if (!timer) {
+        timer = setTimeout(() => {
+          timer = undefined;
+          sendChangedProgress();
+        }, Math.max(0, searchUpdateIntervalMs - (Date.now() - lastSentAt)));
       }
-    }));
+    };
+
+    try {
+      await Promise.all(Array.from({ length: Math.min(24, sources.length) }, async () => {
+        while (!searchSignal.aborted && nextIndex < sources.length) {
+          const index = nextIndex++;
+          const source = sources[index]!;
+          const sourceDeadline = AbortSignal.timeout(sourceSearchTimeoutMs);
+          const sourceSignal = AbortSignal.any([searchSignal, sourceDeadline]);
+          try {
+            const results = await waitForSearch(() => searchSource(keyword, source, sourceSignal), sourceSignal);
+            settled[index] = { status: "fulfilled", value: results };
+            completed++;
+            reportProgress(results.length > 0);
+          } catch (reason) {
+            if (signal?.aborted) return;
+            const timedOut = deadline.aborted || sourceDeadline.aborted;
+            if (timedOut) console.warn(JSON.stringify({ 日志关键字: "codex-resource-search-timeout",
+              事件: "来源搜索超时", 来源类型: source.kind, 来源: source.key, 已用毫秒: Date.now() - startedAt }));
+            settled[index] = { status: "rejected", reason: deadline.aborted
+              ? new Error("整轮搜索超时，已停止等待") : reason };
+            completed++;
+            reportProgress(false);
+          }
+        }
+      }));
+      if (deadline.aborted && nextIndex < sources.length) {
+        const skipped = sources.length - nextIndex;
+        const result = this.collectResults(sources, settled);
+        console.warn(JSON.stringify({ 日志关键字: "codex-resource-search-timeout",
+          事件: "整轮搜索超时", 来源总数: sources.length, 未开始来源数: skipped, 已返回资源数: result.items.length }));
+        result.errors.push(`整轮搜索超时，已跳过 ${skipped} 个尚未开始的来源`);
+        return result;
+      }
+      return this.collectResults(sources, settled);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** 分批与完整响应沿用相同的去重和排序规则。 */
+  private collectResults(sources: SearchSource[], settled: PromiseSettledResult<ShareSearchResult[]>[]) {
     const items = new Map<string, ShareSearchResult>();
     const errors: string[] = [];
     settled.forEach((outcome, index) => {

@@ -32,7 +32,7 @@ export interface OrganizePlanItem {
   /** 整夹预览时的完整子项签名，执行前复查目录内容没有变化。 */
   containedEntries?: string[];
   /** 未识别项始终移动，普通整理仍遵循计划的复制或移动模式。 */
-  action?: "organize" | "unrecognized" | "wash_cleanup";
+  action?: "organize" | "unrecognized" | "wash_cleanup" | "wash_source_cleanup";
   washIdentity?: WashIdentity;
   /** 清理项引用本次新保留文件的来源 ID，或已存在的保留文件快照。 */
   washWinnerSourceId?: string;
@@ -68,10 +68,12 @@ export interface OrganizePlan {
   aiAssistEnabled?: boolean;
   aiModelId?: string | null;
   washEnabled?: boolean;
+  /** 开启后，清理本次洗版落选的来源文件。 */
+  washCleanupSources?: boolean;
   washPriorities?: WashPriority[];
   /** 仅本次来源涉及的作品身份，用于清理结束后的目标唯一性核验。 */
   washGroups?: WashIdentity[];
-  washSummary?: { keepExisting: number; selectNew: number; cleanup: number; skippedSources: number };
+  washSummary?: { keepExisting: number; selectNew: number; cleanup: number; skippedSources: number; sourceCleanup?: number };
   /** 模型请求失败时仍继续规则结果和未识别转移，供页面提示。 */
   aiFailureCount?: number;
   scannedDirectories: OrganizeDirectory[];

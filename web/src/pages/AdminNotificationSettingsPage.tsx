@@ -12,6 +12,7 @@ import {
 } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
 import { cn } from "@/lib/utils";
+import { AdminTelegramBotPanel } from "@/pages/TelegramBotPanels";
 
 // 关键变量：四类业务完成或异常通知可分别关闭，Telegram 渠道总开关仍独立生效。
 const eventOptions = [
@@ -251,6 +252,7 @@ export function AdminTelegramNotificationSettingsPanel() {
             </form>
           )}
       </Panel>
+      <AdminTelegramBotPanel />
     </section>
   );
 }

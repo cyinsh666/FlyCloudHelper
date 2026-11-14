@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowLeft, Film, LoaderCircle, RefreshCw, Rss, Search } from "lucide-react";
+import { ArrowLeft, LoaderCircle, RefreshCw, Rss, Search } from "lucide-react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
+import { RecommendationMovieCard, RecommendationMovieSkeleton, RecommendationPoster, recommendationCardGridStyle } from "@/components/RecommendationCards";
 import { SubscribeMovieDialog } from "@/components/SubscribeMovieDialog";
 import { ResourceSearchPage } from "@/pages/ResourceSearchPage";
 import { getRecommendationDetail, getRecommendationItemDetail, getRecommendationRelatedItems,
@@ -10,23 +11,9 @@ import { getRecommendationDetail, getRecommendationItemDetail, getRecommendation
 import { useApiResource } from "@/lib/use-api-resource";
 
 // 关键变量：优先保持与榜单上游相同的业务分组顺序，新增分组仍可自动显示。
-const preferredGroups = ["短剧", "热门推荐", "今日热度", "高分经典", "动画追番", "华语与地区"];
+const preferredGroups = ["新片与追剧", "短剧", "热门推荐", "今日热度", "高分经典", "动画追番", "华语与地区"];
 // 关键变量：竖版海报至少占 9.5rem，容器宽度决定一行展示的列数。
 const posterGridStyle = { gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 9.5rem), 1fr))" };
-
-/** 海报缺失或图片加载失败时保持相同的竖版卡片尺寸。 */
-function RecommendationPoster({ url, title }: { url: string | null; title: string }) {
-  const [failed, setFailed] = useState(false);
-  /** 榜单刷新后更换了封面地址时允许重新加载，不沿用旧地址的错误状态。 */
-  useEffect(() => { setFailed(false); }, [url]);
-  return <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-secondary">
-    {url && !failed ? <img src={url} alt={title} loading="lazy" onError={() => setFailed(true)}
-      className="h-full w-full object-cover" />
-      : <div className="flex h-full flex-col items-center justify-center gap-2 p-3 text-center text-muted-foreground">
-        <Film className="size-9 opacity-50" /><span className="line-clamp-3 text-xs">{title}</span>
-      </div>}
-  </div>;
-}
 
 /** 展示单个榜单入口，点击后读取本地快照中的分页条目。 */
 function BlockCard({ block, onOpen }: { block: RecommendationBlock; onOpen: () => void }) {
@@ -35,23 +22,6 @@ function BlockCard({ block, onOpen }: { block: RecommendationBlock; onOpen: () =
     <p className="mt-2 line-clamp-2 min-h-10 text-sm font-medium">{block.title}</p>
     <p className="mt-1 text-xs text-muted-foreground">{block.itemCount.toLocaleString()} 部作品</p>
     {block.description && <p className="mt-1 line-clamp-2 text-[11px] text-muted-foreground">{block.description}</p>}
-  </button>;
-}
-
-/** 竖版电影或剧集卡片；点击后进入该榜单条目的 TMDB 详情。 */
-function MovieCard({ item, onOpen }: { item: RecommendationItem; onOpen: () => void }) {
-  return <button type="button" onClick={onOpen} className="surface min-w-0 p-2.5 text-left transition-colors hover:bg-secondary/50">
-    <div className="relative">
-      <RecommendationPoster url={item.posterUrl} title={item.title} />
-      <span className="absolute left-1.5 top-1.5 rounded-md bg-black/75 px-2 py-0.5 text-xs font-medium text-white">
-        #{item.rank}
-      </span>
-    </div>
-    <h3 className="mt-2 line-clamp-2 min-h-10 text-sm font-medium" title={item.title}>{item.title}</h3>
-    <p className="mt-1 truncate text-[11px] text-muted-foreground">
-      {item.releaseDate?.slice(0, 4) || "年份未知"}{item.rating !== null ? ` · 评分 ${item.rating.toFixed(1)}` : ""}
-    </p>
-    {item.overview && <p className="mt-1 line-clamp-2 text-[11px] text-muted-foreground" title={item.overview}>{item.overview}</p>}
   </button>;
 }
 
@@ -80,7 +50,8 @@ function MovieDetail({ detail, related, relatedLoading, relatedError, searchOpen
         {tmdb?.originalTitle && tmdb.originalTitle !== title &&
           <p className="mt-1 text-sm text-muted-foreground">{tmdb.originalTitle}</p>}
         <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-sm text-muted-foreground">
-          {(tmdb?.releaseDate || item.releaseDate) && <span>上映：{tmdb?.releaseDate || item.releaseDate}</span>}
+          {item.scheduleDate ? <span>{item.mediaType === "tv" ? "下一集播出" : "中国大陆上映"} · {item.scheduleDate}</span>
+            : (tmdb?.releaseDate || item.releaseDate) && <span>上映：{tmdb?.releaseDate || item.releaseDate}</span>}
           {(tmdb?.rating ?? item.rating) !== null && <span>评分：{(tmdb?.rating ?? item.rating)!.toFixed(1)}</span>}
           {tmdb?.mediaType === "tv" && tmdb.episodeCount > 0 && <span>共 {tmdb.episodeCount} 集</span>}
         </div>
@@ -386,7 +357,7 @@ export function RecommendationsPage({ admin = false }: { admin?: boolean }) {
     {!tmdbSearch && syncMessage && <p role="status" className="mb-3 text-sm text-muted-foreground">{syncMessage}</p>}
     {!tmdbSearch && syncError && <p role="alert" className="mb-3 text-sm text-destructive">{syncError}</p>}
 
-    {!tmdbSearch && <div role="tablist" aria-label="榜单类型" className="mb-4 flex gap-2 overflow-x-auto border-b border-border pb-3">
+    {!tmdbSearch && <div role="tablist" aria-label="榜单类型" className="mb-4 flex flex-wrap gap-2 border-b border-border pb-3">
       {["全部", ...groups].map((group) => <button key={group} type="button" role="tab" aria-selected={activeGroup === group}
         onClick={() => { setActiveGroup(group); setSelectedBlockId(null); setSelectedItemRank(null); setPage(1); }}
         className={`shrink-0 rounded-lg border px-3 py-1.5 text-sm transition-colors ${activeGroup === group
@@ -418,14 +389,14 @@ export function RecommendationsPage({ admin = false }: { admin?: boolean }) {
           {selectedBlock?.description && <p className="text-xs text-muted-foreground">{selectedBlock.description}</p>}</div>
       </div>
       {detailError && <p role="alert" className="mb-3 text-sm text-destructive">{detailError}</p>}
-      {detailLoading && !visibleDetail && <div className="grid gap-3" style={posterGridStyle}>
-        {Array.from({ length: 12 }, (_, index) => <div key={index} className="surface animate-pulse p-2.5">
-          <div className="aspect-[2/3] rounded-lg bg-secondary" /><div className="mt-2 h-4 rounded bg-secondary" /></div>)}
-      </div>}
-      {visibleDetail && <>
+      {detailLoading && !visibleDetail && <RecommendationMovieSkeleton count={12} />}
+      {visibleDetail && visibleDetail.items.length === 0 && <p className="py-10 text-center text-sm text-muted-foreground">
+        {visibleDetail.lastUpdated ? "暂无符合条件的作品" : "榜单尚未同步成功，可点击「立即同步」重试"}
+      </p>}
+      {visibleDetail && visibleDetail.items.length > 0 && <>
         <p className="mb-3 text-xs text-muted-foreground">共 {visibleDetail.pagination.totalItems} 部作品 · 第 {page} / {visibleDetail.pagination.totalPages} 页</p>
-        <div className="grid gap-3" style={posterGridStyle}>{visibleDetail.items.map((item) =>
-          <MovieCard key={`${item.rank}:${item.tmdbId ?? item.title}`} item={item} onOpen={() => setSelectedItemRank(item.rank)} />)}</div>
+        <div className="grid gap-3" style={recommendationCardGridStyle}>{visibleDetail.items.map((item) =>
+          <RecommendationMovieCard key={`${item.rank}:${item.tmdbId ?? item.title}`} item={item} onOpen={() => setSelectedItemRank(item.rank)} />)}</div>
         <div className="mt-5 flex justify-center gap-2">
           <SecondaryButton type="button" disabled={page <= 1 || detailLoading} onClick={() => setPage((current) => current - 1)}>上一页</SecondaryButton>
           <SecondaryButton type="button" disabled={page >= visibleDetail.pagination.totalPages || detailLoading}

@@ -66,6 +66,8 @@ import { loadTmdbBaseUrls, loadTmdbKeys } from "./system-settings.js";
 import { ScanWorker } from "./worker.js";
 import { MediaProbeWorker } from "./media-probe-worker.js";
 import { TelegramNotificationService } from "./telegram-notification-service.js";
+import { TelegramBotService } from "./telegram-bot/service.js";
+import { registerTelegramBotRoutes } from "./telegram-bot/routes.js";
 import { NetworkProxyManager, setActiveNetworkProxy } from "./network-proxy.js";
 import { RecommendationService } from "./recommendations/service.js";
 import { registerRecommendationRoutes } from "./recommendations/routes.js";
@@ -208,9 +210,6 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await networkProxy.initialize();
   setActiveNetworkProxy(networkProxy);
   const logger = createBusinessLogger(server);
-  const recommendations = new RecommendationService(config.recommendationCacheDirectory,
-    config.recommendationUpstreamUrl, logger);
-  await recommendations.start();
   const providers = new ProviderRegistry(config, (fields) => logger("warn", fields));
   const imageCache = new ProtocolImageCache(config.imageCacheDirectory);
   const telegramNotifications = new TelegramNotificationService(database, vault, logger, imageCache);
@@ -248,6 +247,9 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     tmdbCache,
     tmdbBaseUrls,
   );
+  const recommendations = new RecommendationService(config.recommendationCacheDirectory,
+    config.recommendationUpstreamUrl, logger, tmdb);
+  await recommendations.start();
   logger("info", {
     日志关键字: "codex-flycloud-helper-tmdb-proxy",
     事件: "TMDB代理地址启动配置已加载",
@@ -346,6 +348,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   });
   server.addHook("onClose", async () => {
     recommendations.close();
+    await runtime.telegramBot?.stop();
     await movieSubscriptionWorker.stop();
     await channelTypeCacheWorker.stop();
     await contentSourceAutoSync.stop();
@@ -535,7 +538,14 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerCloudAuthorizationRoutes(server, runtime);
   await registerBaiduPanWebLoginRoutes(server, runtime);
   await registerServiceRoutes(server, runtime);
-  await registerOrganizeRoutes(server, runtime);
+  const organize = await registerOrganizeRoutes(server, runtime);
+  const telegramBot = new TelegramBotService(runtime, movieSubscriptionWorker, organize.manager, organize.scheduler);
+  runtime.telegramBot = telegramBot;
+  database.setNotificationDeliveryHandler((notification) => {
+    telegramNotifications.enqueue(notification);
+    telegramBot.enqueueNotification(notification);
+  });
+  await registerTelegramBotRoutes(server, runtime, telegramBot);
   await registerResourceSearchRoutes(server, runtime, movieSubscriptionWorker, channelTypeCacheWorker);
   await registerMovieSubscriptionRoutes(server, runtime, movieSubscriptionWorker);
   await registerRecommendationRoutes(server, runtime);
@@ -594,6 +604,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   worker.start();
   mediaProbeWorker.start();
   if (config.workerEnabled) {
+    telegramBot.start();
     scanScheduleWorker.start();
     contentSourceAutoSync.start();
     movieSubscriptionWorker.start();

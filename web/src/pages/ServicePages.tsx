@@ -1,6 +1,6 @@
 import { Link, useNavigate } from "@tanstack/react-router";
-import { FolderOutput, Plus, RefreshCw, Settings2, Trash2, X } from "lucide-react";
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { Plus, RefreshCw, Settings2, Trash2, X } from "lucide-react";
+import { useRef, useState, type FormEvent } from "react";
 import { createPortal } from "react-dom";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { AdminServiceFilters } from "@/components/AdminServiceFilters";
@@ -16,8 +16,6 @@ import {
   createService,
   deleteCloudService,
   getService,
-  getServiceOrganizeCapabilities,
-  runServiceOrganizeNow,
   listAdminUsers,
   listProviders,
   listServices,
@@ -50,41 +48,9 @@ function getServiceProviderLabel(service: CloudService): string {
 function ServiceCard({ service, admin, onChanged }: { service: CloudService; admin: boolean; onChanged: () => Promise<void> }) {
   const [message, setMessage] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
-  const [organizeSupported, setOrganizeSupported] = useState(false);
-  const [organizing, setOrganizing] = useState(false);
-  const [organizeMessage, setOrganizeMessage] = useState<{ text: string; failed: boolean } | null>(null);
   // 关键变量：同步阻止连续点击在状态刷新前重复发送删除请求。
   const deletingRef = useRef(false);
-  // 关键变量：整理请求发出时立即占位，避免双击重复生成预览。
-  const organizingRef = useRef(false);
   const detailPath = admin ? "/admin/services/$serviceId" : "/app/services/$serviceId";
-
-  /** 卡片入口按当前服务的实际写能力显示，服务或凭据变化后重新读取。 */
-  useEffect(() => {
-    let alive = true;
-    setOrganizeSupported(false);
-    void getServiceOrganizeCapabilities(service.id, admin).then((result) => {
-      if (alive) setOrganizeSupported(result.supported);
-    }).catch(() => { if (alive) setOrganizeSupported(false); });
-    return () => { alive = false; };
-  }, [service.id, admin, service.credentialRevision, service.status, service.connectionStatus, service.connectionAuthMode]);
-
-  /** 根据该服务已保存的整理配置立即生成预览，完成后由后台自动执行。 */
-  async function triggerOrganize(): Promise<void> {
-    if (organizingRef.current) return;
-    organizingRef.current = true;
-    setOrganizing(true);
-    setOrganizeMessage(null);
-    try {
-      await runServiceOrganizeNow(service.id, admin);
-      setOrganizeMessage({ text: "已开始识别来源文件，完成后自动整理", failed: false });
-    } catch (error) {
-      setOrganizeMessage({ text: error instanceof Error ? error.message : "启动整理失败", failed: true });
-    } finally {
-      organizingRef.current = false;
-      setOrganizing(false);
-    }
-  }
 
   /** 二次确认后从服务卡片删除服务，并同步刷新服务列表。 */
   async function deleteCardService(): Promise<void> {
@@ -148,36 +114,21 @@ function ServiceCard({ service, admin, onChanged }: { service: CloudService; adm
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold">{service.displayName}</h2>
             {service.description && <p className="mt-1 line-clamp-2 whitespace-pre-line break-words text-xs text-muted-foreground">{service.description}</p>}
-            <p className="truncate text-[11px] text-muted-foreground">{getServiceProviderLabel(service)}{admin ? ` · ${service.ownerUsername}` : ""}</p>
+            {admin && <p className="truncate text-[11px] text-muted-foreground">{getServiceProviderLabel(service)} · {service.ownerUsername}</p>}
           </div>
         </div>
         <ServiceStateDot service={service} />
       </header>
       <ServiceConnectionAlert service={service} admin={admin} />
 
-      <div className="mt-3 text-[11px] text-muted-foreground">
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-          <span>连接 r{service.credentialRevision}</span>
-          <span>{service.connectionStatus === "valid" ? "登录有效" : "需要重新登录"}</span>
-        </div>
-      </div>
-
-      <footer className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/70 pt-3">
-        <Link to={detailPath} params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Settings2 className="size-3.5" /> 配置</Link>
-        {organizeSupported && <button type="button" onClick={() => void triggerOrganize()} disabled={organizing}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40">
-          <FolderOutput className="size-3.5" /> {organizing ? "启动中…" : "整理"}
-        </button>}
-        {service.canCreateLibrary && !admin && <Link to="/app/libraries/new/$serviceId" params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-3 py-2 text-xs text-primary-soft"><Plus className="size-3.5" /> 创建媒体库</Link>}
-        <button type="button" aria-label={deleting ? `正在删除${service.displayName}` : `删除${service.displayName}`} title={!service.canDeleteService ? "已关联媒体库，请先解除全部关联" : deleting ? "正在删除…" : "删除服务"} onClick={() => void deleteCardService()} disabled={deleting || !service.canDeleteService} className="ml-auto grid size-8 cursor-pointer place-items-center rounded-lg border border-destructive/50 bg-destructive/10 text-destructive transition-colors enabled:hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-50">
+      <footer className="mt-3 flex items-center gap-2 border-t border-border/70 pt-3">
+        <Link to={detailPath} params={{ serviceId: service.id }} className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Settings2 className="size-3.5" /> 配置</Link>
+        {service.canCreateLibrary && !admin && <Link to="/app/libraries/new/$serviceId" params={{ serviceId: service.id }} className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-primary/15 px-3 py-2 text-xs text-primary-soft"><Plus className="size-3.5" /> 媒体库</Link>}
+        <button type="button" aria-label={deleting ? `正在删除${service.displayName}` : `删除${service.displayName}`} title={!service.canDeleteService ? "已关联媒体库，请先解除全部关联" : deleting ? "正在删除…" : "删除服务"} onClick={() => void deleteCardService()} disabled={deleting || !service.canDeleteService} className="ml-auto grid size-8 shrink-0 cursor-pointer place-items-center rounded-lg border border-destructive/50 bg-destructive/10 text-destructive transition-colors enabled:hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-50">
           <Trash2 className="size-3.5" />
         </button>
       </footer>
       {message && <p className="mt-3 text-xs text-muted-foreground">{message}</p>}
-      {organizeMessage && <p role={organizeMessage.failed ? "alert" : "status"}
-        className={`mt-3 text-xs ${organizeMessage.failed ? "text-destructive" : "text-muted-foreground"}`}>
-        {organizeMessage.text}
-      </p>}
     </article>
   );
 }

@@ -1,7 +1,8 @@
+import { PassThrough } from "node:stream";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { ApiError, validationError } from "../errors.js";
 import { requireRequestUser, requireSuperAdmin, requireString } from "../http.js";
-import { ResourceSearchEngine, type SearchSource } from "../resource-search/engine.js";
+import { ResourceSearchEngine, type ResourceSearchProgress, type SearchSource } from "../resource-search/engine.js";
 import type { ChannelTypeCacheWorker } from "../resource-search/channel-types.js";
 import { getServiceTransferDirectory, saveServiceTransferDirectory, verifyServiceTransferDirectory,
   getSubscriptionTransferRename, saveSubscriptionTransferRename,
@@ -10,6 +11,43 @@ import { readShareTransferStatus, submitShareTransfer } from "../resource-search
 import { readGuangyaOfflineTransfer, submitGuangyaOfflineTransfer } from "../resource-search/offline-transfer.js";
 import type { ApiRuntime } from "../runtime.js";
 import type { MovieSubscriptionWorker } from "../subscriptions/worker.js";
+
+/** 分批发送当前结果，连接较慢时只保留最新的一份待发进度。 */
+function streamResourceSearch(engine: ResourceSearchEngine, keyword: string): PassThrough {
+  const stream = new PassThrough();
+  const controller = new AbortController();
+  let waitingForDrain = false;
+  let pending: ResourceSearchProgress | undefined;
+  stream.on("close", () => controller.abort());
+
+  /** 同一时刻只排队一份进度，最终结果由结束帧完整传送。 */
+  function sendProgress(progress: ResourceSearchProgress): void {
+    if (stream.destroyed) return;
+    if (waitingForDrain) {
+      pending = progress;
+      return;
+    }
+    waitingForDrain = !stream.write(JSON.stringify({ type: "progress", ...progress }) + "\n");
+  }
+
+  stream.on("drain", () => {
+    waitingForDrain = false;
+    const latest = pending;
+    pending = undefined;
+    if (latest) sendProgress(latest);
+  });
+  void engine.search(keyword, sendProgress, controller.signal).then((result) => {
+    pending = undefined;
+    if (!stream.destroyed) stream.end(JSON.stringify({ type: "done", ...result }) + "\n");
+  }).catch((error: unknown) => {
+    pending = undefined;
+    if (stream.destroyed) return;
+    const message = error instanceof Error && error.name === "TimeoutError"
+      ? "读取搜索来源超时，请重试" : "搜索未完成，请重试";
+    stream.end(JSON.stringify({ type: "error", message }) + "\n");
+  });
+  return stream;
+}
 
 /** 注册资源搜索、Telegram 频道配置及同网盘分享转存。 */
 export async function registerResourceSearchRoutes(server: FastifyInstance, runtime: ApiRuntime,
@@ -131,10 +169,16 @@ export async function registerResourceSearchRoutes(server: FastifyInstance, runt
         return { items: await engine.saveSources(request.body?.items, userId) };
       });
     }
-    server.get<{ Querystring: { keyword?: string } }>(`${prefix}/search`, async (request) => {
+    server.get<{ Querystring: { keyword?: string } }>(`${prefix}/search`, async (request, reply) => {
       await actor(request);
       const keyword = typeof request.query.keyword === "string" ? request.query.keyword.trim() : "";
       if (!keyword || keyword.length > 100) throw validationError("keyword", "请输入不超过 100 字的搜索内容");
+      reply.header("Vary", "Accept");
+      if (request.headers.accept?.includes("application/x-ndjson")) {
+        reply.type("application/x-ndjson; charset=utf-8")
+          .header("Cache-Control", "private, no-store, no-transform").header("X-Accel-Buffering", "no");
+        return reply.send(streamResourceSearch(engine, keyword));
+      }
       return engine.search(keyword);
     });
     server.get(`${prefix}/targets`, async (request) => {
@@ -155,8 +199,12 @@ export async function registerResourceSearchRoutes(server: FastifyInstance, runt
         const serviceId = requireString(body, "serviceId", "网盘服务", 100);
         const shareUrl = requireString(body, "shareUrl", "网盘分享链接", 1000);
         const password = typeof body.password === "string" ? body.password.trim() : "";
+        const service = await runtime.repository.getServiceDetail(serviceId, ownerId);
         const result = await submitShareTransfer(runtime, { serviceId, shareUrl, password,
           actorUserId: userId, ownerId });
+        // 关键变量：转存已经提交，跟踪写入异常不得把成功提交伪装成失败引导用户再次提交。
+        await runtime.telegramBot?.trackTransfer(service.userId, serviceId, result.taskId, "网页分享转存", "web")
+          .catch(() => runtime.logBusinessEvent("warn", { 日志关键字: "codex-telegram-bot", 事件: "网页转存跟踪保存失败", 服务ID: serviceId }));
         return reply.status(202).send({ taskId: result.taskId, fileCount: result.fileCount });
       });
     /** 搜索结果中的磁力由用户确认后提交到光鸭云添加，不经过本机下载。 */

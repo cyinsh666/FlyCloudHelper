@@ -114,7 +114,7 @@ function AuthLayout({ children }: { children: ReactNode }) {
 
 type AuthMode = "setup" | "login" | "register";
 
-/** 提交真实认证 API，并根据服务端角色进入对应控制台。 */
+/** 提交认证请求，完成初始化校验后进入个人控制台。 */
 function useAuthSubmit(mode: AuthMode) {
   const navigate = useNavigate();
   const [message, setMessage] = useState<string | null>(null);
@@ -202,7 +202,7 @@ function useAuthSubmit(mode: AuthMode) {
         }
         return;
       }
-      await navigate({ to: user.role === "super_admin" ? "/admin" : "/app", replace: true });
+      await navigate({ to: "/app", replace: true });
     } catch (error) {
       if (error instanceof ApiClientError && error.code === "setup_required") {
         await navigate({ to: "/setup", replace: true });
@@ -256,7 +256,7 @@ function CredentialKeyBackupPanel({ backup }: { backup: CredentialKeyBackup }) {
   const [message, setMessage] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
-  /** 确认备份状态并进入超级管理员后台。 */
+  /** 确认备份状态并进入个人控制台。 */
   async function completeBackup(): Promise<void> {
     if (!confirmed) {
       setMessage("请先确认已经将主密钥保存到安全位置");
@@ -266,7 +266,7 @@ function CredentialKeyBackupPanel({ backup }: { backup: CredentialKeyBackup }) {
     setMessage(null);
     try {
       await acknowledgeCredentialKeyBackup();
-      await navigate({ to: "/admin", replace: true });
+      await navigate({ to: "/app", replace: true });
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "无法确认备份状态");
     } finally {

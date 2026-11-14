@@ -9,6 +9,7 @@ import { AdminTelegramSearchSourcesPanel } from "@/pages/AdminTelegramSearchSour
 import { AdminAiModelsPanel } from "@/pages/AiModelPages";
 import { AdminNetworkProxySettingsPanel } from "@/pages/AdminNetworkProxySettingsPanel";
 import { AdminChannelTypeAnalysisPanel } from "@/pages/AdminChannelTypeAnalysisPanel";
+import { TelegramBindingPanel } from "@/pages/TelegramBotPanels";
 import {
   clearAdminTmdbCache,
   createAdminUser,
@@ -213,6 +214,8 @@ export function AdminUsersPage() {
     return { ...users, currentUser };
   }, []);
   const [showCreate, setShowCreate] = useState(false);
+  // 关键变量：一次只展开一个用户的绑定管理，切换用户时销毁旧绑定码。
+  const [telegramUserId, setTelegramUserId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [deletingUserId, setDeletingUserId] = useState<string | null>(null);
   // 关键变量：同步占用删除操作，避免状态刷新前重复提交同一个敏感请求。
@@ -330,6 +333,9 @@ export function AdminUsersPage() {
   return (
     <>
       <PageHeader title="用户管理" actions={<PrimaryButton onClick={() => setShowCreate((value) => !value)}><Plus className="size-4" /> 创建用户</PrimaryButton>} />
+      {telegramUserId && <div className="mb-4"><div className="flex justify-end"><SecondaryButton onClick={() => setTelegramUserId(null)}>关闭绑定管理</SecondaryButton></div>
+        <TelegramBindingPanel key={telegramUserId} userId={telegramUserId}
+          username={resource.data?.items.find((user) => user.userId === telegramUserId)?.username} /></div>}
       {showCreate && <Panel className="mb-4 p-4 sm:p-4" title="创建普通用户"><form onSubmit={(event) => void submitCreate(event)} className="grid gap-2 md:grid-cols-4"><input name="username" required minLength={4} placeholder="用户名" className="rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm" /><input name="password" required minLength={4} type="password" placeholder="密码" className="rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm" /><input name="passwordConfirmation" required minLength={4} type="password" placeholder="确认密码" className="rounded-lg border border-input bg-background/50 px-3 py-2.5 text-sm" /><PrimaryButton type="submit">确认创建</PrimaryButton></form></Panel>}
       {message && <p className="mb-4 text-sm text-muted-foreground">{message}</p>}
       <div className="grid gap-5">{userGroups.map((group) => <section key={group.key}>
@@ -356,6 +362,7 @@ export function AdminUsersPage() {
             <span>媒体 {user.mediaCount.toLocaleString()}</span>
           </div>
           <p className="mt-1 truncate text-[10px] text-muted-foreground" title={user.lastLoginAt ? formatJobDateTime(user.lastLoginAt) : "尚未登录"}>最近登录 {user.lastLoginAt ? formatJobDateTime(user.lastLoginAt) : "尚未登录"}</p>
+          <button type="button" onClick={() => setTelegramUserId(user.userId)} className="mt-2 cursor-pointer text-xs text-muted-foreground underline">Telegram 绑定</button>
           <footer className="mt-3 flex items-center gap-2 border-t border-border/70 pt-3">
             <button type="button" onClick={() => void toggleUser(user.userId, user.username, user.status === "active")} className="cursor-pointer rounded-lg border border-border bg-secondary/30 px-3 py-2 text-xs text-foreground transition-colors hover:border-foreground/30 hover:bg-secondary">{user.status === "active" ? "停用" : "启用"}</button>
             <button type="button" onClick={() => void revokeUserSessions(user.userId, user.username)} className="cursor-pointer rounded-lg border border-border bg-secondary/30 px-3 py-2 text-xs text-foreground transition-colors hover:border-warning/50 hover:bg-warning/10 hover:text-warning">撤销会话</button>

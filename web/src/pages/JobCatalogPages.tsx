@@ -40,7 +40,7 @@ import { loadJobRecordPrefix } from "./job-records";
 // 关键变量：后台任务页固定每 5 秒读取一次进度，避免轮询和 SSE 同时触发重复请求。
 const JOB_PROGRESS_REFRESH_INTERVAL_MS = 5_000;
 
-// 关键变量：右侧任务列表每页固定展示 8 条，以两列四行展示当前页任务。
+// 关键变量：左侧任务列表每页固定展示 8 条，以两列四行展示当前页任务。
 const JOB_LIST_PAGE_SIZE = 8;
 
 // 关键变量：媒体库卡片使用简短中文类型，避免在紧凑布局中展示接口枚举。
@@ -796,98 +796,7 @@ function JobsView({ admin }: { admin: boolean }) {
       {!activeRecord ? <Panel title="任务列表" description={`当前页 0 条 · 共 ${jobTotal} 条`}>
         <div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "当前筛选条件下没有任务"}</div>
       </Panel> : (
-        <div className="grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
-          {activeOrganizeTask && <OrganizeTaskDetail key={activeOrganizeTask.id} task={activeOrganizeTask}
-            admin={admin} onRefresh={resource.refresh} />}
-          {activeJob && <>
-          <Panel className="p-4 sm:p-4 xl:h-[calc(100vh-14rem)] xl:min-h-[560px] xl:max-h-[720px] xl:overflow-y-auto" title="任务详情" description={`${activeJob.serviceName} · ${getBackgroundJobLabel(activeJob)}${admin ? ` · ${activeJob.ownerUsername}` : ""} · 任务 ${activeJob.id.slice(0, 8)}`}>
-            <div className="rounded-xl border border-primary/25 bg-primary/8 p-4">
-              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3"><div><p className="text-[11px] text-muted-foreground">当前阶段</p><p className="font-display mt-0.5 text-xl font-semibold">{getJobStageLabel(activeJob.stage)}</p><p className="mt-0.5 text-[11px] text-muted-foreground">{getJobDurationLabel(activeJob.status)}：{formatJobDuration(activeJob.elapsedMs)}</p></div><StatusPill tone={getJobTone(activeJob.status)}>{getJobStatusLabel(activeJob)}</StatusPill></div>
-              <div className="mt-3"><ProgressMeter value={activeJob.status === "completed" ? 1 : activeJob.processedCount} total={activeJob.status === "completed" ? 1 : activeJob.totalCount} /></div>
-              {activeJob.status === "queued" && <div className="mt-3 rounded-lg border border-warning/30 bg-warning/8 px-3 py-2.5">
-                <p className="text-xs font-medium">{getQueuedJobWaitSummary(activeJob)}</p>
-                {activeJob.waitingForJobs.length > 0 && <ul className="mt-2 space-y-1.5">
-                  {activeJob.waitingForJobs.map((target) => <li key={`${target.jobType}:${target.id}`} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 text-[11px] text-muted-foreground">
-                    <span className="min-w-0 truncate" title={`${target.serviceName} · ${target.id}`}>{target.serviceName} · <span className="font-mono">{target.id}</span>{admin ? ` · ${target.ownerUsername}` : ""}</span>
-                    <span>{jobStatusLabels[target.status]}</span>
-                  </li>)}
-                </ul>}
-              </div>}
-              <div className="mt-3 min-w-0 border-t border-border/70 pt-3">
-                <p className="text-[11px] text-muted-foreground">{activeJob.jobType === "media_probe" ? "当前分析文件" : activeJobIsAiSupplement ? "当前处理内容" : "当前扫描路径"}</p>
-                <p className="mt-1 truncate font-mono text-xs" title={activeJob.currentPath ?? undefined}>{activeJob.currentPath || (activeJob.jobType === "media_probe" ? "等待领取视频文件" : activeJobIsAiSupplement ? "准备读取媒体库未匹配内容" : "准备读取扫描目录")}</p>
-                {activeJob.jobType === "scan" && activeJob.resumeSupported && <p className="mt-2 text-[11px] text-muted-foreground">可恢复检查点：{formatCheckpointTime(activeJob.checkpointUpdatedAt)}</p>}
-              </div>
-              {activeJob.status === "retry_waiting" && <div className="mt-3 rounded-lg border border-warning/30 bg-warning/8 px-3 py-2"><p className="text-sm font-medium">{activeJob.jobType === "media_probe" ? activeJob.errorCode === "provider_authentication_failed" ? "Provider 登录已失效，等待 APP 同步有效登录信息" : "上游地址或文件读取暂时失败，任务会自动重试" : "TMDB 暂时不可用，任务会自动恢复"}</p><p className="mt-1 text-[11px] text-muted-foreground">{activeJob.jobType === "media_probe" && activeJob.errorCode === "provider_authentication_failed" ? "同步成功后后台任务会自动继续" : <>预计恢复时间：{formatCheckpointTime(activeJob.nextRetryAt)}{activeJob.jobType === "scan" ? ` · 已等待 ${activeJob.retryCount.toLocaleString()} 次` : ""}</>}</p></div>}
-              {activeJob.jobType === "media_probe" ? (
-                <div className="mt-3 grid grid-cols-3 gap-3 font-mono text-[11px] text-muted-foreground">
-                  <span>总文件 {activeJob.totalCount?.toLocaleString() ?? "0"}</span>
-                  <span>已处理 {activeJob.processedCount.toLocaleString()}</span>
-                  <span>失败 {activeJob.errorCount.toLocaleString()}</span>
-                </div>
-              ) : (
-                <div className="mt-3 grid grid-cols-2 gap-3 font-mono text-[11px] text-muted-foreground sm:grid-cols-5">
-                  <span title={activeJobIsAiSupplement ? "当前任务尚未完成 AI 补充处理的电影或节目数量" : "扫描路径中识别出的可处理媒体文件数量"}>{activeJobIsAiSupplement ? "待补充" : getScannedMediaLabel(activeJob.dataType)} {(activeJobIsAiSupplement ? getAiSupplementPendingCount(activeJob) : getScannedMediaCount(activeJob)).toLocaleString()}</span>
-                  <span title={activeJobIsAiSupplement ? "已经完成 AI 补充处理的电影或节目数量" : getProcessedMediaDescription(activeJob.dataType)}>{activeJobIsAiSupplement ? "已处理" : getProcessedMediaLabel(activeJob.dataType)} {activeJob.processedCount.toLocaleString()}</span>
-                  <span title={getMatchedMediaDescription(activeJob.dataType, true)}>已匹配 {formatOptionalCount(activeJob.matchedCount)}</span>
-                  <span title={getMatchedMediaDescription(activeJob.dataType, false)}>未匹配 {formatOptionalCount(activeJob.unmatchedCount)}</span>
-                  <span title="完整电影或节目处理失败的数量">错误 {activeJob.errorCount.toLocaleString()}</span>
-                </div>
-              )}
-              <div className="mt-3 border-t border-border/70 pt-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <p className="text-[11px] text-muted-foreground">{activeParentJobId ? `当前来源任务 · ${activeJob.serviceName}` : "当前任务操作"}</p>
-                  <div className="flex flex-wrap justify-end gap-2">
-                    <SecondaryButton onClick={() => void pauseJob(activeJob)} disabled={!canPauseActiveJob || activeJobOperationBlocked}><Pause className="size-4" /> {pendingActiveJobOperation === "pause" || activeJob.controlAction === "pause" ? "暂停处理中…" : "暂停当前"}</SecondaryButton>
-                    <SecondaryButton onClick={() => void resumeJob(activeJob)} disabled={!canResumeActiveJob || activeJobOperationBlocked}><Play className="size-4" /> {pendingActiveJobOperation === "resume" ? "正在继续…" : "继续当前"}</SecondaryButton>
-                    <SecondaryButton onClick={() => void cancelJob(activeJob)} disabled={!canCancelActiveJob || activeJobOperationBlocked}><Square className="size-4" /> {pendingActiveJobOperation === "cancel" || activeJob.controlAction === "cancel" ? "取消处理中…" : "取消当前"}</SecondaryButton>
-                    <PrimaryButton onClick={() => void retryJob(activeJob)} disabled={!canRetryActiveJob || activeJobOperationBlocked}><RotateCcw className="size-4" /> {pendingActiveJobOperation === "retry" ? "正在重试…" : activeJobIsAiSupplement ? "重试AI补充" : "重试当前"}</PrimaryButton>
-                    <button type="button" onClick={() => void deleteJob(activeJob)} disabled={!canDeleteActiveJob || activeJobOperationBlocked} className="inline-flex items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {pendingActiveJobOperation === "delete" ? "正在删除…" : "删除当前"}</button>
-                  </div>
-                </div>
-              </div>
-              {activeJob.jobType === "scan" && <div className="mt-3 flex flex-wrap justify-end gap-2 border-t border-border/70 pt-3">
-                <SecondaryButton onClick={() => void openAiSupplementDialog()}>
-                  <Sparkles className="size-4" /> AI补充详情
-                </SecondaryButton>
-                <SecondaryButton
-                  onClick={() => void downloadSelectedFailureReport()}
-                  disabled={!canDownloadFailureReport || (failureReportState?.jobId === activeJob.id && failureReportState.downloading)}
-                >
-                  <Download className="size-4" /> {failureReportState?.jobId === activeJob.id && failureReportState.downloading
-                    ? "正在下载…"
-                    : activeJobIsAiSupplement ? "下载AI补充失败报告" : "下载失败报告"}
-                </SecondaryButton>
-              </div>}
-              {activeJob.jobType === "scan" && failureReportState?.jobId === activeJob.id && (
-                <p className="mt-2 text-right text-xs text-muted-foreground">{failureReportState.message}</p>
-              )}
-            </div>
-            {activeJob.dataType === "music" && <MusicScanStages jobId={activeJob.id} admin={admin} stages={activeJob.snapshot.musicStages} retryEnabled={canRetryActiveJob && !activeJobOperationBlocked} onRetry={(stage) => void retryJob(activeJob, stage)} />}
-            <h3 className="mt-4 mb-2 text-sm font-semibold">配置快照（只读）</h3>
-            <div className="rounded-xl border border-border bg-secondary/40 p-3">
-              <dl className="grid gap-x-4 gap-y-2 sm:grid-cols-2">
-                {snapshotFields.map((field) => <div key={field.label}><dt className="text-[10px] text-muted-foreground">{field.label}</dt><dd className="mt-0.5 break-all text-xs">{field.value}</dd></div>)}
-              </dl>
-              {activeJob.jobType === "scan" && <div className="mt-4 border-t border-border pt-4">
-                <p className="text-[11px] text-muted-foreground">元数据插件</p>
-                {pluginSnapshots.length === 0 ? <p className="mt-2 text-sm">未使用插件</p> : <ul className="mt-2 space-y-2">{pluginSnapshots.map((plugin) => <li key={`${plugin.pluginId}@${plugin.version}`} className="rounded-lg border border-border bg-background/35 px-3 py-2"><p className="text-sm">{plugin.pluginId} · {plugin.version}</p><p className="mt-1 text-[11px] text-muted-foreground">配置 {plugin.configurationRevision}{plugin.sha256 ? ` · SHA256 ${plugin.sha256.slice(0, 12)}` : ""}</p></li>)}</ul>}
-              </div>}
-            </div>
-            {activeJob.jobType === "media_probe" && activeJob.errorCount > 0 && (
-              <div className="mt-4 rounded-xl border border-warning/30 bg-warning/8 p-4">
-                <h3 className="text-sm font-semibold">失败文件</h3>
-                {mediaProbeFailures.length > 0 ? <ul className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">{mediaProbeFailures.map((failure) => (
-                  <li key={failure.sourceFileId} className="rounded-lg border border-border bg-background/35 px-3 py-2">
-                    <p className="truncate text-xs" title={failure.fileName}>{failure.fileName}</p>
-                    <p className="mt-1 font-mono text-[10px] text-muted-foreground">{failure.errorCode} · {failure.errorMessage}</p>
-                  </li>
-                ))}</ul> : <p className="mt-2 text-xs text-muted-foreground">{mediaProbeFailuresLoaded ? "没有需要逐文件展示的失败记录" : "正在读取失败文件…"}</p>}
-              </div>
-            )}
-            {activeJob.status !== "retry_waiting" && (activeJob.errorCode || activeJob.errorMessage) && <div className="mt-4 rounded-xl border border-destructive/30 bg-destructive/8 p-4"><p className="font-mono text-xs text-destructive">{activeJob.errorCode}</p><p className="mt-2 text-sm">{activeJob.errorMessage}</p></div>}
-          </Panel>
-          </>}
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.15fr)]">
           <Panel
             className="overflow-hidden p-4 sm:p-4 xl:flex xl:h-[calc(100vh-14rem)] xl:min-h-[560px] xl:max-h-[720px] xl:flex-col"
             title="任务列表"
@@ -986,6 +895,97 @@ function JobsView({ admin }: { admin: boolean }) {
               <button type="button" disabled={jobPageOffset + JOB_LIST_PAGE_SIZE >= jobTotal || resource.loading} onClick={() => setJobPageOffset(jobPageOffset + JOB_LIST_PAGE_SIZE)} className="rounded-lg border border-border px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40">下一页</button>
             </div>
           </Panel>
+          {activeOrganizeTask && <OrganizeTaskDetail key={activeOrganizeTask.id} task={activeOrganizeTask}
+            admin={admin} onRefresh={resource.refresh} />}
+          {activeJob && <>
+          <Panel className="p-4 sm:p-4 xl:h-[calc(100vh-14rem)] xl:min-h-[560px] xl:max-h-[720px] xl:overflow-y-auto" title="任务详情" description={`${activeJob.serviceName} · ${getBackgroundJobLabel(activeJob)}${admin ? ` · ${activeJob.ownerUsername}` : ""} · 任务 ${activeJob.id.slice(0, 8)}`}>
+            <div className="rounded-xl border border-primary/25 bg-primary/8 p-4">
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3"><div><p className="text-[11px] text-muted-foreground">当前阶段</p><p className="font-display mt-0.5 text-xl font-semibold">{getJobStageLabel(activeJob.stage)}</p><p className="mt-0.5 text-[11px] text-muted-foreground">{getJobDurationLabel(activeJob.status)}：{formatJobDuration(activeJob.elapsedMs)}</p></div><StatusPill tone={getJobTone(activeJob.status)}>{getJobStatusLabel(activeJob)}</StatusPill></div>
+              <div className="mt-3"><ProgressMeter value={activeJob.status === "completed" ? 1 : activeJob.processedCount} total={activeJob.status === "completed" ? 1 : activeJob.totalCount} /></div>
+              {activeJob.status === "queued" && <div className="mt-3 rounded-lg border border-warning/30 bg-warning/8 px-3 py-2.5">
+                <p className="text-xs font-medium">{getQueuedJobWaitSummary(activeJob)}</p>
+                {activeJob.waitingForJobs.length > 0 && <ul className="mt-2 space-y-1.5">
+                  {activeJob.waitingForJobs.map((target) => <li key={`${target.jobType}:${target.id}`} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 text-[11px] text-muted-foreground">
+                    <span className="min-w-0 truncate" title={`${target.serviceName} · ${target.id}`}>{target.serviceName} · <span className="font-mono">{target.id}</span>{admin ? ` · ${target.ownerUsername}` : ""}</span>
+                    <span>{jobStatusLabels[target.status]}</span>
+                  </li>)}
+                </ul>}
+              </div>}
+              <div className="mt-3 min-w-0 border-t border-border/70 pt-3">
+                <p className="text-[11px] text-muted-foreground">{activeJob.jobType === "media_probe" ? "当前分析文件" : activeJobIsAiSupplement ? "当前处理内容" : "当前扫描路径"}</p>
+                <p className="mt-1 truncate font-mono text-xs" title={activeJob.currentPath ?? undefined}>{activeJob.currentPath || (activeJob.jobType === "media_probe" ? "等待领取视频文件" : activeJobIsAiSupplement ? "准备读取媒体库未匹配内容" : "准备读取扫描目录")}</p>
+                {activeJob.jobType === "scan" && activeJob.resumeSupported && <p className="mt-2 text-[11px] text-muted-foreground">可恢复检查点：{formatCheckpointTime(activeJob.checkpointUpdatedAt)}</p>}
+              </div>
+              {activeJob.status === "retry_waiting" && <div className="mt-3 rounded-lg border border-warning/30 bg-warning/8 px-3 py-2"><p className="text-sm font-medium">{activeJob.jobType === "media_probe" ? activeJob.errorCode === "provider_authentication_failed" ? "Provider 登录已失效，等待 APP 同步有效登录信息" : "上游地址或文件读取暂时失败，任务会自动重试" : "TMDB 暂时不可用，任务会自动恢复"}</p><p className="mt-1 text-[11px] text-muted-foreground">{activeJob.jobType === "media_probe" && activeJob.errorCode === "provider_authentication_failed" ? "同步成功后后台任务会自动继续" : <>预计恢复时间：{formatCheckpointTime(activeJob.nextRetryAt)}{activeJob.jobType === "scan" ? ` · 已等待 ${activeJob.retryCount.toLocaleString()} 次` : ""}</>}</p></div>}
+              {activeJob.jobType === "media_probe" ? (
+                <div className="mt-3 grid grid-cols-3 gap-3 font-mono text-[11px] text-muted-foreground">
+                  <span>总文件 {activeJob.totalCount?.toLocaleString() ?? "0"}</span>
+                  <span>已处理 {activeJob.processedCount.toLocaleString()}</span>
+                  <span>失败 {activeJob.errorCount.toLocaleString()}</span>
+                </div>
+              ) : (
+                <div className="mt-3 grid grid-cols-2 gap-3 font-mono text-[11px] text-muted-foreground sm:grid-cols-5">
+                  <span title={activeJobIsAiSupplement ? "当前任务尚未完成 AI 补充处理的电影或节目数量" : "扫描路径中识别出的可处理媒体文件数量"}>{activeJobIsAiSupplement ? "待补充" : getScannedMediaLabel(activeJob.dataType)} {(activeJobIsAiSupplement ? getAiSupplementPendingCount(activeJob) : getScannedMediaCount(activeJob)).toLocaleString()}</span>
+                  <span title={activeJobIsAiSupplement ? "已经完成 AI 补充处理的电影或节目数量" : getProcessedMediaDescription(activeJob.dataType)}>{activeJobIsAiSupplement ? "已处理" : getProcessedMediaLabel(activeJob.dataType)} {activeJob.processedCount.toLocaleString()}</span>
+                  <span title={getMatchedMediaDescription(activeJob.dataType, true)}>已匹配 {formatOptionalCount(activeJob.matchedCount)}</span>
+                  <span title={getMatchedMediaDescription(activeJob.dataType, false)}>未匹配 {formatOptionalCount(activeJob.unmatchedCount)}</span>
+                  <span title="完整电影或节目处理失败的数量">错误 {activeJob.errorCount.toLocaleString()}</span>
+                </div>
+              )}
+              <div className="mt-3 border-t border-border/70 pt-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-[11px] text-muted-foreground">{activeParentJobId ? `当前来源任务 · ${activeJob.serviceName}` : "当前任务操作"}</p>
+                  <div className="flex flex-wrap justify-end gap-2">
+                    <SecondaryButton onClick={() => void pauseJob(activeJob)} disabled={!canPauseActiveJob || activeJobOperationBlocked}><Pause className="size-4" /> {pendingActiveJobOperation === "pause" || activeJob.controlAction === "pause" ? "暂停处理中…" : "暂停当前"}</SecondaryButton>
+                    <SecondaryButton onClick={() => void resumeJob(activeJob)} disabled={!canResumeActiveJob || activeJobOperationBlocked}><Play className="size-4" /> {pendingActiveJobOperation === "resume" ? "正在继续…" : "继续当前"}</SecondaryButton>
+                    <SecondaryButton onClick={() => void cancelJob(activeJob)} disabled={!canCancelActiveJob || activeJobOperationBlocked}><Square className="size-4" /> {pendingActiveJobOperation === "cancel" || activeJob.controlAction === "cancel" ? "取消处理中…" : "取消当前"}</SecondaryButton>
+                    <PrimaryButton onClick={() => void retryJob(activeJob)} disabled={!canRetryActiveJob || activeJobOperationBlocked}><RotateCcw className="size-4" /> {pendingActiveJobOperation === "retry" ? "正在重试…" : activeJobIsAiSupplement ? "重试AI补充" : "重试当前"}</PrimaryButton>
+                    <button type="button" onClick={() => void deleteJob(activeJob)} disabled={!canDeleteActiveJob || activeJobOperationBlocked} className="inline-flex items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {pendingActiveJobOperation === "delete" ? "正在删除…" : "删除当前"}</button>
+                  </div>
+                </div>
+              </div>
+              {activeJob.jobType === "scan" && <div className="mt-3 flex flex-wrap justify-end gap-2 border-t border-border/70 pt-3">
+                <SecondaryButton onClick={() => void openAiSupplementDialog()}>
+                  <Sparkles className="size-4" /> AI补充详情
+                </SecondaryButton>
+                <SecondaryButton
+                  onClick={() => void downloadSelectedFailureReport()}
+                  disabled={!canDownloadFailureReport || (failureReportState?.jobId === activeJob.id && failureReportState.downloading)}
+                >
+                  <Download className="size-4" /> {failureReportState?.jobId === activeJob.id && failureReportState.downloading
+                    ? "正在下载…"
+                    : activeJobIsAiSupplement ? "下载AI补充失败报告" : "下载失败报告"}
+                </SecondaryButton>
+              </div>}
+              {activeJob.jobType === "scan" && failureReportState?.jobId === activeJob.id && (
+                <p className="mt-2 text-right text-xs text-muted-foreground">{failureReportState.message}</p>
+              )}
+            </div>
+            {activeJob.dataType === "music" && <MusicScanStages jobId={activeJob.id} admin={admin} stages={activeJob.snapshot.musicStages} retryEnabled={canRetryActiveJob && !activeJobOperationBlocked} onRetry={(stage) => void retryJob(activeJob, stage)} />}
+            <h3 className="mt-4 mb-2 text-sm font-semibold">配置快照（只读）</h3>
+            <div className="rounded-xl border border-border bg-secondary/40 p-3">
+              <dl className="grid gap-x-4 gap-y-2 sm:grid-cols-2">
+                {snapshotFields.map((field) => <div key={field.label}><dt className="text-[10px] text-muted-foreground">{field.label}</dt><dd className="mt-0.5 break-all text-xs">{field.value}</dd></div>)}
+              </dl>
+              {activeJob.jobType === "scan" && <div className="mt-4 border-t border-border pt-4">
+                <p className="text-[11px] text-muted-foreground">元数据插件</p>
+                {pluginSnapshots.length === 0 ? <p className="mt-2 text-sm">未使用插件</p> : <ul className="mt-2 space-y-2">{pluginSnapshots.map((plugin) => <li key={`${plugin.pluginId}@${plugin.version}`} className="rounded-lg border border-border bg-background/35 px-3 py-2"><p className="text-sm">{plugin.pluginId} · {plugin.version}</p><p className="mt-1 text-[11px] text-muted-foreground">配置 {plugin.configurationRevision}{plugin.sha256 ? ` · SHA256 ${plugin.sha256.slice(0, 12)}` : ""}</p></li>)}</ul>}
+              </div>}
+            </div>
+            {activeJob.jobType === "media_probe" && activeJob.errorCount > 0 && (
+              <div className="mt-4 rounded-xl border border-warning/30 bg-warning/8 p-4">
+                <h3 className="text-sm font-semibold">失败文件</h3>
+                {mediaProbeFailures.length > 0 ? <ul className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">{mediaProbeFailures.map((failure) => (
+                  <li key={failure.sourceFileId} className="rounded-lg border border-border bg-background/35 px-3 py-2">
+                    <p className="truncate text-xs" title={failure.fileName}>{failure.fileName}</p>
+                    <p className="mt-1 font-mono text-[10px] text-muted-foreground">{failure.errorCode} · {failure.errorMessage}</p>
+                  </li>
+                ))}</ul> : <p className="mt-2 text-xs text-muted-foreground">{mediaProbeFailuresLoaded ? "没有需要逐文件展示的失败记录" : "正在读取失败文件…"}</p>}
+              </div>
+            )}
+            {activeJob.status !== "retry_waiting" && (activeJob.errorCode || activeJob.errorMessage) && <div className="mt-4 rounded-xl border border-destructive/30 bg-destructive/8 p-4"><p className="font-mono text-xs text-destructive">{activeJob.errorCode}</p><p className="mt-2 text-sm">{activeJob.errorMessage}</p></div>}
+          </Panel>
+          </>}
         </div>
       )}
       <AiSupplementDialog state={{
@@ -1074,7 +1074,6 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
             <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
               <StatusPill>{library.libraryKind === "content_source_live" ? "电视直播" : catalogDataTypeLabels[library.dataType] ?? library.dataType}</StatusPill>
               {library.libraryKind !== "content_source_live" && <span>条目 {library.itemCount.toLocaleString()}</span>}
-              {library.libraryKind !== "content_source_live" && <span>版本 v{library.catalogVersion}</span>}
               {library.libraryKind === "content_source_live" ? <span>M3U 频道订阅</span> : library.dataType === "music" ? <span>Navidrome {library.navidromeEnabled ? "已启用" : "未启用"}</span> : library.dataType === "audiobook" ? <span>ABS {library.absEnabled ? "已启用" : "未启用"}</span> : <span>Jellyfin {library.jellyfinEnabled ? "已启用" : "未启用"}</span>}
             </div>
             <footer className="mt-3 flex flex-wrap gap-2 border-t border-border/70 pt-3">

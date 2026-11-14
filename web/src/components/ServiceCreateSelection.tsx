@@ -64,9 +64,9 @@ export function getProviderSelectionDescription(provider: ProviderDescriptor): s
 }
 
 /** 返回 Provider 对应的 Flymby 图标，未来新增类型没有资源时显示通用图标。 */
-export function ProviderSelectionIcon({ providerType }: { providerType: string }) {
+export function ProviderSelectionIcon({ providerType, compact = false }: { providerType: string; compact?: boolean }) {
   const iconPath = providerIconPaths[providerType];
   return iconPath
-    ? <img src={iconPath} alt="" className="size-10 rounded-lg object-contain" />
-    : <HardDrive className="size-5 text-muted-foreground" />;
+    ? <img src={iconPath} alt="" className={compact ? "size-5 shrink-0 rounded object-contain" : "size-10 rounded-lg object-contain"} />
+    : <HardDrive className="size-5 shrink-0 text-muted-foreground" />;
 }

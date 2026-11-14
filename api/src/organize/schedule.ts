@@ -21,6 +21,7 @@ export interface OrganizeSchedule extends ScanScheduleConfiguration {
   aiAssistEnabled?: boolean;
   aiModelId?: string | null;
   washEnabled?: boolean;
+  washCleanupSources?: boolean;
   washPriorities?: WashPriority[];
   nextRunAt: string | null;
   lastTriggeredAt: string | null;
@@ -47,7 +48,7 @@ function defaultSchedule(serviceId: string, userId: string): OrganizeSchedule {
   return {
     serviceId, userId, sources: [], target: null, mode: "move", enabled: false,
     unrecognizedTransferEnabled: false, unrecognizedDirectory: null, aiAssistEnabled: false, aiModelId: null,
-    washEnabled: false, washPriorities: ["resolution"],
+    washEnabled: false, washCleanupSources: false, washPriorities: ["resolution"],
     scheduleType: "interval", intervalMinutes: 24 * 60, timeOfDay: "03:00", dayOfWeek: 1,
     dayOfMonth: 1, timezoneOffsetMinutes: -new Date().getTimezoneOffset(), quietPeriodEnabled: false,
     quietStartTime: "00:00", quietEndTime: "07:00", nextRunAt: null, lastTriggeredAt: null,
@@ -59,7 +60,7 @@ function defaultSchedule(serviceId: string, userId: string): OrganizeSchedule {
 export function readOrganizeScheduleInput(body: Record<string, unknown>): Pick<OrganizeSchedule,
   "enabled" | "scheduleType" | "intervalMinutes" | "timeOfDay" | "dayOfWeek" | "dayOfMonth" |
   "timezoneOffsetMinutes" | "quietPeriodEnabled" | "quietStartTime" | "quietEndTime" | "sources" | "target" | "mode" |
-  "unrecognizedTransferEnabled" | "unrecognizedDirectory" | "aiAssistEnabled" | "aiModelId" | "washEnabled" | "washPriorities"> {
+  "unrecognizedTransferEnabled" | "unrecognizedDirectory" | "aiAssistEnabled" | "aiModelId" | "washEnabled" | "washPriorities" | "washCleanupSources"> {
   const integer = (name: string, min: number, max: number): number => {
     const value = body[name];
     if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
@@ -191,7 +192,7 @@ export class ServiceOrganizeScheduler {
         unrecognizedTransferEnabled: schedule.unrecognizedTransferEnabled,
         unrecognizedDirectory: schedule.unrecognizedDirectory,
         aiAssistEnabled: schedule.aiAssistEnabled, aiModelId: schedule.aiModelId,
-        washEnabled: schedule.washEnabled, washPriorities: schedule.washPriorities,
+        washEnabled: schedule.washEnabled, washPriorities: schedule.washPriorities, washCleanupSources: schedule.washCleanupSources,
       });
       const now = new Date().toISOString();
       schedule.pendingPlanId = plan.id;
@@ -292,7 +293,7 @@ export class ServiceOrganizeScheduler {
           unrecognizedTransferEnabled: schedule.unrecognizedTransferEnabled,
           unrecognizedDirectory: schedule.unrecognizedDirectory,
           aiAssistEnabled: schedule.aiAssistEnabled, aiModelId: schedule.aiModelId,
-          washEnabled: schedule.washEnabled, washPriorities: schedule.washPriorities });
+          washEnabled: schedule.washEnabled, washPriorities: schedule.washPriorities, washCleanupSources: schedule.washCleanupSources });
         schedule.lastTriggeredAt = now.toISOString();
         schedule.nextRunAt = calculateNextScanRunAt(schedule, now);
         schedule.pendingPlanId = plan.id;

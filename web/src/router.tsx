@@ -84,7 +84,7 @@ function RootIndexRouteComponent() {
   useEffect(() => {
     let active = true;
 
-    /** 依次判断首次初始化状态和当前登录角色。 */
+    /** 完成实例状态和会话校验后进入个人控制台。 */
     async function resolveRootDestination(): Promise<void> {
       try {
         const setupState = await getSetupStatus();
@@ -110,7 +110,7 @@ function RootIndexRouteComponent() {
             return;
           }
           await navigate({
-            to: user.role === "super_admin" ? "/admin" : "/app",
+            to: "/app",
             replace: true,
           });
         } catch (error) {

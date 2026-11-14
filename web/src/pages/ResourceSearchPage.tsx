@@ -2,12 +2,16 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useRouterState } from "@tanstack/react-router";
 import { ExternalLink, LoaderCircle, Search } from "lucide-react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
+import { RecommendationMovieCard, RecommendationMovieSkeleton, recommendationCardGridStyle } from "@/components/RecommendationCards";
 import { Panel, StatusPill } from "@/components/ui-kit";
 import {
-  getOfflineTransferStatus, getResourceSearchTargets, getResourceTransferStatus, offlineTransferResource,
+  getOfflineTransferStatus, getRecommendationDetail, getResourceSearchTargets, getResourceTransferStatus, offlineTransferResource,
   searchResources, transferResource,
-  type ResourceSearchItem, type ResourceSearchTarget,
+  type RecommendationDetail, type ResourceSearchItem, type ResourceSearchTarget,
 } from "@/lib/api";
+
+// 关键变量：使用「新片与追剧」里的同一个榜单和缓存。
+const weeklyUpdatesBlockId = "tmdb-tv-next-seven-days";
 
 // 关键变量：标签与搜索引擎识别的网盘类型保持一致，切换标签只筛选当前结果。
 const cloudTabs = [
@@ -28,6 +32,41 @@ function transferProviderName(providerType: string): string {
   return providerType === "quark" ? "夸克" : "光鸭";
 }
 
+/** 独立搜索页空闲时展示未来七天排期，点击作品后直接查找资源。 */
+function WeeklyUpdates({ admin, onSearch }: { admin: boolean; onSearch: (title: string) => void }) {
+  const [page, setPage] = useState(1);
+  const [detail, setDetail] = useState<RecommendationDetail | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  /** 直接读取榜单快照，发起搜索后丢弃未完成的排期响应。 */
+  useEffect(() => {
+    let active = true;
+    setError(null);
+    void getRecommendationDetail(weeklyUpdatesBlockId, page, admin).then((next) => {
+      if (active) setDetail(next);
+    }).catch((failure) => {
+      if (active) setError(failure instanceof Error ? failure.message : "读取更新榜单失败");
+    });
+    return () => { active = false; };
+  }, [admin, page]);
+
+  const visible = detail?.pagination.page === page ? detail : null;
+  return <Panel className="mt-5" title={detail?.title ?? "未来 7 天更新"} description={detail?.description ?? undefined}>
+    {error ? <p role="alert" className="text-sm text-destructive">{error}</p>
+      : !visible ? <RecommendationMovieSkeleton count={6} />
+      : visible.items.length === 0 ? <p className="py-5 text-center text-sm text-muted-foreground">
+        {visible.lastUpdated ? "未来 7 天暂无符合条件的剧集" : "更新榜单尚未同步"}
+      </p> : <div className="grid gap-3" style={recommendationCardGridStyle}>
+        {visible.items.map((item) => <RecommendationMovieCard key={item.rank} item={item} onOpen={() => onSearch(item.title)} />)}
+      </div>}
+    {detail && detail.pagination.totalPages > 1 && <div className="mt-4 flex items-center justify-center gap-2">
+      <SecondaryButton disabled={page === 1} onClick={() => setPage(page - 1)}>上一页</SecondaryButton>
+      <span className="text-xs text-muted-foreground">{page} / {detail.pagination.totalPages}</span>
+      <SecondaryButton disabled={page >= detail.pagination.totalPages} onClick={() => setPage(page + 1)}>下一页</SecondaryButton>
+    </div>}
+  </Panel>;
+}
+
 /** 用户和管理员共用的资源搜索内容，也可嵌入影片详情并自动搜索片名。 */
 export function ResourceSearchPage({ admin = false, embedded = false, initialKeyword = "", onSearchingChange }: {
   admin?: boolean; embedded?: boolean; initialKeyword?: string; onSearchingChange?: (searching: boolean) => void;
@@ -43,7 +82,7 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
   const keywordInputRef = useRef<HTMLInputElement>(null);
   const searchedRouteKeywordRef = useRef<string | null>(null);
   // 关键变量：自动搜索与手动搜索可能相继发起，只展示最后一次请求的结果。
-  const searchRequestRef = useRef(0);
+  const searchRequestRef = useRef<AbortController | null>(null);
   // 关键变量：组件卸载后不再把旧搜索状态回传给影片详情。
   const mountedRef = useRef(false);
   const [targets, setTargets] = useState<ResourceSearchTarget[]>([]);
@@ -56,7 +95,9 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
   const [task, setTask] = useState<{ serviceId: string; taskId: string; providerType: string;
     mode: "share" | "offline"; status: string; progress: number } | null>(null);
   const [loading, setLoading] = useState(true);
+  const [hasSearched, setHasSearched] = useState(false);
   const [searching, setSearching] = useState(false);
+  const [searchProgress, setSearchProgress] = useState<{ completed: number; total: number } | null>(null);
   const [transferring, setTransferring] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -64,7 +105,11 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
   /** 标记组件是否仍在页面上，开发模式重复执行副作用时保留首次搜索请求。 */
   useEffect(() => {
     mountedRef.current = true;
-    return () => { mountedRef.current = false; };
+    return () => {
+      mountedRef.current = false;
+      // 开发模式会同步重跑 effect；仅在页面真正离开后取消请求。
+      queueMicrotask(() => { if (!mountedRef.current) searchRequestRef.current?.abort(); });
+    };
   }, []);
 
   /** 页面初次加载时读取可转存服务，搜索频道由系统设置统一维护。 */
@@ -101,8 +146,16 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
   /** 从已启用来源搜索关键词，自动跳转与手动提交共用同一段状态更新。 */
   async function searchKeyword(keyword: string): Promise<void> {
     if (!keyword) return;
-    const requestId = ++searchRequestRef.current;
+    searchRequestRef.current?.abort();
+    const request = new AbortController();
+    searchRequestRef.current = request;
+    /** 离开详情或提交新关键词后，旧请求不能覆盖当前结果。 */
+    function isCurrent(): boolean {
+      return mountedRef.current && searchRequestRef.current === request;
+    }
+    setHasSearched(true);
     setSearching(true);
+    setSearchProgress(null);
     onSearchingChange?.(true);
     setError(null);
     setMessage(null);
@@ -110,17 +163,36 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
     setSourceErrors([]);
     setActiveCloudType("all");
     setActiveSource("all");
+    // 关键变量：结束帧可能与最后一次进度相同，复用当前列表和错误状态。
+    let lastItems = "[]";
+    let lastErrors = "[]";
+    /** 只有可见数据变化才替换对应状态。 */
+    function showResults(items: ResourceSearchItem[], errors: string[]): void {
+      const itemsKey = JSON.stringify(items);
+      if (itemsKey !== lastItems) {
+        lastItems = itemsKey;
+        setResults(items);
+      }
+      const errorsKey = JSON.stringify(errors);
+      if (errorsKey !== lastErrors) {
+        lastErrors = errorsKey;
+        setSourceErrors(errors);
+      }
+    }
     try {
-      const found = await searchResources(keyword, admin);
-      if (!mountedRef.current || requestId !== searchRequestRef.current) return;
-      setResults(found.items);
-      setSourceErrors(found.errors);
+      const found = await searchResources(keyword, admin, (progress) => {
+        if (!isCurrent()) return;
+        showResults(progress.items, progress.errors);
+        setSearchProgress({ completed: progress.completed, total: progress.total });
+      }, request.signal);
+      if (!isCurrent()) return;
+      showResults(found.items, found.errors);
     } catch (failure) {
-      if (mountedRef.current && requestId === searchRequestRef.current) {
+      if (isCurrent() && !request.signal.aborted) {
         setError(failure instanceof Error ? failure.message : "搜索失败");
       }
     } finally {
-      if (mountedRef.current && requestId === searchRequestRef.current) {
+      if (isCurrent()) {
         setSearching(false);
         onSearchingChange?.(false);
       }
@@ -137,11 +209,30 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
 
   /** 用路由或详情传入的片名填充原生输入框，并自动执行一次资源搜索。 */
   useEffect(() => {
+    if (!autoKeyword && searchedRouteKeywordRef.current) {
+      searchedRouteKeywordRef.current = null;
+      searchRequestRef.current?.abort();
+      searchRequestRef.current = null;
+      if (keywordInputRef.current) keywordInputRef.current.value = "";
+      setHasSearched(false);
+      setSearching(false);
+      setResults([]);
+      setSourceErrors([]);
+      setError(null);
+      onSearchingChange?.(false);
+      return;
+    }
     if (!autoKeyword || searchedRouteKeywordRef.current === `${admin}:${autoKeyword}`) return;
     searchedRouteKeywordRef.current = `${admin}:${autoKeyword}`;
     if (keywordInputRef.current) keywordInputRef.current.value = autoKeyword;
     void searchKeyword(autoKeyword);
   }, [autoKeyword, admin]);
+
+  /** 从更新榜单选片后填入同一个搜索框，并使用原有分批搜索流程。 */
+  function searchRecommendedTitle(title: string): void {
+    if (keywordInputRef.current) keywordInputRef.current.value = title;
+    void searchKeyword(title.trim().slice(0, 100));
+  }
 
   /** 打开转存选择并刷新服务目录，避免使用进入页面时的旧配置。 */
   async function openTransfer(item: ResourceSearchItem): Promise<void> {
@@ -220,7 +311,7 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
             onCompositionEnd={() => { composingRef.current = false; }}
             placeholder="输入影片名称" aria-label="影片名称"
             className="min-w-0 flex-1 rounded-lg border border-border bg-background px-3 py-2.5 text-sm" />
-          <PrimaryButton type="submit" disabled={searching}>
+          <PrimaryButton type="submit">
             {searching ? <LoaderCircle className="size-4 animate-spin" /> : <Search className="size-4" />}搜索
           </PrimaryButton>
         </form>}
@@ -249,11 +340,16 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
             {source.label} <span className="text-xs text-muted-foreground">{source.count}</span>
           </button>)}
         </div>}
-        {searching && !embedded && <p className="mt-3 text-sm text-muted-foreground">正在搜索已启用来源，来源较多时可能需要一些时间…</p>}
       </Panel>}
+      {searching && <p role="status" className="mt-3 text-sm text-muted-foreground">
+        {searchProgress ? `已查找 ${searchProgress.completed} / ${searchProgress.total} 个来源 · 已找到 ${results.length} 条资源`
+          : "正在查找资源…"}
+      </p>}
+
+      {!embedded && !autoKeyword && !hasSearched && <WeeklyUpdates admin={admin} onSearch={searchRecommendedTitle} />}
 
       {/* 关键变量：结果卡片按容器宽度自动换列，窄屏仍保持单列。 */}
-      <div className="mt-5 grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 22rem), 1fr))" }}>
+      {(hasSearched || embedded) && <div className="mt-5 grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 22rem), 1fr))" }}>
         {visibleResults.map((item) => <Panel key={`${item.cloudType}:${item.shareUrl}`} className="min-w-0">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="min-w-0 flex-1">
@@ -281,7 +377,7 @@ export function ResourceSearchPage({ admin = false, embedded = false, initialKey
           <summary className="cursor-pointer">{sourceErrors.length} 个来源搜索失败，点击查看具体来源；{admin ? "可在系统设置的数据源分类中调整" : "请联系管理员检查数据源配置"}。</summary>
           <ul className="mt-2 space-y-1 pl-4">{sourceErrors.map((sourceError, index) => <li key={`${sourceError}:${index}`} className="list-disc">{sourceError}</li>)}</ul>
         </details>}
-      </div>
+      </div>}
 
       {selected && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="presentation" onClick={() => setSelected(null)}>
         <div role="dialog" aria-modal="true" aria-label={`选择${transferProviderName(selected.cloudType)}转存位置`} onClick={(event) => event.stopPropagation()}

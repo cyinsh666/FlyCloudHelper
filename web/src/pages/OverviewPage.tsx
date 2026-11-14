@@ -1,7 +1,8 @@
 import { Link } from "@tanstack/react-router";
-import { ArrowUpRight, FolderOutput, Plus, ScanLine } from "lucide-react";
+import { ArrowUpRight, FolderOutput, Images, LoaderCircle, Plus, ScanLine, Settings } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { PageHeader, PrimaryButton } from "@/components/ConsoleShell";
+import { ProviderSelectionIcon } from "@/components/ServiceCreateSelection";
 import { Panel, PosterCard, ProgressMeter, StatCard, StatusPill } from "@/components/ui-kit";
 import {
   getOverview,
@@ -52,6 +53,9 @@ const recentTaskTypeOptions: Array<{ value: RecentTaskType; label: string }> = [
   { value: "organize", label: "影片整理" },
 ];
 
+// 关键变量：概览卡片右下角的快捷入口使用同尺寸的图标按钮。
+const overviewIconActionClass = "grid size-8 shrink-0 place-items-center rounded-lg border border-border text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-foreground disabled:cursor-not-allowed disabled:opacity-40";
+
 /** 为最近任务中的影片整理记录显示实际执行状态。 */
 function getOrganizeTaskStatus(task: OrganizeTaskSummary): { label: string; tone: "primary" | "warning" | "success" | "danger" | "neutral" } {
   if (task.status === "preparing") return { label: "识别中", tone: "primary" };
@@ -100,19 +104,21 @@ function OverviewServiceCard({ service }: { service: CloudService }) {
 
   return <div className="rounded-xl border border-border bg-secondary/40 p-3">
     <div className="flex items-start justify-between gap-2">
-      <p className="truncate text-sm font-medium">{service.displayName}</p>
+      <div className="flex min-w-0 items-center gap-2">
+        <ProviderSelectionIcon providerType={service.providerType} compact />
+        <p className="truncate text-sm font-medium" title={service.displayName}>{service.displayName}</p>
+      </div>
       <StatusPill tone={service.status === "active" ? "success" : "warning"}>{serviceStatusLabels[service.status]}</StatusPill>
     </div>
-    <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" title={service.id}>{service.providerType} · {service.id}</p>
-    <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
-      <span>连接 r{service.credentialRevision}</span>
-      <div className="flex flex-wrap items-center gap-3">
-        {organizeSupported && <button type="button" onClick={() => void triggerOrganize()} disabled={organizing}
-          className="inline-flex items-center gap-1 text-primary-soft disabled:cursor-not-allowed disabled:opacity-40">
-          <FolderOutput className="size-3.5" />{organizing ? "启动中…" : "整理"}
-        </button>}
-        <Link to="/app/services/$serviceId" params={{ serviceId: service.id }} className="text-primary-soft">服务设置</Link>
-      </div>
+    <div className="mt-2 flex flex-wrap items-center justify-end gap-3 text-[11px]">
+      {organizeSupported && <button type="button" onClick={() => void triggerOrganize()} disabled={organizing}
+        className="inline-flex items-center gap-1 text-primary-soft disabled:cursor-not-allowed disabled:opacity-40">
+        <FolderOutput className="size-3.5" />{organizing ? "启动中…" : "开始整理"}
+      </button>}
+      <Link to="/app/services/$serviceId" params={{ serviceId: service.id }}
+        className={overviewIconActionClass} title="服务设置" aria-label="服务设置">
+        <Settings className="size-4" aria-hidden="true" />
+      </Link>
     </div>
     {organizeMessage && <p role={organizeMessage.failed ? "alert" : "status"}
       className={`mt-2 text-xs ${organizeMessage.failed ? "text-destructive" : "text-muted-foreground"}`}>
@@ -150,11 +156,22 @@ function OverviewLibraryCard({ library }: { library: MediaLibrary }) {
     <div className="flex items-center justify-between gap-2"><p className="truncate text-sm font-medium">{library.displayName}</p><StatusPill>{library.dataType === "music" ? "音乐" : "影视"}</StatusPill></div>
     {library.description && <p className="mt-0.5 truncate text-xs text-muted-foreground" title={library.description}>{library.description}</p>}
     <div className="mt-1 flex flex-wrap items-center justify-between gap-2">
-      <p className="min-w-0 truncate text-[11px] text-muted-foreground" title={library.sourceServiceName}>来源：{library.sourceServiceName} · 条目 {library.itemCount.toLocaleString()}</p>
-      {canScan && <button type="button" onClick={() => void triggerIncrementalScan()} disabled={creating || library.status !== "active"}
-        className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-border px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40">
-        <ScanLine className="size-3" />{creating ? "创建中…" : "增量扫描"}
-      </button>}
+      <p className="text-[11px] text-muted-foreground">条目 {library.itemCount.toLocaleString()}</p>
+      <div className="ml-auto flex items-center gap-1.5">
+        {canScan && <button type="button" onClick={() => void triggerIncrementalScan()} disabled={creating || library.status !== "active"}
+          className={overviewIconActionClass} title={creating ? "正在创建增量扫描任务" : "增量扫描"}
+          aria-label={creating ? "正在创建增量扫描任务" : "增量扫描"}>
+          {creating ? <LoaderCircle className="size-4 animate-spin" aria-hidden="true" /> : <ScanLine className="size-4" aria-hidden="true" />}
+        </button>}
+        <Link to="/app/libraries/$serviceId/settings" params={{ serviceId: library.id }}
+          className={overviewIconActionClass} title="媒体库设置" aria-label="媒体库设置">
+          <Settings className="size-4" aria-hidden="true" />
+        </Link>
+        {library.libraryKind !== "content_source_live" && <Link to="/app/libraries/$serviceId/catalog" params={{ serviceId: library.id }}
+          className={overviewIconActionClass} title="海报墙" aria-label="海报墙">
+          <Images className="size-4" aria-hidden="true" />
+        </Link>}
+      </div>
     </div>
     {feedback && <p role={feedback.failed ? "alert" : "status"} className={`mt-2 break-all text-xs ${feedback.failed ? "text-destructive" : "text-muted-foreground"}`}>{feedback.message}</p>}
   </div>;
@@ -237,7 +254,7 @@ export function OverviewPage() {
                 return <li key={`organize:${task.id}`} className="min-w-0 rounded-xl border border-border bg-secondary/40 p-3">
                   <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
                     <div className="min-w-0"><p className="truncate text-sm font-medium">{task.serviceName}</p>
-                      <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" title={task.id}>{task.id} · 影片整理</p></div>
+                      <p className="mt-0.5 text-[11px] text-muted-foreground">影片整理</p></div>
                     <StatusPill tone={status.tone}>{status.label}</StatusPill>
                   </div>
                   <div className="mt-1.5 grid gap-1 text-[11px] text-muted-foreground">
@@ -253,7 +270,7 @@ export function OverviewPage() {
                 <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
                   <div className="min-w-0">
                     <p className="truncate text-sm font-medium">{job.serviceName}</p>
-                    <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" title={job.id}>{job.id} · {job.jobType === "media_probe" ? "视频规格分析" : `${job.scanMode === "full" ? "全量" : "增量"}扫描刮削`} · {job.stage}</p>
+                    <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{job.jobType === "media_probe" ? "视频规格分析" : `${job.scanMode === "full" ? "全量" : "增量"}扫描刮削`} · {job.stage}</p>
                   </div>
                   <StatusPill tone={job.status === "completed" ? "success" : job.status === "failed" ? "danger" : job.status === "retry_waiting" || job.status === "paused" || job.status === "queued" ? "warning" : "primary"}>{job.status === "retry_waiting" && job.jobType === "media_probe" ? "等待重试" : jobStatusLabels[job.status]}</StatusPill>
                 </div>
@@ -273,13 +290,13 @@ export function OverviewPage() {
 
       <div className="mt-4 grid gap-3 xl:grid-cols-2">
         <Panel title="我的服务" className="p-4 sm:p-4" action={<Link to="/app/services" className="inline-flex items-center gap-1 text-xs text-primary-soft">管理服务 <ArrowUpRight className="size-3.5" /></Link>}>
-          <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-1">
+          <div className="grid gap-2 sm:grid-cols-2">
             {services.map((service) => <OverviewServiceCard key={service.id} service={service} />)}
           </div>
         </Panel>
 
         <Panel title="我的媒体库" className="p-4 sm:p-4" action={<Link to="/app/catalog" className="inline-flex items-center gap-1 text-xs text-primary-soft">管理媒体库 <ArrowUpRight className="size-3.5" /></Link>}>
-          <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-1">{libraries.map((library) => <OverviewLibraryCard key={library.id} library={library} />)}</div>
+          <div className="grid gap-2 sm:grid-cols-2">{libraries.map((library) => <OverviewLibraryCard key={library.id} library={library} />)}</div>
         </Panel>
       </div>
 

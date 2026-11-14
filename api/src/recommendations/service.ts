@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { ApiError } from "../errors.js";
+import type { TmdbKeyPool } from "../metadata/tmdb.js";
+import { fetchReleaseList, releaseListDetail, releaseLists, type ReleaseListCache } from "./release-lists.js";
 
 const REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 const UPSTREAM_PAGE_SIZE = 50;
@@ -30,6 +32,8 @@ export interface RecommendationItem {
   mediaType: string | null;
   rating: number | null;
   releaseDate: string | null;
+  /** 院线地区上映日期或下一集播出日期。 */
+  scheduleDate?: string;
 }
 
 interface RecommendationDetail {
@@ -124,10 +128,16 @@ export class RecommendationService {
   private lastManualSyncAt = 0;
   private timer: NodeJS.Timeout | null = null;
   private readonly snapshotPath: string;
+  private readonly releaseListPath: string;
+  private releaseCache: ReleaseListCache = {};
+  private releaseRefresh: Promise<void> | null = null;
+  private readonly releaseAbort = new AbortController();
   private readonly upstreamUrl: URL;
 
-  public constructor(cacheDirectory: string, upstreamUrl: string, private readonly logger: RecommendationLogger) {
+  public constructor(cacheDirectory: string, upstreamUrl: string, private readonly logger: RecommendationLogger,
+    private readonly tmdb: TmdbKeyPool) {
     this.snapshotPath = path.join(cacheDirectory, "snapshot.json");
+    this.releaseListPath = path.join(cacheDirectory, "release-lists.json");
     this.upstreamUrl = new URL(upstreamUrl.endsWith("/") ? upstreamUrl : `${upstreamUrl}/`);
     if (this.upstreamUrl.protocol !== "https:") throw new Error("影视推荐榜单上游必须使用 HTTPS");
   }
@@ -144,39 +154,61 @@ export class RecommendationService {
         this.logger("warn", { 事件: "读取影视推荐榜单缓存失败", 错误: error instanceof Error ? error.message : "未知错误" });
       }
     }
-    this.timer = setInterval(() => { void this.refresh().catch(() => undefined); }, REFRESH_INTERVAL_MS);
+    try {
+      const saved = record(JSON.parse(await fs.readFile(this.releaseListPath, "utf8")));
+      for (const list of releaseLists) {
+        const cached = record(saved?.[list.id]);
+        if (typeof cached?.updatedAt === "string" && Array.isArray(cached.items)) {
+          this.releaseCache[list.id] = { updatedAt: cached.updatedAt, items: cached.items as RecommendationItem[] };
+        }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") this.logger("warn", { 事件: "读取新片与追剧缓存失败" });
+    }
+    this.timer = setInterval(() => {
+      void this.refresh().catch(() => undefined);
+      void this.refreshReleaseLists();
+    }, REFRESH_INTERVAL_MS);
     this.timer.unref();
     // 关键变量：旧快照时间无效时也重新同步，避免永久停留在损坏的缓存版本。
     const cachedAt = Date.parse(this.snapshot?.updatedAt ?? "");
     if (!this.snapshot || !Number.isFinite(cachedAt) || Date.now() - cachedAt >= REFRESH_INTERVAL_MS) {
       void this.refresh().catch(() => undefined);
     }
+    if (releaseLists.some(({ id }) => {
+      const updatedAt = Date.parse(this.releaseCache[id]?.updatedAt ?? "");
+      return !Number.isFinite(updatedAt) || Date.now() - updatedAt >= REFRESH_INTERVAL_MS;
+    })) void this.refreshReleaseLists();
   }
 
   /** 停止定时器；正在执行的 HTTP 请求会自行完成。 */
   public close(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    this.releaseAbort.abort();
   }
 
   /** 返回已缓存榜单；首次没有快照时等待同一次预热。 */
   public async list(): Promise<{ total: number; updatedAt: string; items: RecommendationBlock[] }> {
-    const snapshot = await this.currentSnapshot();
-    return { total: snapshot.blocks.length, updatedAt: snapshot.updatedAt, items: snapshot.blocks };
+    const snapshot = await this.currentSnapshot().catch((error: unknown) => {
+      if (Object.keys(this.releaseCache).length === 0) throw error;
+      return null;
+    });
+    const releaseBlocks = releaseLists.map((list) => releaseListDetail(list, this.releaseCache[list.id]).block);
+    const items = [...(snapshot?.blocks ?? []), ...releaseBlocks];
+    const updatedAt = [snapshot?.updatedAt, ...releaseBlocks.map((block) => block.lastUpdated)]
+      .filter((value): value is string => Boolean(value)).sort().at(-1) ?? "";
+    return { total: items.length, updatedAt, items };
   }
 
   /** 立即从上游同步完整榜单；失败时旧快照仍保持可读。 */
   public async syncNow(): Promise<{ total: number; updatedAt: string; items: RecommendationBlock[] }> {
-    if (this.refreshPromise) {
-      this.lastManualSyncAt = Date.now();
-      try { await this.refreshPromise; } catch { throw new ApiError(502, "recommendation_sync_failed", "榜单同步失败，已保留上一份缓存"); }
-      return this.list();
-    }
-    if (Date.now() - this.lastManualSyncAt < MANUAL_SYNC_INTERVAL_MS) {
+    if (!this.refreshPromise && Date.now() - this.lastManualSyncAt < MANUAL_SYNC_INTERVAL_MS) {
       throw new ApiError(429, "recommendation_sync_too_frequent", "榜单每 60 秒最多手动同步一次");
     }
     this.lastManualSyncAt = Date.now();
-    try { await this.refresh(); } catch {
+    const [upstream] = await Promise.allSettled([this.refresh(), this.refreshReleaseLists()]);
+    if (upstream.status === "rejected") {
       throw new ApiError(502, "recommendation_sync_failed", "榜单同步失败，已保留上一份缓存");
     }
     return this.list();
@@ -187,13 +219,12 @@ export class RecommendationService {
     pagination: { page: number; pageSize: number; totalItems: number; totalPages: number }; items: RecommendationItem[];
   }> {
     if (!BLOCK_ID_PATTERN.test(id)) throw new ApiError(404, "recommendation_missing", "榜单不存在");
-    const snapshot = await this.currentSnapshot();
-    const detail = snapshot.details[id];
+    const detail = await this.readDetail(id);
     if (!detail) throw new ApiError(404, "recommendation_missing", "榜单不存在");
     const totalItems = detail.items.length;
     return {
       ...detail.block,
-      pagination: { page, pageSize, totalItems, totalPages: Math.ceil(totalItems / pageSize) },
+      pagination: { page, pageSize, totalItems, totalPages: Math.max(1, Math.ceil(totalItems / pageSize)) },
       items: detail.items.slice((page - 1) * pageSize, page * pageSize),
     };
   }
@@ -203,25 +234,63 @@ export class RecommendationService {
     if (!BLOCK_ID_PATTERN.test(blockId) || !Number.isInteger(rank) || rank < 1) {
       throw new ApiError(404, "recommendation_item_missing", "榜单条目不存在");
     }
-    const snapshot = await this.currentSnapshot();
-    const detail = snapshot.details[blockId];
+    const detail = await this.readDetail(blockId);
     const item = detail?.items.find((candidate) => candidate.rank === rank);
     if (!detail || !item) throw new ApiError(404, "recommendation_item_missing", "榜单条目不存在");
     return { block: detail.block, item };
+  }
+
+  /** 新片排期和原榜单共用详情接口，各自读取对应缓存。 */
+  private async readDetail(id: string): Promise<RecommendationDetail | undefined> {
+    const releaseList = releaseLists.find((list) => list.id === id);
+    if (releaseList) return releaseListDetail(releaseList, this.releaseCache[id]);
+    return (await this.currentSnapshot()).details[id];
+  }
+
+  /** 每个排期榜单独立刷新，TMDB 或任一榜单失败时保留上次成功结果。 */
+  private refreshReleaseLists(): Promise<void> {
+    if (this.releaseRefresh) return this.releaseRefresh;
+    if (this.releaseAbort.signal.aborted || this.tmdb.getStatus().configuredCount === 0) return Promise.resolve();
+    this.releaseRefresh = this.updateReleaseCache().catch(() => {
+      this.logger("warn", { 事件: "保存新片与追剧缓存失败" });
+    }).finally(() => { this.releaseRefresh = null; });
+    return this.releaseRefresh;
+  }
+
+  /** 顺序刷新榜单，成功后用原子写入更新缓存。 */
+  private async updateReleaseCache(): Promise<void> {
+    const next = { ...this.releaseCache };
+    for (const list of releaseLists) {
+      if (this.releaseAbort.signal.aborted) return;
+      const signal = AbortSignal.any([this.releaseAbort.signal, AbortSignal.timeout(45_000)]);
+      try {
+        next[list.id] = await fetchReleaseList(this.tmdb, list, new Date(), signal);
+        this.releaseCache = { ...next };
+      } catch {
+        if (!this.releaseAbort.signal.aborted) this.logger("warn", { 事件: "刷新新片与追剧榜单失败", 榜单: list.title });
+      }
+    }
+    if (this.releaseAbort.signal.aborted) return;
+    await this.saveCache(this.releaseListPath, next);
+  }
+
+  /** 先写入同目录临时文件，再原子替换缓存。 */
+  private async saveCache(fileName: string, value: unknown): Promise<void> {
+    await fs.mkdir(path.dirname(fileName), { recursive: true });
+    const temporary = `${fileName}.${randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(temporary, JSON.stringify(value));
+      await fs.rename(temporary, fileName);
+    } finally {
+      await fs.rm(temporary, { force: true }).catch(() => undefined);
+    }
   }
 
   /** 多个请求共用同一次刷新，只有完整成功后才替换当前快照。 */
   public refresh(): Promise<void> {
     if (this.refreshPromise) return this.refreshPromise;
     this.refreshPromise = this.fetchSnapshot().then(async (snapshot) => {
-      await fs.mkdir(path.dirname(this.snapshotPath), { recursive: true });
-      const temporary = `${this.snapshotPath}.${randomUUID()}.tmp`;
-      try {
-        await fs.writeFile(temporary, JSON.stringify(snapshot));
-        await fs.rename(temporary, this.snapshotPath);
-      } finally {
-        await fs.rm(temporary, { force: true }).catch(() => undefined);
-      }
+      await this.saveCache(this.snapshotPath, snapshot);
       this.snapshot = snapshot;
       this.logger("info", { 事件: "影视推荐榜单刷新完成", 榜单数量: snapshot.blocks.length });
     }).catch((error: unknown) => {

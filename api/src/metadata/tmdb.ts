@@ -678,6 +678,47 @@ export class TmdbKeyPool {
     });
   }
 
+  /** 读取上映或在播榜单候选，沿用配置的 Key 池、代理和海报地址。 */
+  public async readReleaseList(list: "now_playing" | "upcoming" | "on_the_air", page: number, signal: AbortSignal) {
+    const mediaType = list === "on_the_air" ? "tv" : "movie";
+    const params: Record<string, string> = { language: "zh-CN", page: String(page) };
+    if (mediaType === "movie") params.region = "CN";
+    else params.timezone = "Asia/Shanghai";
+    const payload = await this.requestJson<Record<string, unknown>>(`/${mediaType}/${list}`,
+      params, signal);
+    if (!Array.isArray(payload?.results)) throw new Error("TMDB 榜单数据不可用");
+    return {
+      totalPages: toNumber(payload.total_pages),
+      dates: { min: toText(asRecord(payload.dates).minimum), max: toText(asRecord(payload.dates).maximum) },
+      items: payload.results.flatMap((raw) => {
+        const item = asRecord(raw);
+        const tmdbId = item.id;
+        const title = toText(mediaType === "movie" ? item.title : item.name).trim();
+        if (typeof tmdbId !== "number" || !Number.isInteger(tmdbId) || tmdbId < 1 || !title) return [];
+        return [{ tmdbId, title, mediaType, overview: toText(item.overview) || null,
+          posterUrl: buildImageUrl(toText(item.poster_path), "w500", this.imageBaseUrl),
+          rating: toPositiveNumber(item.vote_count) ? toNumber(item.vote_average) : null,
+          releaseDate: toText(mediaType === "movie" ? item.release_date : item.first_air_date) || null }];
+      }),
+    };
+  }
+
+  /** 读取中国大陆院线上映日期，同时排除点映以外的非院线发行类型。 */
+  public async readChinaTheatricalDates(id: number, signal: AbortSignal): Promise<string[]> {
+    const payload = await this.requestJson<Record<string, unknown>>(`/movie/${id}/release_dates`, {}, signal);
+    const regions = Array.isArray(payload?.results) ? payload.results : [];
+    const releases = asRecord(regions.find((row) => asRecord(row).iso_3166_1 === "CN")).release_dates;
+    if (!Array.isArray(releases)) return [];
+    return releases.map(asRecord).filter((release) => release.type === 2 || release.type === 3)
+      .map((release) => toText(release.release_date).slice(0, 10));
+  }
+
+  /** 剧集详情中的下一集日期用于排期，避免把剧集首播日期误作本周更新日期。 */
+  public async readNextEpisodeDate(id: number, signal: AbortSignal): Promise<string> {
+    const payload = await this.requestJson<Record<string, unknown>>(`/tv/${id}`, { language: "zh-CN" }, signal);
+    return toText(asRecord(payload?.next_episode_to_air).air_date);
+  }
+
   /** 读取节目季信息，并只返回本地文件实际需要的单集元数据。 */
   public async readTvSeason(
     tvId: number,

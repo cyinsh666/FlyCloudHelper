@@ -16,14 +16,18 @@ interface Features { dv: number; hdr: number; bitrate: number | null; frameRate:
 interface Candidate { name: string; displayPath: string; source?: OrganizePlanItem; existing?: WashExistingFile }
 
 /** 前后端只接受有限优先项，旧配置默认关闭且默认优先高分辨率。 */
-export function readWashOptions(input: { washEnabled?: unknown; washPriorities?: unknown }):
-  { washEnabled: boolean; washPriorities: WashPriority[] } {
+export function readWashOptions(input: { washEnabled?: unknown; washPriorities?: unknown; washCleanupSources?: unknown }):
+  { washEnabled: boolean; washPriorities: WashPriority[]; washCleanupSources: boolean } {
   if (input.washEnabled !== undefined && typeof input.washEnabled !== "boolean") throw new ApiError(422, "organize_wash_invalid", "洗版开关无效");
+  if (input.washCleanupSources !== undefined && typeof input.washCleanupSources !== "boolean") {
+    throw new ApiError(422, "organize_wash_invalid", "清理剩余内容开关无效");
+  }
   const selected = input.washPriorities ?? ["resolution"];
   if (!Array.isArray(selected) || selected.length > priorities.length
     || selected.some((item) => !priorities.includes(item)) || new Set(selected).size !== selected.length
     || input.washEnabled && !selected.length) throw new ApiError(422, "organize_wash_invalid", "请选择不重复的洗版优先级");
-  return { washEnabled: input.washEnabled === true, washPriorities: [...selected] as WashPriority[] };
+  return { washEnabled: input.washEnabled === true, washPriorities: [...selected] as WashPriority[],
+    washCleanupSources: input.washEnabled === true && input.washCleanupSources === true };
 }
 
 /** 一部电影或一集节目只有一个身份，规格、分类名称及扩展名不进入身份键。 */
@@ -149,7 +153,7 @@ export async function readWashTargets(plan: OrganizePlan, browse: WashBrowse): P
   return result;
 }
 
-/** 本次来源与目标已有版本统一选优；清理项放在普通整理之后，来源落选项保持原位。 */
+/** 本次来源与目标已有版本统一选优，清理项排在普通整理之后。 */
 export async function prepareWashPlan(plan: OrganizePlan, browse: WashBrowse): Promise<void> {
   if (!plan.washEnabled) return;
   const sourceGroups = new Map<string, OrganizePlanItem[]>();
@@ -161,7 +165,9 @@ export async function prepareWashPlan(plan: OrganizePlan, browse: WashBrowse): P
   }
   plan.washGroups = [...sourceGroups.values()].map((group) => group[0]!.washIdentity!);
   const targets = await readWashTargets(plan, browse);
-  const summary = { keepExisting: 0, selectNew: 0, cleanup: 0, skippedSources: 0 };
+  const summary = { keepExisting: 0, selectNew: 0, cleanup: 0, skippedSources: 0, sourceCleanup: 0 };
+  // 关键变量：先完成所有普通整理和目标洗版，再处理来源重复文件。
+  const sourceCleanupItems: OrganizePlanItem[] = [];
   for (const [key, sources] of sourceGroups) {
     const previous = (targets.get(key) ?? []).sort((a, b) => a.name.localeCompare(b.name, "zh-CN", { numeric: true })
       || a.resourceId.localeCompare(b.resourceId));
@@ -183,6 +189,15 @@ export async function prepareWashPlan(plan: OrganizePlan, browse: WashBrowse): P
       item.washWinnerSourceId = winner.source?.sourceId;
       item.washExistingWinner = winner.existing;
       if (item === winner.source) continue;
+      if (plan.washCleanupSources && (!winner.existing || winner.existing.size > 0)) {
+        item.action = "wash_source_cleanup";
+        item.targetParts = [];
+        item.targetName = winner.existing?.displayPath ?? path.posix.join(plan.targetDirectory.displayPath,
+          ...winner.source!.targetParts, winner.source!.targetName);
+        sourceCleanupItems.push(item);
+        summary.sourceCleanup += 1;
+        continue;
+      }
       item.status = "skipped";
       item.reason = `洗版重复版本跳过：${reason}；来源文件保留`;
       summary.skippedSources += 1;
@@ -197,6 +212,9 @@ export async function prepareWashPlan(plan: OrganizePlan, browse: WashBrowse): P
         washWinnerSourceId: winner.source?.sourceId, washExistingWinner: winner.existing });
       summary.cleanup += 1;
     }
+  }
+  if (sourceCleanupItems.length) {
+    plan.items = plan.items.filter((item) => item.action !== "wash_source_cleanup").concat(sourceCleanupItems);
   }
   plan.washSummary = summary;
 }

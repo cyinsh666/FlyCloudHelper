@@ -24,7 +24,9 @@ function jobSummary(job: OrganizeJob) {
 }
 
 /** 服务级影片整理入口；普通用户和管理员共享同一归属校验与执行器。 */
-export async function registerOrganizeRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
+export async function registerOrganizeRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<{
+  manager: ServiceOrganizeManager; scheduler: ServiceOrganizeScheduler;
+}> {
   const manager = new ServiceOrganizeManager(runtime);
   const scheduler = new ServiceOrganizeScheduler(runtime, manager);
   if (runtime.config.workerEnabled) {
@@ -92,7 +94,7 @@ export async function registerOrganizeRoutes(server: FastifyInstance, runtime: A
       reply.status(202).send({ schedule: await scheduler.runNow(request.params.serviceId, await actorId(request)) }));
     server.post<{ Params: { serviceId: string }; Body: { sources: OrganizeDirectory[]; target: OrganizeDirectory; mode: OrganizeMode;
       unrecognizedTransferEnabled?: boolean; unrecognizedDirectory?: OrganizeDirectory | null;
-      aiAssistEnabled?: boolean; aiModelId?: string | null; washEnabled?: boolean; washPriorities?: WashPriority[] } }>(
+      aiAssistEnabled?: boolean; aiModelId?: string | null; washEnabled?: boolean; washPriorities?: WashPriority[]; washCleanupSources?: boolean } }>(
       `${prefix}/:serviceId/organize/plans`, async (request, reply) => {
         if (!request.body || typeof request.body !== "object") throw validationError("sources", "请选择有效的整理目录");
         const plan = await manager.createPlan(request.params.serviceId, await actorId(request), request.body);
@@ -133,4 +135,5 @@ export async function registerOrganizeRoutes(server: FastifyInstance, runtime: A
         return { job: jobSummary(await manager.controlJob(request.params.serviceId, request.params.jobId, action, await actorId(request))) };
       });
   }
+  return { manager, scheduler };
 }

@@ -445,7 +445,7 @@ export function ConsoleShell({
                 </span>
                 <span className="hidden text-xs sm:block">{username}</span>
                 <StatusPill tone="primary" className="hidden md:inline-flex">
-                  {role === "super_admin" ? "超级管理员" : "普通用户"}
+                  {actualRole === "super_admin" ? "超级管理员" : "普通用户"}
                 </StatusPill>
               </div>
             </div>

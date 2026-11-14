@@ -1008,6 +1008,11 @@ export class FlyCloudHelperDatabase {
         .whereNot({ user_id: userId })
         .update({ requested_by_user_id: transaction.ref("user_id") });
       await transaction("system_secret_settings").where({ updated_by_user_id: userId }).update({ updated_by_user_id: null });
+      // 关键变量：彻底删除用户时清除机器人绑定、一次性码和任务，释放 TG 账号供后续重新绑定。
+      await transaction("system_settings").where({ updated_by_user_id: userId })
+        .andWhere((query) => query.whereLike("setting_key", "telegram_bot:binding:%")
+          .orWhereLike("setting_key", "telegram_bot:identity:%").orWhereLike("setting_key", "telegram_bot:code:%")
+          .orWhereLike("setting_key", "telegram_bot:preferences:%").orWhereLike("setting_key", "telegram_bot:task:%")).delete();
       await transaction("system_settings").where({ updated_by_user_id: userId }).update({ updated_by_user_id: null });
       await transaction("audit_log_entries").where({ operator_user_id: userId }).update({
         operator_user_id: null,

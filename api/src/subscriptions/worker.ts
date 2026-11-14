@@ -15,7 +15,12 @@ const subscriptionPollMs = 10 * 60_000;
 const transferStatusPollMs = 30_000;
 const feedPageLimit = 40;
 
-interface ChannelCursor { activatedAt: string; lastMessageId: number }
+interface ChannelCursor {
+  activatedAt: string;
+  lastMessageId: number;
+  /** 本轮开始读取的时间，供正常巡检覆盖两轮之间的调度间隔。 */
+  lastCheckedAt?: string;
+}
 export interface SubscriptionActivity {
   id: string;
   channel: string;
@@ -122,21 +127,28 @@ export class MovieSubscriptionWorker {
     });
   }
 
-  /** 用户设置页只展示本服务最近的转存与跳过记录，不返回分享令牌。 */
-  public async recent(serviceId: string): Promise<{ lastRunAt: string | null; nextRunAt: string; lastError: string | null;
+  /** 按作品过滤后再截取最近记录，避免较早作品被其他作品的记录挤出。 */
+  public async recent(serviceId: string, identity?: Pick<MovieSubscription, "mediaType" | "tmdbId">): Promise<{ lastRunAt: string | null; nextRunAt: string; lastError: string | null;
     items: SubscriptionActivity[] }> {
     return this.serial(serviceId, async () => {
       const state = await this.readState(serviceId);
+      const activities = identity ? state.activities.filter((item) => item.mediaType === identity.mediaType
+        && item.tmdbId === identity.tmdbId) : state.activities;
       return { lastRunAt: state.lastRunAt, nextRunAt: state.nextRunAt, lastError: state.lastError,
-        items: [...state.activities].reverse().slice(0, 100) };
+        items: [...activities].reverse().slice(0, 100) };
     });
   }
 
-  /** 用户主动检查当前服务时立即执行，并从本次运行重新计算下次巡检。 */
-  public async runNow(serviceId: string): Promise<void> {
-    const subscriptions = (await listStoredSubscriptions(this.runtime.database)).filter((item) => item.serviceId === serviceId);
-    if (!subscriptions.length) throw new ApiError(422, "subscription_empty", "当前网盘服务还没有影片订阅");
-    await this.serial(serviceId, async () => this.runService(await this.readState(serviceId), subscriptions));
+  /** 单部查找只处理指定作品；整服务查找继续沿用原来的巡检计划。 */
+  public async runNow(serviceId: string, identity?: Pick<MovieSubscription, "mediaType" | "tmdbId">): Promise<{ lastError: string | null }> {
+    return this.serial(serviceId, async () => {
+      const subscriptions = (await listStoredSubscriptions(this.runtime.database)).filter((item) => item.serviceId === serviceId);
+      if (!subscriptions.length) throw new ApiError(422, "subscription_empty", "当前网盘服务还没有影片订阅");
+      if (identity && !subscriptions.some((item) => item.mediaType === identity.mediaType && item.tmdbId === identity.tmdbId)) {
+        throw new ApiError(404, "subscription_missing", "该作品已不在当前网盘的订阅中");
+      }
+      return { lastError: await this.runService(await this.readState(serviceId), subscriptions, identity) };
+    });
   }
 
   /** 同一服务的频道变更、巡检和状态查询串行，避免 JSON 文件写入互相覆盖。 */
@@ -227,13 +239,19 @@ export class MovieSubscriptionWorker {
   }
 
   /** 先查已提交的任务，再读取新消息；缺少目录或登录时不推进任何频道游标。 */
-  private async runService(state: ServiceSubscriptionState, subscriptions: MovieSubscription[]): Promise<void> {
+  private async runService(state: ServiceSubscriptionState, subscriptions: MovieSubscription[],
+    identity?: Pick<MovieSubscription, "mediaType" | "tmdbId">): Promise<string | null> {
     const now = new Date();
-    state.lastRunAt = now.toISOString();
-    state.nextRunAt = new Date(now.getTime() + subscriptionPollMs).toISOString();
-    state.lastError = null;
+    // 关键变量：单部查找不改变整网盘的下次巡检时间及最近巡检结果。
+    if (!identity) {
+      state.lastRunAt = now.toISOString();
+      state.nextRunAt = new Date(now.getTime() + subscriptionPollMs).toISOString();
+      state.lastError = null;
+    }
+    let lastError: string | null = null;
     try {
       for (const activity of state.activities) {
+        if (identity && (activity.mediaType !== identity.mediaType || activity.tmdbId !== identity.tmdbId)) continue;
         if (activity.status === "submitting") {
           activity.status = "needs_review";
           activity.reason = "服务曾在提交期间中断，需核实目标目录后处理";
@@ -242,46 +260,52 @@ export class MovieSubscriptionWorker {
       }
       const service = await this.runtime.repository.getServiceDetail(state.serviceId);
       if (service.providerType !== "guangya" && service.providerType !== "quark") {
-        state.lastError = "当前网盘暂不支持自动转存";
-        return;
+        lastError = "当前网盘暂不支持自动转存";
+        return lastError;
       }
       if (service.status !== "active" || service.connectionStatus !== "valid") {
-        state.lastError = "网盘服务当前不可用";
-        return;
+        lastError = "网盘服务当前不可用";
+        return lastError;
       }
-      await this.refreshTasks(state);
+      await this.refreshTasks(state, identity);
       if (!await getServiceTransferDirectory(this.runtime.database, state.serviceId)) {
-        state.lastError = "请先设置服务的独立转存目录";
-        return;
+        lastError = "请先设置服务的独立转存目录";
+        return lastError;
       }
       const available = (await this.engine.listSources()).filter((source) => source.kind === "telegram" && source.enabled)
         .map((source) => source.key);
       const channels = await this.engine.serviceChannels(state.serviceId, available);
-      if (!channels.length) { state.lastError = "请先为网盘服务选择关注频道"; return; }
-      const selected = new Set(channels);
-      for (const channel of Object.keys(state.channels)) if (!selected.has(channel)) delete state.channels[channel];
-      for (const channel of channels) {
-        if (!state.channels[channel]) state.channels[channel] = { activatedAt: now.toISOString(), lastMessageId: 0 };
+      if (!channels.length) { lastError = "请先为网盘服务选择关注频道"; return lastError; }
+      if (!identity) {
+        const selected = new Set(channels);
+        for (const channel of Object.keys(state.channels)) if (!selected.has(channel)) delete state.channels[channel];
+        for (const channel of channels) {
+          if (!state.channels[channel]) state.channels[channel] = { activatedAt: now.toISOString(), lastMessageId: 0 };
+        }
       }
       await this.saveState(state);
       const failures: string[] = [];
       for (const channel of channels) {
         if (this.stopping) break;
-        try { await this.scanChannel(state, channel, service.providerType, service.userId, subscriptions); }
+        try { await this.scanChannel(state, channel, service.providerType, service.userId, subscriptions, identity); }
         catch (error) {
           failures.push(`@${channel}：${error instanceof Error ? error.message : "频道读取失败"}`);
           this.logFailure("订阅频道巡检失败", state.serviceId, error, channel);
         }
       }
-      state.lastError = failures.length ? failures.slice(0, 3).join("；") : null;
+      lastError = failures.length ? failures.slice(0, 3).join("；") : null;
     } catch (error) {
-      state.lastError = error instanceof Error ? error.message : "订阅巡检失败";
+      lastError = error instanceof Error ? error.message : "订阅巡检失败";
       this.logFailure("订阅服务运行失败", state.serviceId, error);
-    } finally { await this.saveState(state); }
+    } finally {
+      if (!identity) state.lastError = lastError;
+      await this.saveState(state);
+    }
+    return lastError;
   }
 
-  /** 分页读到旧游标或激活时间为止；页数超限则不推进游标，留待后续核实。 */
-  private async newerMessages(channel: string, cursor: ChannelCursor): Promise<TelegramChannelMessage[]> {
+  /** 只读取最近窗口内的新消息，达到页数上限时直接使用当前结果并放弃更早积压。 */
+  private async newerMessages(channel: string, cursor: ChannelCursor, sinceAt: string): Promise<TelegramChannelMessage[]> {
     const found = new Map<number, TelegramChannelMessage>();
     let before: number | undefined;
     for (let page = 0; page < feedPageLimit; page += 1) {
@@ -294,6 +318,9 @@ export class MovieSubscriptionWorker {
       if (cursor.lastMessageId > 0 && oldest.messageId <= cursor.lastMessageId) {
         return [...found.values()].sort((a, b) => a.messageId - b.messageId);
       }
+      if (oldest.postedAt && Number.isFinite(Date.parse(oldest.postedAt)) && !postedAfter(oldest.postedAt, sinceAt)) {
+        return [...found.values()].sort((a, b) => a.messageId - b.messageId);
+      }
       if (cursor.lastMessageId === 0 && oldest.postedAt && !Number.isFinite(Date.parse(oldest.postedAt))) {
         throw new Error("Telegram 消息发布时间无效，无法确定订阅起点");
       }
@@ -304,14 +331,23 @@ export class MovieSubscriptionWorker {
       if (before !== undefined && oldest.messageId >= before) throw new Error("Telegram 频道分页未前进");
       before = oldest.messageId;
     }
-    throw new Error("Telegram 新消息过多，超过单次巡检页数上限");
+    this.runtime.logBusinessEvent("info", { 日志关键字: "codex-movie-subscription",
+      事件: "订阅频道达到页数上限，放弃更早积压", 频道: channel, 读取页数: feedPageLimit,
+      原消息位置: cursor.lastMessageId, 最新消息位置: Math.max(cursor.lastMessageId, ...found.keys()),
+      查询起始时间: sinceAt });
+    return [...found.values()].sort((a, b) => a.messageId - b.messageId);
   }
 
   /** 同一频道按消息顺序处理，成功落盘后才把最高消息 ID 写入游标。 */
   private async scanChannel(state: ServiceSubscriptionState, channel: string, providerType: string,
-    ownerId: string, subscriptions: MovieSubscription[]): Promise<void> {
-    const cursor = state.channels[channel]!;
-    const messages = await this.newerMessages(channel, cursor);
+    ownerId: string, subscriptions: MovieSubscription[], identity?: Pick<MovieSubscription, "mediaType" | "tmdbId">): Promise<void> {
+    const cursor = state.channels[channel] ?? { activatedAt: new Date().toISOString(), lastMessageId: 0 };
+    const checkStartedAt = new Date();
+    const previousCheck = cursor.lastCheckedAt ? Date.parse(cursor.lastCheckedAt) : NaN;
+    // 关键变量：首次读取或长时间积压只取最近十分钟，正常轮询衔接上次读取时间。
+    const sinceAt = Number.isFinite(previousCheck) && checkStartedAt.getTime() - previousCheck <= subscriptionPollMs * 2
+      ? cursor.lastCheckedAt! : new Date(checkStartedAt.getTime() - subscriptionPollMs).toISOString();
+    const messages = await this.newerMessages(channel, cursor, sinceAt);
     // 关键变量：本频道的一次巡检使用内存集合查重，避免随着历史记录增长反复扫描整个数组。
     const seenActivities = new Set(state.activities.map((item) => item.id));
     // 关键变量：已有提交记录的日期与链接指纹，同服务跨频道、跨消息当天只提交一次。
@@ -321,23 +357,30 @@ export class MovieSubscriptionWorker {
       if (this.stopping) break;
       if (!message.postedAt || !Number.isFinite(Date.parse(message.postedAt))) {
         for (const share of message.shares.filter((item) => item.cloudType === providerType)) {
+          if (identity) {
+            const matched = matchSubscription(share.title, subscriptions).subscription;
+            if (matched?.mediaType !== identity.mediaType || matched.tmdbId !== identity.tmdbId) continue;
+          }
           const digest = createHash("sha256").update(share.shareUrl).digest("hex");
           const id = `${message.channelId}:${message.messageId}:${digest}`;
           if (seenActivities.has(id)) continue;
           const now = new Date().toISOString();
           state.activities.push({ id, channel, channelId: message.channelId, messageId: message.messageId,
             messageUrl: `https://t.me/${channel}/${message.messageId}`, title: share.title,
-            mediaType: null, tmdbId: null, status: "skipped", reason: "消息缺少有效发布时间，无法确定是否属于新消息",
+            mediaType: identity?.mediaType ?? null, tmdbId: identity?.tmdbId ?? null,
+            status: "skipped", reason: "消息缺少有效发布时间，无法确定是否属于新消息",
             taskId: null, createdAt: now, updatedAt: now });
           seenActivities.add(id);
           await this.saveState(state);
         }
       }
-      if (postedAfter(message.postedAt, cursor.activatedAt)) {
+      if (postedAfter(message.postedAt, cursor.activatedAt) && postedAfter(message.postedAt, sinceAt)) {
         for (const share of message.shares.filter((item) => item.cloudType === providerType)) {
           const eligible = subscriptions.filter((item) => postedAfter(message.postedAt, item.createdAt));
           if (!eligible.length) continue;
           const matched = matchSubscription(share.title, eligible);
+          // 关键变量：仍使用完整订阅集合判断同名歧义，但仅执行选中作品。
+          if (identity && (matched.subscription?.mediaType !== identity.mediaType || matched.subscription.tmdbId !== identity.tmdbId)) continue;
           if (!matched.subscription && !matched.reason) continue;
           const digest = createHash("sha256").update(share.shareUrl).digest("hex");
           // 关键变量：频道、消息和分享链接共同确定一次转存，消息内多个分享互不覆盖。
@@ -374,6 +417,8 @@ export class MovieSubscriptionWorker {
             activity.taskId = submitted.taskId;
             activity.updatedAt = new Date().toISOString();
             await this.saveState(state);
+            await this.runtime.telegramBot?.trackTransfer(ownerId, state.serviceId, submitted.taskId,
+              subscription.title, "subscription").catch((error) => this.logFailure("订阅转存跟踪保存失败", state.serviceId, error));
           } catch (error) {
             activity.status = "needs_review";
             activity.reason = error instanceof Error ? error.message : "转存提交结果不明";
@@ -383,16 +428,23 @@ export class MovieSubscriptionWorker {
           }
         }
       }
-      cursor.lastMessageId = Math.max(cursor.lastMessageId, message.messageId);
+      if (!identity) {
+        cursor.lastMessageId = Math.max(cursor.lastMessageId, message.messageId);
+        await this.saveState(state);
+      }
+    }
+    if (!this.stopping && !identity) {
+      cursor.lastCheckedAt = checkStartedAt.toISOString();
       await this.saveState(state);
     }
   }
 
   /** 已取得任务 ID 的分享只查询状态，失败也不直接重新提交。 */
-  private async refreshTasks(state: ServiceSubscriptionState): Promise<void> {
+  private async refreshTasks(state: ServiceSubscriptionState, identity?: Pick<MovieSubscription, "mediaType" | "tmdbId">): Promise<void> {
     // 关键变量：多个频道消息可能返回同一个网盘任务编号，本轮只向网盘查询一次。
     const checkedTasks = new Map<string, ShareTransferStatus | null>();
     for (const activity of state.activities) {
+      if (identity && (activity.mediaType !== identity.mediaType || activity.tmdbId !== identity.tmdbId)) continue;
       if (activity.status === "completed" && activity.completionNotificationPending) {
         await this.notifyTransferCompleted(state, activity);
         continue;
@@ -421,6 +473,8 @@ export class MovieSubscriptionWorker {
         if (status === "completed") activity.completionNotificationPending = true;
         await this.saveState(state);
         if (status === "completed") await this.notifyTransferCompleted(state, activity);
+        if (status === "failed") await this.runtime.telegramBot?.transfers.subscriptionFailed(state.serviceId, activity.taskId)
+          .catch((error) => this.logFailure("订阅失败状态同步失败", state.serviceId, error));
       } catch (error) {
         if (activity.transferCompleted) {
           activity.reason = `网盘转存已完成，根目录命名待重试：${error instanceof Error ? error.message : "未知错误"}`;
@@ -442,6 +496,8 @@ export class MovieSubscriptionWorker {
       const notified = state.activities.find((other) => other.taskId === activity.taskId && other.completionNotificationAt);
       if (!notified) {
         const service = await this.runtime.repository.getServiceDetail(state.serviceId);
+        if (activity.taskId) await this.runtime.telegramBot?.trackTransfer(service.userId, state.serviceId,
+          activity.taskId, activity.transferRoot?.identity.title ?? activity.title, "subscription", true);
         const target = activity.transferRoot?.directory ?? await getServiceTransferDirectory(this.runtime.database, state.serviceId);
         await this.runtime.database.createNotification({
           userId: service.userId, category: "task", tone: "success", title: "订阅转存已完成",

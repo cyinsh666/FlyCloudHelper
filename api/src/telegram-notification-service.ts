@@ -125,6 +125,9 @@ function buildTelegramMessage(notification: Pick<NotificationRecord, "category" 
 /** 管理 Telegram 系统配置，并串行投递已有站内通知。 */
 export class TelegramNotificationService {
   private deliveryQueue: Promise<void> = Promise.resolve();
+  /** 机器人列表和菜单连续发消息时，按聊天及全局发送节奏排队。 */
+  private readonly botNextSendAtByChat = new Map<string, number>();
+  private botNextSendAt = 0;
 
   public constructor(
     private readonly database: FlyCloudHelperDatabase,
@@ -132,6 +135,34 @@ export class TelegramNotificationService {
     private readonly logger: TelegramNotificationLogger,
     private readonly imageCache: ProtocolImageCache,
   ) {}
+
+  /** 机器人交互复用加密 Token；是否接收指令由独立机器人开关控制。 */
+  public async callBotApi<T>(method: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
+    const configuration = await this.loadConfiguration();
+    if (!configuration.botToken) throw new ApiError(422, "telegram_bot_token_missing", "请先在 Telegram 通知设置中保存 Bot Token");
+    try {
+      if ((method === "sendMessage" || method === "sendPhoto") && body.chat_id !== undefined) {
+        const chatId = String(body.chat_id);
+        const now = Date.now();
+        const sendAt = Math.max(now, this.botNextSendAt, this.botNextSendAtByChat.get(chatId) ?? 0);
+        this.botNextSendAt = sendAt + 40;
+        this.botNextSendAtByChat.set(chatId, sendAt + 1100);
+        for (const [key, next] of this.botNextSendAtByChat) if (next < now) this.botNextSendAtByChat.delete(key);
+        if (sendAt > now) await new Promise<void>((resolve) => setTimeout(resolve, sendAt - now));
+      }
+      const response = await fetch(`https://api.telegram.org/bot${configuration.botToken}/${method}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(40_000)]) : AbortSignal.timeout(15_000),
+      });
+      const result = await response.json() as { ok: boolean; result: T; description?: string };
+      if (!response.ok || !result.ok) throw new Error(result.description || `Telegram 返回 HTTP ${response.status}`);
+      return result.result;
+    } catch (error) {
+      // 关键变量：底层异常可能包含请求地址，统一移除 Token 后再向外抛出。
+      const message = error instanceof Error ? error.message : "Telegram 请求失败";
+      throw new ApiError(502, "telegram_bot_request_failed", message.replaceAll(configuration.botToken, "[已脱敏]"));
+    }
+  }
 
   /** 读取脱敏后的 Telegram 通知设置。 */
   public async getSettings(): Promise<TelegramNotificationSettings> {

@@ -6,6 +6,7 @@ import { Panel } from "@/components/ui-kit";
 import { getCurrentUser, getSubscriptionChannels, saveServiceSubscriptionChannels,
   type ChannelCloudTypes, type ServiceSubscriptionChannels } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
+import { TelegramBindingPanel } from "@/pages/TelegramBotPanels";
 
 /** 个人设置中的账号信息；本轮只展示当前登录账号。 */
 function AccountSettingsTab() {
@@ -208,6 +209,6 @@ export function PersonalSettingsPage({ tab }: { tab: "account" | "subscription" 
       <Link to="/app/settings/subscriptions" role="tab" aria-selected={tab === "subscription"}
         className={`rounded-lg border px-4 py-2 text-sm ${tab === "subscription" ? "border-border bg-secondary text-foreground" : "border-transparent text-muted-foreground hover:bg-secondary/50"}`}>订阅</Link>
     </div>
-    {tab === "account" ? <AccountSettingsTab /> : <SubscriptionSettingsTab />}
+    {tab === "account" ? <><AccountSettingsTab /><TelegramBindingPanel /></> : <SubscriptionSettingsTab />}
   </>;
 }
