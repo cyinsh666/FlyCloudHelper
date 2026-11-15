@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
-import { parseJsonObject, type LibraryScanJobRecord, type LibrarySourceRecord, type MediaType } from "../domain.js";
+import { parseJsonObject, type LibraryScanJobRecord, type LibrarySourceRecord, type MediaLibraryKind, type MediaType } from "../domain.js";
 import { ApiError, toSafeErrorMessage, validationError } from "../errors.js";
 import {
   readPagination,
@@ -168,9 +168,25 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     if (rawStatus && rawStatus !== "active" && rawStatus !== "disabled") {
       throw validationError("status", "媒体库状态只支持 active 或 disabled");
     }
+    const libraryKind = typeof request.query.libraryKind === "string" ? request.query.libraryKind : "";
+    const sourceKind = typeof request.query.sourceKind === "string" ? request.query.sourceKind : "";
+    // 关键变量：只校验新增的显式筛选，旧网页不传参数时仍走原查询。
+    const supportedLibraryKinds: MediaLibraryKind[] = [
+      "legacy_single_source", "cloud_aggregate_video", "content_source_video", "content_source_music",
+      "content_source_audiobook", "content_source_live",
+    ];
+    if (libraryKind && !supportedLibraryKinds.includes(libraryKind as MediaLibraryKind)) {
+      throw validationError("libraryKind", "媒体库类型筛选值无效");
+    }
+    if (sourceKind && sourceKind !== "drive" && sourceKind !== "content") {
+      throw validationError("sourceKind", "来源类型只支持 drive 或 content");
+    }
     return runtime.repository.listLibraries({
       userId: user.id,
       dataType,
+      libraryKind: libraryKind ? libraryKind as MediaLibraryKind : undefined,
+      sourceKind: sourceKind ? sourceKind as "drive" | "content" : undefined,
+      sourceServiceId: typeof request.query.sourceServiceId === "string" ? request.query.sourceServiceId : undefined,
       status: rawStatus ? rawStatus as "active" | "disabled" : undefined,
       keyword: typeof request.query.search === "string" ? request.query.search : undefined,
       ...readPagination(request.query),

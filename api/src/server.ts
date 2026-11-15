@@ -482,7 +482,21 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
           ? "credential_key_backup_required"
           : credentialReady ? "ready" : "configuration_required",
       setupRequired: state.setupRequired,
-      supportedMediaTypes: ["video", "music"],
+      supportedMediaTypes: ["video", "music", "audiobook"],
+      supportedLibraryKinds: [
+        "legacy_single_source", "cloud_aggregate_video", "content_source_video", "content_source_music",
+        "content_source_audiobook", "content_source_live",
+      ],
+      supportedProtocols: ["jellyfin", "emby", "navidrome", "abs", "flyaudiobook", "m3u"],
+      // 关键变量：代码支持由 features 声明，以下只报告已知运行条件，不把安装能力视为配置可用。
+      featureAvailability: {
+        credentialConfigured: credentialReady,
+        backgroundTasksEnabled: config.workerEnabled,
+        scanWorkerRunning: worker.getStatus().running,
+        mediaProbeWorkerRunning: mediaProbeWorker.getStatus().running,
+        tmdbConfigured: tmdbStatus.configuredCount > 0,
+        tmdbAvailable: tmdbStatus.healthyCount > 0,
+      },
       providers: providers.listDescriptors(),
       metadataProviders: [
         {
@@ -529,6 +543,22 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
         embyCompatibility: true,
         navidromeCompatibility: true,
         nativeAudiobookProtocol: true,
+        absCompatibility: true,
+        cloudAggregateVideo: true,
+        contentSourceVideo: true,
+        contentSourceMusic: true,
+        contentSourceAudiobook: true,
+        liveLibraries: true,
+        libraryFileBrowse: true,
+        targetedVideoScan: true,
+        serviceOrganize: true,
+        serviceOrganizeWash: true,
+        resourceSearch: true,
+        movieSubscriptions: true,
+        telegramBot: true,
+        personalTelegramPreferences: true,
+        personalPluginView: true,
+        overviewTaskCounts: true,
       },
     };
   });
@@ -537,7 +567,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerGuangyaAuthRoutes(server, runtime);
   await registerCloudAuthorizationRoutes(server, runtime);
   await registerBaiduPanWebLoginRoutes(server, runtime);
-  await registerServiceRoutes(server, runtime);
+  // 关键变量：整理管理器在注册阶段稍后创建，统计请求到达时才通过回调读取，旧首页不增加文件查询。
+  await registerServiceRoutes(server, runtime, (userId) => organize.manager.listTaskSummaries(userId));
   const organize = await registerOrganizeRoutes(server, runtime);
   const telegramBot = new TelegramBotService(runtime, movieSubscriptionWorker, organize.manager, organize.scheduler);
   runtime.telegramBot = telegramBot;

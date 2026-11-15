@@ -29,9 +29,11 @@ function readPlaybackMode(value: unknown): { protocol: ContentSourcePlaybackProt
 
 /** 注册独立源插件、用户配置实例和在线库同步接口。 */
 export async function registerContentSourceRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
-  server.get("/api/v1/content-source-plugins", async (request) => {
+  server.get<{ Querystring: { view?: string } }>("/api/v1/content-source-plugins", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    return { items: await runtime.contentSources.listPlugins(user.role === "super_admin") };
+    // 关键变量：个人视图仅列启用插件；未传参数继续保留网页管理员的全部安装状态。
+    const includeDisabled = user.role === "super_admin" && request.query.view !== "personal";
+    return { items: await runtime.contentSources.listPlugins(includeDisabled) };
   });
 
   /** 读取插件分类只做预览，不提前创建用户源记录。 */

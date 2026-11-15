@@ -67,7 +67,7 @@ export function ServiceOrganizeWash({ state }: { state: {
       <div className="flex items-center justify-between gap-4 border-t border-border pt-3">
         <div>
           <p className="text-sm">清理剩余内容</p>
-          <p className="mt-0.5 text-xs text-muted-foreground">整理后删除来源中同一部电影或同一集的落选版本，移动和复制模式均生效。</p>
+          <p className="mt-0.5 text-xs text-muted-foreground">删除来源中的落选版本，并清理此前已整理且已无视频的目录、杂项文件和空目录，移动和复制模式均生效。</p>
         </div>
         <button type="button" role="switch" aria-label="清理剩余内容" aria-checked={state.cleanupSources}
           disabled={state.busy}

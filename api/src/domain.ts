@@ -83,6 +83,8 @@ export interface CloudServiceRecord {
   canCreateLibrary: boolean;
   /** 服务允许删除；删除时解除媒体库引用，有未结束任务时由接口拒绝。 */
   canDeleteService: boolean;
+  /** 非删除来源关联的不同媒体库数量，停用来源仍保留关联。 */
+  linkedLibraryCount: number;
   createdAt: string;
   updatedAt: string;
 }

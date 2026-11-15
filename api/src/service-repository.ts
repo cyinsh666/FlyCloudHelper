@@ -89,6 +89,15 @@ function readStringArray(value: unknown): string[] {
     : [];
 }
 
+/** 把数据库按状态分组的任务数转为完整分项，状态名沿用原接口。 */
+function mapJobStatusCounts(rows: Array<{ status: JobStatus; count: string | number }>): Record<JobStatus, number> {
+  const counts: Record<JobStatus, number> = {
+    queued: 0, running: 0, retry_waiting: 0, paused: 0, completed: 0, failed: 0, cancelled: 0,
+  };
+  for (const row of rows) counts[row.status] = Number(row.count);
+  return counts;
+}
+
 /** 根据节目 TMDB origin_country 计算稳定地区分组；电影和缺失数据统一归入 other。 */
 export function readVideoRegionGroup(itemType: string, metadata: Record<string, unknown>): VideoRegionGroup {
   if (itemType !== "video.series") return "other";
@@ -113,6 +122,8 @@ interface ServiceRow {
   credential_revision: number | string;
   library_source_id: string | null;
   any_library_source_id: string | null;
+  /** 已关联的不同媒体库数量，不按来源行重复计数。 */
+  linked_library_count: number | string;
   created_at: string;
   updated_at: string;
 }
@@ -345,6 +356,7 @@ function mapService(row: ServiceRow): CloudServiceRecord {
     credentialRevision: Number(row.credential_revision),
     canCreateLibrary: !row.library_source_id,
     canDeleteService: !row.any_library_source_id,
+    linkedLibraryCount: Number(row.linked_library_count),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -948,6 +960,7 @@ export class ServiceRepository {
         "s.credential_revision",
         transaction.raw("max(case when attached_l.library_kind = ? then ls.id else null end) as library_source_id", ["legacy_single_source"]),
         transaction.raw("max(ls.id) as any_library_source_id"),
+        transaction.raw("count(distinct case when ls.status <> ? and attached_l.id is not null then ls.library_id else null end) as linked_library_count", ["deleted"]),
         "s.created_at",
         "s.updated_at",
       )
@@ -1783,6 +1796,12 @@ export class ServiceRepository {
   public async listLibraries(filters: {
     userId?: string;
     dataType?: MediaType;
+    /** 明确的媒体库类型，直播仍使用 video 数据类型。 */
+    libraryKind?: MediaLibraryKind;
+    /** 网盘包含空聚合库；内容源包含影视、音乐、听书和直播。 */
+    sourceKind?: "drive" | "content";
+    /** 仅查询引用此网盘服务的媒体库，不以来源名称匹配。 */
+    sourceServiceId?: string;
     status?: "active" | "disabled";
     keyword?: string;
     limit: number;
@@ -1806,6 +1825,26 @@ export class ServiceRepository {
     if (filters.keyword) {
       query.whereLike("l.display_name", `%${filters.keyword}%`);
       countQuery.whereLike("l.display_name", `%${filters.keyword}%`);
+    }
+    // 关键变量：列表与 total 使用相同条件，来源过滤用 EXISTS 避免多来源放大结果。
+    for (const filteredQuery of [query, countQuery]) {
+      if (filters.libraryKind) filteredQuery.where("l.library_kind", filters.libraryKind);
+      if (filters.sourceKind === "drive") {
+        filteredQuery.whereIn("l.library_kind", ["legacy_single_source", "cloud_aggregate_video"]);
+      } else if (filters.sourceKind === "content") {
+        filteredQuery.whereIn("l.library_kind", ["content_source_video", "content_source_music", "content_source_audiobook", "content_source_live"]);
+      }
+      if (filters.sourceServiceId) {
+        const sourceServiceId = filters.sourceServiceId; // 来源服务 ID 在子查询闭包内保持不变。
+        filteredQuery.whereExists(function matchLibraryService() {
+          // 仅匹配当前媒体库所属账号仍保留的目标服务来源。
+          this.select("filter_source.id").from("library_sources as filter_source")
+            .whereRaw("?? = ??", ["filter_source.library_id", "l.id"])
+            .whereRaw("?? = ??", ["filter_source.user_id", "l.user_id"])
+            .where("filter_source.service_id", sourceServiceId)
+            .whereNot("filter_source.status", "deleted");
+        });
+      }
     }
     const [rows, countRow] = await Promise.all([
       query.orderBy("l.created_at", "desc").limit(filters.limit).offset(filters.offset) as unknown as Promise<LibraryRow[]>,
@@ -3015,6 +3054,8 @@ export class ServiceRepository {
     userId?: string;
     serviceId?: string;
     libraryId?: string;
+    /** 搜索任务 ID、当前媒体库名、网盘服务名或来源名。 */
+    keyword?: string;
     status?: JobStatus;
     /** 组合状态筛选，例如“未结束”同时包含排队、运行、等待恢复和暂停。 */
     statuses?: JobStatus[];
@@ -3046,6 +3087,33 @@ export class ServiceRepository {
       mediaProbeQuery.where("j.library_id", filters.libraryId);
       countQuery.where("j.library_id", filters.libraryId);
       mediaProbeCountQuery.where("j.library_id", filters.libraryId);
+    }
+    if (filters.keyword) {
+      const pattern = `%${filters.keyword}%`; // 关键变量：四个查询共用相同条件，保证分页总数一致。
+      for (const filteredQuery of [query, mediaProbeQuery, countQuery, mediaProbeCountQuery]) {
+        filteredQuery.where(function matchJobIdentity() {
+          // 搜索结果与计数均从任务自身 ID 和三类关联名称匹配。
+          this.whereLike("j.id", pattern)
+            .orWhereExists(function matchJobLibrary() {
+              // 以媒体库 ID 关联当前库名称，不依赖摘要查询的 JOIN 别名。
+              this.select("search_library.id").from("media_libraries as search_library")
+                .whereRaw("?? = ??", ["search_library.id", "j.library_id"])
+                .whereLike("search_library.display_name", pattern);
+            })
+            .orWhereExists(function matchJobService() {
+              // 网盘服务名称按稳定服务 ID 匹配。
+              this.select("search_service.id").from("cloud_services as search_service")
+                .whereRaw("?? = ??", ["search_service.id", "j.service_id"])
+                .whereLike("search_service.display_name", pattern);
+            })
+            .orWhereExists(function matchJobSource() {
+              // 聚合来源有独立名称，按任务的来源 ID 匹配。
+              this.select("search_source.id").from("library_sources as search_source")
+                .whereRaw("?? = ??", ["search_source.id", "j.library_source_id"])
+                .whereLike("search_source.display_name", pattern);
+            });
+        });
+      }
     }
     const selectedStatuses = filters.statuses && filters.statuses.length > 0
       ? filters.statuses
@@ -7595,6 +7663,23 @@ export class ServiceRepository {
         },
       };
     });
+  }
+
+  /** 按需读取个人首页的新统计；只计实际扫描任务，不重复叠加聚合父任务。 */
+  public async getOverviewTaskCounts(userId: string) {
+    const [libraryCount, scanRows, probeRows] = await Promise.all([
+      this.database.query("media_libraries").where("user_id", userId)
+        .count<{ count: string | number }[]>({ count: "id" }).first(),
+      this.database.query("scan_jobs").where("user_id", userId)
+        .select("status").count({ count: "id" }).groupBy("status") as unknown as Promise<Array<{ status: JobStatus; count: string | number }>>,
+      this.database.query("media_probe_jobs").where("user_id", userId)
+        .select("status").count({ count: "id" }).groupBy("status") as unknown as Promise<Array<{ status: JobStatus; count: string | number }>>,
+    ]);
+    return {
+      libraryCount: Number(libraryCount?.count ?? 0),
+      scan: mapJobStatusCounts(scanRows),
+      mediaProbe: mapJobStatusCounts(probeRows),
+    };
   }
 
   /** 查询用户或全局概览统计。 */

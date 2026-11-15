@@ -732,7 +732,7 @@ export class ServiceOrganizeManager {
     return deletedCount;
   }
 
-  /** 从预览创建后台任务；定时或立即执行的空结果也保存为已完成的执行记录。 */
+  /** 从预览创建后台任务；开启剩余清理时，空视频结果也进入来源目录收尾。 */
   public async createJob(serviceId: string, planId: string, actorUserId?: string,
     recordEmptyExecution = false): Promise<OrganizeJob> {
     if (this.creatingServices.has(serviceId)) throw new ApiError(409, "organize_job_creating", "当前服务正在创建整理任务");
@@ -747,7 +747,9 @@ export class ServiceOrganizeManager {
         throw new ApiError(409, "organize_plan_stale", "预览尚未完成或服务凭据已变化，请重新预览");
       }
       const hasReadyItems = plan.items.some((item) => item.status === "ready");
-      if (!hasReadyItems && !recordEmptyExecution) {
+      // 关键变量：历史目录可能只剩附属文件，不能再以有无视频任务决定是否执行清理。
+      const needsSourceCleanup = plan.washEnabled === true && plan.washCleanupSources === true;
+      if (!hasReadyItems && !needsSourceCleanup && !recordEmptyExecution) {
         throw new ApiError(422, "organize_plan_empty", "预览中没有可整理的影片");
       }
       const previous = await this.listJobs(serviceId, actorUserId);
@@ -759,7 +761,7 @@ export class ServiceOrganizeManager {
       }
       const now = new Date().toISOString();
       const job: OrganizeJob = { id: randomUUID(), planId, serviceId, userId: context.userId,
-        credentialRevision: context.credentialRevision, status: hasReadyItems ? "queued" : "completed", workDirectoryId: null,
+        credentialRevision: context.credentialRevision, status: hasReadyItems || needsSourceCleanup ? "queued" : "completed", workDirectoryId: null,
         stageDirectoryId: null, backupDirectoryId: null, error: null, autoRetryCount: 0, nextRetryAt: null,
         items: plan.items.map((item, index): OrganizeJobItem => ({ index, stage: "pending", sourceId: item.sourceId, stageRequested: false,
           stagedId: null, replacedId: null, targetParentId: null, stageParentId: null,
@@ -772,8 +774,8 @@ export class ServiceOrganizeManager {
         oldJob.nextRetryAt = null;
         await this.saveJob(oldJob);
       }
-      // 空结果只留下执行记录；没有网盘文件变化，不进入整理执行器或完成通知流程。
-      if (hasReadyItems) this.startJob(job.id);
+      // 未开启剩余清理的空结果仍只保留记录，不改变原来的执行和通知规则。
+      if (hasReadyItems || needsSourceCleanup) this.startJob(job.id);
       return job;
     } finally { this.creatingServices.delete(serviceId); }
   }
@@ -1516,9 +1518,41 @@ export class ServiceOrganizeManager {
     await this.removeIfEmpty(context, directory);
   }
 
-  /** 按层级逆序清理来源子目录；只清理本次涉及视频且整棵树已无视频的目录。 */
+  /** 从已完成的来源操作及已提交的洗版删除找回历史目录，按当前路径和资源 ID 双重匹配。 */
+  private async historicalSourceDirectoryIds(plan: OrganizePlan): Promise<Set<string>> {
+    const directoryIds = new Set<string>();
+    const currentDirectories = new Map(plan.scannedDirectories.map((directory) => [directory.displayPath, directory.resourceId]));
+    for (const job of await this.listJobs(plan.serviceId, plan.userId)) {
+      if (job.planId === plan.id || job.createdAt > plan.createdAt
+        || !job.items.some((item) => item.stage === "completed" || item.stageRequested)) continue;
+      const previous = await readJson<OrganizePlan>(this.planPath(job.planId));
+      if (!previous || previous.serviceId !== plan.serviceId || previous.userId !== plan.userId) continue;
+      // 关键变量：光鸭删除状态查询失败后仍可能完成删除；已提交的来源洗版删除也交给实时无视频检查收尾。
+      const handledPaths = new Set<string>();
+      for (const state of job.items) {
+        const item = previous.items[state.index];
+        if (!item || item.action === "wash_cleanup" || item.isDirectory) continue;
+        if (state.stage !== "completed" && !(item.action === "wash_source_cleanup" && state.stageRequested)) continue;
+        let parentPath = normalizedPath(path.posix.dirname(item.sourcePath));
+        while (parentPath !== "/") {
+          handledPaths.add(parentPath);
+          parentPath = normalizedPath(path.posix.dirname(parentPath));
+        }
+      }
+      for (const directory of previous.scannedDirectories) {
+        if (handledPaths.has(directory.displayPath) && currentDirectories.get(directory.displayPath) === directory.resourceId) {
+          directoryIds.add(directory.resourceId);
+        }
+      }
+    }
+    return directoryIds;
+  }
+
+  /** 按层级逆序清理无视频来源子目录；开启剩余清理后也处理有历史整理依据的目录。 */
   private async cleanupSources(context: OrganizeContext, plan: OrganizePlan): Promise<void> {
     context.subscriptionPendingRoots = (await readSubscriptionTransferRoots(this.runtime, plan.serviceId)).filter((root) => !root.ready);
+    const historicalDirectoryIds = plan.washEnabled && plan.washCleanupSources
+      ? await this.historicalSourceDirectoryIds(plan) : new Set<string>();
     const scannedByPath = new Map(plan.scannedDirectories.map((directory) => [directory.displayPath, directory]));
     // 关键变量：已整夹转移的目录及子目录属于新目标，不能再按旧来源路径清理。
     const movedFolders = plan.items.filter((item) => item.status === "ready" && item.action === "unrecognized" && item.isDirectory)
@@ -1536,7 +1570,7 @@ export class ServiceOrganizeManager {
       if (!parent) continue;
       const current = (await this.children(context, parent)).find((entry) => entry.isDirectory && entry.resourceId === directory.resourceId);
       if (!current) continue;
-      const involved = plan.items.some((item) => item.sourcePath === directory.displayPath
+      const involved = historicalDirectoryIds.has(directory.resourceId) || plan.items.some((item) => item.sourcePath === directory.displayPath
         || item.sourcePath.startsWith(`${directory.displayPath.replace(/\/$/u, "")}/`));
       if (!involved) { await this.removeIfEmpty(context, directory); continue; }
       if (await this.containsSourceVideo(context, directory)) continue;
@@ -1688,7 +1722,8 @@ export class ServiceOrganizeManager {
           }
         }
       }
-      if (plan.mode === "move" || plan.items.some((item) => item.status === "ready" && item.action === "unrecognized")) {
+      if (plan.mode === "move" || plan.washEnabled && plan.washCleanupSources
+        || plan.items.some((item) => item.status === "ready" && item.action === "unrecognized")) {
         await this.cleanupSources(context, plan);
       }
       if (job.workDirectoryId) {

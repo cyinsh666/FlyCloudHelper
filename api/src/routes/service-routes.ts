@@ -13,6 +13,7 @@ import {
   requireString,
 } from "../http.js";
 import type { ApiRuntime } from "../runtime.js";
+import type { OrganizeTaskSummary } from "../organize/types.js";
 import {
   createFlymbyRecommendedScanSettings,
   type ProviderAdapter,
@@ -670,10 +671,33 @@ function readExpectedRevision(value: unknown): number | undefined {
 }
 
 /** 注册普通用户作用域的服务、任务、连接和配置接口。 */
-export async function registerServiceRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
-  server.get("/api/v1/overview", async (request) => {
+export async function registerServiceRoutes(
+  server: FastifyInstance,
+  runtime: ApiRuntime,
+  readOrganizeTasks: (userId: string) => Promise<OrganizeTaskSummary[]>,
+): Promise<void> {
+  server.get<{ Querystring: { include?: string } }>("/api/v1/overview", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    return runtime.repository.getOverview(user.id);
+    // 关键变量：旧网页未传 include 时，响应与查询成本保持原样，不读取整理历史文件。
+    if (request.query.include !== "taskCounts") return runtime.repository.getOverview(user.id);
+    const [overview, counts, organizeTasks] = await Promise.all([
+      runtime.repository.getOverview(user.id),
+      runtime.repository.getOverviewTaskCounts(user.id),
+      readOrganizeTasks(user.id),
+    ]);
+    const organize = { preparing: 0, queued: 0, running: 0, paused: 0, completed: 0, failed: 0, cancelled: 0 };
+    for (const task of organizeTasks) organize[task.status] += 1;
+    return {
+      ...overview,
+      libraryCount: counts.libraryCount,
+      runningJobCount: counts.scan.running + counts.mediaProbe.running + organize.running,
+      unfinishedJobCount: counts.scan.queued + counts.scan.running + counts.scan.retry_waiting + counts.scan.paused
+        + counts.mediaProbe.queued + counts.mediaProbe.running + counts.mediaProbe.retry_waiting + counts.mediaProbe.paused
+        + organize.preparing + organize.queued + organize.running + organize.paused,
+      // 扫描分项按来源任务计数，父任务不重复计入；整理识别中的预览由现有管理器去重。
+      scanTaskCountUnit: "source_job",
+      taskCounts: { scan: counts.scan, mediaProbe: counts.mediaProbe, organize },
+    };
   });
 
   server.get<{ Querystring: Record<string, unknown> }>("/api/v1/providers", async (request) => {
@@ -1175,6 +1199,8 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     return runtime.repository.listJobs({
       userId: user.id,
       serviceId: typeof request.query.serviceId === "string" ? request.query.serviceId : undefined,
+      libraryId: typeof request.query.libraryId === "string" ? request.query.libraryId : undefined,
+      keyword: typeof request.query.search === "string" ? request.query.search.trim() : undefined,
       status: status && status !== "active" ? status as JobStatus : undefined,
       statuses: status === "active" ? ["queued", "running", "retry_waiting", "paused"] : undefined,
       jobType: jobType ? jobType as "scan" | "media_probe" : undefined,

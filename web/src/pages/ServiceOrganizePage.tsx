@@ -222,7 +222,7 @@ export function ServiceOrganizePage({ serviceId, admin = false }: { serviceId: s
             保留并跳过来源重复版本 {plan.washSummary.skippedSources} 份。</p>}
           {Boolean(plan.aiFailureCount) && <p className="mt-1 text-xs text-amber-600">{plan.aiFailureCount} 个条目的 AI 请求失败，已按未识别内容处理。</p>}
           <p className="mt-1 text-xs text-muted-foreground">普通整理遵循所选移动或复制模式，未识别项始终移动。{plan.washCleanupSources
-            ? "确认目标中的保留版本后，删除预览列出的来源重复文件。"
+            ? "确认目标中的保留版本后，删除预览列出的来源重复文件；此前已整理且已无视频的来源子目录也会清理，本轮没有视频任务时仍会执行。"
             : "移动后会清理已无视频的来源子目录。"}</p>
           <div className="mt-3 max-h-80 overflow-y-auto rounded-lg border border-border">
             {plan.items.map((item, index) => <div key={`${item.sourceId}-${index}`} className="border-b border-border px-3 py-2 text-xs last:border-b-0">
@@ -236,11 +236,11 @@ export function ServiceOrganizePage({ serviceId, admin = false }: { serviceId: s
             </div>)}
           </div>
           {plan.nextOffset !== null && <div className="mt-3"><SecondaryButton disabled={loadingMore} onClick={() => void loadMore()}>{loadingMore ? "读取中…" : "加载更多预览"}</SecondaryButton></div>}
-          <div className="mt-4"><PrimaryButton onClick={() => void execute()} disabled={busy || readyCount === 0 || Boolean(job && ["queued", "running", "paused"].includes(job.status))}>开始整理</PrimaryButton></div>
+          <div className="mt-4"><PrimaryButton onClick={() => void execute()} disabled={busy || readyCount === 0 && !(plan.washEnabled && plan.washCleanupSources) || Boolean(job && ["queued", "running", "paused"].includes(job.status))}>开始整理</PrimaryButton></div>
         </>}
       </Panel>}
       {job && <Panel title="整理任务">
-        <p className="text-sm">状态：{{ queued: "等待中", running: "整理中", paused: "已暂停", completed: "已完成", failed: "失败", cancelled: "已取消" }[job.status]} · {job.status === "completed" && job.itemCount === 0 ? "本次没有可整理的内容" : `已完成 ${completedCount}/${job.itemCount}`}</p>
+        <p className="text-sm">状态：{{ queued: "等待中", running: "整理中", paused: "已暂停", completed: "已完成", failed: "失败", cancelled: "已取消" }[job.status]} · {job.status === "completed" && job.itemCount === 0 ? "本次执行已完成（无视频文件处理）" : `已完成 ${completedCount}/${job.itemCount}`}</p>
         {job.error && <p role="alert" className="mt-2 text-sm text-destructive">{job.error}</p>}
         {job.status === "failed" && job.nextRetryAt &&
           <p className="mt-2 text-xs text-muted-foreground">临时故障将在 {new Date(job.nextRetryAt).toLocaleString("zh-CN")} 自动继续（第 {(job.autoRetryCount ?? 0) + 1}/3 次）</p>}

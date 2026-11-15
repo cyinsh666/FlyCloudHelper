@@ -317,7 +317,8 @@ export class ServiceOrganizeScheduler {
       schedule.lastJobId = job.id;
       schedule.lastError = null;
       schedule.lastBlockedNotificationKey = null;
-      schedule.lastRunMessage = hasReadyItems ? "已启动整理任务" : "本次没有可整理的内容";
+      schedule.lastRunMessage = hasReadyItems ? "已启动整理任务"
+        : plan.washEnabled && plan.washCleanupSources ? "已启动来源剩余内容清理" : "本次没有可整理的内容";
       schedule.pendingPlanId = null;
       schedule.pendingRunKind = undefined;
       schedule.updatedAt = new Date().toISOString();
