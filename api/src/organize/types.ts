@@ -74,6 +74,10 @@ export interface OrganizePlan {
   /** 仅本次来源涉及的作品身份，用于清理结束后的目标唯一性核验。 */
   washGroups?: WashIdentity[];
   washSummary?: { keepExisting: number; selectNew: number; cleanup: number; skippedSources: number; sourceCleanup?: number };
+  /** 按保存设置启动的光鸭计划先确认旧操作，再跳过仍受影响的资源和路径。 */
+  reconcilePrevious?: boolean;
+  deferredResources?: string[];
+  deferredPaths?: string[];
   /** 模型请求失败时仍继续规则结果和未识别转移，供页面提示。 */
   aiFailureCount?: number;
   scannedDirectories: OrganizeDirectory[];
@@ -108,7 +112,21 @@ export interface OrganizeJobItem {
   directRetryCount?: number;
   /** 只有上游明确报告删除失败时才允许重试，避免网络未知状态下重复删除。 */
   directDeleteFailed?: boolean;
+  /** 新预览已核对该旧操作，历史失败结果仍原样保留。 */
+  reconciled?: boolean;
+  /** 补改名请求已发出，只有明确失败或目录已核对时才结束等待。 */
+  recoveryRenameRequested?: boolean;
+  /** 旧移动已核对入位并完成命名，原来源目录仍可按历史依据清理。 */
+  recoveredMove?: boolean;
   error: string | null;
+}
+
+/** 来源清理异步删除的定位依据，供下一轮核对同一批网盘任务。 */
+export interface OrganizeSourceDeletion {
+  taskId: string;
+  parent: OrganizeDirectory;
+  resourceIds: string[];
+  resourcePaths: string[];
 }
 
 export interface OrganizeJob {
@@ -129,6 +147,9 @@ export interface OrganizeJob {
   nextRetryAt?: string | null;
   /** 旧版原名冲突仅自动恢复一次；其他人工处理类失败不因此重试。 */
   sourceNameConflictRecoveryAt?: string;
+  /** 旧执行快照已交给新预览处理，不能再整体继续。 */
+  supersededAt?: string;
+  pendingSourceDeletions?: OrganizeSourceDeletion[];
   createdAt: string;
   updatedAt: string;
 }
@@ -144,6 +165,7 @@ export interface OrganizeTaskSummary {
   error: string | null;
   autoRetryCount?: number;
   nextRetryAt?: string | null;
+  supersededAt?: string;
   createdAt: string;
   updatedAt: string;
 }

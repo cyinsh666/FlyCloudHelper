@@ -28,6 +28,11 @@ import {
 import { ApiError, toSafeErrorMessage } from "./errors.js";
 import { hasActiveOrganizeTask } from "./organize/activity.js";
 import { isFlymbyExcludedPath } from "./media/flymby-scan-exclusions.js";
+import {
+  preserveCatalogEntryBatchOnConflict,
+  readCatalogEntryBatch,
+  withCatalogEntryBatch,
+} from "./media/catalog-entry-batch.js";
 import { createStableId } from "./media/filename.js";
 import type { FlymbyNfoMetadata } from "./media/flymby-nfo-parser.js";
 import { parseFlymbyVideoName } from "./media/flymby-video-parser.js";
@@ -1719,7 +1724,7 @@ export class ServiceRepository {
           backdrop_url: payload.backdropUrl === null || typeof payload.backdropUrl === "string" ? payload.backdropUrl : item.backdrop_url,
           match_state: typeof payload.matchState === "string" ? payload.matchState : item.match_state,
           external_ids_json: JSON.stringify(externalIds),
-          metadata_json: JSON.stringify(metadata),
+          metadata_json: JSON.stringify(withCatalogEntryBatch(metadata, readCatalogEntryBatch(currentMetadata))),
           updated_at: new Date().toISOString(),
         });
       }
@@ -5456,6 +5461,7 @@ export class ServiceRepository {
     externalIds: Record<string, string>;
     metadata: Record<string, unknown>;
     generationId: string;
+    entryBatchId?: string;
   }): Promise<{ itemId: string; changed: boolean; hasManualMatch: boolean; itemType: string }> {
     const existing = await this.database.query("media_items").where({
       user_id: input.userId,
@@ -5558,7 +5564,9 @@ export class ServiceRepository {
       metadata: existingMetadata,
     } : artworkPreservingInput;
     const externalIdsJson = JSON.stringify(effectiveInput.externalIds);
-    const metadataJson = JSON.stringify(effectiveInput.metadata);
+    // 已存在条目保留原批次（包括旧条目没有批次的情况），首次创建才接受本次入库批次。
+    const entryBatchId = existing ? readCatalogEntryBatch(existingMetadata) : input.entryBatchId;
+    const metadataJson = JSON.stringify(withCatalogEntryBatch(effectiveInput.metadata, entryBatchId));
     const regionGroup = readVideoRegionGroup(effectiveInput.itemType, effectiveInput.metadata);
     const premiereDate = readMediaPremiereDate(effectiveInput.metadata);
     const changed = !existing
@@ -5619,7 +5627,7 @@ export class ServiceRepository {
         backdrop_url: effectiveInput.backdropUrl,
         match_state: effectiveInput.matchState,
         external_ids_json: externalIdsJson,
-        metadata_json: metadataJson,
+        metadata_json: preserveCatalogEntryBatchOnConflict(this.database.query, this.database.databaseType),
         generation_id: input.generationId,
         updated_at: now,
         deleted_at: null,
@@ -6118,6 +6126,7 @@ export class ServiceRepository {
       const originalItem = await transaction("media_items").where({ id: range.itemIds[0], library_id: input.libraryId }).first();
       const serviceId = originalItem?.service_id ?? null;
       const generationId = originalItem?.generation_id ?? randomUUID();
+      const entryBatchId = randomUUID(); // 同一次范围匹配新建的作品与分集共享批次。
       const manualMetadata = {
         originalTitle: input.metadata.originalTitle, releaseDate: input.metadata.releaseDate,
         rating: input.metadata.rating, genres: input.metadata.genres, people: input.metadata.people,
@@ -6125,6 +6134,7 @@ export class ServiceRepository {
         originCountries: input.metadata.originCountries, matchedQuery: input.metadata.matchedQuery,
         manualMatch: { source: "tmdb", tmdbId: input.metadata.id,
           mediaType: input.metadata.mediaType, appliedAt: now },
+        entryBatchId,
       };
       await transaction("media_items").insert({
         id: itemId, user_id: input.userId, service_id: serviceId, library_id: input.libraryId,
@@ -6146,7 +6156,8 @@ export class ServiceRepository {
         overview: input.metadata.overview, poster_url: input.metadata.posterUrl,
         backdrop_url: input.metadata.backdropUrl, match_state: "matched",
         external_ids_json: JSON.stringify({ tmdb: String(input.metadata.id) }),
-        metadata_json: JSON.stringify(manualMetadata), deleted_at: null, updated_at: now,
+        metadata_json: preserveCatalogEntryBatchOnConflict(transaction, this.database.databaseType),
+        deleted_at: null, updated_at: now,
       });
       const changedIds = new Set<string>([...range.itemIds, itemId]);
       let fallbackEpisodeNumber = 1;
@@ -6170,7 +6181,7 @@ export class ServiceRepository {
             overview: "", poster_url: input.metadata.posterUrl, backdrop_url: input.metadata.backdropUrl,
             match_state: "needs_review", external_ids_json: JSON.stringify({ tmdbTv: String(input.metadata.id) }),
             metadata_json: JSON.stringify({ query: input.metadata.title, seriesTitle: input.metadata.title,
-              seasonNumber, episodeNumber, manualStructure: true }),
+              seasonNumber, episodeNumber, manualStructure: true, entryBatchId }),
             generation_id: generationId, created_at: now, updated_at: now, deleted_at: null,
           }).onConflict(["user_id", "library_id", "identity_key"]).merge({ deleted_at: null, updated_at: now });
           await transaction("media_relations").insert({
@@ -6787,6 +6798,8 @@ export class ServiceRepository {
 
   /** 映射数据库媒体行。 */
   private mapMediaItem(row: Record<string, unknown>): MediaItemRecord {
+    const metadata = parseJsonObject(row.metadata_json);
+    const entryBatchId = readCatalogEntryBatch(metadata);
     return {
       id: String(row.id),
       userId: String(row.user_id),
@@ -6806,7 +6819,7 @@ export class ServiceRepository {
       backdropUrl: row.backdrop_url ? String(row.backdrop_url) : null,
       matchState: row.match_state as MatchState,
       externalIds: Object.fromEntries(Object.entries(parseJsonObject(row.external_ids_json)).map(([key, value]) => [key, String(value)])),
-      metadata: parseJsonObject(row.metadata_json),
+      metadata,
       fileCount: Number(row.file_count ?? 0),
       mediaProbeSummary: row.media_probe_summary && typeof row.media_probe_summary === "object"
         ? row.media_probe_summary as MediaProbeSummaryRecord
@@ -6814,6 +6827,7 @@ export class ServiceRepository {
       ownerUsername: String(row.owner_username),
       serviceName: String(row.service_name),
       sourceNames: Array.isArray(row.source_names) ? row.source_names.map(String) : [],
+      ...(entryBatchId ? { entryBatchId } : {}),
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
     };
@@ -7114,7 +7128,7 @@ export class ServiceRepository {
         backdrop_url: input.backdropUrl,
         match_state: "matched",
         external_ids_json: JSON.stringify({ ...currentExternalIds, ...input.externalIds }),
-        metadata_json: JSON.stringify(nextMetadata),
+        metadata_json: JSON.stringify(withCatalogEntryBatch(nextMetadata, readCatalogEntryBatch(currentMetadata))),
         region_group: readVideoRegionGroup(nextItemType, nextMetadata),
         updated_at: now,
       });
@@ -7250,7 +7264,8 @@ export class ServiceRepository {
         backdrop_url: input.metadata.backdropUrl,
         match_state: "matched",
         external_ids_json: JSON.stringify({ tmdb: String(input.metadata.id) }),
-        metadata_json: JSON.stringify(nextMetadata),
+        metadata_json: JSON.stringify(withCatalogEntryBatch(nextMetadata,
+          readCatalogEntryBatch(parseJsonObject(row.metadata_json)))),
         region_group: readVideoRegionGroup(nextItemType, nextMetadata),
         updated_at: now,
       });
@@ -7294,7 +7309,8 @@ export class ServiceRepository {
         backdrop_url: null,
         match_state: "unmatched",
         external_ids_json: "{}",
-        metadata_json: JSON.stringify(original.metadata),
+        metadata_json: JSON.stringify(withCatalogEntryBatch(original.metadata,
+          readCatalogEntryBatch(parseJsonObject(row.metadata_json)))),
         region_group: readVideoRegionGroup(original.itemType, original.metadata),
         updated_at: now,
       });
@@ -7464,6 +7480,7 @@ export class ServiceRepository {
       return changedItemIds;
     }
 
+    const entryBatchId = randomUUID(); // 类型纠正时本次生成的所有新分集使用同一编号。
     let fallbackEpisodeNumber = 1;
     for (const sourceRow of uniqueSourceRows) {
       const existingEpisode = await transaction("file_links as fl")
@@ -7491,6 +7508,7 @@ export class ServiceRepository {
           seasonNumber,
           episodeNumber,
           manualStructure: true,
+          entryBatchId,
         };
         await transaction("media_items").insert({
           id: episodeItemId,
@@ -7519,7 +7537,7 @@ export class ServiceRepository {
           year: metadata?.year ?? row.year,
           poster_url: metadata?.posterUrl ?? row.poster_url,
           backdrop_url: metadata?.backdropUrl ?? row.backdrop_url,
-          metadata_json: JSON.stringify(episodeMetadata),
+          metadata_json: preserveCatalogEntryBatchOnConflict(transaction, this.database.databaseType),
           updated_at: now,
           deleted_at: null,
         });

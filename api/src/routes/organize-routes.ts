@@ -10,7 +10,8 @@ import type { ApiRuntime } from "../runtime.js";
 /** 预览逐页返回，避免几千个源文件一次塞进浏览器响应。 */
 function planPage(plan: OrganizePlan, offset: number) {
   const limit = 100;
-  return { ...plan, washGroups: undefined, scannedDirectories: [], directoryCount: plan.scannedDirectories.length,
+  return { ...plan, washGroups: undefined, reconcilePrevious: undefined, deferredResources: undefined, deferredPaths: undefined,
+    scannedDirectories: [], directoryCount: plan.scannedDirectories.length,
     items: plan.items.slice(offset, offset + limit), itemCount: plan.items.length,
     readyCount: plan.items.filter((item) => item.status === "ready").length,
     overwriteCount: plan.items.filter((item) => item.status === "ready" && item.willOverwrite).length,
@@ -19,7 +20,7 @@ function planPage(plan: OrganizePlan, offset: number) {
 
 /** 列表和轮询只传进度及少量失败项，不重复传完整任务流水。 */
 function jobSummary(job: OrganizeJob) {
-  return { ...job, items: job.items.filter((item) => item.stage === "failed").slice(0, 50),
+  return { ...job, pendingSourceDeletions: undefined, items: job.items.filter((item) => item.stage === "failed").slice(0, 50),
     itemCount: job.items.length, completedCount: job.items.filter((item) => item.stage === "completed").length };
 }
 

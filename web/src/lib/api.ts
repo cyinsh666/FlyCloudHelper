@@ -1228,6 +1228,7 @@ export interface OrganizeJob {
   error: string | null;
   autoRetryCount?: number;
   nextRetryAt?: string | null;
+  supersededAt?: string;
   createdAt: string;
 }
 
@@ -1252,6 +1253,7 @@ export interface OrganizeTaskSummary {
   error: string | null;
   autoRetryCount?: number;
   nextRetryAt?: string | null;
+  supersededAt?: string;
   createdAt: string;
   updatedAt: string;
 }

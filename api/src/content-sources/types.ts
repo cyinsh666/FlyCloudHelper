@@ -178,6 +178,8 @@ export interface ContentPlaybackSource {
 
 /** 未完成目录批次固定各分类目标页，重试只继续原范围。 */
 export interface ContentSourcePendingBatch {
+  /** 视频导入续传沿用首次提交的入库批次。 */
+  entryBatchId?: string;
   pageCount: number;
   sample: boolean;
   /** 不含该页；当前游标达到此值后该分类不再继续请求。 */

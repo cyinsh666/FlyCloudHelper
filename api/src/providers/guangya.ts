@@ -201,12 +201,17 @@ export class GuangyaProvider implements ProviderAdapter {
     taskStatus: async (connection, taskId, context) => {
       this.requireWebOrganizeConnection(connection);
       const result = await this.webClient.mutateFile(connection, "/userres/v1/get_task_status", { taskId }, context?.persistConnection);
-      const status = Number(result.status ?? result.taskStatus ?? -1);
+      // 关键变量：空值和空串无法证明任务已进入队列，交给整理轮询重查。
+      const rawStatus = result.status ?? result.taskStatus;
+      const status = typeof rawStatus === "number" || typeof rawStatus === "string" && /^\d+$/u.test(rawStatus.trim())
+        ? Number(rawStatus) : NaN;
       if (status === 0) return "pending";
       if (status === 1) return "running";
       if (status === 2) return "completed";
       if (status === 3) return "failed";
-      throw new ApiError(503, "guangya_task_status_unknown", "光鸭文件任务状态无法识别");
+      throw new ApiError(503, "guangya_task_status_unknown", "光鸭文件任务状态无法识别", [
+        { field: "响应状态", message: Number.isFinite(status) ? String(status) : rawStatus === null ? "null" : typeof rawStatus },
+      ]);
     },
   };
   public readonly descriptor: ProviderDescriptor = {

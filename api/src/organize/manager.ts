@@ -10,7 +10,7 @@ import { readSubscriptionTransferRoots, insideSubscriptionRoot, subscriptionRece
   type SubscriptionTransferRoot } from "../subscriptions/transfer-root.js";
 import type { ProviderAdapter, ProviderBrowseEntry, ProviderConnectionContext, ProviderFileOrganizer, ProviderMutationResult } from "../providers/types.js";
 import type { ApiRuntime } from "../runtime.js";
-import type { OrganizeDirectory, OrganizeJob, OrganizeJobItem, OrganizeMode, OrganizePlan, OrganizePlanItem, OrganizeTaskSummary, WashPriority } from "./types.js";
+import type { OrganizeDirectory, OrganizeJob, OrganizeJobItem, OrganizeMode, OrganizePlan, OrganizePlanItem, OrganizeSourceDeletion, OrganizeTaskSummary, WashPriority } from "./types.js";
 
 const VIDEO_EXTENSION = /\.(?:mp4|mkv|avi|mov|wmv|flv|m4v|ts|m2ts|mpg|mpeg|rmvb|webm|3gp|iso)$/iu;
 const MAX_FILES = 5000;
@@ -92,6 +92,7 @@ export class ServiceOrganizeManager {
   private readonly activePlans = new Set<string>();
   private readonly jobWrites = new Map<string, Promise<void>>();
   private readonly creatingServices = new Set<string>();
+  private readonly reconcilingServices = new Set<string>();
 
   public constructor(private readonly runtime: ApiRuntime) {
     this.directory = path.join(runtime.config.exportDirectory, "service-organize");
@@ -153,13 +154,13 @@ export class ServiceOrganizeManager {
     return current;
   }
 
-  /** 创建只读预览任务，递归枚举和 TMDB 匹配在响应之后后台执行。 */
+  /** 创建后台预览；按保存设置执行时，光鸭先核对旧操作，再扫描当前目录。 */
   public async createPlan(serviceId: string, actorUserId: string | undefined, input: {
     sources: OrganizeDirectory[]; target: OrganizeDirectory; mode: OrganizeMode;
     unrecognizedTransferEnabled?: boolean; unrecognizedDirectory?: OrganizeDirectory | null;
     aiAssistEnabled?: boolean; aiModelId?: string | null;
     washEnabled?: boolean; washPriorities?: WashPriority[]; washCleanupSources?: boolean;
-  }): Promise<OrganizePlan> {
+  }, scheduledExecution = false): Promise<OrganizePlan> {
     const context = await this.context(serviceId, actorUserId);
     if (!Array.isArray(input.sources) || input.sources.length < 1 || input.sources.length > 20
       || (input.mode !== "move" && input.mode !== "copy")) {
@@ -200,6 +201,7 @@ export class ServiceOrganizeManager {
       mode: input.mode, sourceDirectories: uniqueSources, targetDirectory: target, scannedDirectories: [],
       unrecognizedTransferEnabled: Boolean(input.unrecognizedTransferEnabled), unrecognizedDirectory,
       aiAssistEnabled: Boolean(input.aiAssistEnabled), aiModelId,
+      reconcilePrevious: scheduledExecution && context.adapter.descriptor.type === "guangya" || undefined,
       ...readWashOptions(input),
       aiFailureCount: 0, status: "preparing", error: null, items: [], createdAt: now, updatedAt: now };
     await this.withExclusiveScanSlot(serviceId, () => saveJson(this.planPath(plan.id), plan));
@@ -218,12 +220,174 @@ export class ServiceOrganizeManager {
     return plan;
   }
 
+  /** 返回旧直达操作预期所在的网盘目录，保留当时的资源 ID 和路径。 */
+  private directTargetDirectory(plan: OrganizePlan, item: OrganizePlanItem, resourceId: string): OrganizeDirectory {
+    const root = item.action === "unrecognized" && plan.unrecognizedDirectory
+      ? plan.unrecognizedDirectory : plan.targetDirectory;
+    return { resourceId, displayPath: normalizedPath(path.posix.join(root.displayPath, ...item.targetParts)) };
+  }
+
+  /** 判断旧操作是否影响当前条目，整夹操作也不得带走待确认的子项。 */
+  private isDeferredItem(plan: OrganizePlan, item: OrganizePlanItem, washKeys: Set<string>): boolean {
+    if (item.washIdentity && washKeys.has(item.washIdentity.key)) return true;
+    if (plan.deferredResources?.includes(item.sourceId)) return true;
+    if (!plan.deferredPaths?.length) return false;
+    const directory = this.directTargetDirectory(plan, item, "");
+    const destination = item.targetName.startsWith("/") ? item.targetName : path.posix.join(directory.displayPath, item.targetName);
+    return plan.deferredPaths.some((pending) => [item.sourcePath, destination].some((current) =>
+      current === pending || current.startsWith(`${pending}/`) || pending.startsWith(`${current}/`)));
+  }
+
+  /** 退役历史执行快照，只核对已提交的操作及补做已入位文件的命名。 */
+  private async reconcilePreviousJobs(context: OrganizeContext, plan: OrganizePlan): Promise<Set<string>> {
+    const serviceId = plan.serviceId;
+    if (this.reconcilingServices.has(serviceId) || this.activeServices.has(serviceId) || this.creatingServices.has(serviceId)) {
+      throw new ApiError(409, "organize_job_active", "当前服务已有整理任务正在处理");
+    }
+    this.reconcilingServices.add(serviceId);
+    const resources = new Set<string>();
+    const paths = new Set<string>();
+    const washKeys = new Set<string>();
+    try {
+      const jobs = await this.listJobs(serviceId, plan.userId);
+      if (jobs.some((job) => ["queued", "running", "paused"].includes(job.status))) {
+        throw new ApiError(409, "organize_job_active", "当前服务已有排队、运行或暂停的整理任务");
+      }
+      await this.requireNoActiveScan(serviceId);
+      const taskStatuses = new Map<string, "completed" | "failed" | null>();
+      /** 同一个光鸭批次在本轮只查询一次，无法读取的结果留到下一轮。 */
+      const readStatus = async (taskId: string | null): Promise<"completed" | "failed" | null> => {
+        if (!taskId) return null;
+        if (taskStatuses.has(taskId)) return taskStatuses.get(taskId) ?? null;
+        const status = await context.organizer.taskStatus(context.connection, taskId, context.providerContext).catch(() => null);
+        const terminal = status === "completed" || status === "failed" ? status : null;
+        taskStatuses.set(taskId, terminal);
+        return terminal;
+      };
+      for (const job of jobs.reverse()) {
+        if (!["failed", "cancelled"].includes(job.status) || job.createdAt > plan.createdAt) continue;
+        const retired = Boolean(job.supersededAt);
+        if (!retired) {
+          job.supersededAt = new Date().toISOString();
+          await this.saveJob(job);
+        }
+        if (job.credentialRevision !== plan.credentialRevision) continue;
+        for (const deletion of [...job.pendingSourceDeletions ?? []]) {
+          const status = await readStatus(deletion.taskId);
+          if (status === "failed" || await this.isDeletionVisible(context, deletion)) {
+            job.pendingSourceDeletions = job.pendingSourceDeletions?.filter((pending) => pending !== deletion);
+            await this.saveJob(job);
+            continue;
+          }
+          // 父目录仍可整理其他文件，但不能整夹移动或清理这一批待确认资源。
+          for (const resourceId of deletion.resourceIds) resources.add(resourceId);
+          for (const resourcePath of deletion.resourcePaths ?? [deletion.parent.displayPath]) paths.add(resourcePath);
+        }
+        const unsettled = job.items.filter((state) => state.stage !== "completed" && !state.reconciled
+          && (state.pendingTaskId || state.stageRequested || state.directPhase === "delete" && state.replacedId
+            || state.directOperation === "move" && state.directPhase === "rename"));
+        if (!unsettled.length) continue;
+        const oldPlan = await readJson<OrganizePlan>(this.planPath(job.planId));
+        if (!oldPlan || oldPlan.serviceId !== serviceId || oldPlan.userId !== plan.userId) continue;
+        const listings = new Map<string, ProviderBrowseEntry[]>();
+        for (const state of unsettled) {
+          const item = oldPlan.items[state.index];
+          if (!item) continue;
+          const status = await readStatus(state.pendingTaskId);
+          const target = state.targetParentId ? this.directTargetDirectory(oldPlan, item, state.targetParentId) : null;
+          const isWashDeletion = item.action === "wash_cleanup" || item.action === "wash_source_cleanup";
+          const deletionParent = isWashDeletion
+            ? { resourceId: item.parentId, displayPath: normalizedPath(path.posix.dirname(item.sourcePath)) } : target;
+          const deletedId = isWashDeletion ? item.sourceId : state.directPhase === "delete" ? state.replacedId : null;
+          let confirmed = status === "failed";
+          if (deletedId && deletionParent) {
+            confirmed ||= await this.isDeletionVisible(context, { parent: deletionParent, resourceIds: [deletedId] });
+          } else if (target && state.directOperation === "move" && state.directPhase !== "delete") {
+            try {
+              confirmed = await this.reconcileMovedItem(context, oldPlan, job, state, target, listings, status);
+            } catch (error) {
+              confirmed = false;
+              this.runtime.logBusinessEvent("warn", {
+                日志关键字: "codex-flycloud-organize-reconcile", 事件: "核对旧移动结果失败",
+                服务ID: serviceId, 来源资源ID: state.sourceId, 错误信息: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
+          if (confirmed) {
+            state.reconciled = true;
+            await this.saveJob(job);
+            continue;
+          }
+          resources.add(item.sourceId);
+          if (deletedId) resources.add(deletedId);
+          paths.add(item.sourcePath);
+          if (target) paths.add(path.posix.join(target.displayPath, item.targetName));
+          if (item.targetName.startsWith("/")) paths.add(item.targetName);
+          if (item.washIdentity) washKeys.add(item.washIdentity.key);
+        }
+      }
+      plan.deferredResources = [...resources];
+      plan.deferredPaths = [...paths];
+      return washKeys;
+    } finally {
+      this.reconcilingServices.delete(serviceId);
+    }
+  }
+
+  /** 用原资源 ID 核对移动结果，仅在仍为原名且目标名空闲时补做改名。 */
+  private async reconcileMovedItem(context: OrganizeContext, plan: OrganizePlan, job: OrganizeJob, state: OrganizeJobItem,
+    target: OrganizeDirectory, listings: Map<string, ProviderBrowseEntry[]>, status: "completed" | "failed" | null): Promise<boolean> {
+    const item = plan.items[state.index]!;
+    let entries = listings.get(target.resourceId);
+    if (!entries) {
+      const current = await this.findDirectory(context, target.displayPath);
+      if (current?.resourceId !== target.resourceId) return false;
+      entries = await this.children(context, target);
+      listings.set(target.resourceId, entries);
+    }
+    const moved = entries.find((entry) => entry.resourceId === (state.stagedId ?? item.sourceId));
+    if (!moved) return status === "failed" && state.directPhase === "transfer";
+    if (moved.isDirectory !== Boolean(item.isDirectory) || !moved.isDirectory && moved.size !== item.size) return false;
+    if (moved.name === item.targetName) {
+      state.recoveredMove = true;
+      return true;
+    }
+    if (moved.name !== item.sourceName || entries.some((entry) => entry.name === item.targetName)) return false;
+    // 原远端操作的结果已由目标资源确认，从这里开始只追踪补做的改名。
+    if (state.directPhase !== "rename" || status === "failed") {
+      state.directPhase = "rename";
+      state.pendingTaskId = null;
+      state.recoveryRenameRequested = false;
+    } else if (state.pendingTaskId || state.recoveryRenameRequested) {
+      return false;
+    }
+    state.recoveryRenameRequested = true;
+    await this.saveJob(job);
+    listings.delete(target.resourceId);
+    const verified = async () => (await this.children(context, target))
+      .some((entry) => entry.resourceId === moved.resourceId && entry.name === item.targetName);
+    try {
+      const result = await context.organizer.rename(context.connection, moved.resourceId, item.targetName, context.providerContext);
+      await this.waitMutation(context, result, job, state, verified);
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "guangya_task_failed") {
+        state.recoveryRenameRequested = false;
+        await this.saveJob(job);
+      }
+      throw error;
+    }
+    state.recoveredMove = await verified();
+    return state.recoveredMove;
+  }
+
   /** 编制目录清单和自动命名；任何 Provider 读取失败都保留失败状态，不伪装为末页。 */
   private async preparePlan(plan: OrganizePlan, context: OrganizeContext): Promise<void> {
     try {
       plan.items = [];
       plan.scannedDirectories = [];
       plan.aiFailureCount = 0;
+      // 必须先核对旧操作，洗版预览才能看到补完命名后的目标版本。
+      const deferredWashKeys = plan.reconcilePrevious ? await this.reconcilePreviousJobs(context, plan) : new Set<string>();
       const entries: ProviderBrowseEntry[] = [];
       // 关键变量：保留完整目录子项，整夹转移前需确认目录树没有变化。
       const allEntries: ProviderBrowseEntry[] = [];
@@ -473,6 +637,11 @@ export class ServiceOrganizeManager {
       if (plan.unrecognizedTransferEnabled && plan.unrecognizedDirectory) {
         this.addUnrecognizedItems(plan, allEntries, aiFailedSourceIds, protectedSubscriptionPaths);
       }
+      for (const item of plan.items) {
+        if (item.status !== "ready" || !this.isDeferredItem(plan, item, deferredWashKeys)) continue;
+        item.status = "skipped";
+        item.reason = "上一轮光鸭操作待确认，本轮暂时跳过";
+      }
       await prepareWashPlan(plan, async (directory) => (await this.children(context, directory))
         .filter((entry) => !entry.isDirectory || !this.isSubscriptionReceivingDirectory(context, entry)));
       const targets = new Set<string>();
@@ -685,7 +854,7 @@ export class ServiceOrganizeManager {
         completedCount: job.items.filter((item) => item.stage === "completed").length,
         failedCount: job.items.filter((item) => item.stage === "failed").length,
         totalCount: job.items.length, error: job.error, autoRetryCount: job.autoRetryCount,
-        nextRetryAt: job.nextRetryAt, createdAt: job.createdAt, updatedAt: job.updatedAt });
+        nextRetryAt: job.nextRetryAt, supersededAt: job.supersededAt, createdAt: job.createdAt, updatedAt: job.updatedAt });
     }
     // 关键变量：已创建执行任务的预览不再作为第二条“识别中”任务展示。
     for (const name of names) {
@@ -720,6 +889,8 @@ export class ServiceOrganizeManager {
       const job = await readJson<OrganizeJob>(fileName);
       if (!job || actorUserId && job.userId !== actorUserId
         || !["completed", "failed", "cancelled"].includes(job.status)) continue;
+      if (this.reconcilingServices.has(job.serviceId) || job.pendingSourceDeletions?.length
+        || job.supersededAt && job.items.some((item) => !item.reconciled && (item.pendingTaskId || item.recoveryRenameRequested))) continue;
       // 计划刚落任务但调度器尚未清除待执行标记时，留给下一次清理，避免误删恢复依据。
       const schedule = await readJson<{ pendingPlanId: string | null }>(path.join(this.directory, `schedule-${job.serviceId}.json`));
       if (schedule?.pendingPlanId === job.planId) continue;
@@ -735,7 +906,9 @@ export class ServiceOrganizeManager {
   /** 从预览创建后台任务；开启剩余清理时，空视频结果也进入来源目录收尾。 */
   public async createJob(serviceId: string, planId: string, actorUserId?: string,
     recordEmptyExecution = false): Promise<OrganizeJob> {
-    if (this.creatingServices.has(serviceId)) throw new ApiError(409, "organize_job_creating", "当前服务正在创建整理任务");
+    if (this.creatingServices.has(serviceId) || this.reconcilingServices.has(serviceId)) {
+      throw new ApiError(409, "organize_job_creating", "当前服务正在创建整理任务或核对上一轮结果");
+    }
     this.creatingServices.add(serviceId);
     try {
       const context = await this.context(serviceId, actorUserId);
@@ -807,10 +980,11 @@ export class ServiceOrganizeManager {
     const update = previousWrite.catch(() => undefined).then(async () => {
       const job = await readJson<OrganizeJob>(this.jobPath(jobId));
       if (!job) throw new ApiError(404, "organize_job_missing", "整理任务不存在");
+      if (job.supersededAt) throw new ApiError(409, "organize_job_superseded", "已有新一轮预览，旧任务仅供查看");
       if (action === "pause" && ["queued", "running"].includes(job.status)) job.status = "paused";
       else if (action === "resume" && ["paused", "failed"].includes(job.status)) {
         // 旧失败任务允许手动继续，但不能与同服务的新任务并行执行。
-        const occupied = this.activeServices.has(serviceId) || this.creatingServices.has(serviceId)
+        const occupied = this.activeServices.has(serviceId) || this.creatingServices.has(serviceId) || this.reconcilingServices.has(serviceId)
           || (await this.listJobs(serviceId, actorUserId)).some((other) => other.id !== jobId
             && ["queued", "running", "paused"].includes(other.status));
         if (occupied) throw new ApiError(409, "organize_job_exists", "当前服务已有排队、运行或暂停的整理任务");
@@ -825,7 +999,12 @@ export class ServiceOrganizeManager {
       }
       else throw new ApiError(409, "organize_job_action_invalid", "当前任务状态不支持此操作");
       job.updatedAt = new Date().toISOString();
-      if (action === "resume") await this.withExclusiveScanSlot(serviceId, () => saveJson(this.jobPath(jobId), job));
+      if (action === "resume") await this.withExclusiveScanSlot(serviceId, async () => {
+        if (this.reconcilingServices.has(serviceId)) {
+          throw new ApiError(409, "organize_job_active", "当前服务正在核对上一轮整理结果");
+        }
+        await saveJson(this.jobPath(jobId), job);
+      });
       else await saveJson(this.jobPath(jobId), job);
       return job;
     });
@@ -938,23 +1117,52 @@ export class ServiceOrganizeManager {
     });
   }
 
-  /** 远端任务必须完成才允许进入下一阶段。 */
-  private async waitMutation(context: OrganizeContext, result: ProviderMutationResult, job?: OrganizeJob, item?: OrganizeJobItem): Promise<void> {
+  /** 光鸭返回未知状态时继续只读查询，必要时再核对预期目录。 */
+  private async waitMutation(context: OrganizeContext, result: ProviderMutationResult, job?: OrganizeJob, item?: OrganizeJobItem,
+    verify?: () => Promise<boolean>): Promise<void> {
     if (!result.taskId) return;
     if (item && job) { item.pendingTaskId = result.taskId; await this.saveJob(job); }
     // 光鸭按 LitePan 的 300 毫秒节奏查询任务；其他网盘保持原有一秒间隔和总等待时长。
-    const pollIntervalMs = context.adapter.descriptor.type === "guangya" ? 300 : 1000;
+    const guangya = context.adapter.descriptor.type === "guangya";
+    const pollIntervalMs = guangya ? 300 : 1000;
     const maxAttempts = Math.ceil(300_000 / pollIntervalMs);
+    let unknownCount = 0;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      const status = await context.organizer.taskStatus(context.connection, result.taskId, context.providerContext);
+      let status: Awaited<ReturnType<ProviderFileOrganizer["taskStatus"]>>;
+      try {
+        status = await context.organizer.taskStatus(context.connection, result.taskId, context.providerContext);
+      } catch (error) {
+        if (!guangya || !(error instanceof ApiError) || error.code !== "guangya_task_status_unknown") throw error;
+        unknownCount += 1;
+        if (unknownCount === 1) this.runtime.logBusinessEvent("warn", {
+          日志关键字: "codex-flycloud-organize-reconcile", 事件: "光鸭操作状态未知，开始重查",
+          网盘任务ID: result.taskId, 整理任务ID: job?.id ?? null, 响应状态: error.fields?.[0]?.message ?? null,
+        });
+        if (unknownCount >= 4) break;
+        await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** (unknownCount - 1)));
+        continue;
+      }
+      unknownCount = 0;
       if (status === "completed") { if (item && job) { item.pendingTaskId = null; await this.saveJob(job); } return; }
       if (status === "failed") {
         if (item && job) { item.pendingTaskId = null; if (item.stage === "pending") item.stageRequested = false; await this.saveJob(job); }
+        if (guangya) throw new ApiError(503, "guangya_task_failed", "网盘文件任务执行失败");
         throw new Error("网盘文件任务执行失败");
       }
       await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
     }
+    if (guangya && verify && await verify()) {
+      if (item && job) { item.pendingTaskId = null; await this.saveJob(job); }
+      return;
+    }
+    if (guangya) throw new ApiError(503, "guangya_task_unconfirmed", "光鸭文件操作结果待确认");
     throw new Error("网盘文件任务等待超时，可稍后继续任务");
+  }
+
+  /** 只在父目录成功读取且所有原资源 ID 均已消失时确认删除。 */
+  private async isDeletionVisible(context: OrganizeContext, deletion: Pick<OrganizeSourceDeletion, "parent" | "resourceIds">): Promise<boolean> {
+    const entries = await this.children(context, deletion.parent).catch(() => null);
+    return Boolean(entries && !entries.some((entry) => deletion.resourceIds.includes(entry.resourceId)));
   }
 
   /** 读取一个目录的实时直接子项，所有目标覆盖判断均基于最新网盘状态。 */
@@ -970,7 +1178,8 @@ export class ServiceOrganizeManager {
       if (!existing.isDirectory) throw new Error(`目标路径有同名文件：${name}`);
       return { resourceId: existing.resourceId, displayPath: existing.displayPath };
     }
-    await this.waitMutation(context, await context.organizer.createDirectory(context.connection, parent.resourceId, name, context.providerContext));
+    await this.waitMutation(context, await context.organizer.createDirectory(context.connection, parent.resourceId, name, context.providerContext),
+      undefined, undefined, async () => (await this.children(context, parent)).some((entry) => entry.isDirectory && entry.name === name));
     const created = (await this.children(context, parent)).find((entry) => entry.name === name && entry.isDirectory);
     if (!created) throw new Error(`网盘目录创建后未找到：${name}`);
     return { resourceId: created.resourceId, displayPath: created.displayPath };
@@ -1068,7 +1277,8 @@ export class ServiceOrganizeManager {
       if (deletion.taskId) {
         for (const state of selected) state.pendingTaskId = deletion.taskId;
         await this.saveJob(job);
-        await this.waitMutation(context, { taskId: deletion.taskId });
+        await this.waitMutation(context, { taskId: deletion.taskId }, undefined, undefined,
+          () => this.isDeletionVisible(context, { parent: target, resourceIds: oldIds }));
         for (const state of selected) state.pendingTaskId = null;
         await this.saveJob(job);
       }
@@ -1164,8 +1374,17 @@ export class ServiceOrganizeManager {
           ? plan.unrecognizedDirectory.displayPath : plan.targetDirectory.displayPath, ...item.targetParts)) };
     if (state.pendingTaskId) {
       const taskId = state.pendingTaskId;
-      await this.waitMutation(context, { taskId });
-      for (const member of job.items) if (member.pendingTaskId === taskId) member.pendingTaskId = null;
+      const members = job.items.filter((member) => member.pendingTaskId === taskId);
+      await this.waitMutation(context, { taskId }, undefined, undefined, async () => {
+        if (state.directPhase === "delete") {
+          const replacedIds = members.flatMap((member) => member.replacedId ? [member.replacedId] : []);
+          return replacedIds.length > 0 && await this.isDeletionVisible(context, { parent: target, resourceIds: replacedIds });
+        }
+        if (state.directOperation !== "move" || state.directPhase !== "transfer") return false;
+        const targets = await this.children(context, target);
+        return members.every((member) => targets.some((entry) => entry.resourceId === member.sourceId));
+      });
+      for (const member of members) member.pendingTaskId = null;
       context.directTargetListings?.delete(target.resourceId);
       await this.saveJob(job);
     }
@@ -1239,7 +1458,8 @@ export class ServiceOrganizeManager {
         context.directTargetListings?.delete(target.resourceId);
       }
       const result = await context.organizer.rename(context.connection, placed.resourceId, item.targetName, context.providerContext);
-      await this.waitMutation(context, result, job, state);
+      await this.waitMutation(context, result, job, state, async () => (await this.children(context, target))
+        .some((entry) => entry.resourceId === placedId && entry.name === item.targetName));
       if (result.resourceId) state.stagedId = result.resourceId;
       context.directTargetListings?.delete(target.resourceId);
       targetEntries = await this.children(context, target);
@@ -1319,10 +1539,11 @@ export class ServiceOrganizeManager {
     }
     if (winnerId === item.sourceId) throw new Error("洗版清理与保留文件身份相同，已停止处理");
     const parent = { resourceId: item.parentId, displayPath: path.posix.dirname(item.sourcePath) };
+    const verifyDeletion = () => this.isDeletionVisible(context, { parent, resourceIds: [item.sourceId] });
     if (item.action === "wash_source_cleanup" && this.isSubscriptionReceivingDirectory(context, parent)) {
       throw new Error("订阅接收目录尚未完成，已保留来源文件");
     }
-    if (state.pendingTaskId) await this.waitMutation(context, { taskId: state.pendingTaskId }, job, state);
+    if (state.pendingTaskId) await this.waitMutation(context, { taskId: state.pendingTaskId }, job, state, verifyDeletion);
     const old = (await this.children(context, parent)).find((entry) => entry.resourceId === item.sourceId);
     if (old) {
       if (old.isDirectory || old.name !== item.sourceName || old.size !== item.size || old.modifiedAt !== item.modifiedAt) {
@@ -1332,7 +1553,7 @@ export class ServiceOrganizeManager {
       state.stageRequested = true;
       await this.saveJob(job);
       await this.waitMutation(context, await context.organizer.remove(context.connection, old.resourceId,
-        context.providerContext), job, state);
+        context.providerContext), job, state, verifyDeletion);
       if ((await this.children(context, parent)).some((entry) => entry.resourceId === old.resourceId)) {
         throw new ApiError(503, "organize_wash_delete_pending", "洗版旧版本删除尚未在目录列表确认，请稍后继续任务");
       }
@@ -1457,9 +1678,44 @@ export class ServiceOrganizeManager {
   }
 
   /** 仅删除网盘实时确认完全为空的目录。 */
-  private async removeIfEmpty(context: OrganizeContext, directory: OrganizeDirectory): Promise<void> {
+  private async removeIfEmpty(context: OrganizeContext, directory: OrganizeDirectory,
+    source?: { job: OrganizeJob; parent: OrganizeDirectory }): Promise<void> {
     if ((await this.children(context, directory)).length > 0) return;
+    if (source) {
+      await this.removeSourceCleanupEntries(context, source.job, source.parent, [directory]);
+      return;
+    }
     await this.waitMutation(context, await context.organizer.remove(context.connection, directory.resourceId, context.providerContext));
+  }
+
+  /** 持久化来源清理的远端任务 ID，下轮可核对同一次删除。 */
+  private async removeSourceCleanupEntries(context: OrganizeContext, job: OrganizeJob, parent: OrganizeDirectory,
+    entries: OrganizeDirectory[]): Promise<void> {
+    const resourceIds = entries.map((entry) => entry.resourceId);
+    const result = resourceIds.length > 1 && context.organizer.removeMany
+      ? await context.organizer.removeMany(context.connection, resourceIds, context.providerContext)
+      : await context.organizer.remove(context.connection, resourceIds[0]!, context.providerContext);
+    if (context.adapter.descriptor.type !== "guangya" || !result.taskId) {
+      await this.waitMutation(context, result);
+      return;
+    }
+    const deletion = { taskId: result.taskId, parent, resourceIds, resourcePaths: entries.map((entry) => entry.displayPath) };
+    (job.pendingSourceDeletions ??= []).push(deletion);
+    await this.saveJob(job);
+    try {
+      await this.waitMutation(context, result, undefined, undefined, () => this.isDeletionVisible(context, deletion));
+      if (!await this.isDeletionVisible(context, deletion)) {
+        throw new ApiError(503, "guangya_task_unconfirmed", "光鸭删除已提交，目录结果待确认");
+      }
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "guangya_task_failed") {
+        job.pendingSourceDeletions = job.pendingSourceDeletions.filter((pending) => pending !== deletion);
+        await this.saveJob(job);
+      }
+      throw error;
+    }
+    job.pendingSourceDeletions = job.pendingSourceDeletions.filter((pending) => pending !== deletion);
+    await this.saveJob(job);
   }
 
   /** 未完成订阅根及其子目录在整理和清理阶段均须保留。 */
@@ -1490,14 +1746,15 @@ export class ServiceOrganizeManager {
   }
 
   /** 仅在整棵目录已确认没有视频后，逐项删除附属文件和子目录，最后删除空目录。 */
-  private async removeVideoFreeSourceTree(context: OrganizeContext, directory: OrganizeDirectory): Promise<void> {
+  private async removeVideoFreeSourceTree(context: OrganizeContext, job: OrganizeJob, parent: OrganizeDirectory,
+    directory: OrganizeDirectory): Promise<void> {
     if (this.isSubscriptionReceivingDirectory(context, directory)) throw new Error("订阅接收目录尚未完成，已停止清理");
     const entries = await this.children(context, directory);
     if (entries.some((entry) => !entry.isDirectory && (VIDEO_EXTENSION.test(entry.name) || /\.strm$/iu.test(entry.name)))) {
       throw new Error("来源目录出现新视频，已停止清理并保留原目录");
     }
     for (const entry of entries) {
-      if (entry.isDirectory) await this.removeVideoFreeSourceTree(context,
+      if (entry.isDirectory) await this.removeVideoFreeSourceTree(context, job, directory,
         { resourceId: entry.resourceId, displayPath: entry.displayPath });
     }
     // 关键变量：只删除再次确认仍在当前目录的非视频文件，避免清理过程中误删新加入的视频。
@@ -1508,14 +1765,12 @@ export class ServiceOrganizeManager {
     for (let offset = 0; offset < remainingFiles.length; offset += 50) {
       const batch = remainingFiles.slice(offset, offset + 50);
       if (batch.length > 1 && context.organizer.removeMany) {
-        await this.waitMutation(context, await context.organizer.removeMany(context.connection,
-          batch.map((entry) => entry.resourceId), context.providerContext));
+        await this.removeSourceCleanupEntries(context, job, directory, batch);
       } else {
-        for (const entry of batch) await this.waitMutation(context,
-          await context.organizer.remove(context.connection, entry.resourceId, context.providerContext));
+        for (const entry of batch) await this.removeSourceCleanupEntries(context, job, directory, [entry]);
       }
     }
-    await this.removeIfEmpty(context, directory);
+    await this.removeIfEmpty(context, directory, { job, parent });
   }
 
   /** 从已完成的来源操作及已提交的洗版删除找回历史目录，按当前路径和资源 ID 双重匹配。 */
@@ -1524,7 +1779,7 @@ export class ServiceOrganizeManager {
     const currentDirectories = new Map(plan.scannedDirectories.map((directory) => [directory.displayPath, directory.resourceId]));
     for (const job of await this.listJobs(plan.serviceId, plan.userId)) {
       if (job.planId === plan.id || job.createdAt > plan.createdAt
-        || !job.items.some((item) => item.stage === "completed" || item.stageRequested)) continue;
+        || !job.items.some((item) => item.stage === "completed" || item.stageRequested || item.recoveredMove)) continue;
       const previous = await readJson<OrganizePlan>(this.planPath(job.planId));
       if (!previous || previous.serviceId !== plan.serviceId || previous.userId !== plan.userId) continue;
       // 关键变量：光鸭删除状态查询失败后仍可能完成删除；已提交的来源洗版删除也交给实时无视频检查收尾。
@@ -1532,7 +1787,8 @@ export class ServiceOrganizeManager {
       for (const state of job.items) {
         const item = previous.items[state.index];
         if (!item || item.action === "wash_cleanup" || item.isDirectory) continue;
-        if (state.stage !== "completed" && !(item.action === "wash_source_cleanup" && state.stageRequested)) continue;
+        if (state.stage !== "completed" && !state.recoveredMove
+          && !(item.action === "wash_source_cleanup" && state.stageRequested)) continue;
         let parentPath = normalizedPath(path.posix.dirname(item.sourcePath));
         while (parentPath !== "/") {
           handledPaths.add(parentPath);
@@ -1549,7 +1805,7 @@ export class ServiceOrganizeManager {
   }
 
   /** 按层级逆序清理无视频来源子目录；开启剩余清理后也处理有历史整理依据的目录。 */
-  private async cleanupSources(context: OrganizeContext, plan: OrganizePlan): Promise<void> {
+  private async cleanupSources(context: OrganizeContext, plan: OrganizePlan, job: OrganizeJob): Promise<void> {
     context.subscriptionPendingRoots = (await readSubscriptionTransferRoots(this.runtime, plan.serviceId)).filter((root) => !root.ready);
     const historicalDirectoryIds = plan.washEnabled && plan.washCleanupSources
       ? await this.historicalSourceDirectoryIds(plan) : new Set<string>();
@@ -1558,11 +1814,30 @@ export class ServiceOrganizeManager {
     const movedFolders = plan.items.filter((item) => item.status === "ready" && item.action === "unrecognized" && item.isDirectory)
       .map((item) => item.sourcePath);
     const sourceRoots = new Set(plan.sourceDirectories.map((directory) => directory.resourceId));
+    let cleanupError: unknown;
+    for (const deletion of [...job.pendingSourceDeletions ?? []]) {
+      try {
+        await this.waitMutation(context, { taskId: deletion.taskId }, undefined, undefined, () => this.isDeletionVisible(context, deletion));
+        if (!await this.isDeletionVisible(context, deletion)) {
+          throw new ApiError(503, "guangya_task_unconfirmed", "光鸭删除已提交，目录结果待确认");
+        }
+      } catch (error) {
+        cleanupError ??= error;
+        if (!(error instanceof ApiError) || error.code !== "guangya_task_failed") continue;
+      }
+      job.pendingSourceDeletions = job.pendingSourceDeletions?.filter((pending) => pending !== deletion);
+      await this.saveJob(job);
+    }
     for (const directory of [...plan.scannedDirectories].sort((left, right) => right.displayPath.length - left.displayPath.length)) {
       if (this.isSubscriptionReceivingDirectory(context, directory)) continue;
       if (directory.displayPath === "/") continue;
       // 关键变量：定时任务下一轮还要读取来源根目录，只清理根目录之下的空目录。
       if (sourceRoots.has(directory.resourceId)) continue;
+      const pendingPaths = [...plan.deferredPaths ?? [],
+        ...job.pendingSourceDeletions?.flatMap((entry) => entry.resourcePaths ?? [entry.parent.displayPath]) ?? []];
+      if (plan.deferredResources?.includes(directory.resourceId) || pendingPaths.some((pending) =>
+        directory.displayPath === pending || pending.startsWith(`${directory.displayPath}/`)
+        || directory.displayPath.startsWith(`${pending}/`))) continue;
       if (movedFolders.some((folder) => directory.displayPath === folder
         || directory.displayPath.startsWith(`${folder}/`))) continue;
       const parentPath = normalizedPath(path.posix.dirname(directory.displayPath));
@@ -1572,10 +1847,17 @@ export class ServiceOrganizeManager {
       if (!current) continue;
       const involved = historicalDirectoryIds.has(directory.resourceId) || plan.items.some((item) => item.sourcePath === directory.displayPath
         || item.sourcePath.startsWith(`${directory.displayPath.replace(/\/$/u, "")}/`));
-      if (!involved) { await this.removeIfEmpty(context, directory); continue; }
-      if (await this.containsSourceVideo(context, directory)) continue;
-      await this.removeVideoFreeSourceTree(context, directory);
+      const pendingCount = job.pendingSourceDeletions?.length ?? 0;
+      try {
+        if (!involved) { await this.removeIfEmpty(context, directory, { job, parent }); continue; }
+        if (await this.containsSourceVideo(context, directory)) continue;
+        await this.removeVideoFreeSourceTree(context, job, parent, directory);
+      } catch (error) {
+        if ((job.pendingSourceDeletions?.length ?? 0) === pendingCount) throw error;
+        cleanupError ??= error;
+      }
     }
+    if (cleanupError) throw cleanupError;
   }
 
   /** 完成任务前再次清理空的逐文件暂存目录；任何遗留文件都会阻止“已完成”状态。 */
@@ -1724,7 +2006,7 @@ export class ServiceOrganizeManager {
       }
       if (plan.mode === "move" || plan.washEnabled && plan.washCleanupSources
         || plan.items.some((item) => item.status === "ready" && item.action === "unrecognized")) {
-        await this.cleanupSources(context, plan);
+        await this.cleanupSources(context, plan, job);
       }
       if (job.workDirectoryId) {
         const working = await ensureWork();

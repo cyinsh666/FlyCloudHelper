@@ -90,6 +90,7 @@ export function OrganizeTaskDetail({ task, admin, onRefresh }: {
       {task.totalCount !== 0 && <div className="mt-3"><ProgressMeter value={task.completedCount + task.failedCount} total={task.totalCount} /></div>}
       {task.error && <p role="alert" className="mt-3 text-sm text-destructive">{task.error}</p>}
       {message && <p role="alert" className="mt-3 text-sm text-destructive">{message}</p>}
+      {task.supersededAt && <p className="mt-2 text-xs text-muted-foreground">已由新一轮计划接替，此记录仅供查看。</p>}
       {task.status === "failed" && task.nextRetryAt &&
         <p className="mt-2 text-xs text-muted-foreground">临时故障将在 {new Date(task.nextRetryAt).toLocaleString("zh-CN")} 自动继续（第 {(task.autoRetryCount ?? 0) + 1}/3 次）</p>}
       {task.status === "failed" && !task.nextRetryAt && task.autoRetryCount === 3 &&
@@ -100,8 +101,8 @@ export function OrganizeTaskDetail({ task, admin, onRefresh }: {
           {detailsOpen ? "收起整理详情" : "查看整理详情"}
         </SecondaryButton>
         {["queued", "running"].includes(task.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control("pause")}><Pause className="size-4" />暂停</SecondaryButton>}
-        {["paused", "failed"].includes(task.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control("resume")}><Play className="size-4" />继续</SecondaryButton>}
-        {["queued", "running", "paused", "failed"].includes(task.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control("cancel")}><Square className="size-4" />取消</SecondaryButton>}
+        {!task.supersededAt && ["paused", "failed"].includes(task.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control("resume")}><Play className="size-4" />继续</SecondaryButton>}
+        {!task.supersededAt && ["queued", "running", "paused", "failed"].includes(task.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control("cancel")}><Square className="size-4" />取消</SecondaryButton>}
       </div>
     </div>
     {detailsOpen && <div className="mt-4"><OrganizeTaskStatsPanel key={task.id} task={task} admin={admin} /></div>}
@@ -200,6 +201,7 @@ export function OrganizeTasksPanel({ admin, statusFilter }: { admin: boolean; st
               `已完成 ${selected.completedCount} · 失败 ${selected.failedCount} · 总计 ${selected.totalCount} · ${taskPercent(selected)}`}</p>
           {selected.totalCount !== 0 && <div className="mt-3"><ProgressMeter value={selected.completedCount + selected.failedCount} total={selected.totalCount} /></div>}
           {selected.error && <p role="alert" className="mt-3 text-sm text-destructive">{selected.error}</p>}
+          {selected.supersededAt && <p className="mt-2 text-xs text-muted-foreground">已由新一轮计划接替，此记录仅供查看。</p>}
           {selected.status === "failed" && selected.nextRetryAt &&
             <p className="mt-2 text-xs text-muted-foreground">临时故障将在 {new Date(selected.nextRetryAt).toLocaleString("zh-CN")} 自动继续（第 {(selected.autoRetryCount ?? 0) + 1}/3 次）</p>}
           {selected.status === "failed" && !selected.nextRetryAt && selected.autoRetryCount === 3 &&
@@ -211,8 +213,8 @@ export function OrganizeTasksPanel({ admin, statusFilter }: { admin: boolean; st
               {detailsTaskId === selected.id ? "收起整理详情" : "查看整理详情"}
             </SecondaryButton>
             {["queued", "running"].includes(selected.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control(selected, "pause")}><Pause className="size-4" />暂停</SecondaryButton>}
-            {["paused", "failed"].includes(selected.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control(selected, "resume")}><Play className="size-4" />继续</SecondaryButton>}
-            {["queued", "running", "paused", "failed"].includes(selected.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control(selected, "cancel")}><Square className="size-4" />取消</SecondaryButton>}
+            {!selected.supersededAt && ["paused", "failed"].includes(selected.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control(selected, "resume")}><Play className="size-4" />继续</SecondaryButton>}
+            {!selected.supersededAt && ["queued", "running", "paused", "failed"].includes(selected.status) && <SecondaryButton disabled={Boolean(operation)} onClick={() => void control(selected, "cancel")}><Square className="size-4" />取消</SecondaryButton>}
           </div>
           {detailsTaskId === selected.id && <div className="mt-4"><OrganizeTaskStatsPanel key={selected.id}
             task={selected} admin={admin} /></div>}

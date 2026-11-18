@@ -100,6 +100,7 @@ export async function persistContentCard(input: {
   libraryId: string;
   identityKey: string;
   generationId: string;
+  entryBatchId: string;
   movie: boolean;
   content: CmsCatalogContentItem;
   contentSource: Record<string, unknown>;
@@ -173,7 +174,8 @@ export async function persistContentCard(input: {
     mediaType: "video", itemType: movie ? "video.movie" : "video.series",
     title: content.title, sortTitle: content.title, subtitle: "", year: content.year, overview: content.overview,
     posterUrl: content.posterUrl, backdropUrl: content.backdropUrl ?? null, matchState: "matched", externalIds: {},
-    metadata: { ...cardMetadata, contentSource: { ...input.contentSource, detailState: "card" } }, generationId,
+    metadata: { ...cardMetadata, contentSource: { ...input.contentSource, detailState: "card" } },
+    generationId, entryBatchId: input.entryBatchId,
   });
   if (!result.changed) return [];
   await repository.publishContentSourceCatalogChanges(userId, libraryId, [result.itemId]);

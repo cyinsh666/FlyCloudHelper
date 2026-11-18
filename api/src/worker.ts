@@ -3183,6 +3183,8 @@ export class ScanWorker {
     const unmatchedSourceNamespace = input.job.snapshot.libraryKind === "cloud_aggregate_video"
       ? input.job.librarySourceId
       : undefined;
+    // 聚合库多个来源共享父任务批次；暂停、自动继续以及扫描根切换沿用原任务。
+    const entryBatchId = input.descriptor.mediaType === "video" ? input.job.parentJobId ?? input.job.id : undefined;
     if (input.descriptor.parent) {
       const parentDescriptor = input.descriptor.parent;
       const parentMetadata = metadata.parent ?? (input.descriptor.mediaType === "music" ? {
@@ -3232,6 +3234,7 @@ export class ScanWorker {
           externalIds: parentMetadata.externalIds,
           metadata: parentMetadata.metadata,
           generationId: input.generationId,
+          entryBatchId,
           });
         })();
         input.metadataCache.parentItems.set(parentCacheKey, parentPromise);
@@ -3275,6 +3278,7 @@ export class ScanWorker {
       externalIds: metadata.externalIds,
       metadata: { ...input.descriptor.metadata, ...metadata.metadata },
       generationId: input.generationId,
+      entryBatchId,
     });
     if (itemResult.changed || input.forceCatalogChange) changedItemIds.push(itemResult.itemId);
     const replacedByFileLink = await this.repository.linkItemFile({

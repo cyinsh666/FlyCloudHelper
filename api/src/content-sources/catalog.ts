@@ -35,6 +35,7 @@ export async function persistCmsContent(input: {
   manifest: ContentSourceManifest;
   categories: ContentSourceCategory[];
   content: CmsCatalogContentItem;
+  entryBatchId?: string;
 }): Promise<string[]> {
   const { database, repository, userId, libraryId, instanceId, content, categories, manifest } = input;
   if (categoryMatches(content.categoryId, manifest.excludedCategoryIds ?? [], categories)) return [];
@@ -42,13 +43,14 @@ export async function persistCmsContent(input: {
     || Boolean(content.parentCategoryId && manifest.movieCategoryIds.includes(content.parentCategoryId));
   const identityKey = `content:${instanceId}:${contentKey(content.id)}`;
   const generationId = randomUUID(); // 关键变量：刷新单条身份；仅完整详情路径用它淘汰该条目的过期播放线路。
+  const entryBatchId = input.entryBatchId ?? generationId; // 即时补齐详情时，父项与本次新增分集共用一次写入批次。
   // 关键变量：分类身份供协议入口筛选，电影/节目/单集共用，不参与稳定媒体 ID。
   const category = categories.find((item) => item.id === content.categoryId);
   const contentSource: Record<string, unknown> = { instanceId, remoteItemId: content.id, categoryId: content.categoryId, categoryName: content.categoryName || category?.name || "", parentCategoryId: content.parentCategoryId ?? category?.parentId ?? null };
   const supportsCards = manifest.adapter === "python_spider" || manifest.adapter === "catvod_js" || manifest.adapter === "cms_json";
   if (supportsCards && content.detailState === "card") {
     const countries = originCountries(content.area); // 摘要和完整详情沿用同一份明确地区转换。
-    return persistContentCard({ database, repository, userId, libraryId, identityKey, generationId, movie, content, contentSource,
+    return persistContentCard({ database, repository, userId, libraryId, identityKey, generationId, entryBatchId, movie, content, contentSource,
       metadata: { originCountries: countries, productionCountries: countries } });
   }
   // 空详情不创建虚构分集，也不能把尚未补齐的卡片标记为完成。
@@ -68,7 +70,7 @@ export async function persistCmsContent(input: {
   const common = {
     userId, serviceId: null, libraryId, mediaType: "video" as const,
     year: content.year, overview: content.overview, posterUrl: content.posterUrl, backdropUrl: content.backdropUrl ?? null,
-    matchState: "matched" as const, externalIds: {}, generationId,
+    matchState: "matched" as const, externalIds: {}, generationId, entryBatchId,
   };
   const parent = await repository.upsertMediaItem({
     ...common, id: createStableId("itm", libraryId, identityKey), identityKey,
@@ -78,7 +80,7 @@ export async function persistCmsContent(input: {
   const changedIds = new Set<string>(parent.changed || parentCategoryChanged ? [parent.itemId] : []);
   let episodeItems = new Map<string, string>();
   if (!movie) {
-    const children = await persistCmsEpisodes({ database, userId, libraryId, identityKey, generationId, content, metadata,
+    const children = await persistCmsEpisodes({ database, userId, libraryId, identityKey, generationId, entryBatchId, content, metadata,
       /** 人工分集仍走仓储原处理，批量写入不会覆盖人工字段。 */
       upsertManualEpisode: async (episode, episodeIdentityKey) => {
         const child = await repository.upsertMediaItem({

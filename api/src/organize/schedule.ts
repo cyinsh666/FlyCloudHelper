@@ -193,7 +193,7 @@ export class ServiceOrganizeScheduler {
         unrecognizedDirectory: schedule.unrecognizedDirectory,
         aiAssistEnabled: schedule.aiAssistEnabled, aiModelId: schedule.aiModelId,
         washEnabled: schedule.washEnabled, washPriorities: schedule.washPriorities, washCleanupSources: schedule.washCleanupSources,
-      });
+      }, true);
       const now = new Date().toISOString();
       schedule.pendingPlanId = plan.id;
       schedule.pendingRunKind = "manual";
@@ -293,7 +293,7 @@ export class ServiceOrganizeScheduler {
           unrecognizedTransferEnabled: schedule.unrecognizedTransferEnabled,
           unrecognizedDirectory: schedule.unrecognizedDirectory,
           aiAssistEnabled: schedule.aiAssistEnabled, aiModelId: schedule.aiModelId,
-          washEnabled: schedule.washEnabled, washPriorities: schedule.washPriorities, washCleanupSources: schedule.washCleanupSources });
+          washEnabled: schedule.washEnabled, washPriorities: schedule.washPriorities, washCleanupSources: schedule.washCleanupSources }, true);
         schedule.lastTriggeredAt = now.toISOString();
         schedule.nextRunAt = calculateNextScanRunAt(schedule, now);
         schedule.pendingPlanId = plan.id;
@@ -319,6 +319,7 @@ export class ServiceOrganizeScheduler {
       schedule.lastBlockedNotificationKey = null;
       schedule.lastRunMessage = hasReadyItems ? "已启动整理任务"
         : plan.washEnabled && plan.washCleanupSources ? "已启动来源剩余内容清理" : "本次没有可整理的内容";
+      if (plan.deferredResources?.length) schedule.lastRunMessage += `，上轮 ${plan.deferredResources.length} 项网盘资源仍待确认`;
       schedule.pendingPlanId = null;
       schedule.pendingRunKind = undefined;
       schedule.updatedAt = new Date().toISOString();

@@ -734,6 +734,7 @@ export class ContentSourceManager {
           ...(options.sample ? { sampledItemIdsByCategory: {} } : {}),
         }
         : previousSync.pendingBatch;
+      if (mode === "next" && pendingBatch && !pendingBatch.entryBatchId) pendingBatch.entryBatchId = randomUUID();
       const nextSync: ContentSourceSyncState = { ...previousSync, status: "queued", processedCount: 0, pageCount: mode === "next" ? pendingBatch!.pageCount : requestedPageCount, startedAt: new Date().toISOString(), finishedAt: null, lastError: null, nextPageByCategory: { ...previousSync.nextPageByCategory }, ...(pendingBatch ? { pendingBatch } : {}) };
       const changed = await transaction("content_source_libraries").where({ library_id: libraryId, user_id: userId }).whereNotIn("sync_status", ["queued", "running"]).update({ sync_status: "queued", sync_json: JSON.stringify(nextSync), updated_at: new Date().toISOString() });
       if (changed !== 1) throw new ApiError(409, "content_sync_running", "此在线库已经在同步");
@@ -756,6 +757,8 @@ export class ContentSourceManager {
       const runtime = await this.adapter(detail.source.id, userId);
       const categories = await runtime.adapter.categories(signal);
       await this.saveCategoryCatalog(libraryId, userId, categories);
+      // 连续导入中途失败时保留原批次；一次目录刷新或首页同步使用自己的批次。
+      const entryBatchId = (mode === "next" ? sync.pendingBatch?.entryBatchId : undefined) ?? randomUUID();
       /** 单条成功入库后同时保存处理数量和样本检查点，重试不能重置剩余额度。 */
       const persist = async (content: Awaited<ReturnType<VideoSourceAdapter["detail"]>>, sampleCategoryId?: string) => {
         signal.throwIfAborted();
@@ -767,7 +770,10 @@ export class ContentSourceManager {
         }
         if (categoryMatches(content.categoryId, runtime.manifest.excludedCategoryIds ?? [], categories)) return;
         await this.adapter(detail.source.id, userId); // 关键变量：每次入库前重新检查源和插件状态，停用后不继续写入。
-        await this.withContentWrite(libraryId, detail.source.id, content.id, () => persistCmsContent({ database: this.database, repository: this.repository, userId, libraryId, instanceId: detail.source.id, manifest: runtime.manifest, categories, content }), signal);
+        await this.withContentWrite(libraryId, detail.source.id, content.id, () => persistCmsContent({
+          database: this.database, repository: this.repository, userId, libraryId, instanceId: detail.source.id,
+          manifest: runtime.manifest, categories, content, entryBatchId,
+        }), signal);
         sync.processedCount += 1;
         if (sampleCategoryId && sync.pendingBatch?.sample) {
           const batch = sync.pendingBatch;

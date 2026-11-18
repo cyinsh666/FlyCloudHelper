@@ -2,6 +2,12 @@ import { randomUUID } from "node:crypto";
 import type { FlyCloudHelperDatabase } from "../database.js";
 import { parseJsonObject } from "../domain.js";
 import { createStableId } from "../media/filename.js";
+import {
+  incomingCatalogColumn,
+  preserveCatalogEntryBatchOnConflict,
+  readCatalogEntryBatch,
+  withCatalogEntryBatch,
+} from "../media/catalog-entry-batch.js";
 import { contentKey } from "./cms-adapter.js";
 import type { CmsCatalogContentItem } from "./types.js";
 
@@ -13,6 +19,7 @@ interface EpisodeBatchInput {
   libraryId: string;
   identityKey: string;
   generationId: string;
+  entryBatchId: string;
   content: CmsCatalogContentItem;
   metadata: Record<string, unknown>;
   /** 人工匹配继续使用既有仓储保护展示字段，并独立补齐源分类。 */
@@ -37,7 +44,7 @@ function episodeChanged(previous: Record<string, unknown> | undefined, payload: 
 
 /** 源节目完整保存分集；每批只读取一次旧数据并写入一次，人工条目不进入批量覆盖。 */
 export async function persistCmsEpisodes(input: EpisodeBatchInput): Promise<{ itemIdsByEpisodeKey: Map<string, string>; changedIds: string[] }> {
-  const { database, userId, libraryId, identityKey, generationId, content, metadata } = input;
+  const { database, userId, libraryId, identityKey, generationId, entryBatchId, content, metadata } = input;
   const selectedEpisodes = uniqueEpisodes(content);
   const itemIdsByEpisodeKey = new Map<string, string>();
   const changedIds = new Set<string>();
@@ -56,7 +63,8 @@ export async function persistCmsEpisodes(input: EpisodeBatchInput): Promise<{ it
       for (const [index, episode] of episodes.entries()) {
         const identity = identities[index]!;
         const previous = previousByIdentity.get(identity);
-        const manualMatch = previous ? parseJsonObject(previous.metadata_json).manualMatch : undefined;
+        const previousMetadata = previous ? parseJsonObject(previous.metadata_json) : {};
+        const manualMatch = previousMetadata.manualMatch;
         if (manualMatch && typeof manualMatch === "object" && !Array.isArray(manualMatch) && Object.keys(manualMatch).length > 0) {
           manual.push({ episode, identity });
           continue;
@@ -68,17 +76,25 @@ export async function persistCmsEpisodes(input: EpisodeBatchInput): Promise<{ it
           title: episode.name, sort_title: episode.name, subtitle: content.title, year: content.year,
           premiere_date: null, overview: content.overview, poster_url: content.posterUrl, backdrop_url: content.backdropUrl ?? null,
           match_state: "matched", external_ids_json: "{}",
-          metadata_json: JSON.stringify({ ...metadata, seriesTitle: content.title, seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber }),
+          metadata_json: JSON.stringify(withCatalogEntryBatch({
+            ...metadata, seriesTitle: content.title, seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber,
+          }, previous ? readCatalogEntryBatch(previousMetadata) : entryBatchId)),
           generation_id: generationId, created_at: previous?.created_at ?? now, updated_at: now, deleted_at: null,
         };
         rows.push(payload);
         itemIdsByEpisodeKey.set(episode.episodeKey, itemId);
         if (episodeChanged(previous, payload)) changedIds.add(itemId);
       }
-      if (rows.length) await transaction("media_items").insert(rows).onConflict(["user_id", "library_id", "identity_key"]).merge([
-        "media_type", "item_type", "region_group", "title", "sort_title", "subtitle", "year", "premiere_date", "overview", "poster_url", "backdrop_url",
-        "match_state", "external_ids_json", "metadata_json", "generation_id", "updated_at", "deleted_at",
-      ]);
+      if (rows.length) {
+        const updateColumns = [
+          "media_type", "item_type", "region_group", "title", "sort_title", "subtitle", "year", "premiere_date", "overview", "poster_url", "backdrop_url",
+          "match_state", "external_ids_json", "generation_id", "updated_at", "deleted_at",
+        ];
+        const updates = Object.fromEntries(updateColumns.map((column) =>
+          [column, incomingCatalogColumn(transaction, database.databaseType, column)]));
+        updates.metadata_json = preserveCatalogEntryBatchOnConflict(transaction, database.databaseType);
+        await transaction("media_items").insert(rows).onConflict(["user_id", "library_id", "identity_key"]).merge(updates);
+      }
       return manual;
     });
     for (const { episode, identity } of manualEpisodes) {
