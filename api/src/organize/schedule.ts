@@ -180,11 +180,13 @@ export class ServiceOrganizeScheduler {
         throw new ApiError(422, "organize_schedule_paths_missing", "请先保存来源目录和目标目录");
       }
       if (schedule.pendingPlanId) throw new ApiError(409, "organize_schedule_pending", "已有整理预览正在准备");
+      await this.manager.requireNoActiveScan(serviceId);
       const active = (await this.manager.listJobs(serviceId, actorUserId))
         .find((job) => ["queued", "running", "paused"].includes(job.status));
       if (active) throw new ApiError(409, "organize_job_active", "当前服务已有排队、运行或暂停的整理任务");
-      if (!(await this.manager.capabilities(serviceId, actorUserId)).supported) {
-        throw new ApiError(409, "organize_service_unavailable", "网盘服务当前不支持影片整理");
+      const capability = await this.manager.capabilities(serviceId, actorUserId);
+      if (!capability.supported) {
+        throw new ApiError(409, "organize_service_unavailable", capability.reason ?? "网盘服务当前不支持影片整理");
       }
       if (schedule.aiAssistEnabled) await prepareOrganizeAi(this.runtime, schedule.aiModelId ?? "");
       const plan = await this.manager.createPlan(serviceId, actorUserId, {
@@ -303,16 +305,19 @@ export class ServiceOrganizeScheduler {
         schedule.updatedAt = now.toISOString();
         await saveSchedule(this.fileName(serviceId), schedule);
         this.schedulePendingProcess(serviceId);
-      } catch (error) { await this.retry(schedule, error instanceof Error ? error.message : "生成预览失败"); }
+      } catch (error) { await this.handleTriggerError(schedule, error, "生成预览失败"); }
       return;
     }
     try {
       const plan = await this.manager.getPlan(serviceId, schedule.pendingPlanId, schedule.userId);
       if (plan.status === "preparing") { this.schedulePendingProcess(serviceId); return; }
-      if (plan.status === "failed") throw new Error(plan.error ?? "识别预览失败");
       const hasReadyItems = plan.items.some((item) => item.status === "ready");
       // 关键变量：任务创建后、计划保存前若重启，用 planId 找回已有任务。
       const existing = (await this.manager.listJobs(serviceId)).find((job) => job.planId === plan.id);
+      if (!existing) {
+        await this.manager.requireNoActiveScan(serviceId);
+        if (plan.status === "failed") throw new Error(plan.error ?? "识别预览失败");
+      }
       const job = existing ?? await this.manager.createJob(serviceId, plan.id, schedule.userId, !hasReadyItems);
       schedule.lastJobId = job.id;
       schedule.lastError = null;
@@ -325,8 +330,25 @@ export class ServiceOrganizeScheduler {
       schedule.updatedAt = new Date().toISOString();
       await saveSchedule(this.fileName(serviceId), schedule);
     } catch (error) {
-      await this.retry(schedule, error instanceof Error ? error.message : "启动整理任务失败");
+      await this.handleTriggerError(schedule, error, "启动整理任务失败");
     }
+  }
+
+  /** 扫描占用属于等待状态，扫描结束后重新生成定时整理预览。 */
+  private async handleTriggerError(schedule: OrganizeSchedule, error: unknown, fallback: string): Promise<void> {
+    if (!(error instanceof ApiError) || error.code !== "organize_scan_active") {
+      await this.retry(schedule, error instanceof Error ? error.message : fallback);
+      return;
+    }
+    const manualRun = schedule.pendingRunKind === "manual";
+    const now = new Date();
+    schedule.pendingPlanId = null;
+    schedule.pendingRunKind = undefined;
+    schedule.lastError = null;
+    schedule.lastRunMessage = manualRun ? error.message : "当前网盘有未结束的扫描任务，定时整理等待中";
+    if (!manualRun) schedule.nextRunAt = schedule.enabled ? new Date(now.getTime() + 5 * 60_000).toISOString() : null;
+    schedule.updatedAt = now.toISOString();
+    await saveSchedule(this.fileName(schedule.serviceId), schedule);
   }
 
   /** 占用时稍后检查；预览或创建失败则放弃本轮，按原配置等待下一轮。 */

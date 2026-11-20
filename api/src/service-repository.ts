@@ -87,6 +87,26 @@ export interface LibrarySourceRuntimeConfiguration {
   metadataProfile: Record<string, unknown>;
 }
 
+/** 检查前记录源文件的版本，提交时忽略检查期间被重新扫描或修改的记录。 */
+export type ExistingVideoFile = Pick<SourceFileRecord, "id" | "providerResourceId" | "parentResourceId" | "path" | "locator">
+  & { updatedAt: string };
+
+/** 缺失结果附带检查时使用的网盘来源和凭据版本。 */
+export interface MovieFileCheckResult {
+  librarySourceId: string;
+  serviceId: string | null;
+  credentialRevision: number;
+  files: ExistingVideoFile[];
+}
+
+/** 远端删除前使用扫描时记录的文件名与指纹核对原文件。 */
+export type CatalogMovieFile = ExistingVideoFile & {
+  librarySourceId: string;
+  name: string;
+  size: number;
+  modifiedAt: string | null;
+};
+
 /** 从已解析JSON字段读取字符串数组，过滤非字符串和值为空的条目。 */
 function readStringArray(value: unknown): string[] {
   return Array.isArray(value)
@@ -2398,15 +2418,15 @@ export class ServiceRepository {
     clientDeviceId: string;
     scanMode: "incremental" | "full";
     sourceCount: number;
-  }): Promise<LibraryScanJobRecord> {
-    const existing = await this.database.query("library_scan_jobs").where({
+  }, query: Knex = this.database.query): Promise<LibraryScanJobRecord> {
+    const existing = await query("library_scan_jobs").where({
       user_id: input.userId,
       client_device_id: input.clientDeviceId,
       request_id: input.requestId,
     }).first();
-    if (existing) return this.getLibraryScanJob(String(existing.id), input.userId);
+    if (existing) return this.getLibraryScanJob(String(existing.id), input.userId, query);
     const now = new Date().toISOString();
-    await this.database.query("library_scan_jobs").insert({
+    await query("library_scan_jobs").insert({
       id: input.id,
       user_id: input.userId,
       library_id: input.libraryId,
@@ -2431,19 +2451,79 @@ export class ServiceRepository {
       notification_sent_at: null,
       updated_at: now,
     });
-    return this.getLibraryScanJob(input.id, input.userId);
+    return this.getLibraryScanJob(input.id, input.userId, query);
   }
 
   /** 读取媒体库扫描父任务和全部来源子任务。 */
-  public async getLibraryScanJob(parentJobId: string, userId?: string): Promise<LibraryScanJobRecord> {
-    const query = this.database.query("library_scan_jobs").where({ id: parentJobId });
+  public async getLibraryScanJob(parentJobId: string, userId?: string, database: Knex = this.database.query): Promise<LibraryScanJobRecord> {
+    const query = database("library_scan_jobs").where({ id: parentJobId });
     if (userId) query.where({ user_id: userId });
     const row = await query.first();
     if (!row) throw new ApiError(404, "library_scan_job_not_found", "媒体库扫描任务不存在");
-    const childRows = await this.jobSummaryQuery()
+    const childRows = await this.jobSummaryQuery(database)
       .where("j.parent_job_id", parentJobId)
       .orderBy("j.created_at", "asc") as unknown as JobRow[];
     return mapLibraryScanJob(row as Record<string, unknown>, childRows.map(mapJob));
+  }
+
+  /** 按媒体库来源创建影片检查任务，聚合的父子任务在同一事务内入队。 */
+  public async createVideoExistenceCheck(input: {
+    library: MediaLibraryRecord;
+    requestedByUserId: string;
+    requestId: string;
+    clientDeviceId: string;
+  }): Promise<{ job: ScanJobRecord | LibraryScanJobRecord; skippedSourceCount: number }> {
+    const { library, ...request } = input;
+    if (library.dataType !== "video" || !["legacy_single_source", "cloud_aggregate_video"].includes(library.libraryKind)) {
+      throw new ApiError(409, "video_existence_check_unsupported", "只有单网盘影视库和云聚合视频库可以检查已有影片");
+    }
+    if (library.status !== "active") throw new ApiError(409, "library_not_active", "请先启用媒体库");
+    const isAggregate = library.libraryKind === "cloud_aggregate_video";
+    const sources = library.sources.filter((source) => isAggregate || source.id === library.sourceId);
+    const readySources = sources.filter((source) => source.status === "active" && source.connectionStatus === "valid" && source.credentialConfigured
+      && (source.serviceStatus === null || source.serviceStatus === "active"));
+    if (!readySources.length) throw new ApiError(409, "library_sources_not_ready", "没有可检查的网盘来源，请先恢复连接");
+    const skippedSourceCount = sources.length - readySources.length;
+    return this.database.query.transaction(async (transaction) => {
+      const libraryQuery = transaction("media_libraries").where({ id: library.id, user_id: library.userId, status: "active" });
+      // PostgreSQL 使用非键更新锁，任务入队的外键检查仍可读取媒体库主键。
+      if (this.database.databaseType === "postgres") libraryQuery.forNoKeyUpdate();
+      else if (this.database.databaseType !== "sqlite") libraryQuery.forUpdate();
+      if (!(await libraryQuery.first())) throw new ApiError(409, "library_not_active", "请先启用媒体库");
+      const task = {
+        ...request, libraryId: library.id, userId: library.userId, scanMode: "full" as const,
+        runtimeRevision: "scanner-worker-v1", tmdbKeyPoolRevision: "", aiModel: null, pluginVersions: [],
+        taskPurpose: "check_existing_video" as const,
+      };
+      if (isAggregate) {
+        const prior = await transaction("library_scan_jobs").select("id").where({
+          library_id: library.id, user_id: library.userId, request_id: request.requestId, client_device_id: request.clientDeviceId,
+        }).first();
+        if (prior) return { job: await this.getLibraryScanJob(String(prior.id), library.userId, transaction), skippedSourceCount };
+      } else {
+        const prior = await this.findJobByRequest(library.userId, request.clientDeviceId, request.requestId, transaction);
+        if (prior) return { job: prior, skippedSourceCount };
+      }
+      if (await transaction("scan_jobs").where({ library_id: library.id, user_id: library.userId })
+        .whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first()) {
+        throw new ApiError(409, "scan_job_conflict", "当前媒体库已有未结束任务，不能重复启动");
+      }
+      if (!isAggregate) {
+        const job = await this.createScanJob({ ...task, jobId: randomUUID(), librarySourceId: library.sourceId }, transaction);
+        return { job, skippedSourceCount };
+      }
+      const parent = await this.createLibraryScanJob({
+        ...task, id: randomUUID(), sourceCount: readySources.length,
+      }, transaction);
+      // 关键变量：来源锁按固定顺序领取，任一来源冲突时整批回滚。
+      for (const source of [...readySources].sort((a, b) => (a.serviceId ?? a.id).localeCompare(b.serviceId ?? b.id))) {
+        await this.createScanJob({
+          ...task, jobId: randomUUID(), librarySourceId: source.id, parentJobId: parent.id,
+          requestId: `${request.requestId.slice(0, 130)}:${source.id}`,
+        }, transaction);
+      }
+      return { job: await this.getLibraryScanJob(parent.id, library.userId, transaction), skippedSourceCount };
+    });
   }
 
   /** 根据来源子任务的真实状态重新汇总父任务。 */
@@ -2561,7 +2641,7 @@ export class ServiceRepository {
   }): Promise<string> {
     const id = createStableId("catalog-projection", input.sourceScanJobId, input.eventKey);
     const now = new Date().toISOString();
-    await this.database.query("catalog_projection_jobs").insert({
+    const insert = this.database.query("catalog_projection_jobs").insert({
       id,
       user_id: input.userId,
       library_id: input.libraryId,
@@ -2583,8 +2663,22 @@ export class ServiceRepository {
       created_at: now,
       updated_at: now,
       finished_at: null,
-    }).onConflict(["source_scan_job_id", "event_key"]).ignore();
+    }).onConflict(["source_scan_job_id", "event_key"]);
+    const requeued = { status: "queued", created_at: now, updated_at: now };
+    // 关键变量：只有本次重放确实重新提交的中断记录才重新进入队列。
+    if (this.database.databaseType === "mysql") {
+      await insert.ignore();
+      await this.database.query("catalog_projection_jobs").where({ id, status: "interrupted" }).update(requeued);
+    } else {
+      await insert.merge(requeued).where("catalog_projection_jobs.status", "interrupted");
+    }
     return id;
+  }
+
+  /** 领取时只看运行中的扫描，暂停或取消的扫描不再占用目录写入队首。 */
+  private activeCatalogProjectionQueue(transaction: Knex.Transaction) {
+    return transaction("catalog_projection_jobs").whereIn("source_scan_job_id",
+      transaction("scan_jobs").select("id").where({ status: "running" }));
   }
 
   /** 只有全局队首投影可以被领取，保证多个来源子任务不会并发合并同一媒体目录。 */
@@ -2596,7 +2690,7 @@ export class ServiceRepository {
       if (target.status === "failed") throw new ApiError(500, "catalog_projection_failed", "目录投影任务已经失败");
       const now = new Date().toISOString();
       // 关键变量：未过期的 processing 项即全局队首锁，必须阻止后续 queued 项越过它并发写目录。
-      let activeLeaseQuery = transaction("catalog_projection_jobs")
+      let activeLeaseQuery = this.activeCatalogProjectionQueue(transaction)
         .where({ status: "processing" })
         .where("lease_expires_at", ">", now)
         .orderBy("created_at", "asc")
@@ -2604,7 +2698,7 @@ export class ServiceRepository {
       if (this.database.databaseType !== "sqlite") activeLeaseQuery = activeLeaseQuery.forUpdate();
       const activeLease = await activeLeaseQuery.first();
       if (activeLease) return "waiting";
-      let headQuery = transaction("catalog_projection_jobs")
+      let headQuery = this.activeCatalogProjectionQueue(transaction)
         .where((builder) => builder.where({ status: "queued" }).orWhere((nested) => nested
           .where({ status: "processing" })
           .where("lease_expires_at", "<=", now)))
@@ -2664,7 +2758,7 @@ export class ServiceRepository {
     runtimeRevision: string;
     tmdbKeyPoolRevision: string;
     aiModel: AiModelTaskSnapshot | null;
-    taskPurpose?: "standard" | "ai_supplement_unmatched";
+    taskPurpose?: "standard" | "ai_supplement_unmatched" | "check_existing_video";
     targetedScope?: TargetedVideoScanScope;
     retryOfJobId?: string;
     pluginVersions: Array<{
@@ -2673,13 +2767,13 @@ export class ServiceRepository {
       sha256: string;
       configurationRevision: number;
     }>;
-  }): Promise<ScanJobRecord> {
-    const existing = await this.findJobByRequest(input.userId, input.clientDeviceId, input.requestId);
+  }, database: Knex = this.database.query): Promise<ScanJobRecord> {
+    const existing = await this.findJobByRequest(input.userId, input.clientDeviceId, input.requestId, database);
     if (existing) {
       return existing;
     }
     try {
-      return await this.database.query.transaction(async (transaction) => {
+      return await database.transaction(async (transaction) => {
         let sourceQuery = transaction("library_sources as ls")
           .join("media_libraries as l", "l.id", "ls.library_id")
           .leftJoin("cloud_services as s", "s.id", "ls.service_id")
@@ -2801,7 +2895,7 @@ export class ServiceRepository {
       });
     } catch (error) {
       // 并发请求可能同时通过事务外查询；唯一索引冲突后返回已经创建的同一任务。
-      const racedJob = await this.findJobByRequest(input.userId, input.clientDeviceId, input.requestId);
+      const racedJob = await this.findJobByRequest(input.userId, input.clientDeviceId, input.requestId, database);
       if (racedJob) {
         return racedJob;
       }
@@ -2810,8 +2904,8 @@ export class ServiceRepository {
   }
 
   /** 按幂等键查询任务。 */
-  private async findJobByRequest(userId: string, clientDeviceId: string, requestId: string): Promise<ScanJobRecord | null> {
-    const row = await this.jobSummaryQuery().where({
+  private async findJobByRequest(userId: string, clientDeviceId: string, requestId: string, database: Knex = this.database.query): Promise<ScanJobRecord | null> {
+    const row = await this.jobSummaryQuery(database).where({
       "j.user_id": userId,
       "j.client_device_id": clientDeviceId,
       "j.request_id": requestId,
@@ -3275,6 +3369,11 @@ export class ServiceRepository {
       if (changed !== 1) {
         return null;
       }
+      // 关键变量：原执行者已退出，先让遗留投影退出队列，安全检查点会重放尚需处理的内容。
+      await transaction("catalog_projection_jobs").where({ source_scan_job_id: row.id })
+        .whereIn("status", ["queued", "processing"]).update({
+          status: "interrupted", lease_owner: null, lease_expires_at: null, updated_at: now,
+        });
       if (row.service_id) {
         await transaction("cloud_services").where({ id: row.service_id }).update({ status: "scanning", updated_at: now });
       }
@@ -3521,6 +3620,7 @@ export class ServiceRepository {
         ? Number(source.credential_revision)
         : Number(service?.credential_revision);
       const usesCurrentCredential = currentCredentialRevision === Number(current.snapshot.credentialRevision);
+      const checksExisting = current.snapshot.taskPurpose === "check_existing_video";
       // 关键变量：不同网盘使用不同错误码，但都必须进入同一重新授权状态流转。
       const isAuthenticationFailure = input.status === "failed"
         && isProviderAuthenticationErrorCode(input.errorCode);
@@ -3533,7 +3633,7 @@ export class ServiceRepository {
         } else if (input.status === "failed" && ["cloud123_business_failed", "cloud123_account_attention_required"].includes(input.errorCode ?? "")
           && source?.provider_type === "cloud123" && connectionStatus !== "reauthorization_required") {
           connectionStatus = "cloud123_business_failed";
-        } else if (input.status === "completed" && current.snapshot.taskPurpose !== "ai_supplement_unmatched") {
+        } else if (input.status === "completed" && !checksExisting && current.snapshot.taskPurpose !== "ai_supplement_unmatched") {
           connectionStatus = "valid";
         }
       }
@@ -3546,16 +3646,16 @@ export class ServiceRepository {
       if (source?.source_mode === "owned_copy") {
         await transaction("library_sources").where({ id: current.librarySourceId }).update({
           ...connectionPatch,
-          ...(input.status === "completed" ? { last_scan_at: now } : {}),
+          ...(input.status === "completed" && !checksExisting ? { last_scan_at: now } : {}),
         });
       } else if (service) {
         await transaction("cloud_services").where({ id: service.id }).update(connectionPatch);
-        if (input.status === "completed") {
+        if (input.status === "completed" && !checksExisting) {
           await transaction("library_sources").where({ id: current.librarySourceId }).update({ last_scan_at: now, updated_at: now });
         }
       }
       // AI 补充只处理数据库现有未匹配内容，完成时不能伪造一次网盘扫描时间。
-      if (input.status === "completed" && current.snapshot.taskPurpose !== "ai_supplement_unmatched") {
+      if (input.status === "completed" && !checksExisting && current.snapshot.taskPurpose !== "ai_supplement_unmatched") {
         const updatedLibraryCount = await transaction("media_libraries")
           .where({ id: current.libraryId, user_id: current.userId })
           .update({ last_scan_at: now, updated_at: now });
@@ -4104,6 +4204,9 @@ export class ServiceRepository {
         throw new ApiError(409, "library_has_active_job", "媒体库仍有未结束后台任务");
       }
       await this.deleteLibraryProtocolData(transaction, libraryId);
+      // 先按媒体库批量清掉候选资料和投影记录，减少源文件及扫描任务逐条级联删除的开销。
+      await transaction("catalog_projection_jobs").where({ library_id: libraryId }).delete();
+      await transaction("media_item_source_candidates").where({ library_id: libraryId }).delete();
       // 历史任务在媒体库删除时一并清理，否则其 library_source_id 会阻止解除来源关联。
       await transaction("scan_jobs").where({ library_id: libraryId }).delete();
       await transaction("media_probe_jobs").where({ library_id: libraryId }).delete();
@@ -4530,6 +4633,225 @@ export class ServiceRepository {
       事件: "协议播放确认来源文件已删除",
       用户ID: userId,
       源文件ID: sourceFileId,
+    });
+  }
+
+  /** 只检查当前来源中已关联到有效影视条目的活动文件。 */
+  public async listExistingVideoFiles(job: ScanJobRecord): Promise<ExistingVideoFile[]> {
+    const rows = await this.database.query("source_files as f")
+      .select("f.id", "f.provider_resource_id", "f.parent_resource_id", "f.path", "f.locator_json", "f.updated_at")
+      .where({ "f.user_id": job.userId, "f.library_id": job.libraryId, "f.library_source_id": job.librarySourceId, "f.status": "active" })
+      .whereExists(this.database.query("file_links as fl").join("media_items as i", "i.id", "fl.item_id")
+        .select("fl.id").whereRaw("?? = ??", ["fl.source_file_id", "f.id"]).whereNull("i.deleted_at")
+        .whereIn("i.item_type", ["video.movie", "video.episode", "video.series"]))
+      .orderBy(["f.parent_resource_id", "f.path", "f.id"]);
+    return rows.map((row) => ({
+      id: String(row.id), providerResourceId: String(row.provider_resource_id),
+      parentResourceId: row.parent_resource_id ? String(row.parent_resource_id) : null,
+      path: String(row.path), locator: parseJsonObject(row.locator_json), updatedAt: String(row.updated_at),
+    }));
+  }
+
+  /** 只查当前节目直接关联的单集，防止将同库别的条目纳入操作。 */
+  private movieOperationEpisodes(query: Knex | Knex.Transaction, item: MediaItemRecord) {
+    return query("media_relations as relation").join("media_items as episode", "episode.id", "relation.child_item_id")
+      .where({
+        "relation.parent_item_id": item.id, "relation.user_id": item.userId, "relation.library_id": item.libraryId,
+        "relation.relation_type": "series_episode", "episode.user_id": item.userId, "episode.library_id": item.libraryId,
+        "episode.item_type": "video.episode",
+      });
+  }
+
+  /** 查找其他仍可用的父条目，防止操作当前节目时删除共享的单集资料。 */
+  private otherMovieOperationParents(query: Knex | Knex.Transaction, item: MediaItemRecord) {
+    return query("media_relations as relation").join("media_items as parent", "parent.id", "relation.parent_item_id")
+      .select("relation.id").where({ "relation.user_id": item.userId, "relation.library_id": item.libraryId,
+        "parent.user_id": item.userId, "parent.library_id": item.libraryId })
+      .whereRaw("?? = ??", ["relation.child_item_id", "episode.id"])
+      .whereNot("relation.parent_item_id", item.id).whereNull("parent.deleted_at");
+  }
+
+  /** 查询影片或节目所关联的活动文件，包含暂不可用来源。 */
+  private activeMovieFiles(query: Knex | Knex.Transaction, item: MediaItemRecord) {
+    const links = query("file_links as fl").select("fl.id")
+      .where({ "fl.user_id": item.userId, "fl.library_id": item.libraryId })
+      .whereRaw("?? = ??", ["fl.source_file_id", "f.id"])
+      .where((scope) => {
+        scope.where("fl.item_id", item.id);
+        if (item.itemType === "video.series") scope.orWhereIn("fl.item_id",
+          this.movieOperationEpisodes(query, item).whereNull("episode.deleted_at").select("episode.id"));
+      });
+    return query("source_files as f")
+      .where({ "f.user_id": item.userId, "f.library_id": item.libraryId, "f.status": "active" })
+      .whereExists(links);
+  }
+
+  /** 读取检测与删除时要核对的文件定位和版本，同步删除前拦截共享单集原文件。 */
+  public async listMovieFilesForCheck(item: MediaItemRecord, operation: "check" | "catalog_only" | "with_files" = "check"): Promise<CatalogMovieFile[]> {
+    const query = this.database.query;
+    if (operation === "with_files" && item.itemType === "video.series") {
+      const sharedEpisode = await this.movieOperationEpisodes(query, item).whereNull("episode.deleted_at")
+        .whereExists(this.otherMovieOperationParents(query, item))
+        .whereExists(query("file_links as fl").join("source_files as sf", "sf.id", "fl.source_file_id").select("fl.id")
+          .where({ "fl.user_id": item.userId, "fl.library_id": item.libraryId, "sf.status": "active" })
+          .whereRaw("?? = ??", ["fl.item_id", "episode.id"]))
+        .first("episode.id");
+      if (sharedEpisode) throw new ApiError(409, "series_has_shared_files", "部分单集仍被其他节目引用，可以取消勾选同步删除网盘原文件后再删除节目");
+    }
+    const rows = await this.activeMovieFiles(query, item)
+      .select("f.id", "f.library_source_id", "f.provider_resource_id", "f.parent_resource_id", "f.path", "f.name", "f.size", "f.modified_at", "f.locator_json", "f.updated_at")
+      .orderBy(["f.library_source_id", "f.parent_resource_id", "f.path", "f.id"]);
+    return rows.map((row) => ({
+      id: String(row.id), librarySourceId: String(row.library_source_id), providerResourceId: String(row.provider_resource_id),
+      parentResourceId: row.parent_resource_id ? String(row.parent_resource_id) : null,
+      path: String(row.path), locator: parseJsonObject(row.locator_json), updatedAt: String(row.updated_at),
+      name: String(row.name), size: Number(row.size), modifiedAt: row.modified_at ? String(row.modified_at) : null,
+    }));
+  }
+
+  /** 提交已确认缺失的版本，显式删除时清除影片或节目和独占单集的资料。 */
+  public async applyMovieFileCheck(item: MediaItemRecord, results: MovieFileCheckResult[],
+    operation: "check" | "catalog_only" | "with_files" = "check"): Promise<string[]> {
+    return this.database.query.transaction(async (transaction) => {
+      const confirmedIds: string[] = [];
+      for (const result of results) {
+        const sourceQuery = transaction("library_sources").where({
+          id: result.librarySourceId, user_id: item.userId, library_id: item.libraryId, status: "active",
+        });
+        if (this.database.databaseType !== "sqlite") sourceQuery.forUpdate();
+        const source = await sourceQuery.first();
+        if (!source) continue;
+        const serviceId = source.source_mode === "linked_service" ? String(source.service_id ?? "") : null;
+        if (serviceId !== result.serviceId) continue;
+        const serviceQuery = serviceId ? transaction("cloud_services")
+          .where({ id: serviceId, user_id: item.userId }).whereIn("status", ["active", "scanning"]).whereNull("deleted_at") : null;
+        if (serviceQuery && this.database.databaseType !== "sqlite") serviceQuery.forUpdate();
+        // 文件和凭据都必须仍是检测时的版本，扫描或换号期间产生的新状态留待下次确认。
+        const credentialSource = serviceQuery ? await serviceQuery.first() : source;
+        if (credentialSource?.connection_status !== "valid" || Number(credentialSource.credential_revision) !== result.credentialRevision) continue;
+        const versions = new Map(result.files.map((file) => [file.id, file.updatedAt]));
+        for (const ids of chunkStrings([...versions.keys()])) {
+          const fileQuery = this.activeMovieFiles(transaction, item).select("f.id", "f.updated_at")
+            .where("f.library_source_id", result.librarySourceId).whereIn("f.id", ids).orderBy("f.id");
+          if (this.database.databaseType !== "sqlite") fileQuery.forUpdate();
+          const rows = await fileQuery;
+          for (const row of rows) {
+            if (versions.get(String(row.id)) === String(row.updated_at)) confirmedIds.push(String(row.id));
+          }
+        }
+      }
+      const libraryQuery = transaction("media_libraries").where({ id: item.libraryId, user_id: item.userId });
+      if (this.database.databaseType !== "sqlite") libraryQuery.forUpdate();
+      if (!(await libraryQuery.first())) throw new ApiError(404, "library_not_found", "媒体库不存在");
+      const movieQuery = transaction("media_items").where({ id: item.id, library_id: item.libraryId, user_id: item.userId }).whereNull("deleted_at");
+      if (this.database.databaseType !== "sqlite") movieQuery.forUpdate();
+      const movie = await movieQuery.first();
+      if (!movie || movie.item_type !== item.itemType || !["video.movie", "video.series"].includes(item.itemType)) return [];
+
+      const now = new Date().toISOString();
+      const result = await this.markCatalogSourceFilesMissing(transaction, confirmedIds, now, true);
+      for (const ids of chunkStrings(confirmedIds)) {
+        await transaction("file_links").where({ user_id: item.userId, library_id: item.libraryId }).whereIn("source_file_id", ids).delete();
+        await transaction("media_item_source_candidates").where({ user_id: item.userId, library_id: item.libraryId })
+          .whereIn("source_file_id", ids).delete();
+      }
+      if (item.itemType === "video.series" && result.affectedItemIds.length > 0) {
+        await this.cleanupOrphanCatalogParents(transaction, item.userId, item.libraryId, now, [item.id]);
+        result.affectedItemIds.push(item.id);
+      }
+      const removeMovie = operation === "catalog_only" || !(await this.activeMovieFiles(transaction, item).first("f.id"));
+      const removeIds = removeMovie ? [item.id] : [];
+      const removedIdentityKeys = removeMovie ? [String(movie.identity_key)] : [];
+      if (removeMovie && item.itemType === "video.series") {
+        const episodes = await this.movieOperationEpisodes(transaction, item)
+          .whereNotExists(this.otherMovieOperationParents(transaction, item))
+          .distinct("episode.id", "episode.identity_key");
+        for (const episode of episodes) {
+          removeIds.push(String(episode.id));
+          removedIdentityKeys.push(String(episode.identity_key));
+        }
+      }
+      for (const ids of chunkStrings(removeIds)) {
+        const changed = await transaction("media_items")
+          .select("id").where({ user_id: item.userId, library_id: item.libraryId }).whereIn("id", ids).whereNull("deleted_at");
+        await transaction("media_items").where({ user_id: item.userId, library_id: item.libraryId })
+          .whereIn("id", ids).whereNull("deleted_at").update({ deleted_at: now, updated_at: now });
+        for (const row of changed) result.affectedItemIds.push(String(row.id));
+      }
+      await this.recordCatalogItemChanges(transaction, item.userId, item.libraryId, result.affectedItemIds, now);
+      if (removeMovie && operation !== "check") {
+        // 先发布删除事件，再用现有外键释放节目和独占单集关联，保留源文件索引供后续扫描。
+        for (const keys of chunkStrings(removedIdentityKeys)) {
+          await transaction("media_item_source_candidates").where({ user_id: item.userId, library_id: item.libraryId })
+            .whereIn("identity_key", keys).delete();
+        }
+        for (const ids of chunkStrings(removeIds)) {
+          const linkedFiles = transaction("file_links").select("source_file_id")
+            .where({ user_id: item.userId, library_id: item.libraryId }).whereIn("item_id", ids);
+          await transaction("media_item_source_candidates").where({ user_id: item.userId, library_id: item.libraryId })
+            .whereIn("source_file_id", linkedFiles).delete();
+          await transaction("media_items").where({ user_id: item.userId, library_id: item.libraryId }).whereIn("id", ids).delete();
+        }
+      }
+      return confirmedIds;
+    });
+  }
+
+  /** 原子提交确认缺失的文件及目录更新，其他来源或仍有单集的节目继续可用。 */
+  public async removeConfirmedMissingVideos(job: ScanJobRecord, files: ExistingVideoFile[]): Promise<number | null> {
+    return this.database.query.transaction(async (transaction) => {
+      const jobQuery = transaction("scan_jobs").where({ id: job.id, status: "running", control_action: "none" });
+      if (this.database.databaseType !== "sqlite") jobQuery.forUpdate();
+      const current = await jobQuery.first();
+      if (!current) return null;
+      const sourceQuery = transaction("library_sources").where({
+        id: job.librarySourceId, library_id: job.libraryId, user_id: job.userId, status: "active",
+      });
+      if (this.database.databaseType !== "sqlite") sourceQuery.forUpdate();
+      const source = await sourceQuery.first();
+      if (!source || (source.source_mode === "linked_service" && (!job.serviceId || source.service_id !== job.serviceId))) {
+        throw new ApiError(409, "video_check_source_changed", "检查期间网盘来源已变化，请重新检查");
+      }
+      // Worker 领取检查任务后会把关联网盘标记为扫描中，提交时仍需确认原服务和凭据版本。
+      const serviceQuery = source.source_mode === "linked_service"
+        ? transaction("cloud_services").where({ id: job.serviceId, user_id: job.userId })
+          .whereIn("status", ["active", "scanning"]).whereNull("deleted_at") : null;
+      if (serviceQuery && this.database.databaseType !== "sqlite") serviceQuery.forUpdate();
+      const credentialSource = serviceQuery ? await serviceQuery.first() : source;
+      if (credentialSource?.connection_status !== "valid"
+        || Number(credentialSource.credential_revision) !== Number(job.snapshot.credentialRevision)) {
+        throw new ApiError(409, "video_check_source_changed", "检查期间网盘来源或凭据已变化，请重新检查");
+      }
+      // 关键变量：来源仍是检查时的记录，防止同期更新的文件被旧检查结果停用。
+      const versions = new Map(files.map((file) => [file.id, file.updatedAt]));
+      const confirmedIds: string[] = [];
+      for (const chunk of chunkStrings([...versions.keys()])) {
+        const query = transaction("source_files").select("id", "updated_at").where({
+          user_id: job.userId, library_id: job.libraryId, library_source_id: job.librarySourceId, status: "active",
+        }).whereIn("id", chunk);
+        if (this.database.databaseType !== "sqlite") query.forUpdate();
+        const rows = await query;
+        for (const row of rows) {
+          if (versions.get(String(row.id)) === String(row.updated_at)) confirmedIds.push(String(row.id));
+        }
+      }
+      // 关键变量：同一个聚合库的来源按库行串行发布变更，后一来源能看见前一来源的缺失结果。
+      const libraryQuery = transaction("media_libraries").where({ id: job.libraryId, user_id: job.userId });
+      if (this.database.databaseType !== "sqlite") libraryQuery.forUpdate();
+      if (!(await libraryQuery.first())) throw new ApiError(404, "library_not_found", "媒体库不存在");
+      const now = new Date().toISOString();
+      const result = await this.markCatalogSourceFilesMissing(transaction, confirmedIds, now, true);
+      const parentIds = new Set<string>();
+      for (const chunk of chunkStrings(result.affectedItemIds)) {
+        const rows = await transaction("media_relations").distinct("parent_item_id")
+          .where({ user_id: job.userId, library_id: job.libraryId }).whereIn("child_item_id", chunk);
+        rows.forEach((row) => parentIds.add(String(row.parent_item_id)));
+      }
+      await this.cleanupOrphanCatalogParents(transaction, job.userId, job.libraryId, now, [...parentIds]);
+      await this.recordCatalogItemChanges(transaction, job.userId, job.libraryId, [...result.affectedItemIds, ...parentIds], now);
+      const removedCount = Number(current.discovered_count) + result.missingSourceCount;
+      await transaction("scan_jobs").where({ id: job.id }).update({ discovered_count: removedCount, updated_at: now });
+      return removedCount;
     });
   }
 
@@ -6268,6 +6590,16 @@ export class ServiceRepository {
         .whereNot({ generation_id: root.generationId });
       missingSourceIds.push(...rows.map((row) => String(row.id)));
     }
+    return this.markCatalogSourceFilesMissing(transaction, missingSourceIds, now);
+  }
+
+  /** 把确认缺失的版本置为失效，并软删除已没有可用版本的叶子条目。 */
+  private async markCatalogSourceFilesMissing(
+    transaction: Knex.Transaction,
+    missingSourceIds: string[],
+    now: string,
+    keepParentsWithChildren = false,
+  ): Promise<{ missingSourceCount: number; affectedItemIds: string[]; deletedItemIds: string[] }> {
     if (missingSourceIds.length === 0) {
       return { missingSourceCount: 0, affectedItemIds: [], deletedItemIds: [] };
     }
@@ -6298,7 +6630,16 @@ export class ServiceRepository {
         .where("f.status", "active");
       activeRows.forEach((row) => activeItemIds.add(String(row.item_id)));
     }
-    const deletedItemIds = candidateItemIds.filter((itemId) => !activeItemIds.has(itemId));
+    const orphanIds = candidateItemIds.filter((itemId) => !activeItemIds.has(itemId));
+    const activeParents = new Set<string>();
+    if (keepParentsWithChildren) {
+      for (const chunk of chunkStrings(orphanIds)) {
+        const rows = await transaction("media_relations as r").join("media_items as child", "child.id", "r.child_item_id")
+          .distinct("r.parent_item_id").whereIn("r.parent_item_id", chunk).whereNull("child.deleted_at");
+        rows.forEach((row) => activeParents.add(String(row.parent_item_id)));
+      }
+    }
+    const deletedItemIds = orphanIds.filter((itemId) => !activeParents.has(itemId));
     for (const itemIdChunk of chunkStrings(deletedItemIds)) {
       await transaction("media_items")
         .whereIn("id", itemIdChunk)
@@ -6393,12 +6734,17 @@ export class ServiceRepository {
     userId: string,
     libraryId: string,
     now: string,
+    candidateIds?: string[],
   ): Promise<string[]> {
-    const parentRows = await transaction("media_items")
+    if (candidateIds?.length === 0) return [];
+    const parentQuery = transaction("media_items")
       .select("id")
       .where({ user_id: userId, library_id: libraryId })
       .whereIn("item_type", ["video.series", "music.album", "music.artist", "audiobook.book"])
       .whereNull("deleted_at");
+    const parentRows = candidateIds
+      ? (await Promise.all(chunkStrings(candidateIds).map((chunk) => parentQuery.clone().whereIn("id", chunk)))).flat()
+      : await parentQuery;
     const parentIds = parentRows.map((row) => String(row.id));
     if (parentIds.length === 0) return [];
     const childRows: Array<{ parent_item_id: unknown }> = [];

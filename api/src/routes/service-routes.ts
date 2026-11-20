@@ -1323,7 +1323,8 @@ export async function registerServiceRoutes(
     }
     const profiles = await runtime.repository.getLibraryProfiles(sourceJob.libraryId, user.id);
     const retriesAiSupplement = sourceJob.snapshot.taskPurpose === "ai_supplement_unmatched";
-    const aiModelSnapshot = retriesAiSupplement
+    const retriesVideoCheck = sourceJob.snapshot.taskPurpose === "check_existing_video";
+    const aiModelSnapshot = retriesVideoCheck ? null : retriesAiSupplement
       ? await runtime.aiModels.buildUnmatchedSupplementTaskSnapshot(profiles.metadataProfile)
       : await runtime.aiModels.buildTaskSnapshot(profiles.metadataProfile);
     if (retriesAiSupplement && !aiModelSnapshot) {
@@ -1341,11 +1342,11 @@ export async function registerServiceRoutes(
       runtimeRevision: "scanner-worker-v1",
       tmdbKeyPoolRevision: runtime.tmdb.revision,
       aiModel: aiModelSnapshot,
-      taskPurpose: retriesAiSupplement ? "ai_supplement_unmatched" : "standard",
+      taskPurpose: retriesVideoCheck ? "check_existing_video" : retriesAiSupplement ? "ai_supplement_unmatched" : "standard",
       targetedScope: sourceJob.snapshot.targetedScope && typeof sourceJob.snapshot.targetedScope === "object"
         ? sourceJob.snapshot.targetedScope as TargetedVideoScanScope : undefined,
       retryOfJobId: sourceJob.id,
-      pluginVersions: await runtime.plugins.buildTaskSnapshots(profiles.metadataProfile),
+      pluginVersions: retriesVideoCheck ? [] : await runtime.plugins.buildTaskSnapshots(profiles.metadataProfile),
     });
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-retry",

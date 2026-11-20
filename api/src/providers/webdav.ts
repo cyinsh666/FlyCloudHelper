@@ -509,6 +509,20 @@ export class WebDavProvider implements ProviderAdapter {
     return this.resolvePlaybackFileAccess(connection, locator);
   }
 
+  /** 用 Depth:0 请求确认 WebDAV 文件状态，区分明确不存在和无法读取。 */
+  public async checkFileExists(connection: Record<string, unknown>, locator: Record<string, unknown>,
+    signal?: AbortSignal): Promise<boolean> {
+    const access = await this.resolvePlaybackFileAccess(connection, locator);
+    try {
+      const entries = await this.propfind(new URL(access.url), connection, "0", signal);
+      if (!entries.length) throw new ApiError(502, "provider_response_invalid", "WebDAV 未返回文件状态");
+      return entries.some((entry) => !entry.isDirectory);
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "provider_resource_not_found") return false;
+      throw error;
+    }
+  }
+
   /**
    * 生成仅供 FlyCloudHelper 中转使用的 WebDAV 上游请求。
    * Authorization 在中转模式下只保留于服务端内存。

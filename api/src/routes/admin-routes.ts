@@ -22,6 +22,7 @@ import {
   searchManualVideoMatches,
 } from "../media/manual-video-match.js";
 import { hydrateRealtimeVideoDetails } from "../media/realtime-video-details.js";
+import { updateCatalogMovieFiles } from "../media/video-existence-check.js";
 import type { ApiRuntime } from "../runtime.js";
 import {
   loadMusicSourceSettings,
@@ -914,6 +915,20 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     return { library };
   });
 
+  /** 管理员对指定影视库发起已入库影片检查，并记录操作。 */
+  server.post<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/admin/libraries/:libraryId/video-existence-checks", async (request, reply) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    const library = await runtime.repository.getLibrary(request.params.libraryId);
+    const body = request.body ?? {};
+    const result = await runtime.repository.createVideoExistenceCheck({
+      library, requestedByUserId: operator.id,
+      requestId: requireString(body, "requestId", "请求 ID", 200),
+      clientDeviceId: typeof body.clientDeviceId === "string" ? requireString(body, "clientDeviceId", "客户端设备 ID", 200) : `admin:${operator.id}`,
+    });
+    await audit(runtime, operator, "check_existing_videos", "media_library", library.id, { 任务ID: result.job.id });
+    return reply.status(202).send(result);
+  });
+
   server.post<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/admin/libraries/:libraryId/scan-jobs", async (request, reply) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const library = await runtime.repository.getLibrary(request.params.libraryId);
@@ -1282,7 +1297,8 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     }
     const profiles = await runtime.repository.getLibraryProfiles(sourceJob.libraryId, sourceJob.userId);
     const retriesAiSupplement = sourceJob.snapshot.taskPurpose === "ai_supplement_unmatched";
-    const aiModelSnapshot = retriesAiSupplement
+    const retriesVideoCheck = sourceJob.snapshot.taskPurpose === "check_existing_video";
+    const aiModelSnapshot = retriesVideoCheck ? null : retriesAiSupplement
       ? await runtime.aiModels.buildUnmatchedSupplementTaskSnapshot(profiles.metadataProfile)
       : await runtime.aiModels.buildTaskSnapshot(profiles.metadataProfile);
     if (retriesAiSupplement && !aiModelSnapshot) {
@@ -1300,11 +1316,11 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       runtimeRevision: "scanner-worker-v1",
       tmdbKeyPoolRevision: runtime.tmdb.revision,
       aiModel: aiModelSnapshot,
-      taskPurpose: retriesAiSupplement ? "ai_supplement_unmatched" : "standard",
+      taskPurpose: retriesVideoCheck ? "check_existing_video" : retriesAiSupplement ? "ai_supplement_unmatched" : "standard",
       targetedScope: sourceJob.snapshot.targetedScope && typeof sourceJob.snapshot.targetedScope === "object"
         ? sourceJob.snapshot.targetedScope as TargetedVideoScanScope : undefined,
       retryOfJobId: sourceJob.id,
-      pluginVersions: await runtime.plugins.buildTaskSnapshots(profiles.metadataProfile),
+      pluginVersions: retriesVideoCheck ? [] : await runtime.plugins.buildTaskSnapshots(profiles.metadataProfile),
     });
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-retry",
@@ -1449,6 +1465,34 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       所属用户: item.ownerUsername,
     });
     return { item: updatedItem };
+  });
+
+  /** 管理员从媒体详情检测指定电影，使用条目所属用户的网盘来源。 */
+  server.post<{ Params: { itemId: string } }>("/api/v1/admin/catalog/items/:itemId/file-validity", async (request) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    const item = await runtime.repository.getCatalogItem(request.params.itemId);
+    const result = await updateCatalogMovieFiles(runtime, item);
+    if (!result.item || result.removedFileIds.length > 0) {
+      await audit(runtime, operator, "check_media_item_file_validity", "media_item", item.id, {
+        所属用户: item.ownerUsername, 清理文件数: result.removedFileIds.length, 影片已移除: result.item === null,
+      });
+    }
+    return result;
+  });
+
+  /** 管理员确认删除指定电影，可同时删除对应来源中的原文件。 */
+  server.post<{ Params: { itemId: string }; Body: Record<string, unknown> }>("/api/v1/admin/catalog/items/:itemId/delete", async (request) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    const body = request.body ?? {};
+    requireConfirmation(body, "DELETE");
+    if (typeof body.deleteFiles !== "boolean") throw validationError("deleteFiles", "请选择是否同步删除原文件");
+    const item = await runtime.repository.getCatalogItem(request.params.itemId);
+    const result = await updateCatalogMovieFiles(runtime, item, body.deleteFiles ? "with_files" : "catalog_only");
+    await audit(runtime, operator, "delete_media_item", "media_item", item.id, {
+      所属用户: item.ownerUsername, 同步删除原文件: body.deleteFiles, 清理文件数: result.removedFileIds.length,
+      未确认文件数: result.unconfirmedCount, 影片已移除: result.item === null,
+    });
+    return result;
   });
 
   server.get<{ Querystring: Record<string, unknown> }>("/api/v1/admin/audit-logs", async (request) => {

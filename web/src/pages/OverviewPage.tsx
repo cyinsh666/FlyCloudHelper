@@ -23,6 +23,7 @@ import {
 } from "@/lib/api";
 import { formatJobDateTime } from "@/lib/job-duration";
 import { useApiResource } from "@/lib/use-api-resource";
+import { getLibraryMaintenanceLabel, useLibraryMaintenance, type LibraryMaintenanceOperation } from "@/lib/library-maintenance";
 
 const serviceStatusLabels: Record<ServiceStatus, string> = {
   active: "正常",
@@ -128,16 +129,17 @@ function OverviewServiceCard({ service }: { service: CloudService }) {
 }
 
 /** 概览媒体库卡片直接创建增量扫描，并保留服务端返回的错误提示。 */
-function OverviewLibraryCard({ library }: { library: MediaLibrary }) {
+function OverviewLibraryCard({ library, maintenance }: { library: MediaLibrary; maintenance?: LibraryMaintenanceOperation }) {
   const [creating, setCreating] = useState(false);
   const [feedback, setFeedback] = useState<{ message: string; failed: boolean } | null>(null);
   // 关键变量：请求发出时同步占位，防止重复点击。
   const creatingRef = useRef(false);
   const canScan = library.libraryKind === "legacy_single_source" || library.libraryKind === "cloud_aggregate_video";
+  const maintenanceRunning = maintenance?.status === "running";
 
   /** 使用媒体库设置页相同的增量扫描接口，路径和任务互斥交给服务端核验。 */
   async function triggerIncrementalScan(): Promise<void> {
-    if (creatingRef.current) return;
+    if (creatingRef.current || maintenanceRunning) return;
     creatingRef.current = true;
     setCreating(true);
     setFeedback(null);
@@ -152,12 +154,14 @@ function OverviewLibraryCard({ library }: { library: MediaLibrary }) {
     }
   }
 
-  return <div className="rounded-xl border border-border bg-secondary/40 p-3">
+  return <div aria-busy={maintenanceRunning} className="rounded-xl border border-border bg-secondary/40 p-3">
     <div className="flex items-center justify-between gap-2"><p className="truncate text-sm font-medium">{library.displayName}</p><StatusPill>{library.dataType === "music" ? "音乐" : "影视"}</StatusPill></div>
     {library.description && <p className="mt-0.5 truncate text-xs text-muted-foreground" title={library.description}>{library.description}</p>}
     <div className="mt-1 flex flex-wrap items-center justify-between gap-2">
       <p className="text-[11px] text-muted-foreground">条目 {library.itemCount.toLocaleString()}</p>
-      <div className="ml-auto flex items-center gap-1.5">
+      {maintenanceRunning ? <span role="status" className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground">
+        <LoaderCircle className="size-4 animate-spin" aria-hidden="true" /> {getLibraryMaintenanceLabel(maintenance.kind)}
+      </span> : <div className="ml-auto flex items-center gap-1.5">
         {canScan && <button type="button" onClick={() => void triggerIncrementalScan()} disabled={creating || library.status !== "active"}
           className={overviewIconActionClass} title={creating ? "正在创建增量扫描任务" : "增量扫描"}
           aria-label={creating ? "正在创建增量扫描任务" : "增量扫描"}>
@@ -171,7 +175,7 @@ function OverviewLibraryCard({ library }: { library: MediaLibrary }) {
           className={overviewIconActionClass} title="海报墙" aria-label="海报墙">
           <Images className="size-4" aria-hidden="true" />
         </Link>}
-      </div>
+      </div>}
     </div>
     {feedback && <p role={feedback.failed ? "alert" : "status"} className={`mt-2 break-all text-xs ${feedback.failed ? "text-destructive" : "text-muted-foreground"}`}>{feedback.message}</p>}
   </div>;
@@ -201,12 +205,17 @@ export function OverviewPage() {
     recentTasks.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
     return { overview, services: services.items, libraries: libraries.items, recentTasks, recentItems: recentCatalogs.flatMap((item) => item.items).slice(0, 6) };
   }, []);
+  const { operations } = useLibraryMaintenance(false, resource.loading ? undefined : resource.refresh);
 
   if (!resource.data) {
     return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取个人概览…"}</div></Panel>;
   }
 
-  const { overview, services, libraries, recentTasks, recentItems } = resource.data;
+  const { overview, services, recentTasks, recentItems } = resource.data;
+  const libraries = resource.data.libraries.filter((library) => {
+    const operation = operations.get(library.id);
+    return operation?.kind !== "delete" || operation.status !== "completed";
+  });
   // 关键变量：仅截取当前类型最近 3 条，不让其他类型占用该标签的展示名额。
   const visibleRecentTasks = recentTasks.filter((task) => recentTaskType === "all" || task.kind === recentTaskType).slice(0, 3);
   const abnormalServices = services.filter((service) => service.status !== "active" || service.connectionStatus !== "valid");
@@ -270,7 +279,7 @@ export function OverviewPage() {
                 <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
                   <div className="min-w-0">
                     <p className="truncate text-sm font-medium">{job.serviceName}</p>
-                    <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{job.jobType === "media_probe" ? "视频规格分析" : `${job.scanMode === "full" ? "全量" : "增量"}扫描刮削`} · {job.stage}</p>
+                    <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{job.jobType === "media_probe" ? "视频规格分析" : job.snapshot.taskPurpose === "check_existing_video" ? "检查已有影片" : `${job.scanMode === "full" ? "全量" : "增量"}扫描刮削`} · {job.stage}</p>
                   </div>
                   <StatusPill tone={job.status === "completed" ? "success" : job.status === "failed" ? "danger" : job.status === "retry_waiting" || job.status === "paused" || job.status === "queued" ? "warning" : "primary"}>{job.status === "retry_waiting" && job.jobType === "media_probe" ? "等待重试" : jobStatusLabels[job.status]}</StatusPill>
                 </div>
@@ -296,7 +305,7 @@ export function OverviewPage() {
         </Panel>
 
         <Panel title="我的媒体库" className="p-4 sm:p-4" action={<Link to="/app/catalog" className="inline-flex items-center gap-1 text-xs text-primary-soft">管理媒体库 <ArrowUpRight className="size-3.5" /></Link>}>
-          <div className="grid gap-2 sm:grid-cols-2">{libraries.map((library) => <OverviewLibraryCard key={library.id} library={library} />)}</div>
+          <div className="grid gap-2 sm:grid-cols-2">{libraries.map((library) => <OverviewLibraryCard key={library.id} library={library} maintenance={operations.get(library.id)} />)}</div>
         </Panel>
       </div>
 

@@ -1,7 +1,9 @@
-import { FolderOpen, Music2, RefreshCw, Search, Trash2, UserRound, WandSparkles, X } from "lucide-react";
+import { FolderOpen, Music2, RefreshCw, ScanLine, Search, Trash2, UserRound, WandSparkles, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  checkMediaItemFileValidity,
   clearMediaItemMatch,
+  deleteMediaMovie,
   getMediaItem,
   listMediaItemArtists,
   listMediaItemChildren,
@@ -249,7 +251,7 @@ function getMatchStateLabel(matchState: MatchState | "all"): string {
   return matchState === "all" ? "全部" : matchStateLabels[matchState];
 }
 
-/** 展示只读媒体详情及节目、专辑或作品的子项。 */
+/** 展示媒体详情、可用操作及关联子项。 */
 function MediaDetailDialog({
   item,
   children,
@@ -258,8 +260,13 @@ function MediaDetailDialog({
   loading,
   error,
   clearingMatch,
+  fileOperation,
+  fileCheckMessage,
+  deleteDialogOpen,
   onManualMatch,
   onClearMatch,
+  onCheckFiles,
+  onDeleteItem,
   onClose,
 }: {
   item: MediaItem;
@@ -269,8 +276,13 @@ function MediaDetailDialog({
   loading: boolean;
   error: string | null;
   clearingMatch: boolean;
+  fileOperation: "checking" | "deleting" | null;
+  fileCheckMessage: string | null;
+  deleteDialogOpen: boolean;
   onManualMatch: () => void;
   onClearMatch: () => void;
+  onCheckFiles: () => void;
+  onDeleteItem: () => void;
   onClose: () => void;
 }) {
   const metadata = getDisplayMetadata(item.metadata);
@@ -278,6 +290,7 @@ function MediaDetailDialog({
   const mediaProbeSummary = item.mediaProbeSummary;
   const isContentSource = item.libraryKind === "content_source_video" || item.libraryKind === "content_source_music" || item.libraryKind === "content_source_audiobook";
   const canMatchVideo = !isContentSource && item.mediaType === "video" && (item.itemType === "video.movie" || item.itemType === "video.series");
+  const canCheckFiles = canMatchVideo && (item.libraryKind === "legacy_single_source" || item.libraryKind === "cloud_aggregate_video");
   const aggregateSourceNames = item.libraryKind === "cloud_aggregate_video" && Array.isArray(item.sourceNames) ? item.sourceNames : [];
   // 关键变量：只有节目详情使用季集位置展示子项，电影及其他媒体保持原展示。
   const isSeries = item.itemType === "video.series";
@@ -285,7 +298,7 @@ function MediaDetailDialog({
   const isAudiobook = item.itemType === "audiobook.book";
 
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center p-3 sm:p-6">
+    <div inert={deleteDialogOpen} className="fixed inset-0 z-50 grid place-items-center p-3 sm:p-6">
       <button type="button" aria-label="关闭媒体详情" onClick={onClose} className="absolute inset-0 bg-black/70 backdrop-blur-sm" />
       <section role="dialog" aria-modal="true" aria-label={`${item.title}详情`} className="relative max-h-[92vh] w-full max-w-5xl overflow-y-auto rounded-2xl border border-border bg-background shadow-2xl">
         <div className="relative min-h-48 overflow-hidden border-b border-border p-5 sm:p-7">
@@ -310,19 +323,27 @@ function MediaDetailDialog({
               </div>
               {canMatchVideo && (
                 <div className="mt-4 flex flex-wrap gap-2">
-                  <SecondaryButton onClick={onManualMatch}><WandSparkles className="size-4" /> 手动匹配</SecondaryButton>
+                  <SecondaryButton disabled={fileOperation !== null} onClick={onManualMatch}><WandSparkles className="size-4" /> 手动匹配</SecondaryButton>
                   {item.matchState !== "unmatched" && (
                     <button
                       type="button"
                       onClick={onClearMatch}
-                      disabled={clearingMatch}
+                      disabled={clearingMatch || fileOperation !== null}
                       className="inline-flex items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       <Trash2 className="size-4" /> {clearingMatch ? "清除中" : "清除匹配"}
                     </button>
                   )}
+                  {canCheckFiles && <SecondaryButton onClick={onCheckFiles} disabled={loading || clearingMatch || fileOperation !== null}>
+                    <ScanLine className="size-4" /> {fileOperation === "checking" ? "检测中…" : "有效性检测"}
+                  </SecondaryButton>}
+                  {canCheckFiles && <button type="button" onClick={onDeleteItem} disabled={loading || clearingMatch || fileOperation !== null}
+                    className="inline-flex items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40">
+                    <Trash2 className="size-4" /> {isSeries ? "删除节目" : "删除影片"}
+                  </button>}
                 </div>
               )}
+              {fileCheckMessage && <p role="status" className="mt-3 text-sm text-muted-foreground">{fileCheckMessage}</p>}
             </div>
           </div>
         </div>
@@ -446,6 +467,43 @@ function MediaDetailDialog({
   );
 }
 
+/** 删除电影或节目时，让用户明确选择是否同步删除关联的网盘原文件。 */
+function DeleteVideoDialog({ item, deleting, error, onClose, onConfirm }: {
+  item: MediaItem;
+  deleting: boolean;
+  error: string | null;
+  onClose: () => void;
+  onConfirm: (deleteFiles: boolean) => void;
+}) {
+  const [deleteFiles, setDeleteFiles] = useState(false);
+  const isSeries = item.itemType === "video.series";
+  return (
+    <div className="fixed inset-0 z-[60] grid place-items-center p-4">
+      <button type="button" aria-label="关闭删除确认" disabled={deleting} onClick={onClose} className="absolute inset-0 bg-black/75 backdrop-blur-sm" />
+      <section role="dialog" aria-modal="true" aria-labelledby="delete-video-title"
+        className="relative w-full max-w-md rounded-xl border border-border bg-background p-5 shadow-2xl">
+        <h2 id="delete-video-title" className="text-lg font-semibold">{isSeries ? "删除节目" : "删除影片"}</h2>
+        <p className="mt-3 text-sm text-muted-foreground">确定从媒体库删除《{item.title}》及其{isSeries ? "全部剧集资料" : "影片资料"}吗？</p>
+        <label className="mt-4 flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={deleteFiles} disabled={deleting} onChange={(event) => setDeleteFiles(event.target.checked)} />
+          同步删除网盘原文件
+        </label>
+        <p className="mt-2 text-xs text-muted-foreground">{deleteFiles
+          ? `此操作会向网盘提交删除请求，涉及${isSeries ? "节目及各集" : "影片"}关联的所有文件版本。`
+          : "保留网盘文件，下次扫描仍可重新入库。"}</p>
+        {error && <p role="alert" className="mt-3 text-sm text-destructive">{error}</p>}
+        <div className="mt-5 flex justify-end gap-2">
+          <SecondaryButton autoFocus disabled={deleting} onClick={onClose}>取消</SecondaryButton>
+          <button type="button" disabled={deleting} onClick={() => onConfirm(deleteFiles)}
+            className="rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm text-destructive hover:bg-destructive/15 disabled:opacity-40">
+            {deleting ? "删除中…" : "确认删除"}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 /**
  * 展示个人、服务或管理员作用域下的无播放海报墙。
  */
@@ -496,6 +554,8 @@ export function MediaCatalogView({
   const [matchState, setMatchState] = useState<MatchState | "all">("matched");
   const [sort, setSort] = useState<CatalogSort>("created_desc");
   const [selectedItem, setSelectedItem] = useState<MediaItem | null>(null);
+  // 关键变量：检测结束后刷新剧集列表前，确认用户仍在查看同一条目。
+  const openDetailItemId = useRef<string | null>(null);
   const openedInitialItemId = useRef<string | null>(null);
   const [selectedChildren, setSelectedChildren] = useState<MediaItem[]>([]);
   const [selectedArtists, setSelectedArtists] = useState<MediaItem[]>([]);
@@ -505,8 +565,14 @@ export function MediaCatalogView({
   // 关键变量：人工匹配窗口与清除操作状态独立，避免关闭内层窗口时误关媒体详情。
   const [manualMatchOpen, setManualMatchOpen] = useState(false);
   const [clearingMatch, setClearingMatch] = useState(false);
-  const [localItems, setLocalItems] = useState<Record<string, MediaItem>>({});
-  const displayItems = useMemo(() => items.map((item) => localItems[item.id] ?? item), [items, localItems]);
+  const [fileOperation, setFileOperation] = useState<"checking" | "deleting" | null>(null);
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [fileCheckMessage, setFileCheckMessage] = useState<{ itemId: string; text: string; removed?: boolean } | null>(null);
+  // 条目移除后立即从海报墙隐藏，等待目录刷新返回新的分页数据。
+  const [localItems, setLocalItems] = useState<Record<string, MediaItem | null>>({});
+  const displayItems = useMemo(() => items.filter((item) => localItems[item.id] !== null)
+    .map((item) => localItems[item.id] ?? item), [items, localItems]);
   const locallyFilteredItems = useMemo(() => displayItems.filter((item) => {
     const matchesMediaType = mediaType === "all" || item.mediaType === mediaType;
     const matchesVideoItemType = videoItemType === "all" || item.itemType === videoItemType;
@@ -517,6 +583,17 @@ export function MediaCatalogView({
       && (!keyword || `${item.title} ${item.subtitle}`.toLocaleLowerCase("zh-CN").includes(keyword));
   }), [displayItems, matchState, mediaType, musicItemType, search, videoItemType]);
   const visibleItems = serverFiltered ? displayItems : locallyFilteredItems;
+
+  useEffect(() => {
+    // 目录刷新确认移除后释放本地隐藏标记，后续重新扫描仍可显示同一部影片。
+    setLocalItems((current) => {
+      const removedIds = Object.keys(current).filter((id) => current[id] === null && !items.some((item) => item.id === id));
+      if (removedIds.length === 0) return current;
+      const next = { ...current };
+      removedIds.forEach((id) => delete next[id]);
+      return next;
+    });
+  }, [items]);
 
   useEffect(() => {
     if (!onQueryChange) return undefined;
@@ -537,15 +614,19 @@ export function MediaCatalogView({
     if (!selectedItem) return undefined;
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
-      if (manualMatchOpen) setManualMatchOpen(false);
-      else setSelectedItem(null);
+      if (deleteDialogOpen) {
+        if (fileOperation !== "deleting") setDeleteDialogOpen(false);
+      } else if (manualMatchOpen) setManualMatchOpen(false);
+      else closeMediaDetail();
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [manualMatchOpen, selectedItem]);
+  }, [deleteDialogOpen, fileOperation, manualMatchOpen, selectedItem]);
 
   /** 打开海报详情并并行读取最新条目和子项。 */
   async function openMediaDetail(item: MediaItem): Promise<void> {
+    openDetailItemId.current = item.id;
+    setFileCheckMessage(null);
     setSelectedItem(item);
     setSelectedChildren([]);
     setSelectedArtists([]);
@@ -564,6 +645,7 @@ export function MediaCatalogView({
         item.itemType === "music.album" ? listMediaItemArtists(item, admin) : Promise.resolve([]),
         item.libraryKind === "content_source_video" || item.libraryKind === "content_source_music" || item.libraryKind === "content_source_audiobook" ? Promise.resolve([]) : listMediaItemPaths(item, admin),
       ]);
+      if (openDetailItemId.current !== item.id) return;
       setSelectedItem(detail);
       setSelectedChildren(children);
       setSelectedArtists(artists);
@@ -591,6 +673,7 @@ export function MediaCatalogView({
         });
       }
     } catch (error) {
+      if (openDetailItemId.current !== item.id) return;
       const errorMessage = error instanceof Error ? error.message : "媒体详情读取失败";
       if (item.itemType === "music.album") {
         console.warn("codex-flycloud-helper-music-album-detail", {
@@ -601,8 +684,18 @@ export function MediaCatalogView({
       }
       setDetailError(errorMessage);
     } finally {
-      setDetailLoading(false);
+      if (openDetailItemId.current === item.id) setDetailLoading(false);
     }
+  }
+
+  /** 关闭媒体详情并丢弃本次浏览的子项数据。 */
+  function closeMediaDetail(): void {
+    openDetailItemId.current = null;
+    setManualMatchOpen(false);
+    setSelectedItem(null);
+    setSelectedChildren([]);
+    setSelectedArtists([]);
+    setSelectedPaths([]);
   }
 
   useEffect(() => {
@@ -658,8 +751,56 @@ export function MediaCatalogView({
     }
   }
 
+  /** 检测或删除当前电影或节目，并更新受影响的文件和剧集列表。 */
+  async function runVideoFileOperation(deleteFiles?: boolean): Promise<void> {
+    if (!selectedItem || detailLoading || clearingMatch || fileOperation) return;
+    const item = selectedItem;
+    const deleting = deleteFiles !== undefined;
+    setFileOperation(deleting ? "deleting" : "checking");
+    setFileCheckMessage(null);
+    setDeleteError(null);
+    try {
+      const result = deleting ? await deleteMediaMovie(item, deleteFiles, admin) : await checkMediaItemFileValidity(item, admin);
+      const { fileCount, removedFileIds, unconfirmedCount, issue } = result;
+      if (deleting) setDeleteDialogOpen(false);
+      setSelectedItem((current) => current?.id === item.id ? result.item : current);
+      if (!result.item) {
+        if (openDetailItemId.current === item.id) closeMediaDetail();
+        setLocalItems((current) => ({ ...current, [item.id]: null }));
+        setFileCheckMessage({ itemId: item.id, text: `《${item.title}》已从媒体库移除。`, removed: true });
+        onRefresh?.();
+        return;
+      }
+      if (removedFileIds.length > 0) {
+        const removed = new Set(removedFileIds);
+        setSelectedPaths((current) => current.filter((entry) => !removed.has(entry.fileId)));
+        onRefresh?.();
+        if (item.itemType === "video.series" && openDetailItemId.current === item.id) {
+          try {
+            const children = await listMediaItemChildren(item, admin);
+            if (openDetailItemId.current === item.id) setSelectedChildren(children);
+          } catch {
+            if (openDetailItemId.current === item.id) setDetailError("无法刷新剧集列表，请重新打开详情");
+          }
+        }
+      }
+      const unconfirmedMessage = unconfirmedCount > 0 ? ` ${unconfirmedCount} 个文件未能确认，已保留。` : "";
+      const summary = deleting
+        ? `仍有文件版本，已清理 ${removedFileIds.length} 个版本。`
+        : `检测 ${fileCount} 个文件，清理 ${removedFileIds.length} 个失效版本。`;
+      setFileCheckMessage({ itemId: item.id, text: `${summary}${unconfirmedMessage}${issue ? ` ${issue}` : ""}` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : deleting ? "删除失败" : "有效性检测失败";
+      if (deleting) setDeleteError(message);
+      else setFileCheckMessage({ itemId: item.id, text: message });
+    } finally {
+      setFileOperation(null);
+    }
+  }
+
   return (
     <>
+      {fileCheckMessage?.removed && <p role="status" className="mb-3 text-sm text-muted-foreground">{fileCheckMessage.text}</p>}
       <Panel
         collapsible
         className="mb-4"
@@ -764,11 +905,19 @@ export function MediaCatalogView({
           loading={detailLoading}
           error={detailError}
           clearingMatch={clearingMatch}
+          fileOperation={fileOperation}
+          fileCheckMessage={fileCheckMessage?.itemId === selectedItem.id ? fileCheckMessage.text : null}
+          deleteDialogOpen={deleteDialogOpen}
           onManualMatch={() => setManualMatchOpen(true)}
           onClearMatch={() => void clearSelectedMatch()}
-          onClose={() => { setManualMatchOpen(false); setSelectedItem(null); setSelectedChildren([]); setSelectedArtists([]); setSelectedPaths([]); }}
+          onCheckFiles={() => void runVideoFileOperation()}
+          onDeleteItem={() => { setDeleteError(null); setDeleteDialogOpen(true); }}
+          onClose={closeMediaDetail}
         />
       )}
+      {selectedItem && deleteDialogOpen && <DeleteVideoDialog item={selectedItem}
+        deleting={fileOperation === "deleting"} error={deleteError}
+        onClose={() => setDeleteDialogOpen(false)} onConfirm={(deleteFiles) => void runVideoFileOperation(deleteFiles)} />}
       {selectedItem && manualMatchOpen && (
         <MediaManualMatchDialog
           item={selectedItem}

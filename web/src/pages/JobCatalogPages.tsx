@@ -1,6 +1,6 @@
 import { MusicScanStages } from "../components/MusicScanStages";
 import { Link } from "@tanstack/react-router";
-import { BookOpen, Download, Images, Layers3, Music2, Pause, Play, Plus, Radio, RefreshCw, RotateCcw, ScanLine, Settings2, Sparkles, Square, Trash2 } from "lucide-react";
+import { BookOpen, Download, Images, Layers3, LoaderCircle, Music2, Pause, Play, Plus, Radio, RefreshCw, RotateCcw, ScanLine, Settings2, Sparkles, Square, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { AdminServiceFilters } from "@/components/AdminServiceFilters";
@@ -33,6 +33,7 @@ import {
   type ServiceListFilters,
 } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
+import { getLibraryMaintenanceLabel, useLibraryMaintenance } from "@/lib/library-maintenance";
 import { formatJobDateTime, formatJobDuration, getJobDurationLabel } from "@/lib/job-duration";
 import { OrganizeTaskDetail, OrganizeTaskListCard } from "./OrganizeTasksPanel";
 import { loadJobRecordPrefix } from "./job-records";
@@ -99,10 +100,11 @@ const jobTypeFilterOptions: Array<{ value: JobTypeFilter; label: string }> = [
   { value: "organize", label: "影片整理" },
 ];
 
-/** 区分普通扫描和手动 AI 补充任务，避免任务列表只显示为全量扫描。 */
+/** 按任务用途显示实际操作名称。 */
 function getBackgroundJobLabel(job: ScanJob): string {
   if (job.jobType === "media_probe") return backgroundJobTypeLabels.media_probe;
   if (job.snapshot.taskPurpose === "ai_supplement_unmatched") return "AI补充未识别内容";
+  if (job.snapshot.taskPurpose === "check_existing_video") return "检查已有影片";
   return `${job.scanMode === "full" ? "全量" : "增量"}扫描刮削`;
 }
 
@@ -392,6 +394,7 @@ function JobsView({ admin }: { admin: boolean }) {
   const pendingActiveJobOperation = activeJob ? pendingJobOperations[activeJob.id] : undefined;
   const pendingActiveGroupOperation = activeParentJobId ? pendingJobOperations[activeParentJobId] : undefined;
   const activeJobIsAiSupplement = activeJob?.snapshot.taskPurpose === "ai_supplement_unmatched";
+  const activeJobIsVideoCheck = activeJob?.snapshot.taskPurpose === "check_existing_video";
   const activeJobOperationBlocked = Boolean(activeJob && (pendingActiveJobOperation || activeJob.controlAction !== "none"));
   const activeGroupOperationBlocked = Boolean(activeJobGroup && (pendingActiveGroupOperation
     || activeJobGroup.jobs.some((job) => job.controlAction !== "none")));
@@ -824,7 +827,8 @@ function JobsView({ admin }: { admin: boolean }) {
                       <button type="button" aria-pressed={groupSelected} onClick={() => setSelectedJobId(selectedSourceJob.id)} className="w-full px-3 py-2.5 text-left">
                         <div className="flex min-w-0 items-center gap-2">
                           <Layers3 className="size-4 shrink-0 text-muted-foreground" />
-                          <p className="truncate text-sm font-semibold">云聚合{firstSourceJob.scanMode === "full" ? "全量" : "增量"}扫描</p>
+                          <p className="truncate text-sm font-semibold">{firstSourceJob.snapshot.taskPurpose === "check_existing_video"
+                            ? "云聚合 · 检查已有影片" : `云聚合${firstSourceJob.scanMode === "full" ? "全量" : "增量"}扫描`}</p>
                           <span role="status" aria-label={jobStatusLabels[groupStatus]} title={jobStatusLabels[groupStatus]} className={`size-2 shrink-0 rounded-full ${getJobStatusDotClass(groupStatus)}`} />
                           <span className="ml-auto shrink-0 text-[11px] text-muted-foreground">{group.jobs.length} 个来源</span>
                         </div>
@@ -912,12 +916,19 @@ function JobsView({ admin }: { admin: boolean }) {
                 </ul>}
               </div>}
               <div className="mt-3 min-w-0 border-t border-border/70 pt-3">
-                <p className="text-[11px] text-muted-foreground">{activeJob.jobType === "media_probe" ? "当前分析文件" : activeJobIsAiSupplement ? "当前处理内容" : "当前扫描路径"}</p>
-                <p className="mt-1 truncate font-mono text-xs" title={activeJob.currentPath ?? undefined}>{activeJob.currentPath || (activeJob.jobType === "media_probe" ? "等待领取视频文件" : activeJobIsAiSupplement ? "准备读取媒体库未匹配内容" : "准备读取扫描目录")}</p>
-                {activeJob.jobType === "scan" && activeJob.resumeSupported && <p className="mt-2 text-[11px] text-muted-foreground">可恢复检查点：{formatCheckpointTime(activeJob.checkpointUpdatedAt)}</p>}
+                <p className="text-[11px] text-muted-foreground">{activeJobIsVideoCheck ? "当前检查目录" : activeJob.jobType === "media_probe" ? "当前分析文件" : activeJobIsAiSupplement ? "当前处理内容" : "当前扫描路径"}</p>
+                <p className="mt-1 truncate font-mono text-xs" title={activeJob.currentPath ?? undefined}>{activeJob.currentPath || (activeJobIsVideoCheck ? "—" : activeJob.jobType === "media_probe" ? "等待领取视频文件" : activeJobIsAiSupplement ? "准备读取媒体库未匹配内容" : "准备读取扫描目录")}</p>
+                {activeJob.jobType === "scan" && !activeJobIsVideoCheck && activeJob.resumeSupported && <p className="mt-2 text-[11px] text-muted-foreground">可恢复检查点：{formatCheckpointTime(activeJob.checkpointUpdatedAt)}</p>}
               </div>
               {activeJob.status === "retry_waiting" && <div className="mt-3 rounded-lg border border-warning/30 bg-warning/8 px-3 py-2"><p className="text-sm font-medium">{activeJob.jobType === "media_probe" ? activeJob.errorCode === "provider_authentication_failed" ? "Provider 登录已失效，等待 APP 同步有效登录信息" : "上游地址或文件读取暂时失败，任务会自动重试" : "TMDB 暂时不可用，任务会自动恢复"}</p><p className="mt-1 text-[11px] text-muted-foreground">{activeJob.jobType === "media_probe" && activeJob.errorCode === "provider_authentication_failed" ? "同步成功后后台任务会自动继续" : <>预计恢复时间：{formatCheckpointTime(activeJob.nextRetryAt)}{activeJob.jobType === "scan" ? ` · 已等待 ${activeJob.retryCount.toLocaleString()} 次` : ""}</>}</p></div>}
-              {activeJob.jobType === "media_probe" ? (
+              {activeJobIsVideoCheck ? (
+                <div className="mt-3 grid grid-cols-2 gap-3 font-mono text-[11px] text-muted-foreground sm:grid-cols-4">
+                  <span>总文件 {activeJob.totalCount?.toLocaleString() ?? "—"}</span>
+                  <span>已检查 {activeJob.processedCount.toLocaleString()}</span>
+                  <span>已剔除版本 {activeJob.discoveredCount.toLocaleString()}</span>
+                  <span>未确认 {activeJob.errorCount.toLocaleString()}</span>
+                </div>
+              ) : activeJob.jobType === "media_probe" ? (
                 <div className="mt-3 grid grid-cols-3 gap-3 font-mono text-[11px] text-muted-foreground">
                   <span>总文件 {activeJob.totalCount?.toLocaleString() ?? "0"}</span>
                   <span>已处理 {activeJob.processedCount.toLocaleString()}</span>
@@ -945,9 +956,9 @@ function JobsView({ admin }: { admin: boolean }) {
                 </div>
               </div>
               {activeJob.jobType === "scan" && <div className="mt-3 flex flex-wrap justify-end gap-2 border-t border-border/70 pt-3">
-                <SecondaryButton onClick={() => void openAiSupplementDialog()}>
+                {!activeJobIsVideoCheck && <SecondaryButton onClick={() => void openAiSupplementDialog()}>
                   <Sparkles className="size-4" /> AI补充详情
-                </SecondaryButton>
+                </SecondaryButton>}
                 <SecondaryButton
                   onClick={() => void downloadSelectedFailureReport()}
                   disabled={!canDownloadFailureReport || (failureReportState?.jobId === activeJob.id && failureReportState.downloading)}
@@ -1022,11 +1033,19 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
     const [users, providers] = await Promise.all([listAdminUsers(), listProviders()]);
     return { users: users.items, providers };
   }, [admin]);
-  const libraries = resource.data?.items ?? [];
+  const { operations, submittedLibraries } = useLibraryMaintenance(admin, resource.loading ? undefined : resource.refresh);
+  const loadedLibraries = resource.data?.items ?? [];
+  // 默认列表保留刚提交的卡片，包含列表尚未读到或超出默认返回范围的媒体库。
+  const pendingCards = Object.values(filters).some(Boolean) ? [] : submittedLibraries.filter((library) =>
+    !loadedLibraries.some((loaded) => loaded.id === library.id));
+  const libraries = [...loadedLibraries, ...pendingCards].filter((library) => {
+    const operation = operations.get(library.id);
+    return operation?.kind !== "delete" || operation.status !== "completed";
+  });
 
   /** 从媒体库卡片创建增量扫描，沿用设置页的接口和服务端路径校验。 */
   async function triggerIncrementalScan(library: MediaLibrary): Promise<void> {
-    if (creatingScanLibraryIdRef.current) return;
+    if (creatingScanLibraryIdRef.current || operations.get(library.id)?.status === "running") return;
     creatingScanLibraryIdRef.current = library.id;
     setCreatingScanLibraryId(library.id);
     setScanFeedback(null);
@@ -1056,8 +1075,10 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
       {admin && <AdminServiceFilters value={filters} users={filterOptions.data?.users ?? []} providers={filterOptions.data?.providers ?? []} resultCount={resource.data?.total ?? 0} onChange={setFilters} />}
       {resource.error && <Panel className="mb-4"><p className="text-sm text-destructive">{resource.error}</p></Panel>}
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-        {libraries.map((library) => (
-          <article key={library.id} className="surface p-4">
+        {libraries.map((library) => {
+          const operation = operations.get(library.id);
+          const maintenanceRunning = operation?.status === "running";
+          return <article key={library.id} aria-busy={maintenanceRunning} className="surface p-4">
             <header className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
               <div className="flex min-w-0 items-center gap-3">
                 <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-border text-xs font-semibold" style={{ backgroundImage: "var(--gradient-surface)" }}>
@@ -1077,6 +1098,9 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
               {library.libraryKind === "content_source_live" ? <span>M3U 频道订阅</span> : library.dataType === "music" ? <span>Navidrome {library.navidromeEnabled ? "已启用" : "未启用"}</span> : library.dataType === "audiobook" ? <span>ABS {library.absEnabled ? "已启用" : "未启用"}</span> : <span>Jellyfin {library.jellyfinEnabled ? "已启用" : "未启用"}</span>}
             </div>
             <footer className="mt-3 flex flex-wrap gap-2 border-t border-border/70 pt-3">
+              {maintenanceRunning ? <span role="status" className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+                <LoaderCircle className="size-3.5 animate-spin" aria-hidden="true" /> {getLibraryMaintenanceLabel(operation.kind)}
+              </span> : <>
               {library.libraryKind !== "content_source_live" && <Link to={admin ? "/admin/libraries/$serviceId/catalog" : "/app/libraries/$serviceId/catalog"} params={{ serviceId: library.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Images className="size-3.5" /> 海报</Link>}
               <Link to={admin ? "/admin/libraries/$serviceId/settings" : "/app/libraries/$serviceId/settings"} params={{ serviceId: library.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Settings2 className="size-3.5" /> 设置</Link>
               {(library.libraryKind === "legacy_single_source" || library.libraryKind === "cloud_aggregate_video") &&
@@ -1085,13 +1109,17 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
                   className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40">
                   <ScanLine className="size-3.5" /> {creatingScanLibraryId === library.id ? "创建中…" : "增量扫描"}
                 </button>}
+              </>}
             </footer>
-            {scanFeedback?.libraryId === library.id && <p role={scanFeedback.failed ? "alert" : "status"}
+            {operation?.status === "failed" && <p role="alert" className="mt-2 break-all text-xs text-destructive">
+              {operation.kind === "clear" ? "清空失败" : "删除失败"}{operation.error && ` · ${operation.error}`}
+            </p>}
+            {!maintenanceRunning && scanFeedback?.libraryId === library.id && <p role={scanFeedback.failed ? "alert" : "status"}
               className={`mt-2 break-all text-xs ${scanFeedback.failed ? "text-destructive" : "text-muted-foreground"}`}>
               {scanFeedback.message}
             </p>}
-          </article>
-        ))}
+          </article>;
+        })}
       </div>
       {!resource.loading && libraries.length === 0 && <Panel><p className="py-12 text-center text-sm text-muted-foreground">还没有媒体库</p></Panel>}
     </>

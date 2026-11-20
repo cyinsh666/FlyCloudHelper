@@ -11,6 +11,7 @@ import { ShieldCheck } from "lucide-react";
 import { useEffect, useState } from "react";
 import { SessionBoundary } from "@/components/SessionBoundary";
 import { ApiClientError, getCurrentUser, getSetupStatus } from "@/lib/api";
+import { isLibraryMaintenanceLocked } from "@/lib/library-maintenance";
 import { SetupPage, LoginPage, RegisterPage } from "@/pages/AuthPages";
 import { OverviewPage } from "@/pages/OverviewPage";
 import {
@@ -75,6 +76,23 @@ function UserConsoleRouteComponent() {
 function AdminConsoleRouteComponent() {
   return <SessionBoundary requiredRole="super_admin" />;
 }
+
+/** 进入具体媒体库前检查维护状态，忙时回到当前控制台的媒体库列表。 */
+function createLibraryMaintenanceGuard(admin: boolean) {
+  const catalogPath = admin ? "/admin/catalog" : "/app/catalog";
+  /** 只在实际导航时请求状态，登录和角色异常交给原有会话边界。 */
+  return async function guardLibraryMaintenance({ params, preload }: {
+    params: { serviceId: string };
+    preload: boolean;
+  }): Promise<void> {
+    if (preload) return;
+    const locked = await isLibraryMaintenanceLocked(params.serviceId, admin).catch(() => false);
+    if (locked) throw redirect({ to: catalogPath, replace: true });
+  };
+}
+
+const guardUserLibrary = createLibraryMaintenanceGuard(false);
+const guardAdminLibrary = createLibraryMaintenanceGuard(true);
 
 /** 根路径根据初始化状态和当前会话进入正确入口。 */
 function RootIndexRouteComponent() {
@@ -477,6 +495,7 @@ const userCatalogRoute = createRoute({
 const userLibrarySettingsRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "libraries/$serviceId/settings",
+  beforeLoad: guardUserLibrary,
   component: UserLibrarySettingsRouteComponent,
 });
 
@@ -495,42 +514,49 @@ const userLibraryCreateWithoutSourceRoute = createRoute({
 const userLibraryCatalogRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "libraries/$serviceId/catalog",
+  beforeLoad: guardUserLibrary,
   component: UserLibraryCatalogRouteComponent,
 });
 
 const userLibraryFileBrowseRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "libraries/$serviceId/files",
+  beforeLoad: guardUserLibrary,
   component: UserLibraryFileBrowseRouteComponent,
 });
 
 const userLibraryScanScheduleRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "libraries/$serviceId/scan-schedules",
+  beforeLoad: guardUserLibrary,
   component: UserLibraryScanScheduleRouteComponent,
 });
 
 const userLibraryJellyfinSettingsRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "libraries/$serviceId/jellyfin",
+  beforeLoad: guardUserLibrary,
   component: UserLibraryJellyfinSettingsRouteComponent,
 });
 
 const userLibraryEmbySettingsRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "libraries/$serviceId/emby",
+  beforeLoad: guardUserLibrary,
   component: UserLibraryEmbySettingsRouteComponent,
 });
 
 const userLibraryAbsSettingsRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "libraries/$serviceId/abs",
+  beforeLoad: guardUserLibrary,
   component: UserLibraryAbsSettingsRouteComponent,
 });
 
 const userNativeAudiobookRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "libraries/$serviceId/flyaudiobook",
+  beforeLoad: guardUserLibrary,
   component: UserNativeAudiobookRouteComponent,
 });
 
@@ -626,48 +652,56 @@ const adminCatalogRoute = createRoute({
 const adminLibrarySettingsRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "libraries/$serviceId/settings",
+  beforeLoad: guardAdminLibrary,
   component: AdminLibrarySettingsRouteComponent,
 });
 
 const adminLibraryCatalogRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "libraries/$serviceId/catalog",
+  beforeLoad: guardAdminLibrary,
   component: AdminLibraryCatalogRouteComponent,
 });
 
 const adminLibraryFileBrowseRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "libraries/$serviceId/files",
+  beforeLoad: guardAdminLibrary,
   component: AdminLibraryFileBrowseRouteComponent,
 });
 
 const adminLibraryScanScheduleRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "libraries/$serviceId/scan-schedules",
+  beforeLoad: guardAdminLibrary,
   component: AdminLibraryScanScheduleRouteComponent,
 });
 
 const adminLibraryJellyfinSettingsRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "libraries/$serviceId/jellyfin",
+  beforeLoad: guardAdminLibrary,
   component: AdminLibraryJellyfinSettingsRouteComponent,
 });
 
 const adminLibraryEmbySettingsRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "libraries/$serviceId/emby",
+  beforeLoad: guardAdminLibrary,
   component: AdminLibraryEmbySettingsRouteComponent,
 });
 
 const adminLibraryAbsSettingsRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "libraries/$serviceId/abs",
+  beforeLoad: guardAdminLibrary,
   component: AdminLibraryAbsSettingsRouteComponent,
 });
 
 const adminNativeAudiobookRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "libraries/$serviceId/flyaudiobook",
+  beforeLoad: guardAdminLibrary,
   component: AdminNativeAudiobookRouteComponent,
 });
 

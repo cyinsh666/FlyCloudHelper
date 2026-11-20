@@ -1,14 +1,15 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { CatalogSort, MatchState, MediaType } from "../domain.js";
-import { ApiError } from "../errors.js";
-import { readPagination, requireRequestUser } from "../http.js";
+import { ApiError, validationError } from "../errors.js";
+import { readPagination, requireConfirmation, requireRequestUser } from "../http.js";
 import {
   applyManualVideoMatch,
   clearManualVideoMatch,
   searchManualVideoMatches,
 } from "../media/manual-video-match.js";
 import { hydrateRealtimeVideoDetails } from "../media/realtime-video-details.js";
+import { updateCatalogMovieFiles } from "../media/video-existence-check.js";
 import type { ApiRuntime } from "../runtime.js";
 import { ensureContentAudiobookDetail } from "../audiobooks/content-source-detail.js";
 
@@ -32,7 +33,7 @@ async function requireLibraryItem(runtime: ApiRuntime, userId: string, libraryId
   return item;
 }
 
-/** 记录普通用户对媒体匹配结果的人工修改。 */
+/** 记录普通用户对媒体条目的人工修改。 */
 async function auditCatalogAction(
   runtime: ApiRuntime,
   user: { id: string; username: string },
@@ -215,5 +216,35 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
     const updatedItem = await clearManualVideoMatch(runtime, item);
     await auditCatalogAction(runtime, user, "clear_media_item_match", item.id);
     return { item: updatedItem };
+  });
+
+  /** 检测当前用户指定电影的文件，并清理已确认缺失的入库记录。 */
+  server.post<{ Params: { libraryId: string; itemId: string } }>("/api/v1/libraries/:libraryId/items/:itemId/file-validity", async (request) => {
+    const user = await requireRequestUser(request, runtime.database);
+    const { libraryId, itemId } = request.params;
+    const item = await requireLibraryItem(runtime, user.id, libraryId, itemId);
+    const result = await updateCatalogMovieFiles(runtime, item);
+    if (!result.item || result.removedFileIds.length > 0) {
+      await auditCatalogAction(runtime, user, "check_media_item_file_validity", item.id, {
+        清理文件数: result.removedFileIds.length, 影片已移除: result.item === null,
+      });
+    }
+    return result;
+  });
+
+  /** 删除当前用户的指定电影，确认后可同时删除对应的原文件。 */
+  server.post<{ Params: { libraryId: string; itemId: string }; Body: Record<string, unknown> }>("/api/v1/libraries/:libraryId/items/:itemId/delete", async (request) => {
+    const user = await requireRequestUser(request, runtime.database);
+    const body = request.body ?? {};
+    requireConfirmation(body, "DELETE");
+    if (typeof body.deleteFiles !== "boolean") throw validationError("deleteFiles", "请选择是否同步删除原文件");
+    const { libraryId, itemId } = request.params;
+    const item = await requireLibraryItem(runtime, user.id, libraryId, itemId);
+    const result = await updateCatalogMovieFiles(runtime, item, body.deleteFiles ? "with_files" : "catalog_only");
+    await auditCatalogAction(runtime, user, "delete_media_item", item.id, {
+      同步删除原文件: body.deleteFiles, 清理文件数: result.removedFileIds.length,
+      未确认文件数: result.unconfirmedCount, 影片已移除: result.item === null,
+    });
+    return result;
   });
 }

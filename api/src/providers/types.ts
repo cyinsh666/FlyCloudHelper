@@ -234,6 +234,9 @@ export interface ProviderAdapter {
     signal?: AbortSignal,
     context?: ProviderConnectionContext,
   ): Promise<ProviderBrowseListing>;
+  /** 对只构造播放地址的 Provider，使用独立的只读请求确认原文件是否存在。 */
+  checkFileExists?(connection: Record<string, unknown>, locator: Record<string, unknown>, signal?: AbortSignal,
+    context?: ProviderConnectionContext): Promise<boolean>;
   /** Provider 支持文件访问时，把扫描 locator 转换为短期有效的下载地址。 */
   resolveFileAccess?(
     connection: Record<string, unknown>,

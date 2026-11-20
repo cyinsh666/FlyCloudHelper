@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
-import { parseJsonObject, type LibraryScanJobRecord, type LibrarySourceRecord, type MediaLibraryKind, type MediaType } from "../domain.js";
+import { parseJsonObject, type LibraryScanJobRecord, type LibrarySourceRecord, type MediaLibraryKind, type MediaLibraryRecord, type MediaType } from "../domain.js";
 import { ApiError, toSafeErrorMessage, validationError } from "../errors.js";
 import {
   readPagination,
@@ -29,6 +29,31 @@ import {
   validateScanProfile,
   validateServiceDataType,
 } from "./service-routes.js";
+
+interface LibraryMaintenanceOperation {
+  id: string;
+  libraryId: string;
+  kind: "clear" | "delete";
+  status: "running" | "completed" | "failed";
+  error: string | null;
+}
+
+/** 在线内容库在维护时先暂停动态写入；直播库删除前停止来源进程。 */
+async function runLibraryMaintenance<T>(runtime: ApiRuntime, library: Pick<MediaLibraryRecord, "id" | "libraryKind">, operation: () => Promise<T>): Promise<T> {
+  switch (library.libraryKind) {
+    case "content_source_live":
+      await runtime.liveLibraries.stopLibrary(library.id);
+      return operation();
+    case "content_source_video":
+      return runtime.contentSources.withLibraryCatalogChange(library.id, operation);
+    case "content_source_music":
+      return runtime.contentMusic.withLibraryCatalogChange(library.id, operation);
+    case "content_source_audiobook":
+      return runtime.contentAudiobooks.withLibraryCatalogChange(library.id, operation);
+    default:
+      return operation();
+  }
+}
 
 /** 云聚合视频库没有来源时使用的媒体库级默认扫描参数；具体根目录保存在各来源配置中。 */
 function createCloudAggregateScanProfile(): Record<string, unknown> {
@@ -160,6 +185,39 @@ export function attachLibrarySourceId(
 
 /** 注册媒体库本体、配置、扫描和删除接口。 */
 export async function registerLibraryRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
+  // 关键变量：同一媒体库只允许一个清空或删除操作。终态短时保留，供列表刷新读取结果。
+  const maintenanceByLibrary = new Map<string, { userId: string; operation: LibraryMaintenanceOperation }>();
+  const activeMaintenance = new Set<Promise<unknown>>();
+
+  // 此钩子晚于数据库关闭钩子注册，Fastify 按逆序执行，先等维护事务结束再关闭数据库。
+  server.addHook("onClose", async () => {
+    await Promise.allSettled(activeMaintenance);
+  });
+
+  /** 仅对可见的媒体库操作返回锁定状态。 */
+  function requireLibraryMaintenanceIdle(libraryId: string, userId?: string): void {
+    const active = maintenanceByLibrary.get(libraryId);
+    if (active?.operation.status !== "running" || (userId !== undefined && active.userId !== userId)) return;
+    throw new ApiError(409, "library_maintenance_in_progress",
+      active.operation.kind === "clear" ? "媒体库正在清空，请稍后再试" : "媒体库正在删除，请稍后再试");
+  }
+
+  /** 读取指定用户的维护进度；管理员可查看全部媒体库。 */
+  function listLibraryMaintenance(libraryId: unknown, userId?: string): { items: LibraryMaintenanceOperation[] } {
+    const records = typeof libraryId === "string" ? [maintenanceByLibrary.get(libraryId)] : [...maintenanceByLibrary.values()];
+    return { items: records.flatMap((record) => record && (userId === undefined || record.userId === userId) ? [record.operation] : []) };
+  }
+
+  server.get<{ Querystring: Record<string, unknown> }>("/api/v1/libraries/maintenance", async (request) => {
+    const user = await requireRequestUser(request, runtime.database);
+    return listLibraryMaintenance(request.query.libraryId, user.id);
+  });
+
+  server.get<{ Querystring: Record<string, unknown> }>("/api/v1/admin/libraries/maintenance", async (request) => {
+    await requireSuperAdmin(request, runtime.database);
+    return listLibraryMaintenance(request.query.libraryId);
+  });
+
   server.get<{ Querystring: Record<string, unknown> }>("/api/v1/libraries", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     const rawDataType = typeof request.query.dataType === "string" ? request.query.dataType : "";
@@ -358,6 +416,7 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
 
   server.get<{ Params: { libraryId: string } }>("/api/v1/libraries/:libraryId", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
+    requireLibraryMaintenanceIdle(request.params.libraryId, user.id);
     const [library, profiles] = await Promise.all([
       runtime.repository.getLibrary(request.params.libraryId, user.id),
       runtime.repository.getLibraryProfiles(request.params.libraryId, user.id),
@@ -382,6 +441,7 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
 
   server.get<{ Params: { libraryId: string } }>("/api/v1/admin/libraries/:libraryId", async (request) => {
     await requireSuperAdmin(request, runtime.database);
+    requireLibraryMaintenanceIdle(request.params.libraryId);
     const library = await runtime.repository.getLibrary(request.params.libraryId);
     const profiles = await runtime.repository.getLibraryProfiles(library.id, library.userId);
     return { library, ...profiles };
@@ -727,6 +787,19 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     return reply.status(result.jobId ? 202 : 200).send({ job, queuedCount: result.queuedCount });
   });
 
+  /** 手动检查已入库文件，不要求配置全量或增量扫描目录。 */
+  server.post<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/libraries/:libraryId/video-existence-checks", async (request, reply) => {
+    const user = await requireRequestUser(request, runtime.database);
+    const library = await runtime.repository.getLibrary(request.params.libraryId, user.id);
+    const body = request.body ?? {};
+    const result = await runtime.repository.createVideoExistenceCheck({
+      library, requestedByUserId: user.id,
+      requestId: requireString(body, "requestId", "请求 ID", 200),
+      clientDeviceId: requireString(body, "clientDeviceId", "客户端设备 ID", 200),
+    });
+    return reply.status(202).send(result);
+  });
+
   server.post<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/libraries/:libraryId/scan-jobs", async (request, reply) => {
     const user = await requireRequestUser(request, runtime.database);
     const scanMode = request.body.scanMode;
@@ -916,107 +989,86 @@ export async function registerLibraryRoutes(server: FastifyInstance, runtime: Ap
     },
   );
 
-  server.delete<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/libraries/:libraryId/catalog", async (request) => {
-    const user = await requireRequestUser(request, runtime.database);
-    requireConfirmation(request.body, request.params.libraryId);
-    const library = await runtime.repository.getLibrary(request.params.libraryId, user.id);
-    // 关键变量：在线库清空前暂停动态入库并清理窗口，避免旧分页缓存或正在写入的内容回填。
-    if (library.libraryKind === "content_source_live") throw new ApiError(409, "live_no_catalog", "直播频道请在直播设置中选择，无需清空影视目录");
-    const cleared = library.libraryKind === "content_source_video"
-      ? await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, user.id))
-      : library.libraryKind === "content_source_music"
-        ? await runtime.contentMusic.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, user.id))
-      : library.libraryKind === "content_source_audiobook"
-        ? await runtime.contentAudiobooks.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, user.id))
-      : await runtime.repository.clearLibraryCatalog(library.id, user.id);
-    runtime.logBusinessEvent("info", {
-      日志关键字: "codex-media-library-catalog-clear",
-      事件: "清空媒体库目录",
-      用户ID: user.id,
-      媒体库ID: library.id,
-      服务ID: library.sourceServiceId,
-      清空媒体条目数: cleared.mediaItemCount,
-      清空源文件数: cleared.sourceFileCount,
-    });
-    return cleared;
-  });
+  /** 保留既有删除接口的同步结果；控制台可请求后台执行并立即收到操作 ID。 */
+  function registerMaintenanceRoute(path: string, kind: LibraryMaintenanceOperation["kind"], admin: boolean): void {
+    server.delete<{ Params: { libraryId: string }; Body: Record<string, unknown> }>(path, async (request, reply) => {
+      const actor = admin ? await requireSuperAdmin(request, runtime.database) : await requireRequestUser(request, runtime.database);
+      const body = request.body ?? {};
+      const { libraryId } = request.params;
+      requireConfirmation(body, libraryId);
+      requireLibraryMaintenanceIdle(libraryId, admin ? undefined : actor.id);
+      // 只读库归属与类型，确认请求无需统计大媒体库的条目数。
+      const primaryService = runtime.database.query("library_sources").select("service_id").where({ library_id: libraryId })
+        .whereNot("status", "deleted").orderBy("sort_order", "asc").orderBy("created_at", "asc").limit(1).as("source_service_id");
+      const libraryQuery = runtime.database.query("media_libraries")
+        .select("user_id", "library_kind", primaryService).where({ id: libraryId });
+      if (!admin) libraryQuery.where({ user_id: actor.id });
+      const row = await libraryQuery.first();
+      if (!row) throw new ApiError(404, "library_not_found", "媒体库不存在");
+      const library = { id: libraryId, libraryKind: String(row.library_kind) as MediaLibraryKind };
+      if (kind === "clear" && library.libraryKind === "content_source_live") {
+        throw new ApiError(409, "live_no_catalog", "直播频道请在直播设置中选择，无需清空影视目录");
+      }
+      requireLibraryMaintenanceIdle(libraryId);
+      const operation: LibraryMaintenanceOperation = { id: randomUUID(), libraryId, kind, status: "running", error: null };
+      const ownerId = String(row.user_id);
+      maintenanceByLibrary.set(libraryId, { userId: ownerId, operation });
+      const action = kind === "clear" ? "清空媒体库目录" : "删除媒体库并保留来源服务";
+      const logContext = {
+        日志关键字: kind === "clear" ? "codex-media-library-catalog-clear" : "codex-media-library-delete",
+        ...(admin ? { 管理员ID: actor.id } : { 用户ID: actor.id }),
+        媒体库ID: libraryId,
+        服务ID: String(row.source_service_id ?? ""),
+        操作ID: operation.id,
+      };
 
-  server.delete<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/admin/libraries/:libraryId/catalog", async (request) => {
-    const operator = await requireSuperAdmin(request, runtime.database);
-    requireConfirmation(request.body, request.params.libraryId);
-    const library = await runtime.repository.getLibrary(request.params.libraryId);
-    // 管理员清空在线库也等待该库动态写入收尾，再沿用原目录清空流程。
-    if (library.libraryKind === "content_source_live") throw new ApiError(409, "live_no_catalog", "直播频道请在直播设置中选择，无需清空影视目录");
-    const cleared = library.libraryKind === "content_source_video"
-      ? await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, library.userId))
-      : library.libraryKind === "content_source_music"
-        ? await runtime.contentMusic.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, library.userId))
-      : library.libraryKind === "content_source_audiobook"
-        ? await runtime.contentAudiobooks.withLibraryCatalogChange(library.id, () => runtime.repository.clearLibraryCatalog(library.id, library.userId))
-      : await runtime.repository.clearLibraryCatalog(library.id, library.userId);
-    runtime.logBusinessEvent("info", {
-      日志关键字: "codex-media-library-catalog-clear",
-      事件: "管理员清空媒体库目录",
-      管理员ID: operator.id,
-      媒体库ID: library.id,
-      服务ID: library.sourceServiceId,
-      清空媒体条目数: cleared.mediaItemCount,
-      清空源文件数: cleared.sourceFileCount,
-    });
-    return cleared;
-  });
+      /** 执行现有事务，发布终态后释放媒体库锁。 */
+      async function execute() {
+        try {
+          const result = kind === "clear"
+            ? await runLibraryMaintenance(runtime, library, () => runtime.repository.clearLibraryCatalog(libraryId, ownerId))
+            : await runLibraryMaintenance(runtime, library, () => runtime.repository.deleteLibrary(libraryId, admin ? undefined : ownerId));
+          runtime.logBusinessEvent("info", {
+            ...logContext,
+            事件: admin ? `管理员${action}` : action,
+            ...(result && { 清空媒体条目数: result.mediaItemCount, 清空源文件数: result.sourceFileCount }),
+          });
+          maintenanceByLibrary.set(libraryId, { userId: ownerId, operation: { ...operation, status: "completed" } });
+          return result;
+        } catch (error) {
+          const fallback = kind === "clear" ? "清空媒体库失败，请稍后重试" : "删除媒体库失败，请稍后重试";
+          const message = error instanceof ApiError && error.statusCode < 500 ? error.message : fallback;
+          maintenanceByLibrary.set(libraryId, { userId: ownerId, operation: { ...operation, status: "failed", error: message } });
+          runtime.logBusinessEvent("warn", {
+            ...logContext,
+            事件: `${action}失败`,
+            错误码: error instanceof ApiError ? error.code : "library_maintenance_failed",
+          });
+          throw error;
+        } finally {
+          setTimeout(() => {
+            if (maintenanceByLibrary.get(libraryId)?.operation.id === operation.id) maintenanceByLibrary.delete(libraryId);
+          }, 5 * 60_000).unref();
+        }
+      }
 
-  server.delete<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/libraries/:libraryId", async (request, reply) => {
-    const user = await requireRequestUser(request, runtime.database);
-    requireConfirmation(request.body, request.params.libraryId);
-    const library = await runtime.repository.getLibrary(request.params.libraryId, user.id);
-    // 删除在线库前暂停新分页并等待已有动态请求，避免删除后继续使用旧库写入。
-    if (library.libraryKind === "content_source_live") {
-      await runtime.liveLibraries.stopLibrary(library.id);
-      await runtime.repository.deleteLibrary(library.id, user.id);
-    } else if (library.libraryKind === "content_source_video") {
-      await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id, user.id));
-    } else if (library.libraryKind === "content_source_music") {
-      await runtime.contentMusic.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id, user.id));
-    } else if (library.libraryKind === "content_source_audiobook") {
-      await runtime.contentAudiobooks.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id, user.id));
-    } else {
-      await runtime.repository.deleteLibrary(library.id, user.id);
-    }
-    runtime.logBusinessEvent("info", {
-      日志关键字: "codex-media-library-delete",
-      事件: "删除媒体库并保留来源服务",
-      用户ID: user.id,
-      媒体库ID: library.id,
-      服务ID: library.sourceServiceId,
+      // 关键变量：后台操作在响应交给 Fastify 后再进入事务，避免 SQLite 主连接被长事务占用时影响提交响应。
+      const task = body.background === true
+        ? new Promise<void>((resolve) => setImmediate(resolve)).then(execute)
+        : execute();
+      activeMaintenance.add(task);
+      const completion = task.finally(() => activeMaintenance.delete(task));
+      if (body.background === true) {
+        void completion.catch(() => undefined);
+        return reply.code(202).send({ operation });
+      }
+      const result = await completion;
+      return kind === "clear" ? result : reply.code(204).send();
     });
-    return reply.status(204).send();
-  });
+  }
 
-  server.delete<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/admin/libraries/:libraryId", async (request, reply) => {
-    const operator = await requireSuperAdmin(request, runtime.database);
-    requireConfirmation(request.body, request.params.libraryId);
-    const library = await runtime.repository.getLibrary(request.params.libraryId);
-    // 管理员删除在线库与个人入口使用相同的动态浏览生命周期。
-    if (library.libraryKind === "content_source_live") {
-      await runtime.liveLibraries.stopLibrary(library.id);
-      await runtime.repository.deleteLibrary(library.id);
-    } else if (library.libraryKind === "content_source_video") {
-      await runtime.contentSources.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id));
-    } else if (library.libraryKind === "content_source_music") {
-      await runtime.contentMusic.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id));
-    } else if (library.libraryKind === "content_source_audiobook") {
-      await runtime.contentAudiobooks.withLibraryCatalogChange(library.id, () => runtime.repository.deleteLibrary(library.id));
-    } else {
-      await runtime.repository.deleteLibrary(library.id);
-    }
-    runtime.logBusinessEvent("info", {
-      日志关键字: "codex-media-library-delete",
-      事件: "管理员删除媒体库并保留来源服务",
-      管理员ID: operator.id,
-      媒体库ID: library.id,
-      服务ID: library.sourceServiceId,
-    });
-    return reply.status(204).send();
-  });
+  registerMaintenanceRoute("/api/v1/libraries/:libraryId/catalog", "clear", false);
+  registerMaintenanceRoute("/api/v1/admin/libraries/:libraryId/catalog", "clear", true);
+  registerMaintenanceRoute("/api/v1/libraries/:libraryId", "delete", false);
+  registerMaintenanceRoute("/api/v1/admin/libraries/:libraryId", "delete", true);
 }

@@ -17,7 +17,7 @@ import {
   requireHistoricalLibrary,
 } from "./schema-upgrade-compatibility.js";
 
-export const currentSchemaVersion = 66;
+export const currentSchemaVersion = 67;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -1410,6 +1410,45 @@ async function migrateCatalogDeletionIndexes(database: Knex): Promise<void> {
   await addIndexIfMissing(database, "catalog_changes", ["library_id"], "idx_catalog_changes_library");
 }
 
+/** 为后续新增的文件和条目关联补索引，避免清空、删库时逐条扫描子表。 */
+async function migrateLibraryDeletionForeignKeyIndexes(database: Knex): Promise<void> {
+  // 级联查询只有外键列的等值条件，既有以用户、库或账号开头的组合索引无法直接定位。
+  const indexes = [
+    ["media_item_source_candidates", "source_file_id"],
+    ["catalog_projection_jobs", "source_file_id"],
+    ["catalog_projection_jobs", "library_source_id"],
+    ["library_playback_progress", "item_id"],
+    ["library_playback_history", "item_id"],
+    ["library_playback_sessions", "item_id"],
+    ["library_item_preferences", "item_id"],
+    ["library_music_playlist_items", "item_id"],
+    ["library_emby_playback_progress", "item_id"],
+    ["library_emby_playback_history", "item_id"],
+    ["library_emby_playback_sessions", "item_id"],
+    ["library_emby_item_preferences", "item_id"],
+    ["library_abs_progress", "item_id"],
+    ["library_abs_bookmarks", "item_id"],
+    ["library_abs_playback_sessions", "item_id"],
+    ["library_abs_collections_items", "item_id"],
+    ["library_abs_playlists_items", "item_id"],
+    ["nfo_sidecar_cache", "library_id"],
+    ["scan_jobs", "library_id"],
+    ["media_probe_jobs", "library_id"],
+  ] as const;
+  const mysql = database.client.config.client === "mysql2";
+  // MySQL 会为外键自动建索引，已有以目标列开头的索引时直接复用。
+  const existingIndexes = mysql ? await database("information_schema.statistics")
+    .select({ tableName: "TABLE_NAME", columnName: "COLUMN_NAME" })
+    .whereRaw("TABLE_SCHEMA = DATABASE()")
+    .where("SEQ_IN_INDEX", 1)
+    .whereIn("TABLE_NAME", [...new Set(indexes.map(([tableName]) => tableName))]) : [];
+  const existingKeys = new Set(existingIndexes.map((row) => `${row.tableName}.${row.columnName}`));
+  for (const [tableName, columnName] of indexes) {
+    if (existingKeys.has(`${tableName}.${columnName}`)) continue;
+    await addIndexIfMissing(database, tableName, [columnName], `idx_${tableName}_${columnName}`);
+  }
+}
+
 /** 清理历史重复文件归属，并从数据库层保证一个源文件只能归属一个媒体条目。 */
 async function migrateUniqueSourceFileOwnership(database: Knex): Promise<void> {
   const results = await repairDuplicateCatalogFileLinks(database);
@@ -2228,6 +2267,7 @@ export async function migrateDatabase(database: Knex, exportDirectory: string): 
   if (!existingState) {
     await dropRemovedAppSyncTables(database);
     await dropLegacyServiceLibraryColumns(database);
+    await migrateLibraryDeletionForeignKeyIndexes(database);
     await database("system_state").insert({
       singleton_id: 1,
       service_instance_id: randomUUID(),
@@ -2279,6 +2319,7 @@ export async function migrateDatabase(database: Knex, exportDirectory: string): 
       await dropRemovedAppSyncTables(database);
       await dropLegacyServiceLibraryColumns(database);
     });
+    await applyMigration(67, () => migrateLibraryDeletionForeignKeyIndexes(database));
     await dropRemovedAppSyncTables(database);
     await dropLegacyServiceLibraryColumns(database);
     await database("system_state").where({ singleton_id: 1 }).update({

@@ -16,6 +16,7 @@ const VIDEO_EXTENSION = /\.(?:mp4|mkv|avi|mov|wmv|flv|m4v|ts|m2ts|mpg|mpeg|rmvb|
 const MAX_FILES = 5000;
 const MAX_DIRECTORIES = 2000;
 const MAX_ENTRIES = 20_000;
+const ACTIVE_SCAN_MESSAGE = "当前网盘有未结束的扫描任务，请等扫描结束后再整理";
 /** 从文件名提取可重复验证的命名标签，不读取媒体字节。 */
 function readNameTags(name: string, resolution: string, source: string): string[] {
   const tags: string[] = [];
@@ -103,17 +104,21 @@ export class ServiceOrganizeManager {
     const service = await this.runtime.repository.getServiceDetail(serviceId, actorUserId);
     const adapter = this.runtime.providers.get(service.providerType);
     const connection = this.runtime.vault.decrypt(await this.runtime.repository.getActiveEncryptedConnection(service.id, service.userId));
+    const mode = String(connection.authMode ?? "");
+    if (await this.hasActiveScan(serviceId)) return { supported: false, mode, reason: ACTIVE_SCAN_MESSAGE };
     const supported = service.status === "active" && service.connectionStatus === "valid"
       && Boolean(adapter.fileOrganizer?.supports(connection));
     const reason = service.status !== "active" || service.connectionStatus !== "valid"
       ? "网盘服务当前不可用，请先恢复连接"
       : "当前网盘或登录方式不支持影片整理";
-    return { supported, mode: String(connection.authMode ?? ""), reason: supported ? null : reason };
+    return { supported, mode, reason: supported ? null : reason };
   }
 
   /** 读取服务连接与 Provider 写适配，并保持 OAuth 令牌刷新后原位保存。 */
   private async context(serviceId: string, actorUserId?: string): Promise<OrganizeContext> {
     const service = await this.runtime.repository.getServiceDetail(serviceId, actorUserId);
+    // 关键变量：扫描运行时服务状态会变成 scanning，先检查实际任务再判断连接状态。
+    await this.requireNoActiveScan(serviceId);
     if (service.status !== "active" || service.connectionStatus !== "valid") {
       throw new ApiError(409, "organize_service_unavailable", "网盘服务当前不可用，请先恢复连接");
     }
@@ -912,7 +917,6 @@ export class ServiceOrganizeManager {
     this.creatingServices.add(serviceId);
     try {
       const context = await this.context(serviceId, actorUserId);
-      await this.requireNoActiveScan(serviceId);
       const plan = await this.getPlan(serviceId, planId, actorUserId);
       await this.requireDirectory(context, plan.targetDirectory);
       if (plan.unrecognizedTransferEnabled && plan.unrecognizedDirectory) await this.requireDirectory(context, plan.unrecognizedDirectory);
@@ -964,11 +968,16 @@ export class ServiceOrganizeManager {
     });
   }
 
-  /** 文件移动期间不与同服务正在排队或运行的扫描任务交叉。 */
-  private async requireNoActiveScan(serviceId: string, query = this.runtime.database.query): Promise<void> {
+  /** 按物理网盘服务检查未结束的来源扫描任务，包括聚合库的来源子任务。 */
+  private async hasActiveScan(serviceId: string, query = this.runtime.database.query): Promise<boolean> {
     const scan = await query("scan_jobs").select("id")
       .where({ service_id: serviceId }).whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first();
-    if (scan) throw new ApiError(409, "organize_scan_active", "当前网盘服务有未结束的扫描任务，请稍后整理");
+    return Boolean(scan);
+  }
+
+  /** 只在调用方已核对网盘归属后使用，锁内校验与扫描创建共用服务行锁。 */
+  public async requireNoActiveScan(serviceId: string, query = this.runtime.database.query): Promise<void> {
+    if (await this.hasActiveScan(serviceId, query)) throw new ApiError(409, "organize_scan_active", ACTIVE_SCAN_MESSAGE);
   }
 
   /** 暂停和取消只在当前文件完成后生效；失败任务仅允许用户主动继续。 */

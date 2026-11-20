@@ -64,6 +64,7 @@ import {
   type ScanRoot,
 } from "./providers/types.js";
 import { ProviderRegistry } from "./providers/registry.js";
+import { isProviderAuthenticationErrorCode } from "./providers/authentication-errors.js";
 import {
   ScanFailureReportService,
   type ScanFailureRecordInput,
@@ -71,6 +72,7 @@ import {
 import { CredentialVault } from "./secrets.js";
 import { loadMusicSourceSettings } from "./system-settings.js";
 import type { ProtocolImageCache } from "./media/image-cache.js";
+import { checkExistingVideoFiles } from "./media/video-existence-check.js";
 import {
   buildAggregateScanCompletionMessage,
   buildScanCompletionMessage,
@@ -79,6 +81,7 @@ import {
 } from "./scan-notification.js";
 import {
   ServiceRepository,
+  type ExistingVideoFile,
   type ScanCreatedMediaCounts,
   type ScanCheckpointProgress,
 } from "./service-repository.js";
@@ -576,6 +579,18 @@ export class ScanWorker {
     try {
       const parentJob = await this.repository.claimLibraryScanJobCompletionNotification(job.parentJobId, job.userId);
       if (!parentJob) return true;
+      if (job.snapshot.taskPurpose === "check_existing_video") {
+        const incomplete = parentJob.errorCount > 0 || parentJob.failedSourceCount > 0 || parentJob.cancelledSourceCount > 0;
+        await this.database.createNotificationSafely({
+          userId: job.userId, category: "task", tone: incomplete ? "warning" : "success",
+          title: "聚合媒体库已有影片检查已结束",
+          message: `核对 ${parentJob.processedCount} 个文件，剔除 ${parentJob.discoveredCount} 个失效版本。`
+            + ` ${parentJob.errorCount} 个文件未能确认，${parentJob.failedSourceCount} 个来源失败，${parentJob.cancelledSourceCount} 个来源已取消。`,
+          actionPath: "/app/jobs",
+          deliverExternally: await this.readServiceNotificationEnabled(job.serviceId, job.libraryId),
+        });
+        return true;
+      }
       const [notificationEnabled, countedMedia] = await Promise.all([
         this.readServiceNotificationEnabled(job.serviceId, job.libraryId),
         this.readLibraryScanCreatedMediaCounts(parentJob),
@@ -785,15 +800,18 @@ export class ScanWorker {
   /** 执行单个任务并把异常转换为脱敏任务错误。 */
   private async executeJob(job: ScanJobRecord): Promise<void> {
     const controller = new AbortController();
+    const checksExisting = job.snapshot.taskPurpose === "check_existing_video";
     this.abortControllers.set(job.id, controller);
     this.logger.info({
       日志标记: "flycloud-helper-worker",
-      事件: isStoredAiSupplementJob(job) ? "AI补充未匹配任务开始" : "扫描任务开始",
+      事件: checksExisting ? "已有影片检查开始" : isStoredAiSupplementJob(job) ? "AI补充未匹配任务开始" : "扫描任务开始",
       任务ID: job.id,
       服务ID: job.serviceId,
     });
     try {
-      if (isStoredAiSupplementJob(job)) {
+      if (checksExisting) {
+        await this.checkStoredVideos(job, controller.signal);
+      } else if (isStoredAiSupplementJob(job)) {
         await this.supplementStoredUnmatchedMedia(job, controller.signal);
       } else {
         await this.scan(job, controller.signal);
@@ -831,7 +849,7 @@ export class ScanWorker {
         });
         return;
       }
-      const code = readFailureCode(error, "scan_failed");
+      const code = readFailureCode(error, checksExisting ? "video_existence_check_failed" : "scan_failed");
       await this.failureReports.record(job, {
         stage: "task",
         errorCode: code,
@@ -842,7 +860,7 @@ export class ScanWorker {
       await this.repository.finishJob(job.id, {
         status: "failed",
         errorCode: code,
-        errorMessage: toSafeErrorMessage(error, isStoredAiSupplementJob(job) ? "AI 补充任务失败" : "扫描任务失败"),
+        errorMessage: toSafeErrorMessage(error, checksExisting ? "已有影片检查失败" : isStoredAiSupplementJob(job) ? "AI 补充任务失败" : "扫描任务失败"),
       });
       const belongsToAggregateParent = await this.notifyAggregateParentIfFinished(job);
       if (!belongsToAggregateParent) {
@@ -851,8 +869,10 @@ export class ScanWorker {
           userId: job.userId,
           category: "task",
           tone: "danger",
-          title: isStoredAiSupplementJob(job) ? "AI 补充任务失败" : "扫描任务失败",
-          message: isStoredAiSupplementJob(job)
+          title: checksExisting ? "已有影片检查失败" : isStoredAiSupplementJob(job) ? "AI 补充任务失败" : "扫描任务失败",
+          message: checksExisting
+            ? `服务“${job.serviceName}”的已有影片检查失败：${toSafeErrorMessage(error, "已有影片检查失败")}`
+            : isStoredAiSupplementJob(job)
             ? `服务“${job.serviceName}”的未匹配内容 AI 补充失败：${toSafeErrorMessage(error, "AI 补充任务失败")}`
             : `服务“${job.serviceName}”的${job.scanMode === "full" ? "全量" : "增量"}扫描失败：${toSafeErrorMessage(error, "扫描任务失败")}`,
           actionPath: "/app/jobs",
@@ -861,13 +881,72 @@ export class ScanWorker {
       }
       this.logger.warn({
         日志标记: "flycloud-helper-worker",
-        事件: isStoredAiSupplementJob(job) ? "AI补充未匹配任务失败" : "扫描任务失败",
+        事件: checksExisting ? "已有影片检查失败" : isStoredAiSupplementJob(job) ? "AI补充未匹配任务失败" : "扫描任务失败",
         任务ID: job.id,
         错误码: code,
       });
     } finally {
       this.abortControllers.delete(job.id);
       this.failureReports.release(job.id);
+    }
+  }
+
+  /** 使用原有来源任务队列核对已入库文件，检查结束后统一提交确认缺失的版本。 */
+  private async checkStoredVideos(job: ScanJobRecord, signal: AbortSignal): Promise<void> {
+    const runtime = await this.repository.getLibrarySourceRuntimeConfiguration(
+      job.librarySourceId, job.userId, Number(job.snapshot.credentialRevision),
+    );
+    const adapter = this.providers.get(runtime.providerType);
+    const connection = this.vault.decrypt(runtime.encryptedConnection);
+    const files = await this.repository.listExistingVideoFiles(job);
+    const missing: ExistingVideoFile[] = [];
+    let processedCount = 0;
+    let errorCount = 0;
+    let lastProgressAt = Date.now();
+    await this.repository.updateJobProgress(job.id, { stage: "enumerating", totalCount: files.length, processedCount, errorCount });
+    await checkExistingVideoFiles({
+      adapter, connection, files, signal,
+      context: { persistConnection: async (nextConnection) => {
+        await this.repository.refreshLibrarySourceEncryptedConnection({
+          librarySourceId: job.librarySourceId, userId: job.userId,
+          credentialRevision: runtime.credentialRevision, encryptedConnection: this.vault.encrypt(nextConnection),
+        });
+      } },
+      beforeDirectory: async () => {
+        // 检查阶段不写媒体资料，暂停或取消统一在最终提交前生效。
+        signal.throwIfAborted();
+        return await this.repository.getJobControl(job.id) === "none";
+      },
+      onResult: async (directory, fileCount, absent, unavailable, error) => {
+        const errorCode = readFailureCode(error, "video_existence_check_unavailable");
+        if (isProviderAuthenticationErrorCode(errorCode)) throw error;
+        processedCount += fileCount;
+        errorCount += unavailable;
+        missing.push(...absent);
+        if (unavailable > 0) await this.failureReports.record(job, {
+          stage: "enumerating", errorCode,
+          error, recovered: false, mediaPath: directory, context: { 未确认文件数量: unavailable },
+        });
+        if (Date.now() - lastProgressAt >= 1000) {
+          lastProgressAt = Date.now();
+          await this.repository.updateJobProgress(job.id, { processedCount, errorCount, currentPath: directory });
+        }
+      },
+    });
+    signal.throwIfAborted();
+    if (await this.applyControlAction(job)) return;
+    await this.repository.updateJobProgress(job.id, { stage: "persisting", processedCount, errorCount, currentPath: null });
+    signal.throwIfAborted();
+    const removedCount = await this.repository.removeConfirmedMissingVideos(job, missing);
+    if (removedCount === null) { await this.applyControlAction(job); return; }
+    await this.repository.finishJob(job.id, { status: "completed" });
+    if (!(await this.notifyAggregateParentIfFinished(job))) {
+      await this.database.createNotificationSafely({
+        userId: job.userId, category: "task", tone: errorCount > 0 ? "warning" : "success",
+        title: "已有影片检查已完成",
+        message: `核对 ${processedCount} 个文件，剔除 ${removedCount} 个失效版本，${errorCount} 个文件未能确认。`,
+        actionPath: "/app/jobs", deliverExternally: await this.readServiceNotificationEnabled(job.serviceId, job.libraryId),
+      });
     }
   }
 
@@ -1631,6 +1710,31 @@ export class ScanWorker {
     }
     const checkpointResult = await this.repository.getOrCreateScanJobCheckpoint(job, runtime.providerType);
     const checkpoint = checkpointResult.checkpoint;
+    if (checkpointResult.restored && readCheckpointSequence(checkpoint.providerState) >= 0) {
+      const progress = checkpoint.progress;
+      // 旧版中断时可能把排队的片段当成已处理，发现不一致时从原扫描根重放。
+      const handled = new Set([...progress.processedKeys, ...progress.failedKeys]);
+      if (progress.taskKeys.some((key) => !handled.has(key))) {
+        const retainedProgress = createCheckpointBusinessProgress(createBusinessTaskProgress(progress), handled);
+        this.logger.warn({
+          日志关键字: "codex-flycloud-scan-recovery",
+          事件: "检查点包含未结束的刮削任务，重新枚举原扫描根",
+          任务ID: job.id, 原游标序号: readCheckpointSequence(checkpoint.providerState),
+          已处理影片数量: handled.size, 检查点影片数量: progress.taskKeys.length,
+        });
+        checkpoint.providerState = {};
+        checkpoint.progress = createCheckpointProgress({
+          enumeratedEntryCount: 0, scannedMediaCount: 0, skippedCount: 0, currentScanPath: null,
+          scannedDirectoryCount: 0, providerWarningKeys: new Set(), businessProgress: retainedProgress,
+          movieTaskKeys: new Set(progress.movieTaskKeys.filter((key) => handled.has(key))),
+          seriesTaskKeys: new Set(progress.seriesTaskKeys.filter((key) => handled.has(key))),
+        });
+        await this.repository.saveScanJobCheckpoint({
+          checkpoint, providerState: checkpoint.providerState, progress: checkpoint.progress,
+          nfoSidecars: checkpoint.nfoSidecars, changedItemIds: checkpoint.changedItemIds,
+        });
+      }
+    }
     // Key 临时冷却时仍先进入扫描，让已有 TMDB 共享缓存继续工作；首次缓存未命中再保存检查点并等待恢复。
     const savedProgress = checkpoint.progress;
     // 关键变量：暂停、进程退出和再次领取任务时始终复用同一 generation，避免续扫被当成新扫描。
@@ -1730,6 +1834,9 @@ export class ScanWorker {
     const pendingDirectoryFlushTasks = new Set<Promise<PendingDirectoryFlushResult>>();
     // 关键变量：源文件批量准备固定最多 4 路，不用无界数据库并发换取表面扫描速度。
     const sourcePreparationConcurrency = Math.max(1, Math.min(4, configuredScanDirectoryConcurrency));
+    // 限制两级队列的积压，源文件和刮削描述只在有限窗口内等待。
+    const pendingDirectoryLimit = sourcePreparationConcurrency * 4;
+    const pendingBusinessLimit = Math.max(64, scrapeConcurrency * 16);
     const sourcePreparationChains = Array.from({ length: sourcePreparationConcurrency }, () => Promise.resolve());
     let nextSourcePreparationWorkerIndex = 0;
     // 关键变量：任意刮削任务发现全部 TMDB Key 临时不可用后，停止提交新结果并在安全窗口回退。
@@ -1774,24 +1881,25 @@ export class ScanWorker {
       || scannedMediaCount - lastProgressPublishedMediaCount >= progressPublishMediaStep
       || Date.now() - lastProgressPublishedAt >= progressPublishIntervalMs;
 
-    /** 等待当前刮削任务或一个进度发布窗口，完成较快时及时进入下一批而不遗留定时器。 */
-    const waitForScrapeProgressWindow = async (tasks: Promise<void>[]): Promise<void> => {
-      let progressTimer: ReturnType<typeof setTimeout> | null = null;
-      const progressWindow = new Promise<void>((resolve) => {
-        progressTimer = setTimeout(resolve, progressPublishIntervalMs);
+    // 只保留一个进度定时器。队列排空时立即唤醒，无需为每项重复注册回调。
+    let finishScrapeProgressWait: (() => void) | undefined;
+    const waitForScrapeProgressWindow = (): Promise<void> => {
+      return new Promise((resolve) => {
+        const finish = (): void => {
+          clearTimeout(timer);
+          finishScrapeProgressWait = undefined;
+          resolve();
+        };
+        const timer = setTimeout(finish, progressPublishIntervalMs);
+        finishScrapeProgressWait = finish;
       });
-      await Promise.race([
-        Promise.allSettled(tasks).then(() => undefined),
-        progressWindow,
-      ]);
-      if (progressTimer) clearTimeout(progressTimer);
     };
 
     /** Provider 枚举结束后持续排空刮削队列，并每 5 秒把真实处理数量同步到任务表。 */
     const waitForBusinessTasksWithProgress = async (): Promise<void> => {
       let lastLoggedHandledCount = getHandledBusinessTaskCount(businessProgress);
       while (pendingBusinessTasks.size > 0) {
-        await waitForScrapeProgressWindow([...pendingBusinessTasks]);
+        await waitForScrapeProgressWindow();
         const handledCount = getHandledBusinessTaskCount(businessProgress);
         const queueDrained = pendingBusinessTasks.size === 0;
         if (queueDrained || Date.now() - lastProgressPublishedAt >= progressPublishIntervalMs) {
@@ -2072,6 +2180,7 @@ export class ScanWorker {
       pendingBusinessTasks.add(mediaTask);
       void mediaTask.finally(() => {
         pendingBusinessTasks.delete(mediaTask);
+        if (pendingBusinessTasks.size === 0) finishScrapeProgressWait?.();
         if (businessTaskChains.get(businessTaskKey) === mediaTask) {
           businessTaskChains.delete(businessTaskKey);
         }
@@ -2226,6 +2335,20 @@ export class ScanWorker {
       activeDirectoryItems = [];
       activeDirectoryKey = null;
       if (directoryItems.length === 0) return;
+      while (pendingDirectoryFlushTasks.size >= pendingDirectoryLimit || pendingBusinessTasks.size >= pendingBusinessLimit) {
+        if (signal.aborted || tmdbRecoveryError) return;
+        if (Date.now() >= nextJobControlPollAt) {
+          const requestedControl = await this.repository.getJobControl(job.id);
+          nextJobControlPollAt = Date.now() + jobControlPollIntervalMs;
+          if (requestedControl !== "none") {
+            this.abortControllers.get(job.id)?.abort();
+            return;
+          }
+        }
+        if (Date.now() - lastProgressPublishedAt >= progressPublishIntervalMs) await publishProgress("enumerating");
+        await new Promise<void>((resolve) => setTimeout(resolve, 250));
+      }
+      if (signal.aborted || tmdbRecoveryError) return;
 
       scannedDirectoryCount += 1;
       const firstItem = directoryItems[0];
@@ -2465,6 +2588,9 @@ export class ScanWorker {
       const candidate = checkpointCandidate;
       checkpointCandidate = null;
       if (!candidate || candidate.checkpointSequence <= scheduledCheckpointSequence) return;
+      // 仅保留一个异步检查点窗口，避免慢刮削时同时持有多份队列快照。
+      await checkpointCommitChain;
+      if (checkpointCommitError || signal.aborted || tmdbRecoveryError) return;
       await flushActiveDirectory();
       const checkpointProviderWarningKeys = new Set(providerWarningKeys);
       const checkpointNfoSidecars = serializeNfoSidecars(nfoSidecars);
@@ -2487,8 +2613,8 @@ export class ScanWorker {
             ...directoryResults.flatMap((result) => result.businessTasks),
           ])];
           await Promise.all(tasksBeforeCheckpoint);
-          // 不能把包含 TMDB 临时失败的窗口保存成新游标，否则恢复后会漏掉该窗口的影片。
-          if (tmdbRecoveryError) return;
+          // 处理函数被中断后可能正常返回，只有窗口从头到尾完成才可以推进游标。
+          if (signal.aborted || tmdbRecoveryError) return;
           // 关键变量：只合并当前游标水位内目录返回的任务键，后续并发目录不会提前进入检查点。
           const checkpointTaskKeys = new Set([
             ...checkpointTaskKeysBeforePreparation,

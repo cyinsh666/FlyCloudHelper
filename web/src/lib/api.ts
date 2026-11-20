@@ -1903,6 +1903,14 @@ export async function createScanJob(serviceId: string, scanMode: "incremental" |
   return result.job;
 }
 
+/** 为单网盘或聚合影视库发起已有影片检查。 */
+export function createVideoExistenceCheck(libraryId: string, admin = false): Promise<{ job: ScanJob | LibraryScanJob; skippedSourceCount: number }> {
+  const prefix = admin ? "/api/v1/admin/libraries" : "/api/v1/libraries";
+  return requestJson(`${prefix}/${libraryId}/video-existence-checks`, {
+    method: "POST", body: JSON.stringify({ requestId: createRequestId(), clientDeviceId: "flycloud-helper-web" }),
+  });
+}
+
 /** 对云聚合父任务统一下发暂停、继续或取消动作。 */
 export async function controlLibraryScanJob(
   libraryId: string,
@@ -2529,6 +2537,28 @@ export async function listMediaItemPaths(
   admin = false,
 ): Promise<MediaPathItem[]> {
   return (await requestJson<{ items: MediaPathItem[] }>(`${getMediaItemApiPath(item, admin)}/paths`)).items;
+}
+
+interface MovieFileOperationResult {
+  item: MediaItem | null;
+  fileCount: number;
+  removedFileIds: string[];
+  unconfirmedCount: number;
+  issue: string | null;
+}
+
+/** 核对当前电影的文件并清理已确认缺失的入库版本。 */
+export async function checkMediaItemFileValidity(item: Pick<MediaItem, "id" | "libraryId">, admin = false) {
+  return requestJson<MovieFileOperationResult>(
+    `${getMediaItemApiPath(item, admin)}/file-validity`, { method: "POST" },
+  );
+}
+
+/** 提交影片删除确认和同步删除原文件的选择。 */
+export async function deleteMediaMovie(item: Pick<MediaItem, "id" | "libraryId">, deleteFiles: boolean, admin = false) {
+  return requestJson<MovieFileOperationResult>(`${getMediaItemApiPath(item, admin)}/delete`, {
+    method: "POST", body: JSON.stringify({ confirmation: "DELETE", deleteFiles }),
+  });
 }
 
 /** 使用系统 TMDB 配置搜索电影或节目候选。 */

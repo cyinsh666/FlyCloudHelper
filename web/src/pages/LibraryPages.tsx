@@ -18,11 +18,10 @@ import { CloudAggregateSourcesPanel } from "@/components/CloudAggregateSourcesPa
 import { CloudAggregateScanPathsPanel } from "@/components/CloudAggregateScanPathsPanel";
 import { AiCleaningSettingsFields, type AiCleaningSettingsValue } from "@/components/AiCleaningSettingsFields";
 import {
-  clearServiceCatalog,
   controlLibraryScanJob,
   createScanJob,
+  createVideoExistenceCheck,
   createServiceAccessAccount,
-  deleteLibrary,
   deleteServiceAccessAccount,
   getLibrary,
   getLibraryScanJob,
@@ -44,6 +43,7 @@ import {
   type LibrarySource,
   type ProviderDirectory,
 } from "@/lib/api";
+import { startLibraryMaintenance } from "@/lib/library-maintenance";
 import { useApiResource } from "@/lib/use-api-resource";
 
 // 关键变量：单个媒体库海报墙每页读取 60 个顶层条目，避免一次加载完整目录。
@@ -156,14 +156,13 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   const [updatingJellyfin, setUpdatingJellyfin] = useState(false);
   const [updatingEmby, setUpdatingEmby] = useState(false);
   const [updatingNavidrome, setUpdatingNavidrome] = useState(false);
-  const [clearingCatalog, setClearingCatalog] = useState(false);
   const [creatingScanMode, setCreatingScanMode] = useState<"full" | "incremental" | null>(null);
-  const [scanActionFeedback, setScanActionFeedback] = useState<{ message: string; failed: boolean } | null>(null);
+  const [creatingVideoCheck, setCreatingVideoCheck] = useState(false);
+  const [scanActionFeedback, setScanActionFeedback] = useState<{ message: string; failed: boolean; videoCheck?: boolean } | null>(null);
   const [aggregateScanJob, setAggregateScanJob] = useState<LibraryScanJob | null>(null);
   const [controllingAggregateScan, setControllingAggregateScan] = useState(false);
   const [updatingNotification, setUpdatingNotification] = useState(false);
   const [savingMetadata, setSavingMetadata] = useState(false);
-  const [unlinkingService, setUnlinkingService] = useState(false);
   const [metadataProvider, setMetadataProvider] = useState("builtin.tmdb");
   const [metadataLanguage, setMetadataLanguage] = useState("zh-CN");
   const [metadataRegion, setMetadataRegion] = useState("CN");
@@ -178,8 +177,11 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   });
   const [musicAggregateMode, setMusicAggregateMode] = useState<"fast" | "complete">("fast");
   const [syncLyrics, setSyncLyrics] = useState(false);
-  // 关键变量：同步占用清空操作，避免按钮状态刷新前重复提交。
-  const clearingCatalogRef = useRef(false);
+  // 跳转列表前占用当前页的管理操作，避免确认后重复提交。
+  const maintenanceSubmission = useRef(false);
+  const [maintenanceAction, setMaintenanceAction] = useState<"clear" | "delete" | "unlink" | null>(null);
+  const clearingCatalog = maintenanceAction === "clear";
+  const unlinkingService = maintenanceAction === "unlink";
   const service = resource.data?.service;
   const settings = resource.data?.settings;
   const scanProfile = resource.data?.scanProfile ?? {};
@@ -271,7 +273,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
 
   /** 手动创建当前媒体库的扫描刮削任务。 */
   async function triggerScan(mode: "full" | "incremental"): Promise<void> {
-    if (creatingScanMode !== null) return;
+    if (creatingScanMode !== null || creatingVideoCheck) return;
     setCreatingScanMode(mode);
     setScanActionFeedback({ message: `正在创建${mode === "full" ? "全量" : "增量"}扫描任务…`, failed: false });
     try {
@@ -305,6 +307,24 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
       setMessage(errorMessage);
     } finally {
       setCreatingScanMode(null);
+    }
+  }
+
+  /** 创建已有影片检查，聚合库使用现有父任务面板显示来源进度。 */
+  async function triggerVideoCheck(): Promise<void> {
+    if (creatingVideoCheck || creatingScanMode !== null) return;
+    setCreatingVideoCheck(true);
+    setScanActionFeedback(null);
+    try {
+      const { job, skippedSourceCount } = await createVideoExistenceCheck(serviceId, admin);
+      if ("sourceJobs" in job) setAggregateScanJob(job);
+      const message = skippedSourceCount > 0
+        ? `检查任务已创建，${skippedSourceCount} 个来源暂不可用。` : "检查任务已创建，可在任务列表查看进度。";
+      setScanActionFeedback({ message, failed: false, videoCheck: true });
+    } catch (error) {
+      setScanActionFeedback({ message: error instanceof Error ? error.message : "检查任务创建失败", failed: true, videoCheck: true });
+    } finally {
+      setCreatingVideoCheck(false);
     }
   }
 
@@ -429,71 +449,45 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
     }
   }
 
-  /** 二次确认后清空媒体库中的扫描和刮削结果。 */
+  /** 登记操作后立即返回列表，由列表跟踪完成结果。 */
+  async function submitLibraryMaintenance(action: "clear" | "delete" | "unlink"): Promise<void> {
+    if (!service || maintenanceSubmission.current) return;
+    maintenanceSubmission.current = true;
+    setMaintenanceAction(action);
+    startLibraryMaintenance(service, action === "clear" ? "clear" : "delete", admin);
+    await navigate({ to: librariesPath, replace: true });
+  }
+
+  /** 二次确认后提交清空扫描和刮削结果的操作。 */
   async function clearCatalog(): Promise<void> {
-    if (!service || clearingCatalogRef.current) return;
+    if (!service || maintenanceSubmission.current) return;
     if (!window.confirm(isContentSource
       ? `确定清空“${service.displayName}”的在线目录吗？内容源配置和协议账号会保留。`
       : `确定清空“${service.displayName}”媒体库的全部内容吗？媒体条目、文件索引和目录版本将被清空，服务连接与扫描配置会保留。`)) return;
-    clearingCatalogRef.current = true;
-    setClearingCatalog(true);
-    setMessage("正在清空当前媒体库…");
-    try {
-      await clearServiceCatalog(serviceId, admin);
-      setMessage("媒体库已清空");
-      await resource.refresh();
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "清空媒体库失败");
-    } finally {
-      clearingCatalogRef.current = false;
-      setClearingCatalog(false);
-    }
+    await submitLibraryMaintenance("clear");
   }
 
-  /** 删除媒体库并返回媒体库列表，来源网盘服务继续保留。 */
+  /** 提交删除媒体库并返回列表，来源网盘服务继续保留。 */
   async function deleteCurrentLibrary(): Promise<void> {
-    if (!service || !window.confirm(isContentSource
+    if (!service || maintenanceSubmission.current || !window.confirm(isContentSource
       ? `确定删除“${service.displayName}”在线媒体库吗？在线目录和协议账号会被删除，源插件继续保留。`
       : `确定删除“${service.displayName}”媒体库吗？扫描结果、任务配置和协议账号会被删除，来源网盘服务会保留。`)) return;
-    try {
-      await deleteLibrary(serviceId, admin);
-      await navigate({ to: librariesPath, replace: true });
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "媒体库删除失败");
-    }
+    await submitLibraryMaintenance("delete");
   }
 
-  /** 取消当前唯一来源时同步删除媒体库，避免留下无法扫描和播放的空媒体库。 */
+  /** 取消唯一来源时提交媒体库删除，避免留下无法扫描和播放的空媒体库。 */
   async function unlinkLastService(): Promise<void> {
-    if (!service || unlinkingService) return;
+    if (!service || maintenanceSubmission.current) return;
     const confirmed = window.confirm(
       `“${service.sourceServiceName}”是“${service.displayName}”的最后一个关联服务。取消关联将同时删除该媒体库及扫描结果、任务配置和协议账号，网盘服务本身会保留。确定继续吗？`,
     );
     if (!confirmed) return;
-    setUnlinkingService(true);
     console.info("codex-media-library-source-unlink", {
-      事件: "取消最后一个关联服务并删除媒体库",
+      事件: "提交取消最后一个关联服务并删除媒体库",
       媒体库ID: serviceId,
       服务ID: service.sourceServiceId,
     });
-    try {
-      await deleteLibrary(serviceId, admin);
-      console.info("codex-media-library-source-unlink", {
-        事件: "取消关联完成，媒体库已删除",
-        媒体库ID: serviceId,
-        服务ID: service.sourceServiceId,
-      });
-      await navigate({ to: librariesPath, replace: true });
-    } catch (error) {
-      console.warn("codex-media-library-source-unlink", {
-        事件: "取消关联失败",
-        媒体库ID: serviceId,
-        服务ID: service.sourceServiceId,
-        错误: error instanceof Error ? error.message : String(error),
-      });
-      setMessage(error instanceof Error ? error.message : "取消关联失败");
-      setUnlinkingService(false);
-    }
+    await submitLibraryMaintenance("unlink");
   }
 
   if (service?.libraryKind === "content_source_live") return <LibraryLiveSettingsPage state={{ library: service, admin, message, onRefresh: resource.refresh, onDelete: deleteCurrentLibrary }} />;
@@ -516,6 +510,17 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   if (!service || !settings) {
     return <Panel>{resource.error ? <p role="alert" className="text-sm text-destructive">{resource.error}</p> : <div aria-label="媒体库设置加载中" className="animate-pulse space-y-4"><div className="h-7 w-48 rounded bg-muted" /><div className="h-20 rounded bg-muted" /><div className="h-40 rounded bg-muted" /></div>}</Panel>;
   }
+  const videoCheckButton = service.dataType === "video" && (
+    <SecondaryButton disabled={creatingVideoCheck || creatingScanMode !== null} onClick={() => void triggerVideoCheck()}>
+      <ScanLine className="size-4" /> {creatingVideoCheck ? "创建中…" : "检查已有影片"}
+    </SecondaryButton>
+  );
+  const scanFeedback = scanActionFeedback && (
+    <p role={scanActionFeedback.failed ? "alert" : "status"} className={`mt-3 rounded-lg border px-3 py-2 text-xs ${scanActionFeedback.failed ? "border-destructive/30 bg-destructive/10 text-destructive" : "border-border bg-secondary/20 text-muted-foreground"}`}>
+      {scanActionFeedback.message}
+    </p>
+  );
+  const aggregateVideoCheck = aggregateScanJob?.sourceJobs.some((job) => job.snapshot.taskPurpose === "check_existing_video");
   // 关键变量：音乐库展示 Navidrome 状态，视频库展示 Jellyfin 状态。
   const libraryProtocolName = settings.navidromeSupported ? "Navidrome" : "Jellyfin";
   const libraryProtocolEnabled = settings.navidromeSupported
@@ -543,7 +548,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
           </div>
           <div className="flex flex-wrap gap-2">
             {service.sourceServiceId && <Link to={admin ? "/admin/services/$serviceId" : "/app/services/$serviceId"} params={{ serviceId: service.sourceServiceId }}><SecondaryButton>查看服务</SecondaryButton></Link>}
-            <button type="button" onClick={() => void unlinkLastService()} disabled={unlinkingService} className="inline-flex cursor-pointer items-center justify-center rounded-lg border border-destructive/50 bg-destructive/10 px-3 py-2 text-xs font-medium text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40">{unlinkingService ? "取消中…" : "取消关联"}</button>
+            <button type="button" onClick={() => void unlinkLastService()} disabled={maintenanceAction !== null} className="inline-flex cursor-pointer items-center justify-center rounded-lg border border-destructive/50 bg-destructive/10 px-3 py-2 text-xs font-medium text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40">{unlinkingService ? "取消中…" : "取消关联"}</button>
           </div>
         </div>
         <p className="mt-2 text-xs text-muted-foreground">当前只有这一个关联服务；取消关联会同时删除媒体库，网盘服务仍然保留。</p>
@@ -570,13 +575,15 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
         {isCloudAggregate ? <Panel title="聚合扫描" description="每个参与来源作为独立子任务并行扫描，扫描结果通过公共队列依次合并到同一媒体库。">
           <p className="text-xs text-muted-foreground">只扫描当前模式下已配置目录的正常来源；未配置路径、失效或停用的来源不会进入本轮任务。</p>
           <div className="mt-3 flex flex-wrap gap-2">
-            <SecondaryButton disabled={creatingScanMode !== null || fullAggregateScanSources.length === 0} onClick={() => void triggerScan("full")}><ScanLine className="size-4" /> {creatingScanMode === "full" ? "创建中…" : "全量扫描已配置来源"}</SecondaryButton>
-            <PrimaryButton disabled={creatingScanMode !== null || incrementalAggregateScanSources.length === 0} onClick={() => void triggerScan("incremental")}><ScanLine className="size-4" /> {creatingScanMode === "incremental" ? "创建中…" : "增量扫描已配置来源"}</PrimaryButton>
+            <SecondaryButton disabled={creatingVideoCheck || creatingScanMode !== null || fullAggregateScanSources.length === 0} onClick={() => void triggerScan("full")}><ScanLine className="size-4" /> {creatingScanMode === "full" ? "创建中…" : "全量扫描已配置来源"}</SecondaryButton>
+            <PrimaryButton disabled={creatingVideoCheck || creatingScanMode !== null || incrementalAggregateScanSources.length === 0} onClick={() => void triggerScan("incremental")}><ScanLine className="size-4" /> {creatingScanMode === "incremental" ? "创建中…" : "增量扫描已配置来源"}</PrimaryButton>
+            {videoCheckButton}
           </div>
-          {scanActionFeedback && <p className={`mt-3 rounded-lg border px-3 py-2 text-xs ${scanActionFeedback.failed ? "border-destructive/30 bg-destructive/10 text-destructive" : "border-border bg-secondary/20 text-muted-foreground"}`}>{scanActionFeedback.message}</p>}
+          <p className="mt-2 text-xs text-muted-foreground">检查确认缺失的播放版本会从资料库剔除。</p>
+          {scanFeedback}
           {aggregateScanJob && <div className="mt-4 rounded-xl border border-border bg-secondary/20 p-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <div><p className="text-sm font-medium">本轮父任务 · {aggregateScanStatusLabels[aggregateScanJob.status]}</p><p className="mt-1 text-xs text-muted-foreground">完成 {aggregateScanJob.completedSourceCount}/{aggregateScanJob.sourceCount}，失败 {aggregateScanJob.failedSourceCount}，取消 {aggregateScanJob.cancelledSourceCount}，错误 {aggregateScanJob.errorCount}</p></div>
+              <div><p className="text-sm font-medium">{aggregateVideoCheck ? "已有影片检查" : "本轮父任务"} · {aggregateVideoCheck && aggregateScanJob.status === "running" ? "检查中" : aggregateScanStatusLabels[aggregateScanJob.status]}</p><p className="mt-1 text-xs text-muted-foreground">完成 {aggregateScanJob.completedSourceCount}/{aggregateScanJob.sourceCount}，失败 {aggregateScanJob.failedSourceCount}，取消 {aggregateScanJob.cancelledSourceCount}{aggregateVideoCheck ? `，剔除 ${aggregateScanJob.discoveredCount} 个失效版本，未确认 ${aggregateScanJob.errorCount} 个文件` : `，错误 ${aggregateScanJob.errorCount}`}</p></div>
               <div className="flex flex-wrap gap-2">
                 <SecondaryButton disabled={controllingAggregateScan || !["pending", "running"].includes(aggregateScanJob.status)} onClick={() => void controlAggregateScan("pause")}>暂停全部</SecondaryButton>
                 <SecondaryButton disabled={controllingAggregateScan || !aggregateScanJob.sourceJobs.some((job) => job.status === "paused")} onClick={() => void controlAggregateScan("resume")}>继续全部</SecondaryButton>
@@ -584,7 +591,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
               </div>
             </div>
             <div className="mt-3 grid gap-2">
-              {aggregateScanJob.sourceJobs.map((job) => <div key={job.id} className="flex items-center justify-between gap-3 rounded-lg border border-border/70 bg-background/35 px-3 py-2 text-xs"><span className="min-w-0 truncate">{job.serviceName}</span><span className="shrink-0 text-muted-foreground">{sourceScanStatusLabels[job.status]} · 已处理 {job.processedCount}{job.errorCount > 0 ? ` · 错误 ${job.errorCount}` : ""}</span></div>)}
+              {aggregateScanJob.sourceJobs.map((job) => <div key={job.id} className="flex items-center justify-between gap-3 rounded-lg border border-border/70 bg-background/35 px-3 py-2 text-xs"><span className="min-w-0 truncate">{job.serviceName}</span><span className="shrink-0 text-muted-foreground">{aggregateVideoCheck && job.status === "running" ? "检查中" : sourceScanStatusLabels[job.status]} · 已处理 {job.processedCount}{job.errorCount > 0 ? ` · 错误 ${job.errorCount}` : ""}</span></div>)}
             </div>
           </div>}
         </Panel> : <Panel title="扫描路径" description="全量与增量路径分别保存到媒体库，网盘服务只提供登录凭据。">
@@ -593,9 +600,12 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
             <ServicePathPicker serviceId={service.sourceServiceId} admin={admin} label="增量扫描目录" value={readLibraryScanRoots(scanProfile, "incremental")} onConfirm={(directories) => saveScanRoots("incremental", directories)} />
           </div>
           <div className="mt-3 flex flex-wrap gap-2">
-            <SecondaryButton disabled={creatingScanMode !== null || readLibraryScanRoots(scanProfile, "full").length === 0} onClick={() => void triggerScan("full")}><ScanLine className="size-4" /> {creatingScanMode === "full" ? "创建中…" : "全量扫描"}</SecondaryButton>
-            <PrimaryButton disabled={creatingScanMode !== null || readLibraryScanRoots(scanProfile, "incremental").length === 0} onClick={() => void triggerScan("incremental")}><ScanLine className="size-4" /> {creatingScanMode === "incremental" ? "创建中…" : "增量扫描"}</PrimaryButton>
+            <SecondaryButton disabled={creatingVideoCheck || creatingScanMode !== null || readLibraryScanRoots(scanProfile, "full").length === 0} onClick={() => void triggerScan("full")}><ScanLine className="size-4" /> {creatingScanMode === "full" ? "创建中…" : "全量扫描"}</SecondaryButton>
+            <PrimaryButton disabled={creatingVideoCheck || creatingScanMode !== null || readLibraryScanRoots(scanProfile, "incremental").length === 0} onClick={() => void triggerScan("incremental")}><ScanLine className="size-4" /> {creatingScanMode === "incremental" ? "创建中…" : "增量扫描"}</PrimaryButton>
+            {videoCheckButton}
           </div>
+          {videoCheckButton && <p className="mt-2 text-xs text-muted-foreground">检查确认缺失的播放版本会从资料库剔除。</p>}
+          {scanActionFeedback?.videoCheck && scanFeedback}
         </Panel>}
         <Panel title="元数据" description={service.dataType === "music" ? "配置音乐平台聚合与歌词补全。" : isCloudAggregate ? "全部网盘来源共用这一套影视元数据配置，并汇总为每部影片唯一的元数据。" : "配置影视刮削来源、语言和扫描增强。"}>
           <div className="grid gap-3 sm:grid-cols-2">
@@ -670,8 +680,8 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
           </div>
         </Panel>
         <Panel title="危险操作" description={isContentSource ? "清空在线目录或删除当前媒体库。" : "清空媒体条目、文件索引和目录版本。"} className="self-start">
-          <button type="button" onClick={() => void clearCatalog()} disabled={clearingCatalog} className="inline-flex w-full cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm font-medium text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {clearingCatalog ? "正在清空…" : "清空媒体库"}</button>
-          <button type="button" onClick={() => void deleteCurrentLibrary()} className="mt-2 inline-flex w-full cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive/50 px-4 py-2.5 text-sm font-medium text-destructive transition-colors hover:bg-destructive/10"><Trash2 className="size-4" /> 删除媒体库</button>
+          <button type="button" onClick={() => void clearCatalog()} disabled={maintenanceAction !== null} className="inline-flex w-full cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm font-medium text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {clearingCatalog ? "正在清空…" : "清空媒体库"}</button>
+          <button type="button" onClick={() => void deleteCurrentLibrary()} disabled={maintenanceAction !== null} className="mt-2 inline-flex w-full cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive/50 px-4 py-2.5 text-sm font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> 删除媒体库</button>
         </Panel>
       </div>
     </>
